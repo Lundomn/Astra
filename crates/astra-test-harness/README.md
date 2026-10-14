@@ -186,8 +186,9 @@ therefore does not manufacture compaction pressure; compaction mechanics and
 
 The **Harness (manual GLM)** workflow builds the selected Git revision's
 Server, CLI and `astra-test`, starts disposable MatrixOne/Memoria dependencies,
-then runs the existing YAML cases against GLM-5.3. It is manual-only; normal
-PR checks do not spend provider tokens or require secrets.
+then runs the existing YAML cases against GLM-5.3. Dispatch defaults to the
+full suite. The same execution job is reused by the automatic live regression
+described below; offline PR checks still work without provider secrets.
 
 In the repository's **Settings → Secrets and variables → Actions**, create:
 
@@ -209,12 +210,98 @@ the workflow definition, not the source under test. Build checks and the report
 use the actual checked-out SHA. Only select trusted source: its build scripts,
 local actions and executables can access the provider credentials. The checkout
 token must have read access; arbitrary private repositories are not guaranteed.
-Managed build-cache uploads are disabled for this workflow (both rust-cache and
-sccache); existing rust-cache artifacts may still be restored.
+Manual/custom checkouts cannot upload build caches. Only automatic pushes of
+the exact main revision save the shared harness cache; existing artifacts may
+be restored in either mode. Sccache remains disabled.
 There is no additional actor or repository allowlist: manual dispatch relies on
 GitHub's repository write-access requirement. No organization membership token
 is needed. This restricts who starts the workflow, not the code they select;
 selected code can read and exfiltrate the provider key, so run only trusted commits.
+
+### Small automatic live regression
+
+**Harness regression (live)** runs on relevant `main` pushes, same-repository
+PRs and explicitly trusted forks. Its `pull_request_target` caller is taken from
+the trusted base, not the PR. Before granting credentials it checks both the
+head repository's full name and immutable GitHub ID:
+
+| Trusted fork | Repository ID |
+| --- | --- |
+| `XuPeng-SH/Astra` | `1355430593` |
+| `gouhongshen/Astra` | `1355443432` |
+| `loveRhythm1990/Astra` | `1355489820` |
+
+The allowlist lives in
+[harness-regression.yml](../../.github/workflows/harness-regression.yml).
+A fork cannot grant itself access by editing its copy. Recreated/lookalike
+repositories fail the ID/name check. Adding a fork **trusts everyone who can
+write code to that fork**: its build scripts, cases and executables run with
+model credentials and can leak them. Log masking does not provide isolation.
+This is deliberate credential access for these repositories, not safe execution
+of arbitrary fork code. Revoke an entry if that trust changes.
+
+Other forks and Dependabot PRs are explicitly skipped, not certified as tested.
+Their merged revision runs on `main`; a maintainer can also manually dispatch a
+reviewed exact SHA. Automatic PR execution checks out the accepted fork's exact
+**head SHA**, not the base SHA or a movable branch. The reusable workflow and
+gate remain base-owned; checkout's explicit fork opt-in is reached only after
+authorization. Token permissions stay `contents: read`, checkout credentials
+are not persisted, and PR runs cannot save the shared build cache. The runner
+is disposable. Keep this lane optional in branch protection: offline required
+checks retain existing coverage. Superseded runs are cancelled by PR number.
+Allowlist changes take effect only after they reach the trusted base branch.
+
+The authoritative selection is [ci-regression.txt](ci-regression.txt). The
+selector stages those original files unchanged into one suite; it does not copy
+prompts into the workflow or implement another grader. Seven cases are reused;
+the mixed-model handoff is added because older heterogeneous probes require
+GLM-5.2 rather than the configured GLM-5.3.
+
+| Case | Level / evidence |
+| --- | --- |
+| `hello_text_contains` | Simple: real response, exact marker, no tools |
+| `reasoning_multi_step_logic` | Simple: exact multi-step reasoning answer |
+| `parallel_readonly_batching` | Simple tools: three repository reads, same-batch judgement |
+| `task_agent_profile_callable` | Delegation: one completed child and actual result adoption |
+| `recovered_validation_user_facing_completion` | Medium: failing baseline, edit, successful validation, user-facing delivery |
+| `cache_provider_matrix_regression` | Four turns: stable-prefix/cache diagnostics (the optional cache-ratio check is not a hard cache-hit guarantee) |
+| `flash_missing_child_model_fail_closed` | Unhappy: rejected unavailable model, zero children, no silent substitution |
+| `multi_model_fanout_handoff` | Medium: GLM-5.3 + DeepSeek-v4.1-Flash, exact slot identities, real child results and parent adoption |
+
+All parents and judges use GLM-5.3. Configure `deepseek-v4.1-flash` in
+`HARNESS_ADDITIONAL_MODELS_JSON`; it may explicitly use the same URL/key when
+that endpoint serves both models. Missing/unavailable models fail preflight;
+they are never silently substituted or omitted. No Jev configuration is required.
+
+Run once, serially, with an aggregate **15-minute execution budget** plus at most
+two minutes for cancellation/settlement. This is a budget, not a measured
+performance claim: build, service startup, registration and artifact publication
+are separate and may make the entire workflow longer. Eight root cases include
+three cache follow-up turns. Per-case timings, results, error classes, usage
+coverage and partial-timeout summaries use the same safe live progress as the
+manual workflow. There is no retry-until-green policy. This sample does not
+replace full-suite, long-task, capacity or deterministic protocol coverage.
+
+To inspect or reproduce the same selection locally:
+
+```sh
+run_dir=$(mktemp -d "$PWD/target/ci-regression.XXXXXX")
+python3 scripts/ci/select_harness_cases.py \
+  --cases crates/astra-test-harness/cases \
+  --list crates/astra-test-harness/ci-regression.txt \
+  --destination "$run_dir/cases"
+# Against a fresh, same-revision Server and a disposable checkout as workspace:
+target/debug/astra-test --suite "$run_dir/cases" \
+  --astra-bin "$PWD/target/debug/astra" --working-dir "$HARNESS_WORKSPACE" \
+  --force-model glm-5.3 --judger-model glm-5.3 --parallel 1 --runs 1 \
+  --progress-file "$run_dir/progress.jsonl" --report-file "$run_dir/report.json"
+```
+
+Local execution retains the cases' individual deadlines; the aggregate deadline
+and owned-process cleanup are provided by the Actions supervisor. Local raw
+reports can contain task/provider data and must not be uploaded as public artifacts.
+
+### Full manual suite and result reporting
 
 The case-name filter defaults to `*` (all top-level YAML cases, not recursive),
 with 1–3 repetitions. Use `hello*` for a small smoke test. Running all cases can
