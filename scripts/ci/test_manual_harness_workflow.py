@@ -178,12 +178,13 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform.startswith("linux"), "CI supervisor requires Linux")
     def test_live_command_enables_grading_and_passes_filter_literally(self):
         self.run_live_command("full")
+        self.run_live_command("full", "deepseek-v4.1-flash")
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "CI supervisor requires Linux")
     def test_regression_runs_reviewed_cases_without_disabling_grading(self):
         self.run_live_command("regression")
 
-    def run_live_command(self, profile):
+    def run_live_command(self, profile, model="glm-5.3"):
         section = WORKFLOW.read_text().split("- name: Run real harness\n", 1)[1].split("\n      - ", 1)[0]
         script = "\n".join(line[10:] for line in section.split("run: |\n", 1)[1].splitlines())
         with tempfile.TemporaryDirectory() as tmp:
@@ -230,13 +231,14 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
                                     env={**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
                                          "RUNNER_TEMP": str(root), "GITHUB_WORKSPACE": str(root),
                                          "ASTRA_BUILD_SOURCE_GIT_SHA": sha,
-                                         "CASE_FILTER": filter_value, "CASE_RUNS": "1", "CASE_PROFILE": profile},
+                                         "CASE_FILTER": filter_value, "CASE_RUNS": "1", "CASE_PROFILE": profile,
+                                         "PRIMARY_MODEL": model},
                                     capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 1, result.stderr)  # no terminal is never a pass
             args = json.loads((root / "argv.json").read_text())
             self.assertNotIn("--no-judger", args)
             self.assertEqual(args[args.index("--judger-model") + 1], "glm-5.3")
-            self.assertEqual(args[args.index("--force-model") + 1], "glm-5.3")
+            self.assertEqual(args[args.index("--force-model") + 1], model)
             if profile == "regression":
                 self.assertEqual(args[args.index("--case-model") + 1],
                                  "cache_provider_matrix_regression=deepseek-v4.1-flash")

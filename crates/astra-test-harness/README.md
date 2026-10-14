@@ -187,7 +187,9 @@ therefore does not manufacture compaction pressure; compaction mechanics and
 The **Harness (manual GLM)** workflow builds the selected Git revision's
 Server, CLI and `astra-test`, starts disposable MatrixOne/Memoria dependencies,
 then runs the existing YAML cases against GLM-5.3. Dispatch defaults to the
-full suite. The same execution job is reused by the automatic live regression
+full suite. The `model` input selects the primary model (default GLM-5.3);
+other choices must be configured in `HARNESS_ADDITIONAL_MODELS_JSON`. The judge
+remains GLM-5.3. The same execution job is reused by the automatic live regression
 described below; offline PR checks still work without provider secrets.
 
 In the repository's **Settings → Secrets and variables → Actions**, create:

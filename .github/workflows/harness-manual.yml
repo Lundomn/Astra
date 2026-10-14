@@ -18,6 +18,10 @@ on:
         required: true
         default: "*"
         type: string
+      model:
+        description: "Primary model (must be configured; judge remains GLM-5.3)"
+        default: "glm-5.3"
+        type: string
       runs:
         description: "Repetitions per case"
         default: "1"
@@ -30,6 +34,9 @@ on:
         options: [full, regression]
   workflow_call:
     inputs:
+      model:
+        type: string
+        default: "glm-5.3"
       repository:
         type: string
         required: true
@@ -187,6 +194,7 @@ jobs:
           CASE_FILTER: ${{ inputs.filter }}
           CASE_RUNS: ${{ inputs.runs }}
           CASE_PROFILE: ${{ inputs.profile }}
+          PRIMARY_MODEL: ${{ inputs.model }}
         run: |
           run_started=$(date +%s)
           workspace="$RUNNER_TEMP/harness/workspace"
@@ -200,7 +208,7 @@ jobs:
           sha256sum target/debug/astra target/debug/astra-server target/debug/astra-test > "$RUNNER_TEMP/harness/binaries.sha256"
           suite="$GITHUB_WORKSPACE/crates/astra-test-harness/cases"
           budget=3300
-          model_args=(--force-model glm-5.3)
+          model_args=(--force-model "$PRIMARY_MODEL")
           if [ "${CASE_PROFILE:-full}" = regression ]; then
             python3 scripts/ci/select_harness_cases.py --cases "$suite" \
               --list crates/astra-test-harness/ci-regression.txt \
