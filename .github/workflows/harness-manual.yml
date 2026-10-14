@@ -200,6 +200,7 @@ jobs:
           sha256sum target/debug/astra target/debug/astra-server target/debug/astra-test > "$RUNNER_TEMP/harness/binaries.sha256"
           suite="$GITHUB_WORKSPACE/crates/astra-test-harness/cases"
           budget=3300
+          model_args=(--force-model glm-5.3)
           if [ "${CASE_PROFILE:-full}" = regression ]; then
             python3 scripts/ci/select_harness_cases.py --cases "$suite" \
               --list crates/astra-test-harness/ci-regression.txt \
@@ -208,6 +209,9 @@ jobs:
             CASE_FILTER='*'
             CASE_RUNS=1
             budget=900
+            # GLM's endpoint omits cache usage. Keep the hard reuse assertion
+            # on the configured model that reports provider cache-read counts.
+            model_args+=(--case-model cache_provider_matrix_regression=deepseek-v4.1-flash)
           elif [ "${CASE_PROFILE:-full}" != full ]; then
             echo 'Unknown harness profile' >&2
             exit 1
@@ -220,7 +224,7 @@ jobs:
             --astra-bin "$GITHUB_WORKSPACE/target/debug/astra" \
             --suite "$suite" \
             --working-dir "$RUNNER_TEMP/harness/workspace" \
-            --filter "$CASE_FILTER" --force-model glm-5.3 \
+            --filter "$CASE_FILTER" "${model_args[@]}" \
             --judger-model glm-5.3 --parallel 1 --runs "$CASE_RUNS" \
             --report-file "$RUNNER_TEMP/harness/report.json"
 

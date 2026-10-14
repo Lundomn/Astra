@@ -236,6 +236,12 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             args = json.loads((root / "argv.json").read_text())
             self.assertNotIn("--no-judger", args)
             self.assertEqual(args[args.index("--judger-model") + 1], "glm-5.3")
+            self.assertEqual(args[args.index("--force-model") + 1], "glm-5.3")
+            if profile == "regression":
+                self.assertEqual(args[args.index("--case-model") + 1],
+                                 "cache_provider_matrix_regression=deepseek-v4.1-flash")
+            else:
+                self.assertNotIn("--case-model", args)
             self.assertEqual(args[args.index("--filter") + 1], "*" if profile == "regression" else filter_value)
             suite = Path(args[args.index("--suite") + 1])
             if profile == "regression":

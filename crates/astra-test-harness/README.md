@@ -264,11 +264,16 @@ GLM-5.2 rather than the configured GLM-5.3.
 | `parallel_readonly_batching` | Simple tools: three repository reads, same-batch judgement |
 | `task_agent_profile_callable` | Delegation: one completed child and actual result adoption |
 | `recovered_validation_user_facing_completion` | Medium: failing baseline, edit, successful validation, user-facing delivery |
-| `cache_provider_matrix_regression` | Four turns: stable-prefix/cache diagnostics (the optional cache-ratio check is not a hard cache-hit guarantee) |
+| `cache_provider_matrix_regression` | Four DeepSeek-v4.1-Flash turns: hard provider-observed cache reuse; the cache-share ratio is optional when creation usage is unknown |
 | `flash_missing_child_model_fail_closed` | Unhappy: rejected unavailable model, zero children, no silent substitution |
 | `multi_model_fanout_handoff` | Medium: GLM-5.3 + DeepSeek-v4.1-Flash, exact slot identities, real child results and parent adoption |
 
-All parents and judges use GLM-5.3. Configure `deepseek-v4.1-flash` in
+Parents and judges use GLM-5.3, except the cache case explicitly uses
+DeepSeek-v4.1-Flash: the GLM endpoint does not report cache-read usage and
+cannot certify that hard contract. No criterion is removed or relaxed.
+`--case-model CASE=MODEL` binds a selected case after `--force-model`, without
+changing its prompts or assertions. Duplicate or unselected case bindings fail
+before preflight/provider calls. Configure `deepseek-v4.1-flash` in
 `HARNESS_ADDITIONAL_MODELS_JSON`; it may explicitly use the same URL/key when
 that endpoint serves both models. Missing/unavailable models fail preflight;
 they are never silently substituted or omitted. No Jev configuration is required.

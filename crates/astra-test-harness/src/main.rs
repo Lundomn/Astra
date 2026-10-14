@@ -68,6 +68,10 @@ struct Args {
     #[arg(long, value_name = "MODEL")]
     force_model: Option<String>,
 
+    /// Bind one selected case to a model, after --force-model. Repeat for distinct cases.
+    #[arg(long, value_name = "CASE=MODEL")]
+    case_model: Vec<String>,
+
     /// Parallel execution concurrency. Default 1 (serial).
     #[arg(long, default_value_t = 1)]
     parallel: usize,
@@ -184,6 +188,24 @@ struct Args {
     /// Opens http://localhost:PORT (default 9100) in your browser.
     #[arg(long, value_name = "PORT", default_missing_value = "9100", num_args = 0..=1)]
     live_dashboard: Option<u16>,
+}
+
+fn apply_case_model_overrides(cases: &mut [Case], bindings: &[String]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for binding in bindings {
+        let (name, model) = binding
+            .split_once('=')
+            .filter(|(name, model)| !name.trim().is_empty() && !model.trim().is_empty())
+            .with_context(|| format!("--case-model requires CASE=MODEL: {binding:?}"))?;
+        anyhow::ensure!(seen.insert(name), "duplicate --case-model for {name:?}");
+        let mut matching = cases.iter_mut().filter(|case| case.name == name);
+        let case = matching
+            .next()
+            .with_context(|| format!("--case-model names an unselected case: {name:?}"))?;
+        anyhow::ensure!(matching.next().is_none(), "ambiguous case name: {name:?}");
+        case.models = Some(vec![model.to_string()]);
+    }
+    Ok(())
 }
 
 fn collect_judger_models(
@@ -523,6 +545,7 @@ async fn run(args: Args) -> Result<()> {
             case.models = Some(vec![forced.clone()]);
         }
     }
+    apply_case_model_overrides(&mut cases, &args.case_model)?;
 
     let fallback_models: Vec<String> = args
         .models
@@ -816,6 +839,53 @@ async fn run(args: Args) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn case_model_bindings_change_only_selected_models_and_reject_typos() {
+        use super::{Case, Parser};
+
+        let case: Case = serde_json::from_value(serde_json::json!({
+            "name": "example", "prompt": "Answer OK", "models": ["primary"],
+            "required_models": ["child"], "criteria": [{"type": "exit_code", "code": 0}]
+        }))
+        .unwrap();
+        let other: Case = serde_json::from_value(serde_json::json!({
+            "name": "other", "prompt": "Other task", "models": ["primary"]
+        }))
+        .unwrap();
+        let args = super::Args::try_parse_from([
+            "astra-test",
+            "--force-model",
+            "primary",
+            "--case-model",
+            "example=secondary",
+        ])
+        .unwrap();
+        let mut cases = vec![case.clone(), other.clone()];
+        super::apply_case_model_overrides(&mut cases, &args.case_model).unwrap();
+        let mut expected = case.clone();
+        expected.models = Some(vec!["secondary".into()]);
+        assert_eq!(
+            serde_json::to_value(&cases).unwrap(),
+            serde_json::to_value([expected, other]).unwrap()
+        );
+        for bindings in [
+            vec!["missing=secondary"],
+            vec!["example="],
+            vec!["=secondary"],
+            vec!["example"],
+            vec!["example=secondary", "example=third"],
+        ] {
+            let mut cases = vec![case.clone()];
+            assert!(
+                super::apply_case_model_overrides(
+                    &mut cases,
+                    &bindings.into_iter().map(String::from).collect::<Vec<_>>()
+                )
+                .is_err()
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn cli_progress_drains_before_nonzero_exit_without_a_provider() {
