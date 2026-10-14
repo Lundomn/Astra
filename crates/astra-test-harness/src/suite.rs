@@ -655,6 +655,17 @@ impl<'a> SuiteRunner<'a> {
     }
 
     async fn run_one(&self, case: &Case, model: &str, run_index: u32) -> CaseRunReport {
+        let bound = match case.bind_model(model) {
+            Ok(bound) => bound,
+            Err(error) => {
+                let mut report =
+                    self.model_resolution_unavailable(case, &error.to_string(), run_index);
+                report.model = model.to_owned();
+                report.outcome.model = model.to_owned();
+                return report;
+            }
+        };
+        let case = &bound;
         if let Some(report) = self.skip_for_unsupported_cache_scope(case, model) {
             eprintln!(
                 "[astra-test] [UNAVAILABLE] {} × {} (unsupported cache scope)",
@@ -765,6 +776,7 @@ impl<'a> SuiteRunner<'a> {
                     prompt: step.prompt.clone(),
                     prompt_variants: vec![],
                     models: Some(vec![model.to_string()]),
+                    required_models: case.required_models.clone(),
                     criteria: vec![],
                     debug_log: case.debug_log,
                     extra_cli_args: {
@@ -1705,6 +1717,7 @@ mod tests {
             prompt: format!("prompt-for-{name}"),
             prompt_variants: vec![],
             models: None,
+            required_models: vec![],
             criteria,
             debug_log: false,
             extra_cli_args: vec![],
@@ -1721,6 +1734,76 @@ mod tests {
             cleanup_memory_records: false,
             requires_memoria: false,
         }
+    }
+
+    #[tokio::test]
+    async fn matrix_binding_reaches_execution_steps_grading_and_reproducer() {
+        struct Echo;
+        #[async_trait]
+        impl CaseExecutor for Echo {
+            async fn execute(&self, case: &Case, model: &str) -> RunOutcome {
+                assert!(!case.prompt.contains("{{model}}"));
+                outcome_ok(model, &case.prompt, &[])
+            }
+            fn reproducer(&self, case: &Case, _: &str) -> String {
+                case.prompt.clone()
+            }
+        }
+        let mut case = case_with(
+            "binding",
+            vec![Criterion::TextContains {
+                needle: "root {{model}}".into(),
+            }],
+        );
+        case.prompt = "root {{model}}".into();
+        case.steps = vec![crate::case::CaseStep {
+            prompt: "follow-up {{model}}".into(),
+            criteria: vec![Criterion::TextContains {
+                needle: "follow-up {{model}}".into(),
+            }],
+            timeout_seconds: None,
+        }];
+        let exec = Echo;
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        for parallel in [1, 2] {
+            let runner = SuiteRunner {
+                executor: &exec,
+                judger: &judger,
+                session_loader: &loader,
+                digest_collector: None,
+                runner_cfg: RunnerConfig::new(PathBuf::from("astra"))
+                    .with_fallback_models(vec!["model-a".into(), "model-b".into()]),
+                no_judger: true,
+                session_mode: SessionCaptureMode::Never,
+                suite_cfg: SuiteConfig {
+                    parallel,
+                    runs: 2,
+                    ..SuiteConfig::default()
+                },
+                dashboard_tx: None,
+                run_id: String::new(),
+                cancel_flag: None,
+            };
+            let report = runner.run_all(std::slice::from_ref(&case)).await;
+            assert_eq!(report.runs.len(), 4);
+            for run in report.runs {
+                assert_eq!(run.status, CaseRunStatus::Passed, "{run:?}");
+                assert_eq!(run.reproducer.unwrap(), format!("root {}", run.model));
+                assert_eq!(run.steps[0].prompt, format!("follow-up {}", run.model));
+            }
+            let mut invalid = case.clone();
+            invalid.prompt = "{{unknown}}".into();
+            invalid.setup_cmd = Some("exit 99".into());
+            let report = runner.run_all(&[invalid]).await;
+            assert!(
+                report
+                    .runs
+                    .iter()
+                    .all(|run| run.status == CaseRunStatus::Unavailable)
+            );
+        }
+        assert_eq!(case.prompt, "root {{model}}");
     }
 
     #[test]
