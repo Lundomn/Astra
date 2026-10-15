@@ -10689,6 +10689,18 @@ impl AgenticRunLifecycleService {
                 )
             })?;
 
+        // Registration publishes the pool and durable row in separate steps.
+        // Read both views behind the same per-owner/executor barrier used by
+        // REST registration and WebSocket setup/rollback, never its half-state.
+        let registration_lock = self
+            .edge_connection_pool
+            .as_ref()
+            .map(|pool| pool.registration_lock(user_id, executor_id));
+        let _registration_guard = match registration_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+
         let path_matches = |path: Option<&str>| {
             path.map(str::trim)
                 .is_some_and(|candidate| candidate == root)
@@ -21996,16 +22008,14 @@ impl ServerSpawnAgentExecutor {
             .get()
             .and_then(Weak::upgrade)
             .ok_or_else(|| "parent's canonical tool executor is no longer available".to_string())?;
-        let policy = match executor.provider_policy_lookup(&request.tool) {
-            runtime_tool_executor::ProviderPolicyLookup::Resolved(policy) => policy,
-            runtime_tool_executor::ProviderPolicyLookup::MissingPolicy { .. }
-            | runtime_tool_executor::ProviderPolicyLookup::NotProvider => {
-                return Err("native collaborator requires a resolved provider tool policy".into());
-            }
-        };
-        if !executor.provider_is_collaborator_stage(&request.tool) {
-            return Err("selected provider is not an admitted collaborator stage".into());
-        }
+        let policy = executor
+            .collaborator_policy(&request.tool, request.model.as_deref())
+            .map_err(|reason| {
+                crate::orchestration::SpawnError::Admission(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::InvalidRequest,
+                    reason,
+                ))
+            })?;
         let provider_schema = executor
             .current_edge_provider_schema(&request.tool)
             .ok_or_else(|| {
