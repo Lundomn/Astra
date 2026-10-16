@@ -58,6 +58,22 @@ def write_events(root, data, tail=b""):
 
 
 class ManualHarnessProgressTests(unittest.TestCase):
+    def test_failed_required_combination_explains_soft_child_without_regrading(self):
+        child = {"type":"duration_between", "severity":"soft", "score":None,
+                 "passed":False, "evaluation":"reported", "diagnostic":{
+                     "kind":"count", "min":0, "max":45000, "actual":49489}}
+        parent = {"type":"all_of", "severity":"hard", "score":None,
+                  "passed":False, "evaluation":"reported", "diagnostic":{
+                      "kind":"composite", "checks":[child]}}
+        lines = list(h.check_lines([parent], "root"))
+        self.assertIn("all_of (hard): Required combination failed", lines[0])
+        self.assertIn("duration_between (soft)", lines[1])
+        self.assertIn("observed 49489", lines[1])
+        self.assertFalse(parent["passed"])
+        self.assertFalse(child["passed"])
+        result = row("incomplete", "failed")
+        self.assertTrue(any("zero counters do not prove" in line for line in h.row_checks(result)))
+
     def test_failure_summary_explains_observations_and_judges_without_regrading(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -69,7 +85,7 @@ class ManualHarnessProgressTests(unittest.TestCase):
                          "kind":"tool_count", "min":1, "max":1, "actual":0,"considered":1,
                          "expected_ok":False, "outcome_matches":1, "error_matches":None, "predicate_matches":[1,0,0],
                          "observed_outcomes":[{"count":1,"outcome":{"disposition":"rejected","ok":False,
-                             "status":"rejected","error_kind":"tool_invalid_args","execution":"not_executed"}}],
+                             "status":"rejected","error_kind":"tool_invalid_args","execution":"not_executed","validation":None}}],
                          "outcomes_omitted":0}}
             result["criteria"] = [check]
             write_events(root, data)
@@ -81,7 +97,8 @@ class ManualHarnessProgressTests(unittest.TestCase):
             self.assertIn("[1, 0, 0]", summary)
             self.assertIn("not configured", summary)
             self.assertIn("tool_invalid_args", summary)
-            self.assertIn("argument validation error reported", summary)
+            self.assertIn("Failure stage: argument validation", summary)
+            self.assertIn("exact invalid field is unknown", summary)
             command = subprocess.run([sys.executable, str(SCRIPT), "summary", "--root", str(root)],
                 env={**os.environ, "ASTRA_BUILD_SOURCE_GIT_SHA":SHA,
                      "GITHUB_STEP_SUMMARY":str(root / "job-summary"), "HARNESS_OUTCOME":"failure"},
@@ -93,6 +110,14 @@ class ManualHarnessProgressTests(unittest.TestCase):
             self.assertEqual(json.loads((root / "summary.json").read_text())["runs"][0]["criteria"][0]
                              ["diagnostic"]["observed_outcomes"], check["diagnostic"]["observed_outcomes"])
             outcome = check["diagnostic"]["observed_outcomes"][0]["outcome"]
+            outcome["validation"] = {"issues":[{"code":"required","path":"/description"}], "omitted":3}
+            write_events(root, data)
+            _, accepted = self.publish(root, "failure")
+            self.assertIsNone(accepted["observation_error"])
+            summary = (root / "job-summary").read_text()
+            self.assertIn("required at /description", summary)
+            self.assertIn("omitted validation issues=3", summary)
+            outcome["validation"] = None
             for status in ("timeout", "still_running", "launched"):
                 outcome["status"] = status
                 write_events(root, data)
@@ -100,7 +125,7 @@ class ManualHarnessProgressTests(unittest.TestCase):
                 self.assertIsNone(accepted["observation_error"])
                 self.assertIn(status, (root / "job-summary").read_text())
             outcome["status"] = "rejected"
-            for field in ("status", "error_kind", "execution", "disposition", "ok"):
+            for field in ("status", "error_kind", "execution", "disposition", "ok", "validation"):
                 prior = outcome[field]
                 outcome[field] = "private-sentinel"
                 write_events(root, data)

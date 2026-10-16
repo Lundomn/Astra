@@ -1135,6 +1135,7 @@ pub(crate) fn execution_contract_proof(
             let mut error_matches = 0;
             let mut predicate_matches = vec![0usize; predicates.len()];
             let mut observed_outcomes: Vec<serde_json::Value> = Vec::new();
+            let mut outcome_bytes = 0;
             let mut outcomes_omitted = 0usize;
             let count = calls
                 .iter()
@@ -1144,12 +1145,17 @@ pub(crate) fn execution_contract_proof(
                     }
                     considered += 1;
                     let outcome = call.safe_outcome();
+                    let bytes = serde_json::to_vec(&outcome)
+                        .expect("safe outcome serializes")
+                        .len()
+                        + 64;
                     if let Some(existing) = observed_outcomes
                         .iter_mut()
                         .find(|entry| entry["outcome"] == outcome)
                     {
                         existing["count"] = (existing["count"].as_u64().unwrap() + 1).into();
-                    } else if observed_outcomes.len() < 16 {
+                    } else if observed_outcomes.len() < 16 && outcome_bytes + bytes <= 8192 {
+                        outcome_bytes += bytes;
                         observed_outcomes.push(serde_json::json!({"outcome":outcome,"count":1}));
                     } else {
                         outcomes_omitted += 1;
@@ -11131,6 +11137,72 @@ mod tests {
                 "post-correction step {index} must accept observed partial reads: {strong_result:?}"
             );
         }
+    }
+
+    #[test]
+    fn diagnostic_budget_does_not_mask_functional_failure() {
+        let mut outcome = outcome_with_tools(&[]);
+        outcome.duration_ms = 49_489;
+        let criteria = [
+            Criterion::ExitCode { code: 0 },
+            Criterion::DurationBetween {
+                min_ms: 0,
+                max_ms: 45_000,
+            },
+        ];
+        for (exit_code, expected_hard_pass) in [(0, true), (1, false)] {
+            outcome.exit_code = exit_code;
+            let results = evaluate_deterministic_with_session(&criteria, &outcome, None);
+            assert!(!results[1].passed);
+            assert_eq!(results[1].severity, CriterionSeverity::Soft);
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|r| r.severity == CriterionSeverity::Hard)
+                    .all(|r| r.passed),
+                expected_hard_pass
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_cases_keep_uncalibrated_efficiency_budgets_diagnostic() {
+        fn check(criteria: &[Criterion], required: bool, case: &str) {
+            for criterion in criteria {
+                match criterion {
+                    Criterion::AllOf { criteria } | Criterion::AnyOf { criteria } => {
+                        check(criteria, true, case);
+                    }
+                    Criterion::DurationBetween { .. }
+                    | Criterion::TokensBetween { .. }
+                    | Criterion::TurnRoundsBetween { .. } => {
+                        assert!(
+                            !required,
+                            "{case}: efficiency budget inside hard combination"
+                        );
+                    }
+                    Criterion::ToolsCountBetween { min, max } if min != max => {
+                        assert!(!required, "{case}: tool budget inside hard combination");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        fn visit(dir: &std::path::Path) {
+            for case in crate::case::Case::load_dir(dir).expect("load shipped cases") {
+                check(&case.criteria, false, &case.name);
+                for step in &case.steps {
+                    check(&step.criteria, false, &case.name);
+                }
+            }
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(&path);
+                }
+            }
+        }
+        visit(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cases"));
     }
 
     #[test]
