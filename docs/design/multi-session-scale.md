@@ -255,12 +255,39 @@ independent server pools share the same durable global and owner budgets, keeps
 successful permits live until all attempts finish, and checks that release does
 not leak a reservation. The admission latency it prints includes pool and gate
 wait; it is not a full server turn or provider throughput metric. The current
-hot path also reads the gate clock and capacity hash with one locked query,
-removing a redundant round trip without weakening configuration fencing.
+hot path reads the capacity hash under the gate lock, then samples database
+time in a separate statement. A timestamp in the locking statement can precede
+its row-lock wait; it must not decide expiry, replay or renewal after that wait.
+This constant round trip is included in the existing admission deadline.
 
 The next stage may introduce sharded/lease-based capacity only after measured
 lock wait, pool wait, or reservation-scan evidence justifies it, with crash and
 expiry tests.
+
+The current fresh-schema gate also holds a conservative earliest-expiry
+frontier beside its materialized usage. A clean future frontier avoids scanning
+all live reservations for expiry on each admission. Dirty state or a due
+frontier reconciles expiry before checking capacity; totals and frontier commit
+together. Insertions and shortened renewals lower the frontier. Release and
+extended renewals may leave it stale only in the earlier direction, causing an
+extra check rather than missing expired work. No process-local expiry cache or
+second cleanup owner is involved.
+
+Saturated admission resolves the exact idempotency identity before rejecting
+new work, without a provisional INSERT. Identical replay remains valid at full
+capacity; changed work remains a mismatch. Rejection commits completed expiry
+and usage repair, so a rejected burst does not repeatedly undo the same
+housekeeping. Owner reads and mutations retain binary identity checks while
+also bounding the native compound-key candidate. These changes reduce work
+inside the existing gate, not its cross-server serialization ceiling.
+
+Reservation storage is keyed by its existing logical idempotency identity
+`(scope, isolation domain, owner, idempotency hash)`. The hash is a bounded
+VARCHAR so native predicates can use that compound key without casting the
+stored column. A unique generation UUID remains separate: expiry and recreation
+produce a new UUID, and renew/release require both the logical key and that
+generation. A late old permit cannot release a new reservation for the same
+idempotency key. No additional index or identity ledger is introduced.
 
 ## Required scenarios
 
