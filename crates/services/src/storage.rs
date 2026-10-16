@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-08-v101";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-14-v102";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -3569,6 +3569,26 @@ async fn ensure_core_schema_while_leased(
 
     core_schema_create!(
         pool,
+        "agent_session_memory_work",
+        "CREATE TABLE IF NOT EXISTS agent_session_memory_work (
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            state_json JSON NOT NULL,
+            lease_token VARCHAR(36) NULL,
+            lease_expires_at DATETIME(6) NULL,
+            next_attempt_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            attempts BIGINT NOT NULL DEFAULT 0,
+            complete BOOLEAN NOT NULL DEFAULT TRUE,
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id),
+            INDEX idx_session_memory_due (complete, next_attempt_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
         "agent_session_lifecycle_fences",
         "CREATE TABLE IF NOT EXISTS agent_session_lifecycle_fences (
             session_id VARCHAR(64) NOT NULL,
@@ -6007,6 +6027,20 @@ async fn verify_core_schema_shape(
     })
     .collect::<Result<BTreeSet<_>, sqlx::Error>>()?;
     for (table, required) in [
+        (
+            "agent_session_memory_work",
+            &[
+                "user_id",
+                "session_id",
+                "state_json",
+                "lease_token",
+                "lease_expires_at",
+                "next_attempt_at",
+                "attempts",
+                "complete",
+                "updated_at",
+            ][..],
+        ),
         ("auth_refresh_tokens", &["session_id"][..]),
         (
             "agent_sessions",
