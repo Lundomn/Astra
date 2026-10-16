@@ -23866,6 +23866,120 @@ async fn durable_live_attach_keeps_terminal_explain_run_open_until_publication_s
 }
 
 #[tokio::test]
+async fn durable_live_attach_waits_for_delayed_publication_after_settlement_committed() {
+    let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+    let svc = AgenticRunLifecycleService::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+        engine.clone(),
+    )
+    .with_model_service(Arc::new(ActiveTestModelService::default()));
+    engine
+        .start_run("remote-settled-explain", "user-1", "remote-session")
+        .await
+        .expect("seed remote Explain run");
+    engine
+        .append_event(
+            "user-1",
+            "remote-session",
+            "remote-settled-explain",
+            json!({
+                "event_type": "run_started",
+                "data": {"explain_analyze_requested": true}
+            }),
+        )
+        .await
+        .expect("mark Explain request");
+    assert!(
+        engine
+            .transition_status_with_event_if_current(
+                "user-1",
+                "remote-session",
+                "remote-settled-explain",
+                &[STATUS_RUNNING],
+                STATUS_COMPLETED,
+                None,
+                None,
+                json!({"event_type": "run_finished", "data": {}}),
+            )
+            .await
+            .expect("complete remote Explain run")
+    );
+    engine
+        .append_event(
+            "user-1",
+            "remote-session",
+            "remote-settled-explain",
+            json!({"event_type": "run_settlement_finished", "data": {}}),
+        )
+        .await
+        .expect("commit settlement before publication");
+
+    let mut reconnect = ok(svc
+        .stream_run_live(
+            "remote-settled-explain".to_string(),
+            "user-1".to_string(),
+            0,
+        )
+        .await);
+    let mut reconnect_rx = reconnect
+        .event_rx
+        .take()
+        .expect("settlement must not close an Explain attach before publication");
+
+    let outcome = astra_turn_types::ArtifactPublicationV1 {
+        schema_version: 1,
+        run_id: "remote-settled-explain".into(),
+        turn_id: "turn-1".into(),
+        execution_owner_generation: 1,
+        artifact_type: "explain_analyze_snapshot".into(),
+        recorded: true,
+        result: astra_turn_types::ArtifactPublicationResult::Published {
+            handle: format!("artifact://session/explain-analyze/{}", "c".repeat(64)),
+        },
+    };
+    engine
+        .append_event(
+            "user-1",
+            "remote-session",
+            "remote-settled-explain",
+            json!({
+                "event_type": "artifact_publication",
+                "data": serde_json::to_value(&outcome).expect("publication payload")
+            }),
+        )
+        .await
+        .expect("publish after settlement");
+
+    let mut observed_publication = false;
+    let mut observed_settlement = false;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while !(observed_publication && observed_settlement) {
+            let event = reconnect_rx
+                .recv()
+                .await
+                .expect("settled Explain attachment must remain open");
+            observed_publication |= event["event_type"] == "artifact_publication";
+            observed_settlement |= event["event_type"] == "run_settlement_finished";
+            assert_ne!(
+                event["event_type"], "artifact_publication_unavailable",
+                "settlement must not replace a later real publication"
+            );
+        }
+    })
+    .await
+    .expect("publication after settlement timeout");
+    assert!(observed_publication && observed_settlement);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), reconnect_rx.recv())
+            .await
+            .expect("attachment close timeout")
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn durable_live_attach_replays_publication_added_between_initial_and_metadata_reads() {
     let outcome = astra_turn_types::ArtifactPublicationV1 {
         schema_version: 1,
@@ -24177,6 +24291,71 @@ fn agent_progress_is_live_only_while_agent_lifecycle_is_durable() {
     }
 }
 
+#[tokio::test]
+async fn production_fanout_flushes_sparse_event_before_terminal() {
+    // Keep the model open beyond the event deadline: a terminal-triggered
+    // flush must not make the sparse-event timer test pass accidentally.
+    let llm = spawn_incremental_terminal_test_llm(Duration::from_secs(1)).await;
+    let store = Arc::new(
+        FaultInjectedRunStateStore::new(&[], &[]).with_append_delay(Duration::from_millis(40)),
+    );
+    let mut owner = AgenticRunLifecycleService::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+        RunEngine::new(store),
+    )
+    .with_fixture_workspace_provider(
+        Arc::new(tempfile::tempdir().unwrap()),
+        "fanout-timer-fixture",
+    )
+    .with_model_service(Arc::new(ActiveTestModelService::new(llm.base_url.clone())));
+    owner.test_inference_ledger = Some(Default::default());
+    let mut request = test_request("sparse live run");
+    request.execution_policy.turn_intent =
+        astra_services::runs::TurnIntentExecutionPolicy::FixedDefault;
+    request.execution_policy.skill_auto_route =
+        astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled;
+    let mut stream = ok(owner.stream_chat("user-1".to_owned(), request).await);
+    let mut rx = stream.event_rx.take().unwrap();
+    owner
+        .server_agent_progress_broadcaster
+        .emit(test_agent_spawned(
+            "agent-timer-canary",
+            "child-timer-canary",
+            &stream.run_id,
+            0,
+        ));
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while let Some(event) = rx.recv().await {
+            assert_ne!(event["type"], "run_finished");
+            if event["type"] == "agent_spawned" && event["agent_id"] == "agent-timer-canary" {
+                return;
+            }
+        }
+        panic!("stream closed before the sparse event");
+    })
+    .await
+    .expect("sparse durable event must flush within 500ms without capacity or terminal");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut completed = false;
+        while let Some(event) = rx.recv().await {
+            if event["type"] == "run_finished" {
+                assert_eq!(event["status"], "completed");
+                completed = true;
+            }
+        }
+        assert!(completed);
+    })
+    .await
+    .unwrap();
+    owner
+        .test_inference_ledger
+        .as_ref()
+        .unwrap()
+        .assert_quiescent();
+}
+
 #[test]
 fn work_task_board_update_is_a_durable_live_lifecycle_edge() {
     let board_update = json!({
@@ -24369,7 +24548,7 @@ async fn structural_explain_events_share_the_bounded_live_microbatch() {
 
     assert!(
         store.appended_batches().is_empty(),
-        "structural events must wait for the 25ms or capacity boundary"
+        "structural events must wait for the timer or capacity boundary"
     );
     assert_eq!(
         live_rx.try_recv(),
@@ -24397,6 +24576,174 @@ async fn structural_explain_events_share_the_bounded_live_microbatch() {
     );
     assert_eq!(live_rx.recv().await.expect("first live explain"), first);
     assert_eq!(live_rx.recv().await.expect("second live explain"), second);
+}
+
+#[tokio::test]
+async fn committed_interactions_remain_immediate_delivery_boundaries() {
+    let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]));
+    let engine = RunEngine::new(store.clone());
+    engine
+        .start_run("run-1", "user-1", "session-1")
+        .await
+        .expect("seed durable run");
+    let runs = Arc::new(RwLock::new(HashMap::new()));
+    let (live_tx, mut live_rx) = broadcast::channel(8);
+    let mut client_event_tx = AttachedStreamDelivery::detached();
+    let mut pending = PendingDurableLiveEvents::default();
+    let durable_tool_terminals = DurableToolTerminalTracker::default();
+
+    pending.push(json!({"type": "agent_spawned", "agent_id": "agent-1"}));
+    let committed_interaction = json!({
+        "type": "tool_request",
+        "request_id": "request-1",
+        "tool": "bash",
+        HOST_INTERACTION_COMMITTED_FIELD: true,
+    });
+
+    let result = process_ordered_live_fanout_event(
+        committed_interaction.clone(),
+        &mut pending,
+        &engine,
+        &runs,
+        "user-1",
+        "session-1",
+        "run-1",
+        &live_tx,
+        &mut client_event_tx,
+        &durable_tool_terminals,
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "deliver committed interaction boundary: {:?}",
+        result.err().map(|error| error.detail)
+    );
+
+    assert_eq!(
+        store.appended_batches(),
+        vec![vec![
+            json!({"type": "agent_spawned", "agent_id": "agent-1"})
+        ]]
+    );
+    assert_eq!(
+        live_rx.recv().await.expect("queued event"),
+        json!({
+            "type": "agent_spawned", "agent_id": "agent-1"
+        })
+    );
+    assert_eq!(
+        live_rx.recv().await.expect("committed interaction"),
+        json!({
+            "type": "tool_request",
+            "request_id": "request-1",
+            "tool": "bash",
+        })
+    );
+    assert!(pending.is_empty());
+}
+
+#[tokio::test]
+async fn ordered_microbatch_keeps_transient_frames_behind_the_durable_commit() {
+    for fail_commit in [false, true] {
+        let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]));
+        let engine = RunEngine::new(store.clone());
+        engine
+            .start_run("run-1", "user-1", "session-1")
+            .await
+            .unwrap();
+        drop(engine);
+        let mut owned = Arc::try_unwrap(store).ok().unwrap();
+        // Inject the fanout failure after start-run setup, not into setup.
+        if fail_commit {
+            let next = owned.counters.lock().unwrap().append_calls + 1;
+            owned.fail_append_calls.insert(next);
+        }
+        let store = Arc::new(owned);
+        let engine = RunEngine::new(store.clone());
+        let runs = Arc::new(RwLock::new(HashMap::new()));
+        let (live_tx, mut live_rx) = broadcast::channel(8);
+        let mut delivery = AttachedStreamDelivery::detached();
+        let mut pending = PendingDurableLiveEvents::default();
+        let tracker = DurableToolTerminalTracker::default();
+        let first = json!({"type": "agent_spawned", "agent_id": "agent-1"});
+        let progress = json!({"type": "agent_progress", "agent_id": "agent-1"});
+        let second = json!({"type": "tool_call_end", "call_id": "call-1", "status": "completed"});
+        for event in [first.clone(), progress.clone(), second.clone()] {
+            assert!(
+                process_ordered_live_fanout_event(
+                    event,
+                    &mut pending,
+                    &engine,
+                    &runs,
+                    "user-1",
+                    "session-1",
+                    "run-1",
+                    &live_tx,
+                    &mut delivery,
+                    &tracker,
+                )
+                .await
+                .is_ok()
+            );
+        }
+        assert!(store.appended_batches().is_empty());
+        assert_eq!(
+            live_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        );
+        let result = flush_durable_live_events(
+            &mut pending,
+            &engine,
+            &runs,
+            "user-1",
+            "session-1",
+            "run-1",
+            &live_tx,
+            &mut delivery,
+            &tracker,
+        )
+        .await;
+        if fail_commit {
+            assert!(result.is_err());
+            assert!(store.appended_batches().is_empty());
+            assert_eq!(
+                live_rx.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            );
+            let mut retained = [second];
+            tracker.mark_committed_retained_copies(&mut retained);
+            assert!(tool_terminal_requires_settlement_repair(&retained[0]));
+        } else {
+            result.unwrap();
+            assert_eq!(
+                store.appended_batches(),
+                vec![vec![first.clone(), second.clone()]]
+            );
+            for expected in [first, progress, second] {
+                assert_eq!(live_rx.try_recv().unwrap(), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn ordered_microbatch_bounds_include_transient_frames() {
+    let mut pending = PendingDurableLiveEvents::default();
+    pending.push(json!({"type": "agent_spawned"}));
+    for _ in 1..DURABLE_LIVE_BATCH_MAX_EVENTS {
+        assert!(!pending.should_flush());
+        pending.push_ordered(json!({"type": "agent_progress"}), false);
+    }
+    assert!(pending.should_flush());
+    assert_eq!(pending.take().len(), DURABLE_LIVE_BATCH_MAX_EVENTS);
+    assert!(pending.is_empty());
+    assert!(!pending.should_flush());
+    pending.push(json!({"type": "agent_spawned"}));
+    pending.push_ordered(
+        json!({"type": "agent_progress", "text": "x".repeat(DURABLE_LIVE_BATCH_MAX_BYTES)}),
+        false,
+    );
+    assert!(pending.should_flush());
 }
 
 #[test]
@@ -33560,6 +33907,113 @@ async fn stream_chat_explain_mode_finishes_a_short_turn() {
         }),
         "short Explain turn did not emit run_finished: {events:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1; provider is localhost mock"]
+async fn db_stream_terminal_precedes_blocked_quota_cleanup() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let owner = format!("cleanup-owner-{}", Uuid::new_v4());
+    let session = format!("cleanup-session-{}", Uuid::new_v4());
+    crate::server::run::insert_active_run_session_fixture(&pool, &owner, &session).await;
+    let llm = spawn_terminal_test_llm().await;
+    let mut service = db_backed_test_service(&pool, "cleanup-test");
+    service
+        .distributed_weighted_admission
+        .as_mut()
+        .unwrap()
+        .with_admission_wait_timeout(Duration::from_secs(60));
+    let mut request = prepared_test_request("hello");
+    request.session_id = Some(session.clone());
+    request.provider_runtime_authorized = true;
+    request.admitted_model_execution = None;
+    request.runtime_auth = Some(RuntimeAuthRequest {
+        authorization: "Bearer fake-cleanup".into(),
+    });
+    request.capability_descriptors =
+        Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
+            model_gateway: Some(test_runtime_descriptor(
+                "cleanup-gateway",
+                "model_gateway",
+                &format!("{}/chat/completions", llm.base_url),
+            )),
+            ..Default::default()
+        });
+    request.execution_policy.skill_auto_route =
+        astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled;
+    let mut stream = ok(service.stream_chat(owner.clone(), request).await);
+    let run_id = stream.run_id.clone();
+    let mut gate = pool.get().begin().await.unwrap();
+    sqlx::query(
+        "SELECT scope_name FROM session_weighted_admission_gates
+         WHERE scope_name = 'canonical_turn_v1' FOR UPDATE",
+    )
+    .fetch_one(&mut *gate)
+    .await
+    .unwrap();
+
+    let mut events = stream.events;
+    let closed = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(event) = stream.event_rx.as_mut().unwrap().recv().await {
+            events.push(event);
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "quota cleanup held the stream open: provider_requests={}, events={:?}",
+        llm.requests.load(Ordering::SeqCst),
+        events
+            .iter()
+            .map(|event| (replay_event_type(event), chat_stream_event_status(event)))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        events.iter().any(|event| {
+            replay_event_type(event) == Some("run_finished")
+                && chat_stream_event_status(event) == Some(STATUS_COMPLETED)
+        }),
+        "{events:?}"
+    );
+    let (completed_turn, writer): (i64, Option<String>) = sqlx::query_as(
+        "SELECT completed_turn, active_writer_json FROM session_context_heads
+         WHERE owner_user_id = ? AND session_id = ? AND branch_id = 'main'",
+    )
+    .bind(&owner)
+    .bind(&session)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(completed_turn, 1);
+    assert!(
+        writer.is_none(),
+        "canonical writer must be released before terminal delivery"
+    );
+    let count = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM session_weighted_admission_reservations
+             WHERE owner_user_id = ? AND session_id = ?",
+        )
+        .bind(&owner)
+        .bind(&session)
+        .fetch_one(pool.get())
+        .await
+        .unwrap()
+    };
+    assert_eq!(
+        count().await,
+        1,
+        "the blocked quota remains conservatively reserved"
+    );
+    gate.rollback().await.unwrap();
+    assert!(
+        service
+            .drain_background_tasks(Duration::from_secs(20))
+            .await
+    );
+    assert_eq!(count().await, 0, "the owning run must finish quota cleanup");
+    cleanup_lifecycle_run_fixture(&pool, &owner, &run_id).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, &session).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

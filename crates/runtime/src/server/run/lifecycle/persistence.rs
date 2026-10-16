@@ -51,7 +51,6 @@ use super::{
 };
 
 const DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY: usize = 4;
-const TERMINAL_PROJECTION_REPAIR_MAX_WAIT: Duration = Duration::from_secs(5);
 const METRIC_TURN_OBSERVER_DISPATCHES_TOTAL: &str = "astra_turn_observer_dispatches_total";
 const METRIC_TURN_OBSERVER_RUNS_TOTAL: &str = "astra_turn_observer_runs_total";
 static TURN_OBSERVER_ASYNC_IN_FLIGHT: std::sync::atomic::AtomicUsize =
@@ -665,35 +664,6 @@ pub(crate) struct CanonicalTerminalSettlementCommit {
     pub(crate) terminal_assistant_source_event_id: Option<String>,
 }
 
-async fn finish_terminal_with_projection<F>(
-    commit: CanonicalTerminalSettlementCommit,
-    projection: F,
-    user_id: &str,
-    run_id: &str,
-    timeout: Duration,
-) -> CanonicalTerminalSettlementCommit
-where
-    F: std::future::Future<Output = Result<(), String>>,
-{
-    match tokio::time::timeout(timeout, projection).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!(
-            target: "astra_runtime::run_lifecycle",
-            user_id,
-            run_id,
-            error = %error,
-            "canonical terminal committed but display projection repair failed"
-        ),
-        Err(_) => tracing::warn!(
-            target: "astra_runtime::run_lifecycle",
-            user_id,
-            run_id,
-            "canonical terminal committed but display projection repair timed out"
-        ),
-    }
-    commit
-}
-
 fn atomic_terminal_request<'a>(
     append: &'a CanonicalLoopAppend<'a>,
     settlement: CanonicalTerminalSettlement<'a>,
@@ -1015,8 +985,7 @@ pub(crate) async fn persist_server_loop_canonical_append(
 }
 
 /// Atomically commit canonical loop evidence, semantic run usage, and the
-/// exact-generation durable terminal. Derived projections run only after the
-/// database commit and cannot reverse it.
+/// exact-generation durable terminal and display projection.
 pub(crate) async fn persist_server_loop_canonical_terminal_settlement(
     pool: &SharedPool,
     append: CanonicalLoopAppend<'_>,
@@ -1024,9 +993,6 @@ pub(crate) async fn persist_server_loop_canonical_terminal_settlement(
     settlement: CanonicalTerminalSettlement<'_>,
     terminal_operation: Option<RunOwnerLeaseTerminalOperation<'_>>,
 ) -> Result<CanonicalTerminalSettlementCommit, String> {
-    let user_id = append.user_id;
-    let session_id = append.session_id;
-    let run_id = append.run_id;
     // Once an exact-generation terminal transaction may have reached COMMIT,
     // dropping its future at the lease deadline would bypass the existing
     // lost-acknowledgement resolution and report a committed run as failed.
@@ -1040,15 +1006,7 @@ pub(crate) async fn persist_server_loop_canonical_terminal_settlement(
         terminal_operation,
     )
     .await?;
-    let store = DatabaseRunStateStore::new(pool.clone());
-    Ok(finish_terminal_with_projection(
-        commit,
-        store.repair_projection_after_atomic_terminal_settlement(user_id, session_id, run_id),
-        user_id,
-        run_id,
-        TERMINAL_PROJECTION_REPAIR_MAX_WAIT,
-    )
-    .await)
+    Ok(commit)
 }
 
 async fn persist_server_loop_canonical_append_inner(
@@ -1094,25 +1052,44 @@ async fn persist_server_loop_canonical_append_inner(
             return Err(msg);
         }
     };
-    // The owner fence below establishes exact run identity and acquires the
-    // run lock. Do not precede it with another locking existence read.
-    let admission = if append.expected_owner_generation.is_some() {
-        astra_services::storage::admit_session_execution_write(
-            &mut tx,
-            append.session_id,
-            append.user_id,
+    let terminal_admission = if settlement.is_some() {
+        Some(
+            DatabaseRunStateStore::new(pool.clone())
+                .admit_terminal_settlement_in_transaction(
+                    &mut tx,
+                    append.user_id,
+                    append.session_id,
+                    append.run_id,
+                )
+                .await
+                .map_err(|error| format!("canonical session admission failed: {error}"))?
+                .ok_or_else(|| {
+                    format!(
+                        "canonical session admission failed: {}",
+                        sqlx::Error::RowNotFound
+                    )
+                })?,
         )
-        .await
     } else {
-        astra_services::storage::admit_session_scoped_run_write(
-            &mut tx,
-            append.session_id,
-            append.user_id,
-            append.run_id,
-        )
-        .await
+        if append.expected_owner_generation.is_some() {
+            astra_services::storage::admit_session_execution_write(
+                &mut tx,
+                append.session_id,
+                append.user_id,
+            )
+            .await
+        } else {
+            astra_services::storage::admit_session_scoped_run_write(
+                &mut tx,
+                append.session_id,
+                append.user_id,
+                append.run_id,
+            )
+            .await
+        }
+        .map_err(|error| format!("canonical session admission failed: {error}"))?;
+        None
     };
-    admission.map_err(|error| format!("canonical session admission failed: {error}"))?;
 
     if let Some(expected_owner_generation) = append.expected_owner_generation {
         let Some(lease_duration) = append.owner_lease_duration else {
@@ -1301,9 +1278,10 @@ async fn persist_server_loop_canonical_append_inner(
     let terminal_commit = if let Some(settlement) = settlement {
         let store = DatabaseRunStateStore::new(pool.clone());
         match store
-            .settle_terminal_in_existing_transaction(
+            .settle_terminal_in_admitted_transaction(
                 &mut tx,
                 atomic_terminal_request(&append, settlement),
+                terminal_admission.expect("terminal evidence owns its transaction admission"),
             )
             .await
         {
@@ -3593,49 +3571,6 @@ mod tests {
     static SHARED_BOOTSTRAP: tokio::sync::OnceCell<MatrixOneSettings> =
         tokio::sync::OnceCell::const_new();
 
-    #[tokio::test(start_paused = true)]
-    async fn confirmed_terminal_receipt_survives_stalled_projection() {
-        let receipt = CanonicalTerminalSettlementCommit {
-            terminal_events: vec![json!({"event_type": "run_finished"})],
-            terminal_assistant_source_event_id: Some("answer-1".into()),
-        };
-        let task = tokio::spawn(finish_terminal_with_projection(
-            receipt,
-            std::future::pending::<Result<(), String>>(),
-            "user-1",
-            "run-1",
-            Duration::from_secs(5),
-        ));
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(5)).await;
-        let result = task.await.expect("bounded projection");
-        assert_eq!(
-            result.terminal_assistant_source_event_id.as_deref(),
-            Some("answer-1")
-        );
-        assert_eq!(result.terminal_events.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn confirmed_terminal_receipt_survives_projection_error() {
-        let receipt = CanonicalTerminalSettlementCommit {
-            terminal_events: vec![],
-            terminal_assistant_source_event_id: Some("answer-2".into()),
-        };
-        let result = finish_terminal_with_projection(
-            receipt,
-            async { Err("projection unavailable".into()) },
-            "user-1",
-            "run-2",
-            Duration::from_secs(5),
-        )
-        .await;
-        assert_eq!(
-            result.terminal_assistant_source_event_id.as_deref(),
-            Some("answer-2")
-        );
-    }
-
     async fn assert_session_event_count(
         db: &sqlx::MySqlPool,
         user_id: &str,
@@ -3676,6 +3611,7 @@ mod tests {
             }],
             last_event_idx: 7,
             latest_event_type: Some("run_finished".to_string()),
+            projection_hash: "projection-hash".to_string(),
         }
     }
 
@@ -5922,7 +5858,6 @@ mod tests {
             .start_run(&run_id, &user_id, &session_id)
             .await
             .expect("start durable run");
-
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.session_turn = 7;
         state.final_text = "assistant final".to_string();
@@ -6884,11 +6819,21 @@ mod tests {
             astra_services::runs::DatabaseRunStateStore::new(pool.clone())
                 .with_owner_pod_id("canonical-terminal-success-owner"),
         );
-        let engine = crate::server::run::engine::RunEngine::new(store);
+        let engine = crate::server::run::engine::RunEngine::new(store.clone());
         let authority = engine
             .start_run(&run_id, &user_id, &session_id)
             .await
             .expect("start durable run");
+        store
+            .save_checkpoint(astra_services::runs::RunCheckpointWriteRequest {
+                user_id: &user_id,
+                expected_session_id: &session_id,
+                run_id: &run_id,
+                checkpoint_json: r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"fixture-terminal-projection"}"#,
+                authority: astra_services::runs::CheckpointWriteAuthority::ControlPlane,
+            })
+            .await
+            .expect("persist pre-terminal checkpoint");
 
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.final_text = "atomically committed answer".into();
@@ -6986,6 +6931,7 @@ mod tests {
         } else {
             astra_core::STATUS_RUNNING
         };
+        terminal_events.push(crate::server::run::lifecycle::AgenticRunLifecycleService::settlement_finished_test_event(authority.owner_generation));
         let append = || CanonicalLoopAppend {
             user_id: &user_id,
             session_id: &session_id,
@@ -7138,6 +7084,94 @@ mod tests {
         assert!(committed_count > 0);
         assert_eq!(commit.terminal_events, terminal_events);
         assert!(commit.terminal_assistant_source_event_id.is_some());
+        let commit_hash = sqlx::query_scalar::<_, String>(
+            "SELECT projection_hash FROM run_display_projections
+             WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .fetch_one(&db)
+        .await
+        .expect("read committed terminal projection hash");
+        let projection_row = sqlx::query(
+            "SELECT status, waiting_for, projection_event_idx, latest_event_type,
+                    latest_checkpoint_id, latest_checkpoint_kind, latest_checkpoint_version,
+                    total_prompt_tokens, total_completion_tokens, total_tool_calls,
+                    projection_hash
+             FROM run_display_projections WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .fetch_one(&db)
+        .await
+        .expect("terminal settlement must commit its display projection");
+        assert_eq!(
+            projection_row.try_get::<String, _>("status").unwrap(),
+            terminal_status
+        );
+        assert!(
+            projection_row
+                .try_get::<Option<String>, _>("waiting_for")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            projection_row
+                .try_get::<i64, _>("projection_event_idx")
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            projection_row
+                .try_get::<Option<String>, _>("latest_event_type")
+                .unwrap()
+                .as_deref(),
+            Some("run_settlement_finished")
+        );
+        assert_eq!(
+            projection_row
+                .try_get::<i64, _>("total_prompt_tokens")
+                .unwrap(),
+            37
+        );
+        assert_eq!(
+            projection_row
+                .try_get::<i64, _>("total_completion_tokens")
+                .unwrap(),
+            17
+        );
+        assert_eq!(
+            projection_row
+                .try_get::<i64, _>("total_tool_calls")
+                .unwrap(),
+            6
+        );
+        assert_eq!(
+            projection_row
+                .try_get::<String, _>("projection_hash")
+                .unwrap(),
+            commit_hash
+        );
+        assert!(
+            projection_row
+                .try_get::<Option<String>, _>("latest_checkpoint_id")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            projection_row
+                .try_get::<Option<String>, _>("latest_checkpoint_kind")
+                .unwrap()
+                .as_deref(),
+            Some("resume")
+        );
+        assert_eq!(
+            projection_row
+                .try_get::<Option<String>, _>("latest_checkpoint_version")
+                .unwrap()
+                .as_deref(),
+            Some("checkpoint_v1")
+        );
         if let Some(execution_started_at) = execution_started_at {
             let timestamps = sqlx::query(
                 "SELECT event_type, created_at FROM agent_events

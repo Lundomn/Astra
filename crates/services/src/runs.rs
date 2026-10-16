@@ -5215,6 +5215,15 @@ pub struct AtomicRunTerminalSettlementCommit {
     pub event_receipts: Vec<AtomicRunTerminalEventReceipt>,
     pub last_event_idx: i64,
     pub latest_event_type: Option<String>,
+    pub projection_hash: String,
+}
+
+/// Exact run facts read under session/execution/run locks. This value may only
+/// be consumed in its admitting transaction, before that transaction changes
+/// run metadata or appends run events. It is not a cache or execution grant.
+pub struct AtomicRunTerminalSettlementAdmission {
+    run: DurableRunRecord,
+    cancellation_requested: bool,
 }
 
 /// Authoritative read result for an atomic terminal settlement.
@@ -11793,6 +11802,137 @@ fn compare_recovery_candidate_order(
 
 impl DatabaseRunStateStore {
     #[allow(clippy::too_many_arguments)]
+    async fn upsert_terminal_display_projection_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        run: &DurableRunRecord,
+        request: AtomicRunTerminalSettlementRequest<'_>,
+        next_last_event_idx: i64,
+        latest_event_type: Option<&str>,
+    ) -> Result<String, String> {
+        let latest_checkpoint = sqlx::query(
+            "SELECT checkpoint_id, checkpoint_kind, checkpoint_version
+             FROM run_checkpoints
+             WHERE user_id = ? AND run_id = ?
+             ORDER BY created_at DESC, checkpoint_id DESC LIMIT 1",
+        )
+        .bind(&run.user_id)
+        .bind(&run.run_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| {
+            db_error(
+                "load_atomic_terminal_projection_checkpoint",
+                &run.run_id,
+                source,
+            )
+            .to_string()
+        })?
+        .map(|row| {
+            Ok::<_, String>((
+                row.try_get("checkpoint_id")
+                    .map_err(|source| {
+                        db_error(
+                            "decode_atomic_terminal_projection_checkpoint_id",
+                            &run.run_id,
+                            source,
+                        )
+                    })
+                    .map_err(|error| error.to_string())?,
+                row.try_get("checkpoint_kind")
+                    .map_err(|source| {
+                        db_error(
+                            "decode_atomic_terminal_projection_checkpoint_kind",
+                            &run.run_id,
+                            source,
+                        )
+                    })
+                    .map_err(|error| error.to_string())?,
+                row.try_get("checkpoint_version")
+                    .map_err(|source| {
+                        db_error(
+                            "decode_atomic_terminal_projection_checkpoint_version",
+                            &run.run_id,
+                            source,
+                        )
+                    })
+                    .map_err(|error| error.to_string())?,
+            ))
+        })
+        .transpose()?;
+        let projection = build_run_display_projection(
+            &DurableRunRecord {
+                status: request.status.to_string(),
+                waiting_for: request.waiting_for.map(str::to_string),
+                error_message: request.error_message.map(str::to_string),
+                last_event_idx: next_last_event_idx,
+                total_prompt_tokens: request.prompt_tokens,
+                total_completion_tokens: request.completion_tokens,
+                total_tool_calls: request.tool_calls,
+                ..run.clone()
+            },
+            latest_event_type.map(str::to_string),
+            latest_checkpoint,
+        );
+        let upsert_sql = matrixone_statement_with_null_shape(
+            "INSERT INTO run_display_projections
+             (run_id, user_id, session_id, status, waiting_for, error_message,
+              projection_event_idx, latest_event_type, latest_checkpoint_id,
+              latest_checkpoint_kind, latest_checkpoint_version, total_prompt_tokens,
+              total_completion_tokens, total_tool_calls, projection_hash, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))
+             ON DUPLICATE KEY UPDATE
+               status = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(status), status),
+               waiting_for = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(waiting_for), waiting_for),
+               error_message = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(error_message), error_message),
+               latest_event_type = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(latest_event_type), latest_event_type),
+               latest_checkpoint_id = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(latest_checkpoint_id), latest_checkpoint_id),
+               latest_checkpoint_kind = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(latest_checkpoint_kind), latest_checkpoint_kind),
+               latest_checkpoint_version = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(latest_checkpoint_version), latest_checkpoint_version),
+               total_prompt_tokens = IF(VALUES(total_prompt_tokens) > total_prompt_tokens, VALUES(total_prompt_tokens), total_prompt_tokens),
+               total_completion_tokens = IF(VALUES(total_completion_tokens) > total_completion_tokens, VALUES(total_completion_tokens), total_completion_tokens),
+               total_tool_calls = IF(VALUES(total_tool_calls) > total_tool_calls, VALUES(total_tool_calls), total_tool_calls),
+               projection_hash = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(projection_hash), projection_hash),
+               updated_at = IF(VALUES(projection_event_idx) >= projection_event_idx, NOW(6), updated_at),
+               projection_event_idx = IF(VALUES(projection_event_idx) > projection_event_idx, VALUES(projection_event_idx), projection_event_idx)",
+            [
+                projection.waiting_for.is_some(),
+                projection.error_message.is_some(),
+                projection.latest_event_type.is_some(),
+                projection.latest_checkpoint_id.is_some(),
+                projection.latest_checkpoint_kind.is_some(),
+                projection.latest_checkpoint_version.is_some(),
+            ],
+        );
+        sqlx::query(&upsert_sql)
+            .bind(&projection.run_id)
+            .bind(&projection.user_id)
+            .bind(&projection.session_id)
+            .bind(&projection.status)
+            .bind(&projection.waiting_for)
+            .bind(&projection.error_message)
+            .bind(projection.projection_event_idx)
+            .bind(&projection.latest_event_type)
+            .bind(&projection.latest_checkpoint_id)
+            .bind(&projection.latest_checkpoint_kind)
+            .bind(&projection.latest_checkpoint_version)
+            .bind(projection.total_prompt_tokens as i64)
+            .bind(projection.total_completion_tokens as i64)
+            .bind(projection.total_tool_calls as i64)
+            .bind(&projection.projection_hash)
+            .execute(&mut **tx)
+            .await
+            .map_err(|source| {
+                db_error(
+                    "upsert_atomic_terminal_run_projection",
+                    request.run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+        Ok(projection.projection_hash)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn transition_run_status(
         &self,
         user_id: &str,
@@ -12797,9 +12937,9 @@ impl DatabaseRunStateStore {
     ///
     /// The caller is responsible for committing or rolling back `tx`. `None`
     /// is a resolved ownership/status conflict and leaves the transaction open
-    /// so the caller can roll back its canonical writes. Projection repair is
-    /// deliberately excluded: it is derived state and must run only after the
-    /// authoritative transaction commits.
+    /// so the caller can roll back its canonical writes. The terminal display
+    /// projection is committed from the locked run and staged event receipts;
+    /// replay, conflict, and failure paths retain the full repair.
     pub async fn settle_terminal_in_existing_transaction(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
@@ -12809,14 +12949,8 @@ impl DatabaseRunStateStore {
         if request.expected_statuses.is_empty() {
             return Ok(None);
         }
-        let terminal_origin = cancelled_terminal_origin(request.status, request.events)?;
-        let terminal_error_code = terminal_error_code_from_transition(
-            request.status,
-            request.error_message,
-            request.events,
-        );
-        let Some(run) = self
-            .load_run_metadata_for_exact_session_tx(
+        let Some(admission) = self
+            .admit_terminal_settlement_in_transaction(
                 tx,
                 request.user_id,
                 request.expected_session_id,
@@ -12827,13 +12961,120 @@ impl DatabaseRunStateStore {
         else {
             return Ok(None);
         };
+        self.settle_terminal_in_admitted_transaction(tx, request, admission)
+            .await
+    }
+
+    /// Admit terminal settlement once, returning the exact locked run facts for
+    /// a caller that appends canonical evidence before settling the terminal.
+    pub async fn admit_terminal_settlement_in_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+    ) -> DbStoreResult<Option<AtomicRunTerminalSettlementAdmission>> {
+        validate_expected_run_session_id(expected_session_id).map_err(|message| {
+            db_error(
+                "admit_terminal_settlement",
+                run_id,
+                sqlx::Error::Protocol(message),
+            )
+        })?;
+        match crate::storage::admit_session_execution_write(tx, expected_session_id, user_id).await
+        {
+            Ok(()) => {}
+            Err(sqlx::Error::RowNotFound) => return Ok(None),
+            Err(source) => return Err(db_error("admit_terminal_settlement", run_id, source)),
+        }
+        let sql = format!(
+            "SELECT {AGENT_RUN_COLUMNS},
+                    CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested
+             FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE"
+        );
+        sqlx::query(&sql)
+            .bind(user_id)
+            .bind(expected_session_id)
+            .bind(run_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|source| db_error("admit_terminal_settlement", run_id, source))?
+            .map(|row| {
+                let cancellation_requested = row
+                    .try_get::<i64, _>("cancellation_requested")
+                    .map_err(|source| {
+                        db_error("decode_terminal_cancellation_marker", run_id, source)
+                    })?
+                    != 0;
+                Ok(AtomicRunTerminalSettlementAdmission {
+                    run: run_record_from_row(row)?,
+                    cancellation_requested,
+                })
+            })
+            .transpose()
+    }
+
+    /// Settle using facts owned by the same transaction's canonical admission.
+    ///
+    /// Renewing this run's lease is allowed between admission and settlement;
+    /// the terminal CAS still validates its live lease using the DB clock.
+    pub async fn settle_terminal_in_admitted_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        request: AtomicRunTerminalSettlementRequest<'_>,
+        admission: AtomicRunTerminalSettlementAdmission,
+    ) -> Result<Option<AtomicRunTerminalSettlementCommit>, String> {
+        validate_expected_run_session_id(request.expected_session_id)?;
+        if request.expected_statuses.is_empty() {
+            return Ok(None);
+        }
+        if admission.run.user_id != request.user_id
+            || admission.run.session_id != request.expected_session_id
+            || admission.run.run_id != request.run_id
+        {
+            return Err("terminal settlement admission does not match the requested run".into());
+        }
+        self.settle_terminal_from_locked_run_in_transaction(tx, request, admission)
+            .await
+    }
+
+    async fn settle_terminal_from_locked_run_in_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        request: AtomicRunTerminalSettlementRequest<'_>,
+        admission: AtomicRunTerminalSettlementAdmission,
+    ) -> Result<Option<AtomicRunTerminalSettlementCommit>, String> {
+        let run = admission.run;
+        let terminal_origin = cancelled_terminal_origin(request.status, request.events)?;
+        let terminal_error_code = terminal_error_code_from_transition(
+            request.status,
+            request.error_message,
+            request.events,
+        );
         if !request.expected_statuses.contains(&run.status.as_str())
             || run.run_generation != request.expected_owner_generation
         {
             return Ok(None);
         }
         ensure_terminal_status_immutable(&run, request.status)?;
-        let lineage_markers = lock_durable_lineage_cancellation_markers_tx(tx, &run).await?;
+        let segments = validated_durable_lineage_segments(&run)?;
+        let lineage_markers = if segments.len() == 1 {
+            // The root is the complete lineage and is still write-locked by
+            // admission. A second SELECT cannot observe a different marker.
+            DurableLineageCancellationMarkers {
+                direct: admission.cancellation_requested,
+                ancestor: false,
+            }
+        } else {
+            lock_durable_lineage_cancellation_markers_for_segments_tx(
+                tx,
+                &run.user_id,
+                &run.session_id,
+                &run.run_id,
+                &segments,
+            )
+            .await?
+        };
         if !cancellation_markers_admit_transition(terminal_origin, lineage_markers) {
             return Ok(None);
         }
@@ -13006,6 +13247,14 @@ impl DatabaseRunStateStore {
             .await
             .map_err(|error| error.to_string())?;
         }
+        let projection_hash = Self::upsert_terminal_display_projection_tx(
+            tx,
+            &run,
+            request,
+            next_last_event_idx,
+            event_rows.last().map(|event| event.event_type.as_str()),
+        )
+        .await?;
 
         Ok(Some(AtomicRunTerminalSettlementCommit {
             committed_events: events_to_commit,
@@ -13022,6 +13271,7 @@ impl DatabaseRunStateStore {
                 .collect(),
             last_event_idx: next_last_event_idx,
             latest_event_type: event_rows.last().map(|event| event.event_type.clone()),
+            projection_hash,
         }))
     }
 
@@ -13057,6 +13307,22 @@ impl DatabaseRunStateStore {
             }
             AtomicRunTerminalFactMatch::Exact => {}
         }
+        let projection_hash = sqlx::query_scalar::<_, String>(
+            "SELECT projection_hash FROM run_display_projections
+             WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(request.user_id)
+        .bind(request.run_id)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| {
+            db_error(
+                "resolve_atomic_terminal_projection_hash",
+                request.run_id,
+                source,
+            )
+            .to_string()
+        })?;
         let (receipts, committed_events) = if let Some(expected) = expected_receipts {
             if expected.last().map(|receipt| receipt.event_idx) != Some(run.last_event_idx)
                 && !expected.is_empty()
@@ -13271,6 +13537,7 @@ impl DatabaseRunStateStore {
                 committed_events,
                 event_receipts: receipts,
                 last_event_idx: run.last_event_idx,
+                projection_hash: projection_hash.unwrap_or_default(),
             },
         ))
     }
@@ -15250,35 +15517,9 @@ impl DatabaseRunStateStore {
             None => transaction.await?,
         };
 
-        if matches!(claim, DurableRunStartClaim::Started { .. }) {
-            let receipt = initial_event_rows
-                .first()
-                .expect("run insertion always has at least one receipt event");
-            let projection = self.sync_projection_for_user(
-                &receipt.user_id,
-                &receipt.session_id,
-                &receipt.run_id,
-            );
-            let projection_result = match deadline {
-                Some(deadline) if tokio::time::Instant::now() >= deadline => None,
-                Some(deadline) => tokio::time::timeout_at(deadline, projection).await.ok(),
-                None => Some(projection.await),
-            };
-            if let Some(Err(error)) = projection_result {
-                tracing::warn!(
-                    user_id = %receipt.user_id,
-                    run_id = %receipt.run_id,
-                    error = %error,
-                    "run create committed but projection refresh failed or exceeded its deadline"
-                );
-            } else if projection_result.is_none() {
-                tracing::warn!(
-                    user_id = %receipt.user_id,
-                    run_id = %receipt.run_id,
-                    "run create committed but projection refresh was skipped at its deadline"
-                );
-            }
-        }
+        // Creation commits the run, slot, initial events and display projection
+        // atomically. Exact receipt reconciliation proves that same transaction;
+        // neither outcome needs a second transaction to rebuild its projection.
         Ok(claim)
     }
 
@@ -32900,6 +33141,28 @@ mod tests {
             1
         );
 
+        let durable = store
+            .load_run(&user_id, &run_id)
+            .await
+            .expect("load exactly claimed run")
+            .expect("claimed run exists");
+        let projection = store
+            .load_run_projection(&user_id, &run_id)
+            .await
+            .expect("load projection without repair")
+            .expect("creation committed its display projection");
+        let expected = build_run_display_projection(
+            &durable,
+            durable.events.last().map(extract_event_type),
+            None,
+        );
+        assert_eq!(projection.session_id, session_id);
+        assert_eq!(
+            projection.projection_event_idx,
+            expected.projection_event_idx
+        );
+        assert_eq!(projection.projection_hash, expected.projection_hash);
+
         sqlx::query(
             "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
         )
@@ -38527,6 +38790,105 @@ mod tests {
             .execute(pool.get())
             .await
             .expect("cleanup approval authority sessions");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_terminal_admission_preserves_identity_and_lineage_cancellation() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        for (cancelled, child) in [(false, false), (true, false), (true, true)] {
+            let user_id = format!("terminal-admission-u-{}", Uuid::new_v4());
+            let session_id = format!("terminal-admission-s-{}", Uuid::new_v4());
+            let root_id = format!("terminal-admission-root-{}", Uuid::new_v4());
+            let child_id = format!("terminal-admission-child-{}", Uuid::new_v4());
+            insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+            let mut root = durable_run_record(&root_id);
+            root.user_id = user_id.clone();
+            root.session_id = session_id.clone();
+            store.insert_run(root).await.expect("insert root");
+            if child {
+                let mut run = durable_run_record(&child_id);
+                run.user_id = user_id.clone();
+                run.session_id = session_id.clone();
+                run.parent_run_id = Some(root_id.clone());
+                run.root_run_id = Some(root_id.clone());
+                run.ancestor_path = Some(format!("{root_id}/{child_id}"));
+                run.depth = 1;
+                store.insert_run(run).await.expect("insert child");
+            }
+            if cancelled {
+                sqlx::query("UPDATE agent_runs SET cancellation_requested_at = NOW(6) WHERE user_id = ? AND run_id = ?")
+                    .bind(&user_id).bind(&root_id).execute(pool.get()).await.expect("mark direct or ancestor cancellation");
+            }
+            let run_id = if child { &child_id } else { &root_id };
+            let events = [json!({"event_type":"run_finished", "data":{"status":STATUS_COMPLETED}})];
+            let request = AtomicRunTerminalSettlementRequest {
+                user_id: &user_id,
+                run_id,
+                expected_session_id: &session_id,
+                expected_statuses: &[STATUS_RUNNING],
+                expected_owner_generation: 0,
+                status: STATUS_COMPLETED,
+                waiting_for: None,
+                error_message: None,
+                events: &events,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                tool_calls: 0,
+            };
+            let mut tx = pool.get().begin().await.expect("begin terminal admission");
+            let admission = store
+                .admit_terminal_settlement_in_transaction(&mut tx, &user_id, &session_id, run_id)
+                .await
+                .expect("admit exact run")
+                .expect("run exists");
+            let error = store
+                .settle_terminal_in_admitted_transaction(
+                    &mut tx,
+                    AtomicRunTerminalSettlementRequest {
+                        expected_session_id: "foreign-session",
+                        ..request
+                    },
+                    admission,
+                )
+                .await
+                .expect_err("admission cannot cross session identity");
+            assert!(error.contains("admission does not match"));
+            let admission = store
+                .admit_terminal_settlement_in_transaction(&mut tx, &user_id, &session_id, run_id)
+                .await
+                .expect("read same locked facts")
+                .expect("run exists");
+            let committed = store
+                .settle_terminal_in_admitted_transaction(&mut tx, request, admission)
+                .await
+                .expect("settle exact locked run");
+            assert_eq!(
+                committed.is_some(),
+                !cancelled,
+                "direct and ancestor cancellation must both reject completion"
+            );
+            tx.rollback()
+                .await
+                .expect("rollback isolated test settlement");
+            let run = store.load_run(&user_id, run_id).await.unwrap().unwrap();
+            assert_eq!(run.status, STATUS_RUNNING);
+            assert_eq!(run.total_prompt_tokens, 0);
+            if child {
+                cleanup_database_run_fixture(&pool, &user_id, &child_id).await;
+            }
+            cleanup_database_run_fixture(&pool, &user_id, &root_id).await;
+            sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
+                .bind(&user_id)
+                .execute(pool.get())
+                .await
+                .expect("cleanup slot");
+            sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
+                .bind(&user_id)
+                .execute(pool.get())
+                .await
+                .expect("cleanup session");
+        }
     }
 
     #[tokio::test]
