@@ -792,6 +792,13 @@ inflate `executed_tool_calls` or settlement success.
 
 ## FAIL report artifacts
 
+CI prints failure analysis both when a case settles and in the final summary.
+Tool-count failures include bounded counts of actual disposition, success,
+recognized result status/error category and explicit execution facts. Arbitrary
+tags and result prose remain private. These facts distinguish argument rejection
+from a model-admission error without claiming an unobserved root cause; missing
+evidence remains unavailable. Original criteria and verdicts are unchanged.
+
 On FAIL, each case report includes:
 
 - `text:` / `stderr:` preview (head of each, truncated).
@@ -872,7 +879,17 @@ Whitespace equivalence never excuses a wrong digest, foreign run, missing
 document, or premature finalization. Scalar expectations are not supported.
 Natural parallel children are matched bijectively by distinct model identities,
 never by their output. For same-model children or explicit fanout, specify
-`fanout_group` and each child's `slot_index`. One successful root start receipt
+`fanout_group: {kind: id, value: <group-id>}` or
+`fanout_group: {kind: title, value: <group-title>}` and each child's `slot_index`.
+Titles are independent of IDs, including the product's default title when one is
+omitted. Multiple matching starts are ambiguous. The successful `started`
+receipt must agree with the request and its canonical fanout/observation
+identity projections, including the exact parent. Missing identity evidence is
+unavailable; contradictory identity evidence fails. String selectors are not accepted.
+Producer-typed pre-execution rejections are not launch candidates, but remain
+visible to call-count checks and the judge. Unknown execution is not a rejection;
+contradictory rejection/execution facts fail rather than being discarded.
+One successful root start receipt
 must bind unique slot indexes, agent and run IDs to exactly the authoritative children;
 optional slot labels are not execution identities.
 array position and aggregate counts are insufficient. A successful `get_results`

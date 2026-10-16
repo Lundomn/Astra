@@ -139,6 +139,15 @@ Retention is a product contract:
 - Run mutations retain the deletion-fence → session → execution-slot → run
   lock order. A caller's exact-owner/session/run locking read also establishes
   existence; it does not need a separate existence query in that transaction.
+- Run status snapshots omit checkpoint bodies and read their canonical binding
+  and accounting facts in one bounded event query after the metadata lookup.
+  A narrow type/index aggregate selects the earliest event of each binding type
+  and the latest finalized fact, or latest finished fact only when none exists;
+  the selected positions then join back to their owner-scoped payloads.
+  At most four payloads are returned. Selection precedes decoding, so corruption
+  of a selected fact remains an error rather than authorizing fallback. This is
+  a read optimization, not a cache, new authority, retention change, or atomic
+  snapshot across the two reads.
 - Data deletion must propagate to derived artifacts.
 - Decision audits and skill selections acquire canonical non-lazy session
   admission in the same transaction as INSERT. Decision reference checks and

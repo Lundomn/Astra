@@ -10,11 +10,34 @@ mod isolated_database;
 use astra_core::SharedPool;
 use astra_services::auth::session::{DatabaseSessionService, SessionService};
 use astra_services::runs::{
-    DatabaseRunStateStore, DurableRunRecord, RunStateStore, ToolOutputBatchItem,
+    DatabaseRunStateStore, DurableRunRecord, RunControlReadKey, RunStateStore, ToolOutputBatchItem,
 };
 use serde_json::json;
 use sqlx::{Connection, Row, mysql::MySqlConnection};
 use std::{sync::Arc, time::Duration};
+use tracing::instrument::WithSubscriber;
+use tracing_subscriber::prelude::*;
+
+/// Capture actual statements only within the instrumented store call.
+#[derive(Clone, Default)]
+struct Queries(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl tracing::field::Visit for Queries {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "db.statement" {
+            self.0.lock().unwrap().push(value.to_owned());
+        }
+    }
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Queries {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().target() == "sqlx::query" {
+            event.record(&mut self.clone());
+        }
+    }
+}
 
 async fn setup() -> (SharedPool, Arc<DatabaseRunStateStore>) {
     let (pool, _settings) = common::setup_pool_and_settings().await;
@@ -1590,34 +1613,483 @@ async fn session_deletion_competes_safely_with_run_admission() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn control_batch_preserves_database_identity_positions_and_isolates_corruption() {
+    let (pool, store) = setup().await;
+    let nonce = uuid::Uuid::new_v4();
+    let (user, other) = (format!("control-a-{nonce}"), format!("control-b-{nonce}"));
+    let (run, bad) = (
+        format!("control-run-{nonce}"),
+        format!("control-bad-{nonce}"),
+    );
+    for (owner, id) in [(&user, &run), (&other, &bad)] {
+        insert_run_fixture(
+            &pool,
+            &store,
+            durable_run_record(id.clone(), owner.clone(), format!("session-{id}")),
+        )
+        .await;
+    }
+    // Historical runs must not become work for unrelated active observations.
+    let mut history = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,ancestor_path,status) ",
+    );
+    history.push_values(0..256, |mut row, i| {
+        let id = format!("control-history-{nonce}-{i}");
+        row.push_bind(&other)
+            .push_bind(format!("session-{bad}"))
+            .push_bind(id.clone())
+            .push_bind(id.clone())
+            .push_bind(format!("/{id}"))
+            .push_bind("completed");
+    });
+    history.build().execute(pool.get()).await.unwrap();
+    let key = |user: &str, run: &str| RunControlReadKey {
+        user_id: user.into(),
+        run_id: run.into(),
+    };
+    let keys = vec![
+        key(&user, &run),
+        key(&other, &run),
+        key(&user, "missing"),
+        key(&other, &bad),
+        key(&user.to_uppercase(), &run.to_uppercase()),
+        key(&user, &run),
+    ];
+    let mut expected = Vec::new();
+    for key in &keys {
+        expected.push(
+            store
+                .load_run_control(&key.user_id, &key.run_id)
+                .await
+                .unwrap(),
+        );
+    }
+    let queries = Queries::default();
+    let subscriber = tracing_subscriber::registry().with(queries.clone());
+    let results = store
+        .load_run_control_batch(&keys)
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+    assert_eq!(
+        results.into_iter().collect::<Result<Vec<_>, _>>().unwrap(),
+        expected
+    );
+    assert!(expected[0].is_some() && expected[1].is_none() && expected[2].is_none());
+    assert_eq!(
+        queries
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|sql| sql.contains("agent_runs"))
+            .count(),
+        1
+    );
+    assert!(store.load_run_control_batch(&[]).await.unwrap().is_empty());
+    assert!(
+        store
+            .load_run_control_batch(&vec![key(&user, &run); 129])
+            .await
+            .is_err()
+    );
+
+    for size in [1, 128] {
+        let requested = keys.iter().cycle().take(size).cloned().collect::<Vec<_>>();
+        let queries = Queries::default();
+        let subscriber = tracing_subscriber::registry().with(queries.clone());
+        let result = store
+            .load_run_control_batch(&requested)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.into_iter().collect::<Result<Vec<_>, _>>().unwrap(),
+            expected
+                .iter()
+                .cycle()
+                .take(size)
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+        let statements = queries
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|sql| sql.contains("agent_runs"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(statements.len(), 1);
+        let mut connection = pool.get().acquire().await.unwrap();
+        let mut arguments = Vec::with_capacity(size * 3);
+        for (ordinal, key) in requested.iter().enumerate() {
+            for value in [&key.user_id, &key.run_id] {
+                assert!(
+                    value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                );
+            }
+            sqlx::raw_sql(&format!(
+                "SET @control_u{ordinal}='{}',@control_r{ordinal}='{}'",
+                key.user_id, key.run_id
+            ))
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+            arguments.push(format!("@control_u{ordinal}"));
+            arguments.push(format!("@control_r{ordinal}"));
+        }
+        arguments.extend((0..size).map(|ordinal| format!("@control_r{ordinal}")));
+        // A removed candidate predicate must fail on scans, not bind count.
+        arguments.truncate(statements[0].matches('?').count());
+        // Inspect the emitted production SELECT, not a test-owned query copy.
+        // MatrixOne supports this prepared diagnostic but not JSON EXPLAIN.
+        sqlx::raw_sql(&format!(
+            "PREPARE control_scan FROM '{}'",
+            statements[0].replace('\'', "''")
+        ))
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+        let rows = sqlx::raw_sql(&format!(
+            "EXPLAIN ANALYZE FORCE EXECUTE control_scan USING {}",
+            arguments.join(",")
+        ))
+        .fetch_all(&mut *connection)
+        .await
+        .unwrap();
+        sqlx::raw_sql("DEALLOCATE PREPARE control_scan")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        let plan = rows
+            .iter()
+            .map(|row| row.get::<String, _>(0))
+            .collect::<Vec<_>>();
+        let table = format!("Table Scan on {}.agent_runs", pool.settings().database);
+        let scans = plan
+            .windows(2)
+            .filter(|lines| lines[0].contains(&table))
+            .map(|lines| {
+                lines[1]
+                    .split("inputRows=")
+                    .nth(1)
+                    .expect("base scan must report input rows")
+                    .split_ascii_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(!scans.is_empty(), "missing base scan counters: {plan:?}");
+        let scanned = scans.iter().sum::<u64>();
+        assert!(
+            (1..=size as u64).contains(&scanned),
+            "{size} lookups scanned {scanned} rows including unrelated history: {plan:?}"
+        );
+        eprintln!("control_batch requests={size} base_scan_rows={scanned}");
+    }
+
+    let independent = SharedPool::new(pool.settings()).await.unwrap();
+    sqlx::query("UPDATE agent_runs SET status='paused', last_event_idx=7, cancellation_requested_at=NOW(6) WHERE user_id=? AND run_id=?")
+        .bind(&user).bind(&run).execute(independent.get()).await.unwrap();
+    sqlx::query(
+        "UPDATE agent_runs SET run_generation=-1,status='failed' WHERE user_id=? AND run_id=?",
+    )
+    .bind(&other)
+    .bind(&bad)
+    .execute(independent.get())
+    .await
+    .unwrap();
+    let results = store.load_run_control_batch(&keys).await.unwrap();
+    let fresh = results[0].as_ref().unwrap().as_ref().unwrap();
+    assert_eq!(
+        (
+            fresh.status.as_str(),
+            fresh.last_event_idx,
+            fresh.cancellation_requested
+        ),
+        ("paused", 7, true)
+    );
+    assert!(
+        results[3].is_err(),
+        "malformed row fails only its request position"
+    );
+    assert_eq!(results[0], results[5]);
+    assert!(results[1].as_ref().unwrap().is_none());
+    for table in ["agent_runs", "agent_sessions"] {
+        for owner in [&user, &other] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE user_id=?"))
+                .bind(owner)
+                .execute(independent.get())
+                .await
+                .unwrap();
+        }
+    }
+    independent.close().await;
+}
+
+/// The status reader must stay independent of history size and checkpoint bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
+    let (pool, store) = setup().await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let user = format!("status-{id}");
+    let session = format!("session-{id}");
+    let run = format!("run-{id}");
+    let mut events = vec![
+        json!({"event_type":"run_started", "data":{"explain_analyze_requested":true,"transport":"edge"}}),
+        json!({"event_type":"executor_bound", "data":{"executor":{"id":"original"}}}),
+        json!({"event_type":"workspace_bound", "data":{"workspace":{"id":"original"},"transport":"ignored"}}),
+        json!({"event_type":"executor_bound", "data":{"executor":{"id":"replacement"}}}),
+        json!({"event_type":"workspace_bound", "data":{"workspace":{"id":"replacement"}}}),
+        json!({"event_type":"run_finished", "data":{"prompt_tokens":10}}),
+        json!({"event_type":"run_finished", "data":{"prompt_tokens":20}}),
+    ];
+    events.extend((0..256).map(
+        |i| json!({"event_type":"agent_progress", "data":{"index":i,"text":"x".repeat(2048)}}),
+    ));
+    insert_run_fixture(
+        &pool,
+        &store,
+        durable_run_record_with_events(run.clone(), user.clone(), session.clone(), "agent", events),
+    )
+    .await;
+    let checkpoint = "x".repeat(256 * 1024);
+    sqlx::query("UPDATE agent_runs SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?")
+        .bind(&checkpoint)
+        .bind(&user)
+        .bind(&run)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    let (_, replica) = setup().await;
+    for (phase, expected_tokens) in [(0, 20), (1, 30)] {
+        if phase == 1 {
+            store.append_events_batch(&user, &session, &run, &[
+                json!({"event_type":"run_accounting_finalized","data":{"prompt_tokens":25}}),
+                json!({"event_type":"run_accounting_finalized","data":{"prompt_tokens":30}}),
+                json!({"event_type":"run_finished","data":{"prompt_tokens":99}}),
+            ]).await.unwrap();
+        }
+        let queries = Queries::default();
+        let subscriber =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(queries.clone()));
+        let snapshot = replica
+            .load_run_status_snapshot(&user, &run)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.explain_requested);
+        assert_eq!(snapshot.workspace.unwrap()["id"], "original");
+        assert_eq!(snapshot.executor.unwrap()["id"], "original");
+        assert_eq!(snapshot.transport.as_deref(), Some("edge"));
+        assert_eq!(
+            snapshot.accounting.unwrap()["prompt_tokens"],
+            expected_tokens
+        );
+        assert_eq!(snapshot.last_event_idx, 262 + phase * 3);
+        let queries = queries.0.lock().unwrap();
+        let reads: Vec<_> = queries
+            .iter()
+            .filter(|q| q.contains("FROM agent_runs") || q.contains("FROM agent_run_events"))
+            .collect();
+        eprintln!(
+            "status_snapshot phase={phase} store_reads={} checkpoint_bytes={}",
+            reads.len(),
+            checkpoint.len()
+        );
+        assert_eq!(reads.len(), 2, "one metadata and one bounded facts read");
+        assert!(
+            queries
+                .iter()
+                .all(|q| !q.trim_start().starts_with("UPDATE")),
+            "status reads cannot write"
+        );
+        assert!(
+            reads[0].contains("CAST(NULL AS CHAR) AS checkpoint_json"),
+            "status must not hydrate recovery bodies"
+        );
+    }
+    for (owner, requested_run) in [("foreign", run.as_str()), (user.as_str(), "missing")] {
+        let queries = Queries::default();
+        let subscriber =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(queries.clone()));
+        assert!(
+            replica
+                .load_run_status_snapshot(owner, requested_run)
+                .with_subscriber(subscriber)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            queries
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|q| q.contains("FROM agent_runs") || q.contains("FROM agent_run_events"))
+                .count(),
+            1,
+            "missing authority cannot read events"
+        );
+    }
+    let retained: String = sqlx::query_scalar(
+        "SELECT checkpoint_json FROM agent_runs WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&user)
+    .bind(&run)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        retained, checkpoint,
+        "read optimization cannot delete recovery data"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn status_snapshot_preserves_selected_fact_failure_semantics() {
+    let (pool, store) = setup().await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let user = format!("status-{id}");
+    let session = format!("session-{id}");
+    let run = format!("run-{id}");
+    insert_run_fixture(
+        &pool,
+        &store,
+        durable_run_record(run.clone(), user.clone(), session.clone()),
+    )
+    .await;
+    let empty = store
+        .load_run_status_snapshot(&user, &run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!empty.explain_requested);
+    assert!(empty.workspace.is_none() && empty.executor.is_none() && empty.accounting.is_none());
+    store
+        .append_events_batch(
+            &user,
+            &session,
+            &run,
+            &[
+                json!({"event_type":"agent_progress","data":{}}),
+                json!({"event_type":"run_finished","data":{"prompt_tokens":19}}),
+            ],
+        )
+        .await
+        .unwrap();
+    // A bad unrelated payload cannot poison the bounded status read.
+    sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_type = 'agent_progress'")
+        .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
+    let finished = store
+        .load_run_status_snapshot(&user, &run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(finished.accounting.unwrap()["prompt_tokens"], 19);
+    sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_type = 'run_finished'")
+        .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
+    assert!(store.load_run_status_snapshot(&user, &run).await.is_err());
+
+    // Presence, not a successfully decoded 'data', selects finalized accounting.
+    store
+        .append_events_batch(
+            &user,
+            &session,
+            &run,
+            &[json!({"event_type":"run_accounting_finalized"})],
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .load_run_status_snapshot(&user, &run)
+            .await
+            .unwrap()
+            .unwrap()
+            .accounting
+            .is_none()
+    );
+    sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_type = 'run_accounting_finalized'")
+        .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
+    assert!(
+        store.load_run_status_snapshot(&user, &run).await.is_err(),
+        "selected corruption must not become missing accounting"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn status_snapshot_keeps_zero_positions_and_ignores_unselected_same_type_corruption() {
+    let (pool, store) = setup().await;
+    let user = common::id("status-zero");
+    for event in [
+        json!({"event_type":"run_finished","data":{"prompt_tokens":0}}),
+        json!({"event_type":"run_accounting_finalized","data":{"prompt_tokens":0}}),
+        json!({"event_type":"workspace_bound","data":{"workspace":{"id":"only-workspace"}}}),
+    ] {
+        let run = common::id("status-run");
+        let session = common::id("status-session");
+        insert_run_fixture(
+            &pool,
+            &store,
+            durable_run_record_with_events(
+                run.clone(),
+                user.clone(),
+                session.clone(),
+                "agent",
+                vec![event.clone()],
+            ),
+        )
+        .await;
+        let snapshot = store
+            .load_run_status_snapshot(&user, &run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.last_event_idx, 0);
+        if event["event_type"] == "workspace_bound" {
+            assert_eq!(snapshot.workspace.as_ref().unwrap()["id"], "only-workspace");
+            assert!(snapshot.executor.is_none() && snapshot.accounting.is_none());
+            store
+                .append_events_batch(
+                    &user,
+                    &session,
+                    &run,
+                    &[json!({"event_type":"workspace_bound","data":{"workspace":{"id":"later"}}})],
+                )
+                .await
+                .unwrap();
+            sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_idx = 1")
+                .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
+            let after = store
+                .load_run_status_snapshot(&user, &run)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.workspace, snapshot.workspace);
+        } else {
+            assert_eq!(snapshot.accounting.unwrap()["prompt_tokens"], 0);
+            assert!(snapshot.workspace.is_none() && snapshot.executor.is_none());
+        }
+    }
+}
+
 /// Count real SQL rather than simulating the batching implementation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 async fn keyed_batches_bound_probe_queries_and_preserve_replay() {
-    use tracing::instrument::WithSubscriber;
-    use tracing_subscriber::prelude::*;
-
-    #[derive(Clone, Default)]
-    struct Queries(Arc<std::sync::Mutex<Vec<String>>>);
-    impl tracing::field::Visit for Queries {
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            if field.name() == "db.statement" {
-                self.0.lock().unwrap().push(value.to_owned());
-            }
-        }
-        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
-    }
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Queries {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if event.metadata().target() == "sqlx::query" {
-                event.record(&mut self.clone());
-            }
-        }
-    }
     let (_pool, store) = setup().await;
     let run_id = format!("large_batch_{}", uuid::Uuid::new_v4());
     let user_id = "test_user".to_string();
@@ -1955,6 +2427,76 @@ async fn thousand_session_append_preserves_results_across_independent_pools() {
                     .await
                     .unwrap();
             assert_eq!(count, 1000);
+        }
+        let facts = [
+            json!({"event_type":"run_started","idempotency_key":"status-start","data":{"transport":"edge","explain_analyze_requested":true}}),
+            json!({"event_type":"workspace_bound","idempotency_key":"status-workspace","data":{"workspace":{"id":"scale-workspace"}}}),
+            json!({"event_type":"executor_bound","idempotency_key":"status-executor","data":{"executor":{"id":"scale-executor"}}}),
+            json!({"event_type":"run_finished","idempotency_key":"status-finish","data":{"prompt_tokens":10}}),
+            json!({"event_type":"run_accounting_finalized","idempotency_key":"status-accounting","data":{"prompt_tokens":20}}),
+            json!({"event_type":"run_finished","idempotency_key":"status-later-finish","data":{"prompt_tokens":99}}),
+        ];
+        eprintln!("status_fixture replicas={replicas} prefix={prefix}");
+        // Both empty and populated facts must work through another pool owner.
+        for populated in [false, true] {
+            if populated {
+                stream::iter(identities.iter().enumerate())
+                    .for_each_concurrent(32, |(n, (user, session, run))| {
+                        let store = &stores[n % replicas];
+                        let facts = &facts;
+                        async move {
+                            store
+                                .append_events_batch(user, session, run, facts)
+                                .await
+                                .unwrap();
+                        }
+                    })
+                    .await;
+            }
+            let started = std::time::Instant::now();
+            let statuses = identities
+                .iter()
+                .enumerate()
+                .map(|(n, (user, session, run))| {
+                    let store = &stores[(n + 1) % replicas];
+                    async move {
+                        let started = std::time::Instant::now();
+                        let status = store
+                            .load_run_status_snapshot(user, run)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(
+                            (&status.user_id, &status.session_id, &status.run_id),
+                            (user, session, run)
+                        );
+                        assert_eq!(status.last_event_idx, if populated { 22 } else { 16 });
+                        assert_eq!(status.explain_requested, populated);
+                        if populated {
+                            assert_eq!(status.workspace.unwrap()["id"], "scale-workspace");
+                            assert_eq!(status.executor.unwrap()["id"], "scale-executor");
+                            assert_eq!(status.transport.as_deref(), Some("edge"));
+                            assert_eq!(status.accounting.unwrap()["prompt_tokens"], 20);
+                        } else {
+                            assert!(
+                                status.workspace.is_none()
+                                    && status.executor.is_none()
+                                    && status.accounting.is_none()
+                            );
+                        }
+                        started.elapsed().as_micros()
+                    }
+                });
+            let mut latencies = tokio::time::timeout(Duration::from_secs(120), join_all(statuses))
+                .await
+                .unwrap();
+            latencies.sort_unstable();
+            eprintln!(
+                "status_scale replicas={replicas} populated={populated} total_connections=32 sessions=1000 owners=100 wall_ms={} p50_us={} p95_us={}",
+                started.elapsed().as_millis(),
+                latencies[499],
+                latencies[949]
+            );
         }
         drop(stores);
         for pool in pools {

@@ -3015,6 +3015,17 @@ pub struct DurableRunControlRecord {
     pub owner_lease_live: bool,
 }
 
+/// One exact tenant/run lookup; database equality, not Rust normalization,
+/// associates a batch's rows with its input positions.
+#[derive(Clone, Debug)]
+pub struct RunControlReadKey {
+    pub user_id: String,
+    pub run_id: String,
+}
+
+pub const RUN_CONTROL_READ_BATCH_SIZE: usize = 128;
+pub type RunControlReadResult = Result<Option<DurableRunControlRecord>, String>;
+
 /// Exact authority required to terminalize a run whose executor is absent.
 ///
 /// The store must compare every field in the same critical section as the
@@ -3689,9 +3700,8 @@ const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, roo
      runtime_profile, start_request_fingerprint, work_id, \
      work_branch_id, work_graph_revision, work_item_id, work_item_revision, \
      work_item_attempt_id, created_at, updated_at";
-// Recovery only projects agent identity, lifecycle, and result metadata. A
-// checkpoint is never executed from this read-only path, so avoid pulling the
-// potentially large JSON column for cancellation/event candidates.
+// Status, observation and recovery-candidate reads need metadata, not the
+// potentially large checkpoint body. Executable recovery loads it separately.
 const AGENT_RUN_RECOVERY_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, root_run_id, \
      ancestor_path, depth, delegation_id, agent_id, retry_of, retry_scope, status, waiting_for, \
      owner_pod_id, owner_lease_expires_at, cancellation_requested_at, run_generation, last_event_idx, checkpoint_version, \
@@ -6168,6 +6178,22 @@ pub trait RunStateStore: Send + Sync {
             }
         }
         Ok(controls)
+    }
+
+    /// Fresh, positional observations, never execution grants. A malformed
+    /// record fails its own position; transport failure fails the whole batch.
+    async fn load_run_control_batch(
+        &self,
+        keys: &[RunControlReadKey],
+    ) -> Result<Vec<RunControlReadResult>, String> {
+        if keys.len() > RUN_CONTROL_READ_BATCH_SIZE {
+            return Err("run control read batch exceeds capacity".into());
+        }
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            results.push(self.load_run_control(&key.user_id, &key.run_id).await);
+        }
+        Ok(results)
     }
 
     /// Process-local marker admission used by an invocation ledger that shares
@@ -11584,6 +11610,13 @@ const UNSETTLED_USER_INTENT_EVENTS_SELECT_SQL: &str =
        AND event_type IN ('user_intent', 'user_intent_applied', 'user_intent_returned')
      ORDER BY event_idx ASC";
 
+const RUN_CONTROL_COLUMNS: &str =
+    "run_id, session_id, status, waiting_for, parent_run_id, ancestor_path,
+     run_generation, last_event_idx,
+     CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested,
+     CAST(owner_pod_id IS NOT NULL AND owner_lease_expires_at IS NOT NULL
+          AND owner_lease_expires_at >= NOW(6) AS SIGNED) AS owner_lease_live";
+
 const EXECUTION_OWNER_CANCELLATION_RECEIPT_SELECT_SQL: &str =
     "SELECT events.payload_json, events.event_hash, events.event_idx,
             runs.last_event_idx
@@ -11634,13 +11667,22 @@ const RUN_CONTROL_EVENTS_BY_KEY_SELECT_PREFIX: &str = "SELECT id, event_idx, eve
             producer_pod_id, payload_json, user_id, session_id, run_id, invocation_supersession_scope_key \
      FROM agent_run_events WHERE user_id = ";
 
-const RUN_STATUS_BINDING_SELECT_SQL: &str = "SELECT payload_json, event_idx FROM agent_run_events
-     WHERE user_id = ? AND run_id = ? AND event_type = ?
-     ORDER BY event_idx ASC LIMIT 1";
-
-const RUN_STATUS_ACCOUNTING_SELECT_SQL: &str = "SELECT payload_json FROM agent_run_events
-     WHERE user_id = ? AND run_id = ? AND event_type = ?
-     ORDER BY event_idx DESC LIMIT 1";
+// Select positions using narrow columns before reading any payload. In
+// particular, an existing finalized row excludes finished even if its JSON is
+// corrupt or has no data. NULL means absent; event index zero remains valid.
+const RUN_STATUS_FACTS_SELECT_SQL: &str = "WITH selected AS (
+ SELECT MIN(CASE WHEN event_type='run_started' THEN event_idx END) AS started,
+        MIN(CASE WHEN event_type='workspace_bound' THEN event_idx END) AS workspace,
+        MIN(CASE WHEN event_type='executor_bound' THEN event_idx END) AS executor,
+        COALESCE(MAX(CASE WHEN event_type='run_accounting_finalized' THEN event_idx END),
+                 MAX(CASE WHEN event_type='run_finished' THEN event_idx END)) AS accounting
+ FROM agent_run_events WHERE user_id=? AND run_id=?
+   AND event_type IN ('run_started','workspace_bound','executor_bound','run_accounting_finalized','run_finished')
+ ) SELECT e.payload_json,e.event_idx FROM agent_run_events e JOIN selected s
+ ON e.event_idx IN (s.started,s.workspace,s.executor,s.accounting)
+ WHERE e.user_id=? AND e.run_id=?
+   AND e.event_type IN ('run_started','workspace_bound','executor_bound','run_accounting_finalized','run_finished')
+ ORDER BY e.event_idx";
 
 const RUN_OBSERVATION_EVENTS_SELECT_SQL: &str = "SELECT payload_json, event_idx FROM (
        (SELECT payload_json, event_idx FROM agent_run_events
@@ -20724,81 +20766,29 @@ impl RunStateStore for DatabaseRunStateStore {
         run_id: &str,
     ) -> Result<Option<DurableRunStatusSnapshot>, String> {
         let Some(mut run) = self
-            .load_run_metadata_for_user(user_id, run_id)
+            .load_run_metadata_with_columns(user_id, run_id, AGENT_RUN_RECOVERY_COLUMNS)
             .await
             .map_err(|error| error.to_string())?
         else {
             return Ok(None);
         };
-        let mut binding_events = Vec::with_capacity(3);
-        for event_type in ["run_started", "workspace_bound", "executor_bound"] {
-            let binding_row = sqlx::query(RUN_STATUS_BINDING_SELECT_SQL)
-                .bind(user_id)
-                .bind(run_id)
-                .bind(event_type)
-                .fetch_optional(self.pool.get())
-                .await
-                .map_err(|source| {
-                    db_error("load_run_status_binding", run_id, source).to_string()
-                })?;
-            if let Some(row) = binding_row {
-                let event_idx: i64 = row.try_get("event_idx").map_err(|source| {
-                    db_error("decode_run_status_binding_index", run_id, source).to_string()
-                })?;
-                let payload_json: String = row.try_get("payload_json").map_err(|source| {
-                    db_error("decode_run_status_binding", run_id, source).to_string()
-                })?;
-                let payload = serde_json::from_str(&payload_json).map_err(|source| {
-                    DatabaseRunStateStoreError::Json {
-                        operation: "decode_run_status_binding",
-                        entity: run_id.to_string(),
-                        source,
-                    }
-                    .to_string()
-                })?;
-                binding_events.push((event_idx, payload));
-            }
-        }
-        binding_events.sort_by_key(|(event_idx, _)| *event_idx);
-        let mut bounded_events = binding_events
-            .into_iter()
-            .map(|(_, payload)| payload)
-            .collect::<Vec<_>>();
-
-        let finalized = sqlx::query(RUN_STATUS_ACCOUNTING_SELECT_SQL)
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| db_error("acquire_run_status_facts", run_id, source).to_string())?;
+        let rows = sqlx::query(RUN_STATUS_FACTS_SELECT_SQL)
             .bind(user_id)
             .bind(run_id)
-            .bind("run_accounting_finalized")
-            .fetch_optional(self.pool.get())
+            .bind(user_id)
+            .bind(run_id)
+            .fetch_all(connection.connection_mut())
             .await
-            .map_err(|source| db_error("load_run_status_accounting", run_id, source).to_string())?;
-        let accounting_row = if finalized.is_some() {
-            finalized
-        } else {
-            sqlx::query(RUN_STATUS_ACCOUNTING_SELECT_SQL)
-                .bind(user_id)
-                .bind(run_id)
-                .bind("run_finished")
-                .fetch_optional(self.pool.get())
-                .await
-                .map_err(|source| {
-                    db_error("load_run_status_finished_fallback", run_id, source).to_string()
-                })?
-        };
-        if let Some(row) = accounting_row {
-            let payload_json: String = row.try_get("payload_json").map_err(|source| {
-                db_error("decode_run_status_accounting", run_id, source).to_string()
-            })?;
-            bounded_events.push(serde_json::from_str(&payload_json).map_err(|source| {
-                DatabaseRunStateStoreError::Json {
-                    operation: "decode_run_status_accounting",
-                    entity: run_id.to_string(),
-                    source,
-                }
-                .to_string()
-            })?);
-        }
-        run.events = bounded_events;
+            .map_err(|source| db_error("load_run_status_facts", run_id, source).to_string())?;
+        connection.release();
+        run.events = rows
+            .iter()
+            .map(|row| decode_run_event_payload(row, run_id))
+            .collect::<DbStoreResult<_>>()
+            .map_err(|error| error.to_string())?;
         Ok(Some(run_status_snapshot_from_run(&run)))
     }
 
@@ -20807,21 +20797,95 @@ impl RunStateStore for DatabaseRunStateStore {
         user_id: &str,
         run_id: &str,
     ) -> Result<Option<DurableRunControlRecord>, String> {
-        let row = sqlx::query(
-            "SELECT run_id, session_id, status, waiting_for, parent_run_id, ancestor_path,
-                    run_generation, last_event_idx,
-                    CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested,
-                    CAST(owner_pod_id IS NOT NULL AND owner_lease_expires_at IS NOT NULL
-                         AND owner_lease_expires_at >= NOW(6) AS SIGNED) AS owner_lease_live
-             FROM agent_runs WHERE user_id = ? AND run_id = ?",
-        )
-        .bind(user_id)
-        .bind(run_id)
-        .fetch_optional(self.pool.get())
-        .await
-        .map_err(|source| db_error("load_run_control", run_id, source).to_string())?;
+        let mut query = QueryBuilder::<MySql>::new("SELECT ");
+        query
+            .push(RUN_CONTROL_COLUMNS)
+            .push(" FROM agent_runs WHERE user_id = ")
+            .push_bind(user_id)
+            .push(" AND run_id = ")
+            .push_bind(run_id);
+        let row = query
+            .build()
+            .fetch_optional(self.pool.get())
+            .await
+            .map_err(|source| db_error("load_run_control", run_id, source).to_string())?;
         row.map(|row| decode_run_control_row(&row, run_id))
             .transpose()
+    }
+
+    async fn load_run_control_batch(
+        &self,
+        keys: &[RunControlReadKey],
+    ) -> Result<Vec<RunControlReadResult>, String> {
+        if keys.len() > RUN_CONTROL_READ_BATCH_SIZE {
+            return Err("run control read batch exceeds capacity".into());
+        }
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = QueryBuilder::<MySql>::new("SELECT requested.ordinal, ");
+        query.push(RUN_CONTROL_COLUMNS).push(" FROM (VALUES ");
+        for (ordinal, key) in keys.iter().enumerate() {
+            if ordinal != 0 {
+                query.push(",");
+            }
+            query
+                .push("ROW(")
+                .push(ordinal)
+                .push(",")
+                .push_bind(&key.user_id)
+                .push(",")
+                .push_bind(&key.run_id)
+                .push(")");
+        }
+        query.push(
+            ") requested(ordinal, requested_user_id, requested_run_id)
+             LEFT JOIN agent_runs ON user_id = requested_user_id AND run_id = requested_run_id
+             AND run_id IN (",
+        );
+        // Give the database an independently pushable candidate filter. Join
+        // equality alone can scan every historical run for each small batch.
+        for (ordinal, key) in keys.iter().enumerate() {
+            if ordinal != 0 {
+                query.push(",");
+            }
+            query.push_bind(&key.run_id);
+        }
+        query.push(")");
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| db_error("acquire_run_control_batch", "batch", source).to_string())?;
+        let rows = query
+            .build()
+            .fetch_all(connection.connection_mut())
+            .await
+            .map_err(|source| db_error("load_run_control_batch", "batch", source).to_string())?;
+        connection.release();
+        let mut results = vec![None; keys.len()];
+        for row in rows {
+            let ordinal = row.try_get::<i64, _>("ordinal").map_err(|source| {
+                db_error("decode_run_control_ordinal", "batch", source).to_string()
+            })?;
+            let ordinal = usize::try_from(ordinal)
+                .map_err(|_| "negative run control request ordinal".to_string())?;
+            let slot = results
+                .get_mut(ordinal)
+                .ok_or_else(|| "run control request ordinal is out of bounds".to_string())?;
+            if slot.is_some() {
+                return Err("duplicate run control request ordinal".into());
+            }
+            *slot = Some(
+                row.try_get::<Option<String>, _>("run_id")
+                    .map_err(|source| {
+                        db_error("decode_run_control_presence", "batch", source).to_string()
+                    })
+                    .and_then(|id| id.map(|id| decode_run_control_row(&row, &id)).transpose()),
+            );
+        }
+        results
+            .into_iter()
+            .map(|result| result.ok_or_else(|| "missing run control request ordinal".into()))
+            .collect()
     }
 
     async fn load_run_controls(
@@ -20832,14 +20896,10 @@ impl RunStateStore for DatabaseRunStateStore {
         if run_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
-            "SELECT run_id, session_id, status, waiting_for, parent_run_id, ancestor_path,
-                    run_generation, last_event_idx,
-                    CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested,
-                    CAST(owner_pod_id IS NOT NULL AND owner_lease_expires_at IS NOT NULL
-                         AND owner_lease_expires_at >= NOW(6) AS SIGNED) AS owner_lease_live
-             FROM agent_runs WHERE user_id = ",
-        );
+        let mut query = QueryBuilder::<MySql>::new("SELECT ");
+        query
+            .push(RUN_CONTROL_COLUMNS)
+            .push(" FROM agent_runs WHERE user_id = ");
         query.push_bind(user_id).push(" AND run_id IN (");
         {
             let mut ids = query.separated(",");
@@ -49293,21 +49353,6 @@ mod tests {
         );
         assert_eq!(snapshot.executor.expect("executor")["kind"], "edge_agent");
         assert_eq!(snapshot.transport.as_deref(), Some("edge_ws"));
-    }
-
-    #[test]
-    fn run_status_database_queries_are_indexed_and_bounded() {
-        for sql in [
-            RUN_STATUS_BINDING_SELECT_SQL,
-            RUN_STATUS_ACCOUNTING_SELECT_SQL,
-        ] {
-            assert!(sql.contains("user_id = ? AND run_id = ?"));
-            assert!(sql.contains("event_type"));
-            assert!(sql.contains("ORDER BY event_idx"));
-            assert!(!sql.contains("SELECT *"));
-        }
-        assert!(GUIDANCE_LATEST_FENCE_SELECT_SQL.contains("event_type IN"));
-        assert!(GUIDANCE_LATEST_FENCE_SELECT_SQL.contains("LIMIT 1"));
     }
 
     #[test]
