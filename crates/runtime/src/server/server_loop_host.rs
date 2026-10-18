@@ -156,21 +156,23 @@ impl ProviderDispatchBudget {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProviderAttemptBoundary {
-    convergence: bool,
+    recovery: bool,
+    suppressed_recovery: bool,
     no_tools: bool,
 }
 
 impl ProviderAttemptBoundary {
-    fn new(convergence: bool, no_tools: bool) -> Self {
+    fn new(recovery: bool, no_tools: bool) -> Self {
         Self {
-            convergence,
+            recovery,
+            suppressed_recovery: false,
             no_tools,
         }
     }
 
     fn budget(self) -> Option<Duration> {
-        self.convergence
-            .then_some(astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET)
+        self.suppressed_recovery
+            .then_some(astra_turn_core::chat_turn_heuristics::SUPPRESSED_PROVIDER_RECOVERY_BUDGET)
     }
 
     fn provider_work_budget(self, execution: Option<ProviderWorkBudget>) -> Option<Duration> {
@@ -182,12 +184,25 @@ impl ProviderAttemptBoundary {
         }
     }
 
-    fn forces_thinking_off(self) -> bool {
-        self.convergence
+    fn with_generation_control(
+        mut self,
+        thinking: &ThinkingConfig,
+        config: &ResolvedTurnLlmConfig,
+    ) -> Self {
+        self.suppressed_recovery = self.recovery
+            && thinking.is_off()
+            && thinking.is_supported_by(
+                &config.provider,
+                config
+                    .thinking_capability
+                    .map(|capability| capability.as_str()),
+                config.thinking_protocol.unwrap_or_default(),
+            );
+        self
     }
 
     fn allows_host_continuation(self) -> bool {
-        !self.convergence
+        !self.recovery
     }
 }
 
@@ -222,7 +237,7 @@ fn provider_result_has_valid_tool_call(result: &LlmCallResult) -> bool {
 /// reasoning.  That is not a settled assistant response: no text has become
 /// visible and no tool has been selected.  Preserve this distinction even on
 /// ordinary (non-convergence) calls so the loop can take its single safe
-/// thinking-off recovery rather than presenting an empty completion as
+/// capability-aware recovery rather than presenting an empty completion as
 /// success.
 ///
 /// A selected tool deliberately does *not* qualify here, including one that
@@ -485,7 +500,7 @@ fn validate_provider_convergence_result(
                         "deadline": {
                             "scope": "provider_convergence",
                             "phase": "actionable_output",
-                            "limit_ms": astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET.as_millis() as u64,
+                            "limit_ms": boundary.budget().map(|budget| budget.as_millis() as u64),
                             "actionable_output": false,
                             "retry_safety": "none"
                         },
@@ -943,21 +958,29 @@ fn primary_thinking_for_attempt(
     final_answer_settlement_text_only: bool,
     provider_attempt_boundary: ProviderAttemptBoundary,
     cache_protocol: astra_turn_core::cache_placement::CacheProtocol,
+    config: &ResolvedTurnLlmConfig,
 ) -> ThinkingConfig {
-    if preserve_thinking {
+    if preserve_thinking || matches!(state_thinking, ThinkingConfig::Enabled { .. }) {
         return state_thinking.clone();
     }
-    if canonical_work_establishment_pending || provider_attempt_boundary.forces_thinking_off() {
-        return ThinkingConfig::Off;
-    }
-    if final_answer_settlement_text_only
+    let uncached_final = final_answer_settlement_text_only
         && !matches!(
             cache_protocol,
             astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix
                 | astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch
-        )
+        );
+    if canonical_work_establishment_pending || provider_attempt_boundary.recovery || uncached_final
     {
-        return ThinkingConfig::Off;
+        let bounded = ThinkingConfig::bounded_auxiliary(
+            &config.provider,
+            config
+                .thinking_capability
+                .map(|capability| capability.as_str()),
+            config.thinking_protocol.unwrap_or_default(),
+        );
+        if bounded != ThinkingConfig::ModelDefault {
+            return bounded;
+        }
     }
     state_thinking.clone()
 }
@@ -20794,9 +20817,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // only selects deterministic execution behavior after that decision.
         let canonical_work_establishment_pending =
             !final_answer_settlement_text_only && self.canonical_work_establishment_pending(state);
-        let force_provider_convergence = state.provider_adaptation.force_next_thinking_off;
+        let safe_provider_recovery = state.provider_adaptation.safe_recovery_pending;
         let provider_attempt_boundary =
-            ProviderAttemptBoundary::new(force_provider_convergence, use_no_tool_choice);
+            ProviderAttemptBoundary::new(safe_provider_recovery, use_no_tool_choice);
         let primary_thinking = primary_thinking_for_attempt(
             &state.thinking,
             self.preserve_thinking,
@@ -20804,7 +20827,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             final_answer_settlement_text_only,
             provider_attempt_boundary,
             cache_cap.protocol,
+            &llm_cfg,
         );
+        let provider_attempt_boundary =
+            provider_attempt_boundary.with_generation_control(&primary_thinking, &llm_cfg);
 
         // Output token recovery: if finish_reason is "length", make at most
         // one catalog/context-valid probe. Never turn an already authoritative
@@ -21339,7 +21365,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             let attempt_label = llm_main_attempt_label(attempt_in_round);
             state
                 .step_recorder
-                .begin_llm_round(&llm_cfg.model_name, state.inference_purpose);
+                .begin_llm_round(&llm_cfg.model_name, state.inference_purpose, durable_invocation.invocation_id(), attempt_in_round);
             if attempt_in_round > 0 {
                 state.current_model_item_id = Some(uuid::Uuid::new_v4().to_string());
                 self.current_model_item_id = state.current_model_item_id.clone();
@@ -21347,6 +21373,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 streamed_reasoning.clear();
             }
             let llm_round_start = std::time::Instant::now();
+            tracing::info!(
+                target: "astra::provider_recovery",
+                safe_recovery = safe_provider_recovery,
+                requested_thinking = %state.thinking,
+                effective_thinking = %primary_thinking,
+                provider_work_budget_ms = ?dispatch_budget.client_timeout.map(|budget| budget.as_millis()),
+                "primary generation controls resolved against admitted capability"
+            );
             self.on_turn_phase_started(
                 state,
                 TurnPhaseKind::ModelInference,
@@ -21609,29 +21643,58 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 }
                 provider_result
             };
-            if state.messaging.progress_emitter.is_none() {
-                self.emit_progress_event(json!({
-                    "type": "agent_progress",
-                    "status": "llm_call_completed",
-                    "turn": state.llm_rounds_completed,
-                    "ttft_ms": attempt_first_stream_update_ms,
-                    "duration_ms": llm_round_start.elapsed().as_millis() as u64,
-                }));
-            }
-            self.publish_explain_analyze_provider_attempt_spans(
-                explain_provider_attempt_observer.drain_spans(),
-            );
+            let llm_round_latency_ms = llm_round_start.elapsed().as_millis() as u64;
             let provider_attempts = durable_invocation.provider_attempt_facts().await;
+            let mut qualified_invocation_usage: Option<astra_turn_types::CanonicalTokenUsage> = None;
             // The invocation's final facts are read once after its call has
             // stopped. Each request key is unique in its existing owner map.
             for usage in provider_attempts.iter().filter_map(|fact| fact.qualified_usage) {
-                qualified_attempt_usage = Some(match qualified_attempt_usage {
+                qualified_invocation_usage = Some(match qualified_invocation_usage {
                     None => usage,
                     Some(total) => total.checked_add(usage).unwrap_or_else(|_| {
                         astra_turn_types::CanonicalTokenUsage::new(None, None, None, None).expect("unknown usage is valid")
                     }),
                 });
             }
+            if let Some(usage) = qualified_invocation_usage {
+                qualified_attempt_usage = Some(match qualified_attempt_usage {
+                    None => usage,
+                    Some(total) => total.checked_add(usage).unwrap_or_else(|_| {
+                        astra_turn_types::CanonicalTokenUsage::new(None, None, None, None)
+                            .expect("unknown usage is valid")
+                    }),
+                });
+            }
+            // A Step terminal describes this invocation only. The outer error
+            // projection may also include earlier logical continuations.
+            let r = r.map_err(|error| attach_qualified_error_usage(error, qualified_invocation_usage));
+            match &r {
+                Ok(response) => {
+                    let usage = crate::turn::token_usage::TokenUsage::from_partial_json_map(&response.usage);
+                    state.step_recorder.end_llm_round(
+                        &llm_cfg.model_name, state.inference_purpose,
+                        usage.input_tokens, usage.output_tokens, usage.cached_input_tokens,
+                        usage.cache_creation_tokens, llm_round_latency_ms,
+                    );
+                }
+                Err(error) => state.step_recorder.fail_llm_round(
+                    &llm_cfg.model_name, state.inference_purpose, error,
+                    llm_round_latency_ms,
+                    durable_invocation.provider_dispatch_started(),
+                ),
+            }
+            if state.messaging.progress_emitter.is_none() {
+                self.emit_progress_event(json!({
+                    "type": "agent_progress",
+                    "status": "llm_call_completed",
+                    "turn": state.llm_rounds_completed,
+                    "ttft_ms": attempt_first_stream_update_ms,
+                    "duration_ms": llm_round_latency_ms,
+                }));
+            }
+            self.publish_explain_analyze_provider_attempt_spans(
+                explain_provider_attempt_observer.drain_spans(),
+            );
             match (
                 durable_invocation.admitted_canonical_transition_id(),
                 provider_canonical_planned_head,
@@ -21673,8 +21736,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }
             record_provider_attempt_cache_observations(state, &provider_attempts);
             if durable_invocation.provider_dispatch_started() {
-                if force_provider_convergence {
-                    state.provider_adaptation.force_next_thinking_off = false;
+                if safe_provider_recovery {
+                    state.provider_adaptation.safe_recovery_pending = false;
                 }
                 durable_canonical_cursor = state.messages.len();
                 record_full_llm_request_event(
@@ -21757,6 +21820,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     &final_tools,
                 );
             }
+
 
             // Context-window errors flow through the accum so the agentic loop's
             // Fatal handler can trigger auto-compaction + retry.
@@ -22008,21 +22072,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     admission_estimated_tokens as u64,
                     &r.usage,
                 );
-                state.step_recorder.end_llm_round(
-                    &llm_cfg.model_name,
-                    state.inference_purpose,
-                    u.input_tokens,
-                    u.output_tokens,
-                    u.cached_input_tokens,
-                    u.cache_creation_tokens,
-                    llm_round_start.elapsed().as_millis() as u64,
-                );
+
             }
 
             // A convergence attempt is one logical provider request, not a
             // new retry budget. Its durable attempt is already settled above;
             // do not let host-level work-establishment, output-cap, or length
-            // continuations silently turn the 30s slice into 60s or more.
+            // continuations create additional logical recovery requests.
             // The returned response still follows the ordinary admission and
             // tool-execution path after this provider loop.
             if !provider_attempt_boundary.allows_host_continuation() {
@@ -22766,6 +22822,17 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
         self.resolved_deferred_activations_for_delivery.clear();
         result
+    }
+
+    fn on_provider_recovery(&mut self, state: &AgenticLoopState, reason: astra_core::ErrorKind) {
+        self.emit_progress_event(json!({
+            "type": "warning",
+            "code": "provider_recovery",
+            "model": state.current_model_identity(),
+            "error_kind": reason.as_str(),
+            "attempt": 1,
+            "message": format!("{} did not produce a usable response. Attempting one recovery with the retained conversation and tool evidence.", state.current_model_identity().unwrap_or("The selected model")),
+        }));
     }
 
     fn emit_hook_config_diagnostic(
@@ -24329,9 +24396,16 @@ mod tests {
             ),
             (
                 Some(test_execution_deadline(600)),
+                ProviderAttemptBoundary::new(true, false)
+                    .with_generation_control(&ThinkingConfig::Off, &nonthinking_test_config()),
+                false,
+                false,
+            ),
+            (
+                Some(test_execution_deadline(600)),
                 ProviderAttemptBoundary::new(true, false),
                 false,
-                false,
+                true,
             ),
             (
                 Some(test_execution_deadline(20)),
@@ -24424,14 +24498,15 @@ mod tests {
 
     #[test]
     fn execution_provider_work_budget_and_convergence_choose_the_smaller_slice() {
-        let convergence = ProviderAttemptBoundary::new(true, false);
+        let convergence = ProviderAttemptBoundary::new(true, false)
+            .with_generation_control(&ThinkingConfig::Off, &nonthinking_test_config());
         assert_eq!(
             convergence.provider_work_budget(Some(ProviderWorkBudget(Duration::from_secs(5)))),
             Some(Duration::from_secs(5))
         );
         assert_eq!(
             convergence.provider_work_budget(Some(ProviderWorkBudget(Duration::from_secs(60)))),
-            Some(astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET)
+            Some(astra_turn_core::chat_turn_heuristics::SUPPRESSED_PROVIDER_RECOVERY_BUDGET)
         );
     }
 
@@ -26491,7 +26566,7 @@ mod tests {
                 // Preserve the final-answer window while exercising a local
                 // approval timeout before durable reconciliation.
                 remaining_seconds:
-                    astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET
+                    astra_turn_core::chat_turn_heuristics::SUPPRESSED_PROVIDER_RECOVERY_BUDGET
                         .as_secs()
                         + 2,
             }))
@@ -29277,6 +29352,12 @@ mod tests {
             timeout_ms,
             128_000,
         )
+    }
+
+    fn nonthinking_test_config() -> ResolvedTurnLlmConfig {
+        let mut config = summary_test_config(String::new());
+        config.thinking_capability = Some(astra_services::models::ThinkingCapability::None);
+        config
     }
 
     fn summary_test_config(base_url: String) -> ResolvedTurnLlmConfig {
@@ -35227,9 +35308,10 @@ mod tests {
     fn provider_convergence_boundary_is_one_shot_text_only_and_bounded() {
         let no_tools = HashSet::new();
         let work_tools = HashSet::from(["start_work".to_string()]);
-        let text_only = ProviderAttemptBoundary::new(true, true);
+        let text_only = ProviderAttemptBoundary::new(true, true)
+            .with_generation_control(&ThinkingConfig::Off, &nonthinking_test_config());
         assert_eq!(text_only.budget(), Some(Duration::from_secs(30)));
-        assert!(text_only.forces_thinking_off());
+        assert!(text_only.recovery);
         assert!(text_only.no_tools);
         assert!(
             !text_only.allows_host_continuation(),
@@ -35238,7 +35320,7 @@ mod tests {
 
         let ordinary = ProviderAttemptBoundary::new(false, false);
         assert_eq!(ordinary.budget(), None);
-        assert!(!ordinary.forces_thinking_off());
+        assert!(!ordinary.recovery);
         assert!(!ordinary.no_tools);
         assert!(ordinary.allows_host_continuation());
 
@@ -47288,6 +47370,11 @@ mod tests {
             append_only
         ));
 
+        let mut thinking_config = summary_test_config(String::new());
+        thinking_config.thinking_capability =
+            Some(astra_services::models::ThinkingCapability::Both);
+        thinking_config.thinking_protocol =
+            Some(astra_core::model_wire::thinking::ThinkingProtocol::ThinkingObject);
         let adaptive = ThinkingConfig::Adaptive {
             effort: ThinkingEffort::High,
         };
@@ -47299,6 +47386,7 @@ mod tests {
                 true,
                 ProviderAttemptBoundary::new(false, false),
                 CacheProtocol::OpenAiAutoPrefix,
+                &thinking_config,
             ),
             adaptive,
             "text-only settlement must preserve the cached thinking shape"
@@ -47313,6 +47401,7 @@ mod tests {
                 true,
                 ProviderAttemptBoundary::new(false, false),
                 CacheProtocol::None,
+                &thinking_config,
             ),
             ThinkingConfig::Off,
             "uncached providers may suppress thinking on a text-only retry"
@@ -47325,6 +47414,7 @@ mod tests {
                 true,
                 ProviderAttemptBoundary::new(false, false),
                 CacheProtocol::OpenAiAutoPrefix,
+                &thinking_config,
             ),
             ThinkingConfig::Off,
             "canonical Work establishment remains an explicit convergence boundary"
@@ -47356,7 +47446,8 @@ mod tests {
                         work,
                         settlement,
                         ProviderAttemptBoundary::new(convergence, true),
-                        CacheProtocol::None
+                        CacheProtocol::None,
+                        &summary_test_config(String::new()),
                     ),
                     thinking
                 );
@@ -51763,11 +51854,11 @@ mod tests {
                 .build();
         let mut state = loop_state(session, Vec::new(), "Describe the supplied information.");
         host.prepare_model_selection(&mut state).await.unwrap();
-        state.provider_adaptation.force_next_thinking_off = true;
+        state.provider_adaptation.safe_recovery_pending = true;
         state.current_run_owner_generation = None;
         let error = host.execute_turn(&mut state).await.err().unwrap();
         assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
-        assert!(state.provider_adaptation.force_next_thinking_off);
+        assert!(state.provider_adaptation.safe_recovery_pending);
         assert!(gateway.requests.lock().await.is_empty());
         assert!(ledger.admissions().is_empty());
         ledger.assert_quiescent();
@@ -54733,4 +54824,5 @@ mod tests {
             );
         }
     }
+    include!("server_loop_host_recovery_tests.rs");
 }

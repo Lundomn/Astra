@@ -3385,6 +3385,17 @@ fn is_llm_provider_admission_error(error: &astra_core::ClassifiedError) -> bool 
     details.get("source").and_then(serde_json::Value::as_str) == Some("llm_provider_admission")
 }
 
+fn exhausted_provider_recovery_action(state: &AgenticLoopState) -> ResumeAction {
+    ResumeAction::RequiresIntervention {
+        description: format!(
+            "{} could not produce a usable response after one recovery. The request remains unfinished. Choose another authorized model, or explicitly retry after the provider recovers; prior conversation and tool evidence remain available.",
+            state
+                .current_model_identity()
+                .unwrap_or("The selected model"),
+        ),
+    }
+}
+
 fn record_direct_llm_error_state(
     state: &mut AgenticLoopState,
     error: &astra_core::ClassifiedError,
@@ -3405,6 +3416,18 @@ fn record_direct_llm_error_state(
     if let Some((kind, action)) =
         astra_turn_core::interruption::interruption_from_error_kind(error.kind)
     {
+        let exhausted_safe_recovery = state.provider_adaptation.safe_recovery_attempted
+            && matches!(
+                error.kind,
+                astra_core::ErrorKind::ProviderDeadline
+                    | astra_core::ErrorKind::StreamIdle
+                    | astra_core::ErrorKind::StreamTransport
+            );
+        let action = if exhausted_safe_recovery {
+            exhausted_provider_recovery_action(state)
+        } else {
+            action
+        };
         state.interruption = Some(InterruptionRecord::new(
             kind,
             action,
@@ -3550,29 +3573,30 @@ fn is_transport_success_empty_completion(details: &serde_json::Value) -> bool {
 fn record_repeated_transport_success_empty_completion(
     state: &mut AgenticLoopState,
     error: &astra_core::ClassifiedError,
-) {
+) -> bool {
     if state.interruption.is_some()
-        || !state.provider_adaptation.action_convergence_attempted
+        || !state.provider_adaptation.safe_recovery_attempted
         || error.kind != astra_core::ErrorKind::ProviderDeadline
     {
-        return;
+        return false;
     }
     let Some(details) = error
         .details_json
         .as_deref()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
     else {
-        return;
+        return false;
     };
     if !is_transport_success_empty_completion(&details) {
-        return;
+        return false;
     }
 
     state.interruption = Some(InterruptionRecord::new(
         InterruptionKind::EmptyCompletion,
-        ResumeAction::ContinueImmediately,
+        exhausted_provider_recovery_action(state),
         interruption_state_summary(state, Some(error.message.clone())),
     ));
+    true
 }
 
 /// Admit one logical recovery round after a provider attempt failed before it
@@ -3593,7 +3617,7 @@ fn schedule_safe_provider_recovery(
         astra_core::ErrorKind::ProviderDeadline
             | astra_core::ErrorKind::StreamTransport
             | astra_core::ErrorKind::StreamIdle
-    ) || state.provider_adaptation.action_convergence_attempted
+    ) || state.provider_adaptation.safe_recovery_attempted
     {
         return false;
     }
@@ -3677,8 +3701,8 @@ fn schedule_safe_provider_recovery(
         state.remaining_turns = 1;
     }
 
-    state.provider_adaptation.action_convergence_attempted = true;
-    state.provider_adaptation.force_next_thinking_off = true;
+    state.provider_adaptation.safe_recovery_attempted = true;
+    state.provider_adaptation.safe_recovery_pending = true;
     let text_only = state.hooks.completion_settlement.text_only;
     let interruption = match error.kind {
         astra_core::ErrorKind::ProviderDeadline => "spent its action window",
@@ -3770,7 +3794,7 @@ pub(crate) fn advance_provider_recovery_epoch_from_new_records(
             .unwrap_or_default(),
     );
     if advanced {
-        state.provider_adaptation.action_convergence_attempted = false;
+        state.provider_adaptation.safe_recovery_attempted = false;
     }
     advanced
 }
@@ -5286,8 +5310,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 tracing::warn!(
                     target: "astra::provider_recovery",
                     error = %error,
-                    "provider attempt ended before executable or visible delivery; scheduling one safe thinking-off recovery round"
+                    "provider attempt ended before executable or visible delivery; scheduling one capability-aware safe recovery round"
                 );
+                host.on_provider_recovery(state, error.kind);
                 state.step_recorder.end_turn(false);
                 return Ok(TurnExecutionControl::ContinueLoop);
             }
@@ -5296,7 +5321,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             // work while the run's final-answer window is still untouched.
             // After the one safe recovery, only a dispatch proven to be
             // run-work-limited can enter that existing terminal boundary.
-            if state.provider_adaptation.action_convergence_attempted
+            if state.provider_adaptation.safe_recovery_attempted
                 && provider_deadline_has_no_actionable_delivery(&error)
                 && error
                     .details_json
@@ -5316,8 +5341,16 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 state.step_recorder.end_turn(false);
                 return Ok(TurnExecutionControl::ContinueLoop);
             }
-            record_repeated_transport_success_empty_completion(state, &error);
+            let empty_completion =
+                record_repeated_transport_success_empty_completion(state, &error);
             state.hooks.completion_settlement.text_only = false;
+            if empty_completion {
+                // Affirmative clean non-delivery is an interrupted completion,
+                // not a provider failure. Use the ordinary terminal path so
+                // every surface preserves the producer's EmptyCompletion action.
+                state.step_recorder.end_turn(false);
+                return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
+            }
             record_direct_llm_error_state(state, &error);
             return Err(error);
         }
@@ -18494,6 +18527,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn final_guidance_fence_without_input_closes_the_inner_step() {
+        let mut state = make_state();
+        let error = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "typed admission fence",
+        )
+        .with_details_json(
+            serde_json::json!({
+                "source": crate::turn::llm::durable::INFERENCE_LEDGER_ERROR_SOURCE,
+                "scope_rejection": astra_services::InferenceScopeRejection::GuidancePending,
+            })
+            .to_string(),
+        );
+        let mut host = DirectErrorHost::new(error);
+        let result =
+            super::super::finalization::run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(result.is_err());
+        assert_eq!(host.turn_count(), 1);
+        let step = state
+            .step_recorder
+            .current_step()
+            .expect("actual inner step began");
+        assert!(step.execution.completed_at.is_some());
+        use astra_pipeline::step_protocol::StepEventType;
+        assert_eq!(
+            state
+                .step_recorder
+                .events()
+                .iter()
+                .filter(|event| event.step_id == step.step_id()
+                    && event.event_type == StepEventType::StepIncomplete)
+                .count(),
+            1
+        );
+        assert!(
+            !state
+                .step_recorder
+                .events()
+                .iter()
+                .any(|event| event.step_id == "unknown")
+        );
+    }
+
+    #[tokio::test]
     async fn guidance_admission_fence_reconciles_before_continuing() {
         // The host boundary fails after pre-request polling, as happens when
         // guidance races the final durable provider-attempt admission.
@@ -18614,7 +18691,7 @@ mod tests {
             (Some("run_work"), true, "none", true, false),
         ] {
             let mut state = make_state();
-            state.provider_adaptation.action_convergence_attempted = recovery_used;
+            state.provider_adaptation.safe_recovery_attempted = recovery_used;
             state.hooks.completion_settlement.text_only = settlement_active;
             let error = astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::ProviderDeadline,
@@ -18666,7 +18743,7 @@ mod tests {
                 );
             } else if !recovery_used {
                 assert!(matches!(result, Ok(TurnExecutionControl::ContinueLoop)));
-                assert!(state.provider_adaptation.force_next_thinking_off);
+                assert!(state.provider_adaptation.safe_recovery_pending);
                 assert!(!state.budget_wrapup_injected);
             } else {
                 assert!(result.is_err());
@@ -18770,7 +18847,7 @@ mod tests {
 
         assert!(matches!(control, TurnExecutionControl::ContinueLoop));
         assert!(state.hooks.completion_settlement.text_only);
-        assert!(state.provider_adaptation.force_next_thinking_off);
+        assert!(state.provider_adaptation.safe_recovery_pending);
 
         let mut rejected_state = make_state();
         rejected_state.remaining_turns = 3;
@@ -18840,8 +18917,8 @@ mod tests {
         assert_eq!(state.max_turns, 35);
         assert_eq!(state.remaining_turns, 1);
         assert!(state.hooks.completion_settlement.text_only);
-        assert!(state.provider_adaptation.action_convergence_attempted);
-        assert!(state.provider_adaptation.force_next_thinking_off);
+        assert!(state.provider_adaptation.safe_recovery_attempted);
+        assert!(state.provider_adaptation.safe_recovery_pending);
         assert!(state.interruption.is_none());
         let advisory = state
             .volatile_pending
@@ -18856,7 +18933,7 @@ mod tests {
         let mut state = make_state();
         state.remaining_turns = 0;
         state.hooks.completion_settlement.text_only = true;
-        state.provider_adaptation.action_convergence_attempted = true;
+        state.provider_adaptation.safe_recovery_attempted = true;
         let mut host = DirectErrorHost::new(
             astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::ProviderDeadline,
@@ -18877,19 +18954,25 @@ mod tests {
             ),
         );
 
-        assert!(
-            execute_turn_and_ingest_phase(
-                &mut host,
-                &mut state,
-                0,
-                TurnIterationPrep {
-                    quiet: true,
-                    turn_start_time: Instant::now(),
-                },
-            )
-            .await
-            .is_err()
-        );
+        let control = execute_turn_and_ingest_phase(
+            &mut host,
+            &mut state,
+            0,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+        )
+        .await
+        .expect("clean empty exhaustion uses interrupted completion");
+        assert!(matches!(
+            control,
+            TurnExecutionControl::Return(AgenticLoopOutcome::Completed)
+        ));
+        assert!(matches!(
+            state.interruption.as_ref().unwrap().resume_action,
+            ResumeAction::RequiresIntervention { .. }
+        ));
 
         let interruption = state
             .interruption
@@ -18947,7 +19030,7 @@ mod tests {
             InterruptionKind::ProviderDeadline
         );
         assert_eq!(state.remaining_turns, 0);
-        assert!(!state.provider_adaptation.force_next_thinking_off);
+        assert!(!state.provider_adaptation.safe_recovery_pending);
     }
 
     #[tokio::test]
@@ -18982,8 +19065,8 @@ mod tests {
         .expect("an unambiguous transport interruption must schedule one recovery turn");
 
         assert!(matches!(control, TurnExecutionControl::ContinueLoop));
-        assert!(state.provider_adaptation.action_convergence_attempted);
-        assert!(state.provider_adaptation.force_next_thinking_off);
+        assert!(state.provider_adaptation.safe_recovery_attempted);
+        assert!(state.provider_adaptation.safe_recovery_pending);
         assert!(state.interruption.is_none());
         assert!(state.stall.tool_call_records.is_empty());
     }
@@ -20458,7 +20541,7 @@ mod tests {
     }
 
     #[test]
-    fn safe_provider_recovery_schedules_exactly_one_thinking_off_convergence() {
+    fn safe_provider_recovery_schedules_exactly_one_capability_aware_attempt() {
         let mut state = make_state();
         state.remaining_turns = 3;
         let error = astra_core::ClassifiedError::new(
@@ -20476,8 +20559,8 @@ mod tests {
         );
 
         assert!(schedule_safe_provider_recovery(&mut state, &error));
-        assert!(state.provider_adaptation.action_convergence_attempted);
-        assert!(state.provider_adaptation.force_next_thinking_off);
+        assert!(state.provider_adaptation.safe_recovery_attempted);
+        assert!(state.provider_adaptation.safe_recovery_pending);
         assert!(state.volatile_pending.iter().any(|entry| {
             entry.kind == VolatileKind::BehaviorAdvisory
                 && entry.payload["schema"] == "provider_safe_recovery.v1"
@@ -20615,7 +20698,7 @@ mod tests {
             schedule_safe_provider_recovery(&mut state, &error),
             "a terminal provider completion with no delivery is safe to converge once"
         );
-        assert!(state.provider_adaptation.force_next_thinking_off);
+        assert!(state.provider_adaptation.safe_recovery_pending);
     }
 
     #[test]
@@ -20662,8 +20745,8 @@ mod tests {
             );
             assert_eq!(state.max_turns, 34);
             assert_eq!(state.remaining_turns, 0);
-            assert!(!state.provider_adaptation.action_convergence_attempted);
-            assert!(!state.provider_adaptation.force_next_thinking_off);
+            assert!(!state.provider_adaptation.safe_recovery_attempted);
+            assert!(!state.provider_adaptation.safe_recovery_pending);
         }
     }
 
@@ -20691,8 +20774,8 @@ mod tests {
         assert_eq!(state.max_turns, 35);
         assert_eq!(state.remaining_turns, 1);
         assert!(state.hooks.completion_settlement.text_only);
-        assert!(state.provider_adaptation.action_convergence_attempted);
-        assert!(state.provider_adaptation.force_next_thinking_off);
+        assert!(state.provider_adaptation.safe_recovery_attempted);
+        assert!(state.provider_adaptation.safe_recovery_pending);
     }
 
     #[test]
@@ -20888,7 +20971,7 @@ mod tests {
         );
 
         assert!(schedule_safe_provider_recovery(&mut state, &error));
-        assert!(state.provider_adaptation.action_convergence_attempted);
+        assert!(state.provider_adaptation.safe_recovery_attempted);
         state.stall.tool_call_records.push(ToolCallRecord {
             name: "bash".into(),
             ok: true,
@@ -20928,7 +21011,7 @@ mod tests {
             let mut non_execution_state = make_state();
             non_execution_state
                 .provider_adaptation
-                .action_convergence_attempted = true;
+                .safe_recovery_attempted = true;
             non_execution_state
                 .stall
                 .tool_call_records
@@ -20945,14 +21028,14 @@ mod tests {
             assert!(
                 non_execution_state
                     .provider_adaptation
-                    .action_convergence_attempted
+                    .safe_recovery_attempted
             );
         }
 
         let mut failed_execution_state = make_state();
         failed_execution_state
             .provider_adaptation
-            .action_convergence_attempted = true;
+            .safe_recovery_attempted = true;
         failed_execution_state
             .stall
             .tool_call_records
@@ -20969,7 +21052,7 @@ mod tests {
         assert!(
             !failed_execution_state
                 .provider_adaptation
-                .action_convergence_attempted
+                .safe_recovery_attempted
         );
     }
 
@@ -20997,7 +21080,7 @@ mod tests {
             )
             .with_details_json(details.to_string());
             assert!(!schedule_safe_provider_recovery(&mut state, &error));
-            assert!(!state.provider_adaptation.force_next_thinking_off);
+            assert!(!state.provider_adaptation.safe_recovery_pending);
         }
     }
 
@@ -21028,7 +21111,7 @@ mod tests {
             advisory.payload["evidence"]["error_kind"],
             "stream_transport"
         );
-        assert!(state.provider_adaptation.force_next_thinking_off);
+        assert!(state.provider_adaptation.safe_recovery_pending);
         assert!(
             !schedule_safe_provider_recovery(&mut state, &error),
             "a transport failure has at most one safe logical recovery"
@@ -21053,7 +21136,7 @@ mod tests {
         );
 
         assert!(!schedule_safe_provider_recovery(&mut state, &error));
-        assert!(!state.provider_adaptation.force_next_thinking_off);
+        assert!(!state.provider_adaptation.safe_recovery_pending);
     }
 
     #[test]
@@ -21076,7 +21159,7 @@ mod tests {
             !schedule_safe_provider_recovery(&mut state, &error),
             "a transport recovery requires typed text, reasoning, and tool-call evidence"
         );
-        assert!(!state.provider_adaptation.force_next_thinking_off);
+        assert!(!state.provider_adaptation.safe_recovery_pending);
     }
 
     #[tokio::test]
