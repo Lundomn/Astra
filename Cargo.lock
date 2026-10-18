@@ -524,6 +524,7 @@ dependencies = [
  "astra-core",
  "astra-turn-types",
  "async-trait",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
