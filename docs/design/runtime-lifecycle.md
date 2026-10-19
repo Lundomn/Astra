@@ -122,6 +122,34 @@ Each CLI SSE invocation publishes its server-verified session and run identity
 before terminal output, including resumed sessions. A previously installed
 session id does not bind a new stream observer or authorize timeout cleanup.
 
+One-shot CLI chat registers SIGINT before admission. The first interrupt stops
+local work and uses the captured owner to cancel only the observed exact run,
+within a bounded settlement window (also bounded by any request wall deadline).
+It drains the existing turn and commits the existing canonical partial before
+publishing an interrupted JSON result. Its nullable `interruption_reason` field
+preserves the typed reason, including `user_interrupted`, independently of any
+observed partial text. Cancellation acceptance alone does not
+prove execution settlement. Missing run identity, failed settlement, a drain
+failure or a second interrupt produces an unverified failure instead of a
+successful terminal result or automatic replay. A setup interrupt before stream
+admission sends no run cancellation. After native callback shutdown, a positively
+unsettled local workspace owner blocks resumable partial publication, even when
+the exact Server run has settled. A request-scoped reference published by the
+ordinary SSE executor factory follows that same executor's active worktree;
+the native delivery executor is checked independently. Neither can substitute
+for the other. Observed partial data remains available as an explicit failure,
+and a closed stdout pipe cannot turn a positively unsettled local owner into a
+successful exit. Absent local evidence does not create settlement authority.
+Secondary root-drain, native-shutdown or event-output cleanup failures append
+their causes to an existing failure without replacing its typed evidence or
+observed partial text. Any such failure vetoes resumable partial and closed-pipe
+success, even when the original failure class is cancellation.
+Both interrupt listeners remain armed through native shutdown and event-writer
+settlement, including cleanup after ordinary stream completion. A late first
+interrupt establishes the same bounded deadline and returns unverified failure;
+a second interrupt vetoes partial recovery even if cleanup later succeeds.
+Cleanup retains its existing join and abort authority within that deadline.
+
 CLI session exit commits the local journal end and workspace boundary before
 optional remote maintenance. A failed local write remains observable and
 retryable; an ambiguous sync result is retried against the journal rather than
