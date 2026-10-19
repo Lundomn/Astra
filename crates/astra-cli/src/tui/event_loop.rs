@@ -8052,6 +8052,9 @@ pub(crate) async fn run_tui_session(
             }
             Some(progress) = login_progress_rx.recv() => {
                 if login_tasks.is_empty() { continue; }
+                if let crate::cli::auth_flow::LoginProgress::BrowserLaunchFailed(reason) = &progress {
+                    chat_widget.commit_system(history_cell::system::SystemCell::response(reason));
+                }
                 if let crate::cli::auth_flow::LoginProgress::OpenBrowser(url) = progress {
                     chat_widget.commit_system(history_cell::system::SystemCell::response(
                         "Complete sign-in in your browser. Esc cancels while waiting.",
@@ -8125,7 +8128,7 @@ pub(crate) async fn run_tui_session(
                             auth_flow::browser_login(&api, profile.as_deref(), method, Arc::new(move |progress| {
                                 match &progress {
                                     LoginProgress::Completing => phase.begin_exchange()?,
-                                    LoginProgress::OpenBrowser(url) => crate::cli::auth_flow::open_login_url(url),
+                                    LoginProgress::OpenBrowser(_) | LoginProgress::BrowserLaunchFailed(_) => {},
                                 }
                                 let _ = tx.send(progress);
                                 Ok(())
@@ -13342,7 +13345,7 @@ mod tests {
         let (opened_tx, mut opened_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move {
-            auth_flow::browser_login(
+            auth_flow::browser_login_with_launcher(
                 &login_api,
                 None,
                 auth_flow::LoginMethod::Memoria(website),
@@ -13351,11 +13354,13 @@ mod tests {
                         auth_flow::LoginProgress::OpenBrowser(url) => {
                             let _ = opened_tx.send(url);
                         }
+                        auth_flow::LoginProgress::BrowserLaunchFailed(_) => {}
                         auth_flow::LoginProgress::Completing => task_phase.begin_exchange()?,
                     }
                     Ok(())
                 }),
                 false,
+                async |_| std::future::pending().await,
             )
             .await?;
             Ok(LoginEffect::Completed { uc: false })
