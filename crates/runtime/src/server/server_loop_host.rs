@@ -3681,6 +3681,9 @@ pub struct ServerAgenticLoopHost {
     /// readiness/policy so introspect can explain why they are unavailable
     /// without changing the LLM-visible `tools[]` payload.
     admission_tool_schemas: Vec<Value>,
+    /// The executor and host consume the same resolver-owned index.
+    runtime_provider_policy_index:
+        Arc<std::sync::RwLock<astra_turn_core::provider_resolution::ResolvedProviderPolicyIndex>>,
     /// Full binding-admitted contracts for the current provider surface.
     ///
     /// Deferred entries are discovered through the manifest; resident entries
@@ -6216,6 +6219,7 @@ impl ServerAgenticLoopHostBuilder {
             canonical_transition_hydrated: false,
             tool_schemas,
             admission_tool_schemas,
+            runtime_provider_policy_index: Arc::new(std::sync::RwLock::new(Default::default())),
             deferred_tool_schemas,
             edge_provider_tool_schemas,
             authenticated_edge_discovery: None,
@@ -6861,6 +6865,22 @@ fn project_retained_action_discovery_summary(schema: &mut Value) {
 }
 
 impl ServerAgenticLoopHost {
+    fn sync_lazy_source_contracts(
+        &mut self,
+        state: &AgenticLoopState,
+    ) -> Result<(), super::capability_source::SourceError> {
+        let Some(executor) = state.runtime_tool_executor.as_deref() else {
+            return Ok(());
+        };
+        self.runtime_provider_policy_index = executor.provider_policy_index_handle();
+        let schemas = executor.source_materialized_schemas()?;
+        // Private admission/discovery contracts only. Do not insert selected
+        // schemas into the repeated resident wire surface.
+        append_tool_schemas_unique(&mut self.admission_tool_schemas, schemas.clone());
+        append_tool_schemas_unique(&mut self.deferred_tool_schemas, schemas);
+        Ok(())
+    }
+
     pub(crate) fn bind_execution_capacity(
         &mut self,
         capacity: crate::server::run::lifecycle::RunExecutionCapacity,
@@ -7578,11 +7598,10 @@ impl ServerAgenticLoopHost {
             return false;
         };
         decision.visible
-            && decision.selected_offer.as_ref().is_some_and(|offer| {
-                descriptor.identity.provider_binding.as_str() == offer.provider_id
-                    && descriptor.identity.native_tool_id.as_str() == offer.native_tool_id
-                    && descriptor.descriptor_version.as_str() == offer.schema_digest
-            })
+            && decision
+                .selected_offer
+                .as_ref()
+                .is_some_and(|offer| offer.descriptor_ref().as_ref() == Some(descriptor))
     }
 
     fn resolve_deferred_tool_admission(
@@ -8341,11 +8360,11 @@ impl ServerAgenticLoopHost {
             // skill exists: CLI startup installs it before background
             // discovery converges. Never expose a virtual tool that neither
             // side can execute.
-            let server_catalog_ready = state
-                .skills
-                .resolver
-                .as_ref()
-                .is_some_and(|resolver| !resolver.available_skills().is_empty());
+            let server_catalog_ready = state.skills.resolver.as_ref().is_some_and(|resolver| {
+                !resolver.available_skills().is_empty()
+                    || (name == crate::turn::skill_tool::SKILL_TOOL_NAME
+                        && resolver.has_dynamic_catalog())
+            });
             let client_catalog_ready = self.runtime_declared_tool_names.contains(name)
                 && self.has_client_tool_delivery_lane()
                 && !state.skills.client_pipeline_skills.is_empty();
@@ -16887,10 +16906,15 @@ impl ServerAgenticLoopHost {
     fn tool_admission_context(&self) -> ToolAdmissionContext {
         let disabled_tool_offers = self.disabled_tool_offers_snapshot();
         let provider_allowed_tools = self.provider_allowed_tools_snapshot();
+        let provider_policy = self.runtime_provider_policy_index.read().ok();
         ToolAdmissionContext {
             server_service_provider_ready: self.server_service_provider_catalog_enabled,
             control_plane_provider_ready: self.control_plane_provider_catalog_enabled,
             request_scoped_mcp_provider_ready: self.request_scoped_mcp_provider_ready,
+            resolved_provider_descriptors: provider_policy
+                .as_ref()
+                .map(|index| index.descriptor_refs())
+                .unwrap_or_default(),
             selected_runtime_platform: self
                 .runtime_binding
                 .as_ref()
@@ -16901,7 +16925,8 @@ impl ServerAgenticLoopHost {
             runtime_declared_tool_schema_digests: self.edge_provider_tool_schema_digests.clone(),
             runtime_declared_tool_native_ids: self.edge_provider_tool_native_ids.clone(),
             policy_snapshot_available: disabled_tool_offers.is_some()
-                && provider_allowed_tools.is_some(),
+                && provider_allowed_tools.is_some()
+                && provider_policy.is_some(),
             provider_capabilities: self.provider_capabilities_snapshot(),
             disabled_tool_offers: disabled_tool_offers.unwrap_or_default(),
             provider_allowed_tools: provider_allowed_tools.unwrap_or_default(),
@@ -17224,16 +17249,7 @@ impl ServerAgenticLoopHost {
                 })
                 .filter_map(|name| {
                     let offer = snapshot.decision(name).selected_offer?;
-                    Some((
-                        name.to_string(),
-                        SelectedToolOfferSnapshot::new_with_route_digest_and_native(
-                            offer.tool_name,
-                            offer.provider_id,
-                            offer.route,
-                            Some(offer.schema_digest),
-                            offer.native_tool_id,
-                        ),
-                    ))
+                    Some((name.to_string(), offer.execution_snapshot()))
                 })
                 .collect();
             executor.set_current_selected_tool_offers(selected_offers);
@@ -19240,6 +19256,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         state: &mut AgenticLoopState,
         activations: &[astra_turn_types::DeferredToolActivation],
     ) {
+        if let Err(error) = self.sync_lazy_source_contracts(state) {
+            tracing::error!(component = "capability_source", operation = "bind_activation", reason = %error,
+                "lazy source contracts are unavailable");
+            return;
+        }
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let admission_schemas = self.current_admission_schemas();
         let snapshot = self.admission_snapshot(&admission_schemas, &registry);
@@ -20162,6 +20183,22 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut qualified_attempt_usage: Option<astra_turn_types::CanonicalTokenUsage> = None;
         let outcome = async {
         let turn_started = Instant::now();
+        if let Some(executor) = state.runtime_tool_executor.as_deref() {
+            if let (Some(run_id), Some(generation)) = (&state.current_run_id, state.current_run_owner_generation) {
+                let expired = executor.restore_source_selections(super::capability_source::SourceScope {
+                    user_id: self.user_id.clone(), session_id: self.session_id.clone(), run_id: run_id.clone(), generation,
+                }, &state.deferred_tool_activations, state.cancellation.token.as_deref()).await.map_err(|error| astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation, error.to_string()))?;
+                if !expired.is_empty() {
+                    state.deferred_tool_activations.retain(|activation| !expired.contains(&activation.name));
+                    tracing::info!(component = "capability_source", operation = "restore_selection", reason = "selection_expired",
+                        run_id, session_id = self.session_id, expired_count = expired.len(),
+                        "expired run-scoped selections require fresh discovery");
+                }
+            }
+        }
+        self.sync_lazy_source_contracts(state).map_err(|error| astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation, error.to_string()))?;
         // Persisted lifecycle facts precede probabilistic classification. A
         // recovered operation already owns this turn-chain and must be replayed
         // before another LLM is allowed to reinterpret the same user intent.
@@ -34406,6 +34443,490 @@ mod tests {
             !schema_names(&after_selection).contains("agent_fanout"),
             "carrier selection must not widen the provider schema inventory"
         );
+    }
+
+    #[tokio::test]
+    async fn capability_source_host_binds_exact_carrier_without_expanding_resident_wire_surface() {
+        use super::super::capability_source::{
+            CapabilitySourceRuntime,
+            tests::{http_fixture, register_fixture_candidate, request},
+        };
+        use super::super::tool_local_transport::ServerLocalToolTransport;
+        let fixture = http_fixture(false).await;
+        let source =
+            CapabilitySourceRuntime::new(fixture.transport.clone(), fixture.store.clone()).unwrap();
+        let key = register_fixture_candidate(&source, &fixture).await;
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            fixture.scope.user_id.clone(),
+            fixture.scope.session_id.clone(),
+        )
+        .build();
+        host.request_scoped_mcp_provider_ready = true;
+        host.resolved_model_name = Some("test-model".into());
+        host.resolved_context_window = Some(200_000);
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut executor = runtime_tool_executor_with_agent_context(dir.path());
+        executor.user_id = fixture.scope.user_id.clone();
+        executor.session_id = fixture.scope.session_id.clone();
+        executor.set_agent_binding_mcp(fixture.transport.clone());
+        executor.set_capability_source(Some(fixture.source()));
+        executor
+            .restore_source_selections(fixture.scope.clone(), &[], None)
+            .await
+            .unwrap();
+        assert!(executor.source_selection_discovery_tool(&key).is_none());
+        let executor = Arc::new(executor);
+        let mut state = create_test_state();
+        state.runtime_tool_executor = Some(executor.clone());
+        state.skills.request_constraints.allowed_tools = Some(HashSet::from([
+            "bash".to_string(),
+            "tool_search".to_string(),
+            "mcp__source__search".to_string(),
+        ]));
+        let initial = host.visible_turn_tools(&mut state);
+        let result = executor
+            .execute_server_local_tool(
+                &request(
+                    &fixture.scope,
+                    "tool_search",
+                    json!({"query":format!("select:{key}")}),
+                ),
+                None,
+            )
+            .await
+            .result;
+        assert!(!result.is_error, "{result:?}");
+        let activation = astra_turn_types::DeferredToolActivation {
+            name: key.clone(),
+            schema_digest: "selected-schema".into(),
+            descriptor: None,
+        };
+        state.deferred_tool_activations.push(activation.clone());
+        host.bind_deferred_tool_activations(&mut state, &[activation]);
+        let bound = state.deferred_tool_activations[0].clone();
+        let descriptor = bound
+            .descriptor
+            .as_ref()
+            .expect("exact source descriptor bound by the canonical host");
+        assert_eq!(
+            descriptor.identity.native_tool_id.as_str(),
+            fixture.candidate.capability.native_id
+        );
+        let admission =
+            host.admission_for_current_binding(&key, &astra_runtime_env::ToolRegistry::builtins());
+        assert!(
+            ServerAgenticLoopHost::deferred_activation_descriptor_is_current(&bound, &admission)
+        );
+        let selected = host.visible_turn_tools(&mut state);
+        assert_eq!(
+            serde_json::to_vec(&initial).unwrap(),
+            serde_json::to_vec(&selected).unwrap()
+        );
+        assert!(!schema_names(&selected).contains(&key));
+        assert!(crate::turn::agentic::tool_interception::runtime_allows_tool(&state, &key));
+        assert_eq!(
+            executor.source_selection_discovery_tool(&key).as_deref(),
+            Some("mcp__source__search")
+        );
+        assert!(
+            executor
+                .source_selection_discovery_tool(
+                    "mcp__cap__aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                )
+                .is_none()
+        );
+        let invoked = executor
+            .execute_server_local_tool(&request(&fixture.scope, &key, json!({})), None)
+            .await
+            .result;
+        assert!(
+            !invoked.is_error,
+            "selected call must work under an explicit Runner allowlist: {invoked:?}"
+        );
+        state
+            .skills
+            .request_constraints
+            .allowed_tools
+            .as_mut()
+            .unwrap()
+            .remove("mcp__source__search");
+        assert!(!crate::turn::agentic::tool_interception::runtime_allows_tool(&state, &key));
+        state
+            .skills
+            .request_constraints
+            .allowed_tools
+            .as_mut()
+            .unwrap()
+            .insert("mcp__source__search".to_string());
+        assert!(
+            !crate::turn::agentic::tool_interception::runtime_allows_tool(
+                &state,
+                "mcp__cap__aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            )
+        );
+        let mut forged = bound.clone();
+        forged.descriptor = Some(
+            astra_turn_types::ResolvedToolDescriptorRef::new(
+                descriptor.identity.clone(),
+                "forged-version",
+            )
+            .unwrap(),
+        );
+        assert!(
+            !ServerAgenticLoopHost::deferred_activation_descriptor_is_current(&forged, &admission)
+        );
+
+        // A failed alias installation may leave a source-side materialization
+        // cached. Its discovery scope must not authorize the other indexed
+        // descriptor occupying the same public name.
+        let materialized = source.materialize(&key, false).await.unwrap();
+        let mut colliding_snapshot = materialized.snapshot.clone();
+        let colliding_ref = astra_turn_types::ResolvedToolDescriptorRef::new(
+            descriptor.identity.clone(),
+            "colliding-version",
+        )
+        .unwrap();
+        colliding_snapshot.descriptors[0].descriptor_version =
+            colliding_ref.descriptor_version.clone();
+        colliding_snapshot.alias_index.insert(
+            astra_turn_types::PublicToolAlias::new(&key).unwrap(),
+            colliding_ref,
+        );
+        let mut colliding_index =
+            astra_turn_core::provider_resolution::ResolvedProviderPolicyIndex::from_snapshots(&[
+                colliding_snapshot,
+            ])
+            .unwrap();
+        assert!(
+            colliding_index
+                .extend_snapshot(&materialized.snapshot)
+                .is_err()
+        );
+        executor.set_provider_policy_index(colliding_index);
+        assert!(executor.source_selection_discovery_tool(&key).is_none());
+        assert!(!crate::turn::agentic::tool_interception::runtime_allows_tool(&state, &key));
+    }
+
+    #[test]
+    fn capability_source_production_loop_discovers_selects_invokes_and_records_exact_identity() {
+        async fn run_case(
+            catalog_size: usize,
+            distinct_bindings: bool,
+            skill: bool,
+            large_tool: bool,
+        ) -> [(usize, u32); 3] {
+            use super::super::capability_source::tests::{
+                fixture_selection_key, http_fixture_with_bindings, http_fixture_with_inventory,
+                http_fixture_with_large_tool,
+            };
+            let fixture = if large_tool {
+                http_fixture_with_large_tool().await
+            } else if distinct_bindings {
+                http_fixture_with_bindings(skill, catalog_size).await
+            } else {
+                http_fixture_with_inventory(skill, catalog_size).await
+            };
+            let source = fixture.source();
+            let key = fixture_selection_key(&source, &fixture);
+            let source_run_engine =
+                crate::server::run::engine::RunEngine::new(fixture.store.clone());
+            let ledger = crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new_process_local(source_run_engine).unwrap();
+            let mut script = vec![("source-discover", "mcp__source__search", json!({}))];
+            if skill {
+                script.push(("source-select", "skill", json!({"skill_name":key})));
+            } else {
+                script.extend([
+                    (
+                        "source-select",
+                        "tool_search",
+                        json!({"query":format!("select:{key}")}),
+                    ),
+                    (
+                        "source-invoke",
+                        "invoke_tool",
+                        json!({"name":key,"arguments":{}}),
+                    ),
+                ]);
+            }
+            let responses: Vec<_> = script.into_iter().map(|(id, name, arguments)| json!({
+                        "choices":[{"message":{"content":null,"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":arguments.to_string()}}]},"finish_reason":"tool_calls"}],
+                        "usage":{"prompt_tokens":100,"completion_tokens":10}
+                    })).chain([json!({"choices":[{"message":{"content":"Connected account inspected."},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":10}})]).collect();
+            let provider = ProviderGateway::start(vec![
+                ProviderScript::new("capability source production loop",
+                    |request| request.path == "/v1/chat/completions" && request.body["model"] == "gpt-5-mini" && request.body["tools"].is_array(),
+                    responses.into_iter().map(ProviderResponse::OpenAi).collect()),
+                ProviderScript::optional_background_json("compaction summary",
+                    |request| request.path == "/v1/chat/completions" && request.body["model"] == "gpt-5-mini" && request.body.get("tools").is_none() && request.body["messages"].is_array(),
+                    json!({"choices":[{"message":{"content":"bounded compaction summary"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":4}})),
+            ]).await;
+            let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
+            let sessions = tempfile::tempdir().unwrap();
+            let _journal = astra_services::session_journal::JournalDirGuard::new(sessions.path());
+            let scratch = tempfile::tempdir().unwrap();
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                fixture.scope.user_id.clone(),
+                fixture.scope.session_id.clone(),
+            )
+            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                false, false,
+            ))
+            .with_server_service_tool_catalog_enabled(false)
+            .with_static_tool_catalog_admissible(false)
+            .with_turn_intent_policy(TurnIntentExecutionPolicy::FixedDefault)
+            .with_test_inference_ledger(
+                crate::turn::llm::durable::TestInferenceLedgerPersistence::default(),
+            )
+            .with_admitted_model_execution(Some(AdmittedModelExecution::from_endpoint(
+                "source-offer".into(),
+                "gpt-5-mini".into(),
+                "openai".into(),
+                gateway_url,
+                "Bearer fixture-token".into(),
+                Some(3_000),
+                200_000,
+            )))
+            .build();
+            host.install_runtime_tool_schemas_with_native_ids(
+                fixture.bundle.schemas.clone(),
+                fixture.bundle.control_tools.clone(),
+                fixture.bundle.native_tool_ids_by_public_name(),
+            );
+            let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+                scratch.path().to_path_buf(),
+                fixture.scope.user_id.clone(),
+                fixture.scope.session_id.clone(),
+                None,
+                None,
+            );
+            executor.set_execution_bindings(
+                WorkspaceBinding::none(),
+                ExecutorBinding::request_scoped_mcp(),
+            );
+            executor.set_invocation_ledger(ledger.clone());
+            executor.set_request_scoped_mcp_schemas(fixture.bundle.schemas.clone());
+            executor.set_provider_policy_index(fixture.bundle.provider_policy_index.clone());
+            executor.set_agent_binding_mcp(fixture.transport.clone());
+            executor.set_capability_source(Some(source.clone()));
+            executor
+                .restore_source_selections(fixture.scope.clone(), &[], None)
+                .await
+                .unwrap();
+            let mut state = create_durable_execution_test_state(&fixture.scope.session_id);
+            state.current_run_id = Some(fixture.scope.run_id.clone());
+            state.canonical_turn_chain_id = Some("source-turn".into());
+            state.context_manifest_user_id = Some(fixture.scope.user_id.clone());
+            let allowed_tools = HashSet::from([
+                "mcp__source__search".into(),
+                "tool_search".into(),
+                "skill".into(),
+            ]);
+            state.permission_context = Some(crate::orchestration::PermissionSyncContext::shared(
+                crate::orchestration::InheritedPermissions {
+                    mode: crate::orchestration::PermissionMode::Auto,
+                    allowed_tools: Some(allowed_tools.clone()),
+                    ..Default::default()
+                },
+            ));
+            state.skills.request_constraints.allowed_tools = Some(allowed_tools);
+            if skill {
+                state.skills.resolver = Some(Arc::new(
+                    super::super::capability_source::CapabilitySourceSkillResolver {
+                        source,
+                        base: None,
+                        policy: state.skills.request_constraints.skill_surfacing_policy(),
+                    },
+                ));
+                assert_eq!(
+                    host.dynamic_service_binding_ready("skill", &state),
+                    Some(true)
+                );
+                assert_eq!(
+                    host.dynamic_service_binding_ready("discover_skills", &state),
+                    Some(false)
+                );
+            }
+            state.runtime_tool_executor = Some(Arc::new(executor));
+            state.step_recorder = astra_pipeline::step_recorder::StepRecorder::new(
+                &fixture.scope.user_id,
+                &fixture.scope.session_id,
+                "source-task",
+            );
+            state.messages.push(json!({"role":"user","content":"Inspect the connected account. Do not send messages."}));
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                run_agentic_loop_with_host(&mut host, &mut state),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            provider.assert_complete();
+            assert_eq!(state.final_text, "Connected account inspected.");
+            let calls = fixture.calls.lock().unwrap();
+            let methods = if skill {
+                vec!["tools/call", "astra/capabilities/read_skill"]
+            } else {
+                vec![
+                    "tools/call",
+                    "astra/capabilities/describe",
+                    "astra/capabilities/invoke",
+                ]
+            };
+            for method in methods {
+                assert_eq!(
+                    calls.iter().filter(|call| call["method"] == method).count(),
+                    1,
+                    "{method}: {calls:?}"
+                );
+            }
+            drop(calls);
+            let requests: Vec<_> = provider
+                .requests
+                .lock()
+                .await
+                .iter()
+                .map(|request| request.body.clone())
+                .collect();
+            assert_eq!(requests.len(), if skill { 3 } else { 4 });
+            for request in requests.iter() {
+                assert!(
+                    !schema_names(request["tools"].as_array().unwrap()).contains(&key),
+                    "selected schema must remain outside resident tools[]"
+                );
+            }
+            let selected_text = if skill {
+                "Inspect the selected repository"
+            } else {
+                "Read the connected account"
+            };
+            assert!(
+                !requests[0].to_string().contains(selected_text),
+                "descriptor must be absent before selection"
+            );
+            assert!(
+                requests[2].to_string().contains(selected_text),
+                "exact descriptor must be available after selection"
+            );
+            if skill {
+                assert!(
+                    state.skills.execution.invoked.contains_key(&key),
+                    "selected Skill must activate through the production interception path"
+                );
+            } else {
+                assert!(
+                    state
+                        .messages
+                        .iter()
+                        .any(|message| message.to_string().contains("account-read-complete"))
+                );
+            }
+            let invocation_ids = if skill {
+                vec!["source-discover"]
+            } else {
+                vec!["source-discover", "source-select", "source-invoke"]
+            };
+            for invocation_id in invocation_ids {
+                let identity = astra_turn_types::ToolInvocationIdentity::new(
+                    &fixture.scope.user_id,
+                    &fixture.scope.session_id,
+                    &fixture.scope.run_id,
+                    "source-turn",
+                    invocation_id,
+                )
+                .unwrap();
+                let record = ledger
+                    .get(&identity)
+                    .await
+                    .unwrap()
+                    .expect("canonical invocation receipt");
+                assert_eq!(
+                    record.state,
+                    astra_turn_types::ToolInvocationState::Succeeded,
+                    "{record:?}"
+                );
+                assert_eq!(record.attempt_count, 1);
+            }
+            if !skill {
+                let activation = state
+                    .deferred_tool_activations
+                    .iter()
+                    .find(|activation| activation.name == key)
+                    .unwrap();
+                assert_eq!(
+                    activation
+                        .descriptor
+                        .as_ref()
+                        .unwrap()
+                        .identity
+                        .native_tool_id
+                        .as_str(),
+                    fixture.candidate.capability.native_id
+                );
+            }
+            let initial = json!({"messages":requests[0]["messages"],"tools":requests[0]["tools"]})
+                .to_string();
+            let result_content = |round: usize, call_id: &str| {
+                requests[round]["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|message| message["role"] == "tool" && message["tool_call_id"] == call_id)
+                    .expect("actual outgoing LLM tool result")["content"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            };
+            let candidates = result_content(1, "source-discover");
+            let selected = result_content(2, "source-select");
+            if large_tool {
+                assert!(
+                    selected.len() > astra_turn_core::tool_result_sanitize::MAX_TOOL_RESULT_CHARS
+                );
+                assert!(selected.len() <= astra_tools::tool_search::MAX_SELECTION_RESULT_BYTES);
+                let selection: Value = serde_json::from_str(&selected).unwrap();
+                assert_eq!(
+                    selection["matches"][0]["parameters"]["properties"]["optional_field_219"]["type"],
+                    "string"
+                );
+            }
+            assert!(!candidates.contains(selected_text));
+            assert!(!candidates.contains("inputSchema"));
+            assert!(selected.contains(selected_text));
+            [initial, candidates, selected].map(|content| {
+                (
+                    content.len(),
+                    astra_turn_core::section_types::estimate_text_tokens(&content),
+                )
+            })
+        }
+        std::thread::Builder::new()
+            .name("capability-source-loop-test".into())
+            .stack_size(astra_core::process_runtime::PROCESS_WORKER_STACK_BYTES)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                    let mut measurements = Vec::new();
+                    for skill in [false, true] {
+                    for distinct_bindings in [false, true] {
+                        for catalog_size in [10, 100, 1000] {
+                            let measured = run_case(catalog_size, distinct_bindings, skill, false).await;
+                            let selected_phase = if skill { "selected_skill_body" } else { "selected_schema" };
+                            for (phase, (bytes, tokens)) in ["initial", "candidate_page", selected_phase].into_iter().zip(measured) {
+                                eprintln!("capability_source inventory={catalog_size} distinct_bindings={distinct_bindings} skill={skill} phase={phase} bytes={bytes} estimated_tokens={tokens}");
+                            }
+                            measurements.push(measured);
+                        }
+                    }
+                    }
+                    for group in measurements.chunks(3) {
+                        assert!(group.iter().all(|value| *value == group[0]), "actual LLM-visible initial, bounded candidates and exact schema must not grow with the external catalog: {group:?}");
+                    }
+                    run_case(1, false, false, true).await;
+                });
+            }).unwrap().join().unwrap();
     }
 
     #[tokio::test]

@@ -1,5 +1,7 @@
 mod completions;
 #[cfg(feature = "server")]
+pub mod edge_capacity_rpc;
+#[cfg(feature = "server")]
 pub mod edge_connection_pool;
 pub mod edge_ws_protocol;
 mod model_admission;

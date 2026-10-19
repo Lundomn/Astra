@@ -2784,8 +2784,10 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             if any_newly_activated && let Some(resolver) = &state.skills.resolver {
                 // Phase-9: byte-stable schema — no enum, skill list is surfaced
                 // via <available_skills> in session-cached prompt prefix.
-                if !resolver.available_skills().is_empty() {
+                if !resolver.available_skills().is_empty() || resolver.has_dynamic_catalog() {
                     host.inject_tool_schema(astra_tools::schemas::skill_tool_schema());
+                }
+                if !resolver.available_skills().is_empty() {
                     host.inject_tool_schema(astra_tools::schemas::discover_skills_tool_schema());
                 }
             }

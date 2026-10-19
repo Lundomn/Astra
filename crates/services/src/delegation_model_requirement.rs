@@ -258,7 +258,7 @@ pub fn parse_delegation_scope_response(
     {
         return Err("delegation scope response exceeds its bounded contract".into());
     }
-    let value = astra_turn_types::parse_unique_judgment_json(raw.as_bytes())
+    let value = astra_turn_types::parse_unique_json(raw.as_bytes())
         .map_err(|_| "delegation scope response is not valid JSON")?;
     let binding: DelegationScopeBinding = serde_json::from_value(value)
         .map_err(|_| "delegation scope response has an invalid schema")?;

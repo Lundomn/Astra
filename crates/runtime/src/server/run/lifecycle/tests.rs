@@ -204,6 +204,7 @@ fn authenticated_edge_discovery_merges_with_mcp_without_overwriting_or_impersona
     .unwrap();
     let mut runtime = PreparedRuntimeCapabilities::default();
     runtime.mcp_bundle = Some(runtime_mcp::RuntimeMcpBundle {
+        capability_source: None,
         schemas: Vec::new(),
         provider_policy_index: ResolvedProviderPolicyIndex::from_snapshots(std::slice::from_ref(
             &mcp,
@@ -14688,6 +14689,89 @@ async fn service_with_in_memory_binding() -> (
     .expect("binding create");
     let service = test_service().with_agent_binding_service(binding_service.clone());
     (service, binding_service, record)
+}
+
+#[tokio::test]
+async fn capability_source_prepares_dynamic_plugin_skills_before_policy_with_empty_catalog() {
+    use astra_services::runs::{
+        RUNTIME_CAPABILITY_DISCOVERY_SNAPSHOT_VERSION, RuntimeCapabilityDescriptorsRequest,
+        RuntimeCapabilityDiscoverySnapshotRequest, RuntimeCapabilitySkillCatalogSnapshotRequest,
+    };
+    let (service, _bindings, record) = service_with_in_memory_binding().await;
+    let mut request = prepared_test_request("find a plugin skill");
+    request.agent_binding = Some(runtime_binding_request(
+        record.id.clone(),
+        "source",
+        "skills",
+    ));
+    request.provider_runtime_authorized = true;
+    request.runtime_auth = Some(RuntimeAuthRequest {
+        authorization: "Bearer test-grant".into(),
+    });
+    request.allow_skill_sources = Some(vec!["plugin".into()]);
+    let mut mcp = test_runtime_descriptor("source", "mcp", "http://127.0.0.1:1/mcp");
+    mcp.metadata.insert(
+        "astra.capability_source".into(),
+        json!({"contract_version":"astra-capability-source-v1", "discovery_tools":["discover"], "selection_authorization":"discovery_scope"}),
+    );
+    request.capability_descriptors = Some(RuntimeCapabilityDescriptorsRequest {
+        mcp: Some(mcp),
+        skills: Some(test_runtime_descriptor(
+            "skills",
+            "skills",
+            "http://127.0.0.1:1/skills",
+        )),
+        discovery_snapshot: Some(RuntimeCapabilityDiscoverySnapshotRequest {
+            version: RUNTIME_CAPABILITY_DISCOVERY_SNAPSHOT_VERSION.into(),
+            tools: vec![
+                json!({"name":"discover", "side_effect_class":"read", "inputSchema":{"type":"object"}}),
+            ],
+            skill_catalogs: vec![RuntimeCapabilitySkillCatalogSnapshotRequest {
+                agent_binding_id: record.id,
+                skills: vec![],
+            }],
+        }),
+        ..Default::default()
+    });
+    let constraints = AgenticRunLifecycleService::try_request_constraints(&request).unwrap();
+    let prepared = service
+        .prepare_runtime_capabilities("test-user", &request, &constraints)
+        .await
+        .unwrap();
+    assert!(
+        prepared
+            .mcp_bundle
+            .as_ref()
+            .unwrap()
+            .capability_source
+            .is_some()
+    );
+    let resolver = prepared
+        .agent_binding
+        .as_ref()
+        .unwrap()
+        .skill_resolver
+        .as_ref()
+        .unwrap();
+    assert!(resolver.has_dynamic_catalog());
+    assert!(resolver.available_skills().is_empty());
+
+    request.allow_skill_sources = Some(vec!["database".into()]);
+    let constraints = AgenticRunLifecycleService::try_request_constraints(&request).unwrap();
+    let restricted = service
+        .prepare_runtime_capabilities("test-user", &request, &constraints)
+        .await
+        .unwrap();
+    assert!(
+        !restricted
+            .agent_binding
+            .as_ref()
+            .unwrap()
+            .skill_resolver
+            .as_ref()
+            .unwrap()
+            .has_dynamic_catalog()
+    );
 }
 
 #[tokio::test]
@@ -31324,6 +31408,7 @@ fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
             stop_after_success_tools: Default::default(),
             manager: None,
             agent_binding_mcp: None,
+            capability_source: None,
             semantic_read_capabilities: Default::default(),
         }),
         request_scoped_skill_resolver: None,

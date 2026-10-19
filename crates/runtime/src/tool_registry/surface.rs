@@ -392,7 +392,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "ready_check",
                 "background_ttl",
             ][..],
-            "Omit mode for inspection; verify adds an explicit unchanged-workspace proof.",
+            astra_tools::schemas::BASH_COMMAND_GUIDANCE,
         ),
         "str_replace" => (
             &[

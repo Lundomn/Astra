@@ -3465,14 +3465,16 @@ pub(crate) fn configure_loop_host<H: AgenticLoopHost>(host: &mut H, state: &Agen
     }
 
     if let Some(resolver) = &state.skills.resolver {
-        // Phase-9: `skill_tool_schema_v2` is a byte-stable constant — it
+        // The canonical skill schema is byte-stable — it
         // takes no skill list and advertises `skill_name` as an open
         // string. The catalog is surfaced via `<available_skills>` in the
         // session-cached prompt prefix (see `build_skill_listing_section`),
         // so adding/removing a skill no longer perturbs the tool schema
         // bytes.
-        if !resolver.available_skills().is_empty() {
+        if !resolver.available_skills().is_empty() || resolver.has_dynamic_catalog() {
             host.inject_tool_schema(astra_tools::schemas::skill_tool_schema());
+        }
+        if !resolver.available_skills().is_empty() {
             host.inject_tool_schema(astra_tools::schemas::discover_skills_tool_schema());
         }
     }

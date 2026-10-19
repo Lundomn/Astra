@@ -31,6 +31,10 @@ const FANOUT_DISCOVERY_SUMMARY: &str = concat!(
     " Exact provider/Offering;slots=target_count;description+prompt;atomic."
 );
 
+/// Producer-owned Bash constraints shared by canonical and resident tool schemas.
+/// Keep this wording within the resident schema budget.
+pub const BASH_COMMAND_GUIDANCE: &str = "No $()/backticks; use literal write paths. Loops via python3. For external writes: minimal absolute roots, owned foreground delta.";
+
 /// Rebuild the compact discovery summary after a typed action projection.
 ///
 /// The retained action order is taken from the executable schema, while the
@@ -1298,29 +1302,34 @@ pub fn skill_tool_schema() -> Value {
         "function": {
             "name": "skill",
             "description":
-                "Execute a skill from the <available_skills> system listing. \
-                 Call it only when the user's request matches a skill whose \
+                "Execute a skill from the <available_skills> system listing or a discovered capability-source Skill. \
+                 For catalog skills, call it only when the user's request matches a skill whose \
                  canonical name or alias appears literally in that listing or a current skill-search result; \
                  never invent or infer a skill name. For work this agent owns, \
                  call a matching skill before substantive work on that objective. \
                  If a child owns the objective, launch it first and let the child \
                  load its own skills. \
-                 `skill_name` is the listed canonical name or alias. `task` is optional \
+                 For a capability-source Skill, copy its exact selection_key into skill_name; title is only a display label. \
+                 `skill_name` is the listed canonical name, alias or exact discovered selection_key. `task` is optional \
                  extra context; omit to use the current conversation. On seeing \
                  `<skill-loaded name=\"...\"/>` in a tool result, follow that \
-                 skill's instructions — do not re-invoke it.",
+                 skill's instructions — do not re-invoke it. To read a referenced text file from a selected remote Skill package, provide resource_path; this reads content without activating the Skill again.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "skill_name": {
                         "type": "string",
                         "description":
-                            "Canonical name or alias of the skill to run."
+                            "Canonical name, alias or exact selection_key of the skill to run."
                     },
                     "task": {
                         "type": "string",
                         "description":
                             "Optional task description or extra context for the skill."
+                    },
+                    "resource_path": {
+                        "type": "string",
+                        "description": "Optional package-relative text resource path, such as references/guide.md. Not a local filesystem path or URL."
                     }
                 },
                 "required": ["skill_name"]
@@ -1887,7 +1896,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "command": {"type": "string", "description": "Shell command to run"},
+                        "command": {"type": "string", "description": BASH_COMMAND_GUIDANCE},
                         "workdir": {"type": "string", "minLength": 1, "description": "Optional execution directory for this call only. Relative paths resolve from the workspace root; absolute paths must remain inside it. The directory must already exist. Defaults to the workspace root and does not persist. Executors without pinned-subdirectory support reject subdirectories rather than weaken path confinement."},
                         "mode": {"type": "string", "enum": ["verify"], "description": "Optional explicit workspace verification contract. Omit this field for calculations, read-only probes, diagnostics, tests, and commands whose stdout is the evidence. Use it only for a foreground command that verifies a bound workspace stayed unchanged after edits; it succeeds only when the command exits zero and the executor proves that fact, and it must not be used for commands that write files.", "x-astra-discovery-summary": "Omit for inspection/diagnostics; verify needs unchanged-workspace proof after edits."},
                     "timeout": {"type": "number", "default": crate::shell_ops::DEFAULT_BASH_TIMEOUT_SECS, "description": "Outer execution timeout in seconds. Set this field to a larger value for long builds/tests, e.g. cargo build or full test suites. A `timeout ...` program inside command does not extend Astra's outer timeout."},
@@ -3411,6 +3420,20 @@ mod tests {
         let description = bash["function"]["description"].as_str().unwrap();
         assert!(description.contains("Self-daemonizing"));
         assert!(description.contains("no persistence guarantee"));
+    }
+
+    #[test]
+    fn bash_schema_explains_static_write_targets_and_command_substitution() {
+        let schemas = all_tool_schemas();
+        let bash = find_schema(&schemas, "bash").expect("bash schema must exist");
+        let description = bash["function"]["parameters"]["properties"]["command"]["description"]
+            .as_str()
+            .expect("bash description");
+        assert_eq!(description, BASH_COMMAND_GUIDANCE);
+        assert!(description.contains("$()/backticks"));
+        assert!(description.starts_with("No $()/backticks"));
+        assert!(description.contains("literal write paths"));
+        assert!(description.contains("Loops via python3"));
     }
 
     #[cfg(not(unix))]

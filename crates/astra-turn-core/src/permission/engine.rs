@@ -396,19 +396,23 @@ pub fn evaluate_permission(
     args: &Value,
     ctx: &PermissionSyncContext,
 ) -> DecisionEnvelope {
-    evaluate_permission_with_provider_policy(tool_name, args, ctx, None)
+    evaluate_permission_with_provider_policy(tool_name, args, ctx, None, None)
 }
 
 /// Evaluate permission using the exact provider policy that was selected for
 /// this invocation. Static tools pass `None` and retain their args-aware
 /// registry behavior; dynamic tools must pass the descriptor-keyed policy used
-/// by batching and execution.
+/// by batching and execution. `source_discovery_tool` is supplied only for an
+/// exact materialized selection whose descriptor is indexed by the runtime;
+/// it grants the selection the discovery tool's allowlist scope, not its other
+/// permission rules or approval policy.
 #[must_use]
 pub fn evaluate_permission_with_provider_policy(
     tool_name: &str,
     args: &Value,
     ctx: &PermissionSyncContext,
     provider_policy: Option<&crate::provider_resolution::ResolvedInvocationPolicy>,
+    source_discovery_tool: Option<&str>,
 ) -> DecisionEnvelope {
     let mut trace = Vec::with_capacity(EVALUATION_ORDER.len());
     let mut risk_tags = risk_tags_for_request(tool_name, args);
@@ -783,7 +787,11 @@ pub fn evaluate_permission_with_provider_policy(
     );
 
     if ctx.inherited.allowed_tools.is_some() {
-        if !ctx.inherited.is_tool_allowed_by_allowlist(tool_name) {
+        if !ctx.inherited.is_tool_allowed_by_allowlist(tool_name)
+            && !(provider_policy.is_some()
+                && source_discovery_tool
+                    .is_some_and(|source| ctx.inherited.is_tool_allowed_by_allowlist(source)))
+        {
             let decision = HardDecision::Deny {
                 reason: format!("Tool '{tool_name}' not in allowed tools list"),
             };
@@ -2777,6 +2785,35 @@ mod tests {
     }
 
     #[test]
+    fn auto_mode_reads_workspace_bash_output_without_weakening_astra_state_guard() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let command = "jq -r '.items[]' /sandbox/.moi/astra-bash-outputs/one.stdout";
+        assert!(!crate::cloud::approval_policy::bash_command_is_read_only(
+            command
+        ));
+        let workspace_output =
+            evaluate_permission("bash", &serde_json::json!({"command": command}), &ctx);
+        assert!(
+            matches!(workspace_output.decision, HardDecision::Allow),
+            "ordinary workspace output should follow existing Auto mode: {workspace_output:?}"
+        );
+
+        let private_state = evaluate_permission(
+            "bash",
+            &serde_json::json!({
+                "command": "jq -r '.items[]' /sandbox/.moi/.astra/bash-outputs/one.stdout"
+            }),
+            &ctx,
+        );
+        assert!(
+            matches!(private_state.decision, HardDecision::NeedExternal { .. }),
+            "Astra private state must remain protected: {private_state:?}"
+        );
+    }
+
+    #[test]
     fn evaluate_reading_hidden_home_secret_requires_approval_in_auto_mode() {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,
@@ -3299,6 +3336,7 @@ mod tests {
             &serde_json::json!({}),
             &ctx,
             Some(&policy),
+            None,
         );
 
         assert_eq!(envelope.decision, HardDecision::Allow);
@@ -3336,6 +3374,7 @@ mod tests {
                 &serde_json::json!({}),
                 &ctx,
                 Some(&policy),
+                None,
             );
 
             assert!(matches!(
@@ -3374,6 +3413,7 @@ mod tests {
             &serde_json::json!({}),
             &ctx,
             Some(&policy),
+            None,
         );
 
         assert!(matches!(envelope.decision, HardDecision::Deny { .. }));
@@ -3399,6 +3439,7 @@ mod tests {
             &serde_json::json!({"task":"inspect"}),
             &child,
             Some(&collaborator),
+            None,
         );
         assert_eq!(admitted.decision, HardDecision::Allow);
         assert_eq!(admitted.source, DecisionSource::InternalOrchestration);
@@ -3413,6 +3454,7 @@ mod tests {
             &serde_json::json!({"task":"inspect"}),
             &child,
             Some(&ordinary_mutating),
+            None,
         );
         assert!(matches!(denied.decision, HardDecision::Deny { .. }));
 
@@ -3424,6 +3466,7 @@ mod tests {
             &serde_json::json!({"task":"inspect"}),
             &root,
             Some(&collaborator),
+            None,
         );
         assert!(matches!(
             root_decision.decision,
@@ -3438,6 +3481,7 @@ mod tests {
             &serde_json::json!({"task":"inspect"}),
             &plan,
             Some(&collaborator),
+            None,
         );
         assert_eq!(plan_decision.decision, HardDecision::Allow);
     }
@@ -3676,6 +3720,7 @@ mod tests {
                 &serde_json::json!({}),
                 &ctx,
                 Some(&dynamic_read),
+                None,
             )
             .decision,
             HardDecision::Allow
@@ -3691,6 +3736,7 @@ mod tests {
                 &serde_json::json!({"path": "x"}),
                 &ctx,
                 Some(&disguised_write),
+                None,
             )
             .decision,
             HardDecision::Deny { .. }

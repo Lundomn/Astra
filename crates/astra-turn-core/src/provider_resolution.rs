@@ -145,7 +145,7 @@ pub struct ResolvedProviderPolicyIndex {
     by_alias: BTreeMap<String, ResolvedProviderEntry>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ResolvedProviderEntry {
     policy: ResolvedInvocationPolicy,
     model_catalog: Option<std::sync::Arc<astra_turn_types::ProviderModelCatalog>>,
@@ -220,8 +220,37 @@ impl ResolvedProviderPolicyIndex {
         self.by_alias.get(public_alias).map(|entry| &entry.policy)
     }
 
+    /// Add an immutable lazy snapshot. Repeated materialization is idempotent;
+    /// an alias cannot silently acquire a different descriptor or policy.
+    pub fn extend_snapshot(
+        &mut self,
+        snapshot: &ResolvedProviderSnapshot,
+    ) -> Result<(), ProviderResolutionError> {
+        let added = Self::from_snapshots(std::slice::from_ref(snapshot))?;
+        for (alias, entry) in &added.by_alias {
+            if self
+                .by_alias
+                .get(alias)
+                .is_some_and(|existing| existing != entry)
+            {
+                return Err(ProviderResolutionError::CrossSnapshotAliasCollision {
+                    alias: alias.clone(),
+                });
+            }
+        }
+        self.by_alias.extend(added.by_alias);
+        Ok(())
+    }
+
     pub fn len(&self) -> usize {
         self.by_alias.len()
+    }
+
+    pub fn descriptor_refs(&self) -> BTreeMap<String, ResolvedToolDescriptorRef> {
+        self.by_alias
+            .iter()
+            .map(|(alias, entry)| (alias.clone(), entry.policy.descriptor.clone()))
+            .collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1026,6 +1055,40 @@ mod tests {
                 .unwrap()
                 .requires_approval()
         );
+    }
+
+    #[test]
+    fn lazy_policy_extension_is_idempotent_and_atomic_on_collision() {
+        let resolve = |binding: &str, ids: &[&str]| {
+            resolve_provider_snapshot(
+                &discovery_for_binding(
+                    binding,
+                    ids.iter()
+                        .map(|id| declaration(id, ProviderToolClaims::default()))
+                        .collect(),
+                ),
+                &ProviderClaimTrustPolicy::default(),
+                &aliases(ids),
+            )
+            .unwrap()
+        };
+        let initial = resolve("initial", &["z_collision"]);
+        let mut index =
+            ResolvedProviderPolicyIndex::from_snapshots(std::slice::from_ref(&initial)).unwrap();
+        let before = index.descriptor_refs();
+        index.extend_snapshot(&initial).unwrap();
+        assert_eq!(index.descriptor_refs(), before);
+        let conflicting = resolve("other", &["a_new", "z_collision"]);
+        assert!(matches!(
+            index.extend_snapshot(&conflicting),
+            Err(ProviderResolutionError::CrossSnapshotAliasCollision { .. })
+        ));
+        assert_eq!(index.descriptor_refs(), before);
+        assert!(index.resolve("provider__a_new").is_none());
+        index
+            .extend_snapshot(&resolve("other", &["a_new"]))
+            .unwrap();
+        assert_eq!(index.len(), 2);
     }
 
     #[test]

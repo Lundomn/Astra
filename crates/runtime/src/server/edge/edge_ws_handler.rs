@@ -373,7 +373,17 @@ async fn handle_edge_connection(
     // fabricate tool names or claim capabilities it doesn't possess.
     // We validate against the server-side registry and strip anything
     // that doesn't check out.
-    let capabilities = match validate_edge_capabilities(capabilities, &edge_agent_id, &user_id) {
+    let capabilities = match validate_edge_capabilities(capabilities, &edge_agent_id, &user_id)
+        .and_then(|mut capabilities| {
+            if capabilities.get("capacity_rpc_v1").is_some() {
+                if let Some(origin) = &state.execution.edge_capacity_relay_origin {
+                    capabilities["capacity_relay_v1"] = serde_json::json!({"origin": origin});
+                } else if state.execution.edge_registry_service.has_durable_routing() {
+                    return Err("capacity node routing is not configured".to_string());
+                }
+            }
+            Ok(capabilities)
+        }) {
         Ok(capabilities) => Some(capabilities),
         Err(message) => {
             tracing::warn!(
@@ -1096,6 +1106,12 @@ async fn handle_edge_connection(
                                         );
                                     }
                                 }
+                                Ok(EdgeClientMessage::CapacityResult { request_id, connection_generation, result }) => {
+                                    state.edge_connection_pool.complete_capacity_rpc(
+                                        &user_id, &edge_agent_id, pool_generation, &request_id,
+                                        connection_generation, result,
+                                    );
+                                }
                                 Ok(EdgeClientMessage::ToolInputAck {
                                     request_id,
                                     delivery_generation,
@@ -1691,6 +1707,31 @@ fn validate_edge_capabilities(
         astra_server_types::edge_ws_protocol::supports_runtime_process_authorization(Some(
             &capabilities,
         ));
+    let capacity_providers = capabilities
+        .get("capacity_rpc_v1")
+        .map(|value| {
+            use astra_server_types::edge_ws_protocol::{
+                EdgeCapacityProvider, valid_capacity_identity,
+            };
+            use base64::Engine;
+            let providers: Vec<EdgeCapacityProvider> = serde_json::from_value(value.clone())
+                .map_err(|_| "invalid capacity provider advertisement".to_string())?;
+            let mut identities = std::collections::HashSet::new();
+            if providers.is_empty()
+                || providers.len() > 8
+                || providers.iter().any(|provider| {
+                    !valid_capacity_identity(&provider.id)
+                        || !identities.insert(&provider.id)
+                        || !base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .decode(&provider.public_key)
+                            .is_ok_and(|key| key.len() == 32)
+                })
+            {
+                return Err("invalid capacity provider identity or public key".to_string());
+            }
+            Ok(providers)
+        })
+        .transpose()?;
 
     let mut advert = astra_runtime_env::RuntimeEnvironmentAdvertisement::decode(capabilities)
         .map_err(|error| error.to_string())?;
@@ -1740,6 +1781,10 @@ fn validate_edge_capabilities(
     }
     let mut sanitized = serde_json::to_value(&advert)
         .map_err(|error| format!("edge capabilities could not be serialized: {error}"))?;
+    if let Some(providers) = capacity_providers {
+        sanitized["capacity_rpc_v1"] = serde_json::to_value(providers)
+            .map_err(|_| "capacity providers could not be serialized".to_string())?;
+    }
     if runtime_process_authorization_v1 {
         let mut accepted = serde_json::Map::new();
         accepted.insert(
@@ -2169,6 +2214,38 @@ mod tests {
                 .get("unrecognized_future_protocol")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn validate_edge_capabilities_preserves_valid_capacities_and_rejects_ambiguous_or_secret_metadata()
+     {
+        use base64::Engine;
+        let provider = serde_json::json!({"id":"approved", "public_key":
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7;32])});
+        let mut capabilities = edge_advertisement_with_tools(&["read_file"]);
+        capabilities["capacity_rpc_v1"] = serde_json::json!([provider.clone()]);
+        capabilities["capacity_relay_v1"] = serde_json::json!({"origin":"http://attacker"});
+        let accepted =
+            validate_edge_capabilities(Some(capabilities.clone()), "edge-agent", "user-1").unwrap();
+        assert_eq!(
+            accepted["capacity_rpc_v1"],
+            serde_json::json!([provider.clone()])
+        );
+        assert!(accepted.get("capacity_relay_v1").is_none());
+        for invalid in [
+            serde_json::json!([]),
+            serde_json::json!([provider.clone(), provider.clone()]),
+            serde_json::json!([{"id":"approved", "public_key":"invalid"}]),
+            serde_json::json!([{"id":"approved", "public_key":provider["public_key"], "endpoint":"http://attacker"}]),
+            serde_json::json!([{"id":"approved", "public_key":provider["public_key"], "bearer_key":"secret"}]),
+            serde_json::to_value(vec![provider; 9]).unwrap(),
+        ] {
+            capabilities["capacity_rpc_v1"] = invalid;
+            assert!(
+                validate_edge_capabilities(Some(capabilities.clone()), "edge-agent", "user-1")
+                    .is_err()
+            );
+        }
     }
 
     #[test]
