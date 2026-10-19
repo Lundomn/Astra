@@ -169,6 +169,42 @@ bundle. A local replica cannot override Server ownership, deletion, or a failed
 restore request. Local-only continuation remains available without Server
 authentication; clearing a stale remote pointer does not delete the replica.
 
+An interactive attachment explicitly restored from a Server canonical bundle
+refreshes that bundle through the authenticated resume API before each actual
+model turn, while holding the local execution lease. This adds one resume
+request per turn for those attachments. Its 30-second deadline and the current
+TUI cancellation token bound the wait while the local lease is held. The
+resume and model requests use the same admitted owner bearer, refreshed only
+through that captured owner's existing binding. An environment bearer remains
+an explicit bearer and cannot borrow profile refresh authority. A typed resume
+401 permits one refresh and retry through the captured owner within the same
+deadline; a repeated rejection, 403 or unowned bearer never retries.
+A failed or degraded refresh stops before execution; it cannot fall back to the
+local replica. The returned canonical messages refresh the client continuation
+mirror. Server admission independently restores its conversation and allocates
+its turn; no client message list or predicted Server turn crosses that boundary.
+Server feedback is validated against the accepted session, run, model and
+terminal receipt, never a local counter or a pre-admission prediction.
+The local snapshot supplies one turn allocation for the local journal, tool
+mutation/rollback scopes, checkpoints and traces, plus the canonical commit
+base. Session state and the workspace's sidecar ordering counter are seeded from
+that local journal during explicit Server canonical restore,
+starting at zero for a replica with no local turns. After remote reads, restore
+holds the captured owner's execution lease while reading the current local
+head and merging metadata under that owner's workspace lock. Already committed
+local trace and workspace fields are retained. The live context-trace cache keeps
+its producer-assigned local turn alongside the trace. Journal recovery orders
+that cache independently from workspace repair, so a delayed sidecar cannot
+replace newer live evidence; display trace IDs and the current session head do
+not determine trace freshness. The Server head must not suppress
+subsequent local workspace or context-trace projections. Server cursors are never advanced as local cursors.
+Ordinary local and fresh attachments do not perform this additional request.
+
+The shared CLI stream entrypoint heap-pins its execution future for all callers.
+Interactive cancellation and drain continue to await that same owned future;
+dropping it releases its state within the caller's existing lease scope. This
+bounds embedded caller state without changing execution or settlement ownership.
+
 Server recovery preserves the opaque execution handoff checkpoint and fences
 its custody to the adopted owner generation. It does not reconstruct execution
 of the original run. Continuing a session in a new run consumes canonical
