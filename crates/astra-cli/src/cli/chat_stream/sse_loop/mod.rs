@@ -125,11 +125,24 @@ pub(crate) fn retain_cli_executor(
 pub(crate) fn stream_chat_sse<'a>(
     p: ChatTurnParams<'a>,
 ) -> impl std::future::Future<Output = Result<StreamResult, crate::TurnFailure>> + 'a {
-    Box::pin(stream_chat_sse_inner(p))
+    Box::pin(async move {
+        // Owned by this physical request, not inferred from an error string or
+        // absence of a run header. Keep it sticky across admission retries.
+        let mut server_admission_dispatched = false;
+        // Boxing only this wrapper still embeds the large execution future in
+        // its poll frame. Pin execution independently so cold local callbacks
+        // keep their stack headroom, including after a Server session restore.
+        let mut result = Box::pin(stream_chat_sse_inner(p, &mut server_admission_dispatched)).await;
+        if let Err(failure) = &mut result {
+            failure.partial.server_admission_not_dispatched = !server_admission_dispatched;
+        }
+        result
+    })
 }
 
 async fn stream_chat_sse_inner(
     mut p: ChatTurnParams<'_>,
+    server_admission_dispatched: &mut bool,
 ) -> Result<StreamResult, crate::TurnFailure> {
     let start = Instant::now();
     p.model = normalize_turn_model(p.model);
@@ -549,6 +562,7 @@ async fn stream_chat_sse_inner(
 
     // ─── Build host + state ──────────────────────────────────────────────
     let mut host = CliServerAdmissionHost {
+        server_admission_dispatched,
         runtime_config: p.runtime_config.clone(),
         api: p.api,
         token: p.token.to_string(),
@@ -894,6 +908,7 @@ async fn stream_chat_sse_inner(
                     host.last_error_metadata.as_ref(),
                     host.last_physical_run_id.as_deref(),
                 ),
+                server_admission_not_dispatched: false,
                 last_heavy_checkpoint: state.stall.last_heavy_checkpoint.take(),
                 partial_text: std::mem::take(&mut state.final_text),
                 run_transcript_messages: state.take_run_transcript_capture(),

@@ -229,9 +229,35 @@ subsequent local workspace or context-trace projections. Server cursors are neve
 Ordinary local and fresh attachments do not perform this additional request.
 
 The shared CLI stream entrypoint heap-pins its execution future for all callers.
+Admission bookkeeping keeps the inner execution independently heap-pinned;
+boxing only an outer async wrapper does not bound that wrapper's poll stack.
+Interactive cancellation settlement likewise heap-pins its state at its owner,
+so its inactive branches do not enlarge ordinary tool-callback poll stacks.
 Interactive cancellation and drain continue to await that same owned future;
 dropping it releases its state within the caller's existing lease scope. This
 bounds embedded caller state without changing execution or settlement ownership.
+
+Explicit interactive user cancellation uses only the accepted run identity on
+that physical response. If it is not yet observed, cancellation first drains
+for that identity and then cancels the exact execution. An already-observed
+run is cancelled alongside local drain so a blocked callback cannot consume
+the entire cancellation budget before the remote request is sent. If the CLI
+confirms that admission was never dispatched, or receives a typed pre-admission
+rejection, cancellation returns without a remote-active warning or another wait.
+Each physical admission attempt checks cancellation and publishes sticky
+dispatch evidence after asynchronous credential preparation, with no intervening
+await before sending. Stopping while credentials are pending cannot start a
+new admission when they resolve; an earlier dispatched attempt remains ambiguous.
+A dispatched request whose identity remains unknown is still unconfirmed;
+absence of a run header alone is not proof that nothing was admitted.
+The opted-in shared SSE owner stops before tools or approvals from that same
+chunk; zero-grace hosts keep their existing chunk handling.
+Drain and exact-run cancellation share one existing ten-second deadline;
+a second interrupt may force an unverified exit. Cancellation uses only the
+run identity observed on that response, never an active-run lookup by Session.
+Unconfirmed identity or execution settlement remains visible with explicit
+recovery guidance. An ordinary transport or callback detach does not gain
+user-cancellation authority.
 
 Server recovery preserves the opaque execution handoff checkpoint and fences
 its custody to the adopted owner generation. It does not reconstruct execution
