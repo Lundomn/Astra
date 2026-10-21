@@ -47,11 +47,18 @@ class CiScopeTests(unittest.TestCase):
             head = git("rev-parse", "HEAD")
             self.assertTrue(git("diff", "--name-status", base, head).startswith("R100"))
 
+            git("switch", "-q", "--detach", base)
+            git("merge", "-q", "--no-ff", head, "-m", "test merge")
+            merge = git("rev-parse", "HEAD")
+
             events = [
-                {"before": base, "after": head},
-                {"pull_request": {"base": {"sha": base}, "head": {"sha": head}}},
+                ({"before": base, "after": head}, head),
+                (
+                    {"pull_request": {"base": {"sha": base}, "head": {"sha": head}}},
+                    merge,
+                ),
             ]
-            for event in events:
+            for event, github_sha in events:
                 with self.subTest(event=next(iter(event))):
                     event_path = root / "event.json"
                     event_path.write_text(json.dumps(event))
@@ -64,6 +71,7 @@ class CiScopeTests(unittest.TestCase):
                             **os.environ,
                             "GITHUB_EVENT_PATH": str(event_path),
                             "GITHUB_OUTPUT": str(output_path),
+                            "GITHUB_SHA": github_sha,
                         },
                         text=True, capture_output=True, check=True,
                     )
@@ -98,6 +106,117 @@ class CiScopeTests(unittest.TestCase):
                 "online_integration",
             },
         )
+
+    def test_pull_request_scope_uses_the_tested_merge_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*args: str) -> str:
+                return subprocess.check_output(
+                    ["git", "-C", str(root), *args],
+                    text=True,
+                    stderr=subprocess.PIPE,
+                ).strip()
+
+            git("init", "-q", "-b", "main")
+            git("config", "user.name", "CI scope regression")
+            git("config", "user.email", "ci-scope@example.invalid")
+            git("config", "commit.gpgsign", "false")
+            (root / "README.md").write_text("baseline\n")
+            git("add", ".")
+            git("commit", "-qm", "baseline")
+            common = git("rev-parse", "HEAD")
+
+            git("switch", "-qc", "feature", common)
+            (root / "README.md").write_text("documentation-only pull request\n")
+            git("commit", "-qam", "update documentation")
+            head = git("rev-parse", "HEAD")
+
+            git("switch", "-q", "main")
+            rust_source = root / "crates/core/src/lib.rs"
+            rust_source.parent.mkdir(parents=True)
+            rust_source.write_text("pub fn base_only() {}\n")
+            git("add", ".")
+            git("commit", "-qm", "advance base with Rust change")
+            base = git("rev-parse", "HEAD")
+            git("merge", "-q", "--no-ff", "feature", "-m", "test merge")
+            merge = git("rev-parse", "HEAD")
+
+            event_path = root / "event.json"
+            event_path.write_text(json.dumps({
+                "pull_request": {
+                    "base": {"sha": base},
+                    "head": {"sha": head},
+                },
+            }))
+            output_path = root / "scope-output"
+            output_path.write_text("")
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).with_name("ci_scope.py").resolve())],
+                cwd=root,
+                env={
+                    **os.environ,
+                    "GITHUB_EVENT_PATH": str(event_path),
+                    "GITHUB_OUTPUT": str(output_path),
+                    "GITHUB_SHA": merge,
+                },
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            self.assertNotIn("enabling every CI scope", result.stderr)
+            self.assertIn("changed_paths=README.md", result.stdout)
+            self.assertFalse(any(
+                line.endswith("=true") for line in output_path.read_text().splitlines()
+            ))
+
+    def test_pull_request_scope_rejects_an_unverified_checkout_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*args: str) -> str:
+                return subprocess.check_output(
+                    ["git", "-C", str(root), *args],
+                    text=True,
+                    stderr=subprocess.PIPE,
+                ).strip()
+
+            git("init", "-q")
+            git("config", "user.name", "CI scope regression")
+            git("config", "user.email", "ci-scope@example.invalid")
+            git("config", "commit.gpgsign", "false")
+            (root / "README.md").write_text("baseline\n")
+            git("add", ".")
+            git("commit", "-qm", "baseline")
+            base = git("rev-parse", "HEAD")
+            (root / "README.md").write_text("head\n")
+            git("commit", "-qam", "head")
+            head = git("rev-parse", "HEAD")
+
+            event_path = root / "event.json"
+            event_path.write_text(json.dumps({
+                "pull_request": {
+                    "base": {"sha": base},
+                    "head": {"sha": head},
+                },
+            }))
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).with_name("ci_scope.py").resolve())],
+                cwd=root,
+                env={
+                    **os.environ,
+                    "GITHUB_EVENT_PATH": str(event_path),
+                    "GITHUB_SHA": head,
+                },
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            self.assertIn("enabling every CI scope", result.stderr)
+            self.assertIn("rust=true", result.stdout)
+            self.assertIn("online_integration=true", result.stdout)
 
     def test_documentation_and_governance_use_no_heavy_scope(self) -> None:
         scopes = classify(

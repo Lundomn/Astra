@@ -214,7 +214,25 @@ def changed_paths_from_event() -> list[str]:
     event = json.loads(Path(event_path).read_text(encoding="utf-8"))
     if "pull_request" in event:
         base = event["pull_request"]["base"]["sha"]
-        head = event["pull_request"]["head"]["sha"]
+        pull_request_head = event["pull_request"]["head"]["sha"]
+        head = os.environ.get("GITHUB_SHA")
+        if not head:
+            raise RuntimeError("GITHUB_SHA is not set for pull request scope detection")
+
+        # GitHub tests pull requests at a synthetic merge commit. Diffing the
+        # current base tip directly against the feature head also includes
+        # base-only changes when the branches have diverged, which can select
+        # unrelated expensive lanes. Trust the tested merge only after its
+        # parents match the event's base and head commits exactly.
+        parents = subprocess.check_output(
+            ["git", "rev-list", "--parents", "-n", "1", head],
+            stderr=subprocess.STDOUT,
+            text=True,
+        ).strip().split()
+        if parents != [head, base, pull_request_head]:
+            raise RuntimeError(
+                "GITHUB_SHA is not the pull request merge commit described by the event"
+            )
     else:
         base = event.get("before")
         head = event.get("after") or os.environ.get("GITHUB_SHA")
