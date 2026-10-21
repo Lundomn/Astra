@@ -96,6 +96,20 @@ class ManualHarnessProgressTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 h.safe_diagnostic(dict(valid, **changes), 0)
 
+    def test_judge_failure_accepts_only_fixed_typed_metadata(self):
+        base = {"kind":"judge", "assessment":"unavailable", "threshold":0.8,
+                "failure":{"error_kind":"provider_deadline", "stage":"completion"}}
+        h.safe_diagnostic(base, 0)
+        for failure in (None, {}, {"error_kind":{}, "stage":"completion"},
+                        {"error_kind":"unknown", "stage":[]},
+                        {"error_kind":"private-sentinel", "stage":"completion"},
+                        {"error_kind":"unknown", "stage":"private-sentinel"},
+                        {**base["failure"], "detail":"private-sentinel"}):
+            with self.subTest(failure=failure), self.assertRaises(ValueError):
+                h.safe_diagnostic({**base, "failure":failure}, 0)
+        with self.assertRaises(ValueError):
+            h.safe_diagnostic({**base, "assessment":"accepted"}, 0)
+
     def test_captured_root_lifecycle_is_a_closed_unavailable_diagnostic(self):
         for state in ("running", "waiting", "paused", "delegated", "interrupted", "failed", "cancelled"):
             diagnostic = {"kind": "child_adoption", "status": "unavailable", "reason": f"root_{state}"}
@@ -133,6 +147,10 @@ class ManualHarnessProgressTests(unittest.TestCase):
                      "passed":False, "evaluation":"reported", "diagnostic":{
                          "kind":"tool_count", "min":1, "max":1, "actual":0,"considered":1,
                          "expected_ok":False, "outcome_matches":1, "error_matches":None, "predicate_matches":[1,0,0],
+                         "predicate_mismatches":[
+                             {"predicate_index":index,"failure_count":1,"first_mismatch":{
+                                 "path":path,"reason":"scalar_mismatch","expected_type":"string","actual_type":"string"}}
+                             for index,path in [(1,"/error_kind"),(2,"/status")]],
                          "observed_outcomes":[{"count":1,"outcome":{"disposition":"rejected","ok":False,
                              "status":"rejected","error_kind":"tool_invalid_args","execution":"not_executed","validation":None}}],
                          "outcomes_omitted":0}}
@@ -144,6 +162,8 @@ class ManualHarnessProgressTests(unittest.TestCase):
             summary = (root / "job-summary").read_text()
             self.assertIn("expected 1..1, observed 0", summary)
             self.assertIn("[1, 0, 0]", summary)
+            self.assertIn("scalar_mismatch", summary)
+            self.assertIn("/error_kind", summary)
             self.assertIn("not configured", summary)
             self.assertIn("tool_invalid_args", summary)
             self.assertIn("Failure stage: argument validation", summary)
@@ -158,6 +178,16 @@ class ManualHarnessProgressTests(unittest.TestCase):
             self.assertIn("does not prove the requested model was checked", command.stdout)
             self.assertEqual(json.loads((root / "summary.json").read_text())["runs"][0]["criteria"][0]
                              ["diagnostic"]["observed_outcomes"], check["diagnostic"]["observed_outcomes"])
+            mismatch = check["diagnostic"]["predicate_mismatches"][0]
+            for field, bad in [("reason", "private-sentinel"), ("actual_value", "private-sentinel"),
+                               ("actual_type", {}), ("path", "/" + "x" * 512)]:
+                original = dict(mismatch["first_mismatch"])
+                mismatch["first_mismatch"][field] = bad
+                write_events(root, data)
+                _, invalid = self.publish(root, "failure")
+                self.assertEqual(invalid["observation_error"], "invalid_progress")
+                self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
+                mismatch["first_mismatch"] = original
             outcome = check["diagnostic"]["observed_outcomes"][0]["outcome"]
             outcome["validation"] = {"issues":[{"code":"required","path":"/description"}], "omitted":3}
             write_events(root, data)
@@ -183,7 +213,7 @@ class ManualHarnessProgressTests(unittest.TestCase):
                 self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
                 outcome[field] = prior
             for assessment in ("rejected", "unavailable"):
-                check.update(type="hard_judger", diagnostic={"kind":"judge", "threshold":0.8,"assessment":assessment})
+                check.update(type="hard_judger", diagnostic={"kind":"judge", "threshold":0.8,"assessment":assessment, "failure": {"error_kind":"provider_deadline", "stage":"completion"} if assessment == "unavailable" else None})
                 write_events(root, data)
                 code, _ = self.publish(root, "failure")
                 self.assertEqual(code, 1)
@@ -500,6 +530,44 @@ while True: time.sleep(.05)
                 self.assertNotIn("private-sentinel", stdout + stderr)
                 _, summary = self.publish(root)
                 self.assertEqual(summary["execution"]["termination"], "cancelled")
+                self.assertFalse(summary["success"])
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "CI supervisor requires Linux")
+    def test_cancel_finalization_survives_repeated_supervisor_signals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launcher = self.stub(root, "graceful")
+            wrapper = root / "slow_finalizer.py"
+            wrapper.write_text("import sys,time\n"
+                f"sys.path.insert(0, {str(SCRIPT.parent)!r})\n"
+                "import manual_harness as h\n"
+                "original=h.write_json\n"
+                "def write(path,value):\n"
+                "    if path.name=='execution.json' and value.get('exit_code')==130: time.sleep(.15)\n"
+                "    return original(path,value)\n"
+                "h.write_json=write\n"
+                "raise SystemExit(h.main())\n")
+            process = subprocess.Popen(supervised([sys.executable, str(wrapper), "run", "--root", str(root),
+                "--timeout-seconds", "10", "--grace-seconds", "1", "--", str(launcher)]),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env={**os.environ, "ASTRA_BUILD_SOURCE_GIT_SHA":SHA})
+            try:
+                end = time.monotonic() + 3
+                while not (root / "progress.jsonl").exists() and time.monotonic() < end:
+                    time.sleep(.01)
+                self.assertTrue((root / "progress.jsonl").exists())
+                process.send_signal(signal.SIGINT)
+                stdout, stderr = process.communicate(timeout=4)
+                self.assertEqual(process.returncode, 130, stderr)
+                self.assertNotIn("private-sentinel", stdout + stderr)
+                execution = json.loads((root / "execution.json").read_text())
+                self.assertEqual(execution, {"exit_code":130, "termination":"cancelled"})
+                summary = json.loads((root / "summary.json").read_text())
+                self.assertEqual(summary["execution"], execution)
                 self.assertFalse(summary["success"])
             finally:
                 if process.poll() is None:

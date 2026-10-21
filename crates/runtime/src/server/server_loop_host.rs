@@ -4549,8 +4549,8 @@ const MAX_RECOVERABLE_EXPLAIN_ANALYZE_GAP_EVENTS: usize = 20_000;
 struct HostEventGapState {
     dropped: AtomicU64,
     recovery_lock: std::sync::Mutex<()>,
-    unacknowledged_explain_events: std::sync::Mutex<Vec<Value>>,
-    recoverable_explain_event_ids: std::sync::Mutex<Vec<String>>,
+    unacknowledged_explain_events: std::sync::Mutex<indexmap::IndexMap<Option<String>, Value>>,
+    recoverable_explain_event_ids: std::sync::Mutex<indexmap::IndexSet<String>>,
     explain_recovery_overflowed: AtomicBool,
     notify: tokio::sync::Notify,
 }
@@ -4587,10 +4587,8 @@ impl HostEventGapTracker {
             .unacknowledged_explain_events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pending
-            .iter()
-            .any(|value| value.get("event_id").and_then(Value::as_str) == Some(event_id))
-        {
+        let event_id = Some(event_id.to_owned());
+        if pending.contains_key(&event_id) {
             return true;
         }
         if pending.len() >= MAX_RECOVERABLE_EXPLAIN_ANALYZE_GAP_EVENTS {
@@ -4599,7 +4597,7 @@ impl HostEventGapTracker {
                 .store(true, Ordering::Release);
             return false;
         }
-        pending.push(event);
+        pending.insert(event_id, event);
         true
     }
 
@@ -4618,12 +4616,9 @@ impl HostEventGapTracker {
             .unacknowledged_explain_events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !pending
-            .iter()
-            .any(|value| value.get("event_id").and_then(Value::as_str) == event_id.as_deref())
-        {
+        if !pending.contains_key(&event_id) {
             if pending.len() < MAX_RECOVERABLE_EXPLAIN_ANALYZE_GAP_EVENTS {
-                pending.push(event);
+                pending.insert(event_id.clone(), event);
             } else {
                 self.0
                     .explain_recovery_overflowed
@@ -4637,9 +4632,9 @@ impl HostEventGapTracker {
                 .recoverable_explain_event_ids
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !recoverable.iter().any(|pending| pending == &event_id) {
+            if !recoverable.contains(&event_id) {
                 if recoverable.len() < MAX_RECOVERABLE_EXPLAIN_ANALYZE_GAP_EVENTS {
-                    recoverable.push(event_id);
+                    recoverable.insert(event_id);
                 } else {
                     self.0
                         .explain_recovery_overflowed
@@ -4666,7 +4661,7 @@ impl HostEventGapTracker {
             .unacknowledged_explain_events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|event| event.get("event_id").and_then(Value::as_str) != Some(event_id));
+            .shift_remove(&Some(event_id.to_owned()));
     }
 
     pub(crate) fn pending_recovery_snapshot(&self) -> (u64, Vec<Value>, bool) {
@@ -4680,15 +4675,6 @@ impl HostEventGapTracker {
             .unacknowledged_explain_events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let pending_by_id: HashMap<&str, &Value> = pending
-            .iter()
-            .filter_map(|event| {
-                event
-                    .get("event_id")
-                    .and_then(Value::as_str)
-                    .map(|id| (id, event))
-            })
-            .collect();
         let recoverable_ids = self
             .0
             .recoverable_explain_event_ids
@@ -4697,8 +4683,8 @@ impl HostEventGapTracker {
             .clone();
         let mut events = Vec::with_capacity(recoverable_ids.len());
         for event_id in recoverable_ids {
-            if let Some(event) = pending_by_id.get(event_id.as_str()) {
-                events.push((*event).clone());
+            if let Some(event) = pending.get(&Some(event_id)) {
+                events.push(event.clone());
             } else {
                 self.0
                     .explain_recovery_overflowed
@@ -4733,7 +4719,7 @@ impl HostEventGapTracker {
             .filter_map(|event| event.get("event_id").and_then(Value::as_str))
             .collect();
         recoverable.retain(|id| !acknowledged_ids.contains(id.as_str()));
-        pending.retain(|event| {
+        pending.retain(|_, event| {
             !event
                 .get("event_id")
                 .and_then(Value::as_str)
@@ -4767,7 +4753,9 @@ impl HostEventGapTracker {
                 .unacknowledged_explain_events
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        )
+        .into_values()
+        .collect();
         self.0
             .recoverable_explain_event_ids
             .lock()
@@ -13928,10 +13916,11 @@ impl ServerAgenticLoopHost {
                 continue;
             }
             self.start_explain_analyze_tool_admission(tool_call, round_index);
-            self.emit_progress_event(json!({
-                "type": "tool_call",
-                "tool_call": tool_call,
-            }));
+            let mut event = json!({"type": "tool_call", "tool_call": tool_call});
+            if let Some(object) = event.get_mut("tool_call").and_then(Value::as_object_mut) {
+                object.remove(astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD);
+            }
+            self.emit_progress_event(event);
         }
     }
 
@@ -21265,7 +21254,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 {
                     if !crate::turn::llm::client::provider_request_preserves_projected_canonical_suffix(
                         attempt_llm_messages,
-                        &appended,
+                        &state.messages,
+                        durable_canonical_cursor,
                     ) {
                         let error = astra_core::ClassifiedError::new(
                             astra_core::ErrorKind::ContractViolation,
@@ -22393,6 +22383,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // consume this same paired admission; independently resolving the
         // carrier here and again later could let a schema refresh give policy
         // and execution different logical targets.
+        result.tool_calls = crate::turn::agentic::tool_interception::accept_provider_tool_calls(
+            std::mem::take(&mut result.tool_calls),
+            &self.user_id, &self.session_id, state.current_run_id.as_deref(),
+            state.canonical_turn_chain_id.as_deref(), state.current_round_index,
+        ).map_err(|error| astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation, error,
+        ))?;
         let mut preflight_admission = self.canonicalize_tool_admission_for_state(
             state,
             crate::turn::agentic::tool_interception::admit_tool_calls(
@@ -25216,7 +25213,7 @@ mod tests {
         settings.database = "mysql".into();
         let bootstrap = SharedPool::new(&settings).await.unwrap();
         let database = format!("astra_test_probe_adopt_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE DATABASE `{database}`"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE `{database}`")))
             .execute(bootstrap.get())
             .await
             .unwrap();
@@ -25653,7 +25650,7 @@ mod tests {
                         facts[field] = Value::Null;
                     }
                     for table in ["agent_runs", "run_checkpoints"] {
-                        sqlx::query(&format!("UPDATE {table} SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?"))
+                        sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {table} SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?")))
                             .bind(malformed.to_string()).bind(&user).bind(run_id)
                             .execute(pool.get()).await.unwrap();
                     }
@@ -25664,9 +25661,9 @@ mod tests {
                     assert!(RuntimeExecutionHandoff::from_adopted(&invalid).is_err());
                 }
                 for table in ["agent_runs", "run_checkpoints"] {
-                    sqlx::query(&format!(
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
                         "UPDATE {table} SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?"
-                    ))
+                    )))
                     .bind(&checkpoint.checkpoint_json)
                     .bind(&user)
                     .bind(run_id)
@@ -25851,7 +25848,7 @@ mod tests {
         // All handles share this test-owned pool. Close it before removing only
         // the fresh UUID catalog above; on assertion failure retain it for diagnosis.
         pool.get().close().await;
-        sqlx::query(&format!("DROP DATABASE `{database}`"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE `{database}`")))
             .execute(bootstrap.get())
             .await
             .unwrap();
@@ -26609,12 +26606,9 @@ mod tests {
     ) -> (AdmittedToolCallOutcome, Vec<Value>) {
         let mut host = test_host_builder(user_id.to_string(), session_id.to_string())
             .with_execution_time_budget(Some(ExecutionTimeBudget {
-                // Preserve the final-answer window while exercising a local
-                // approval timeout before durable reconciliation.
-                remaining_seconds:
-                    astra_turn_core::chat_turn_heuristics::SUPPRESSED_PROVIDER_RECOVERY_BUDGET
-                        .as_secs()
-                        + 2,
+                // This fixture exercises approval reconciliation only; it has
+                // no following provider request or tool execution to budget.
+                remaining_seconds: 1,
             }))
             .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
             .with_interactive_client(true)
@@ -31210,8 +31204,7 @@ mod tests {
         assert_eq!(request.executor.executor_id, "edge-1");
     }
 
-    #[tokio::test]
-    async fn edge_profile_full_deferred_contract_reaches_search_admission_and_offer() {
+    fn weather_deferred_contract_fixture() -> (Value, Map<String, Value>) {
         let tool_name = "mcp__weather__forecast";
         let schema = json!({
             "type": "function",
@@ -31247,6 +31240,13 @@ mod tests {
             json!(200_000),
         );
 
+        (schema, edge_profile)
+    }
+
+    #[tokio::test]
+    async fn edge_profile_full_deferred_contract_rejects_unbound_native_identity() {
+        let tool_name = "mcp__weather__forecast";
+        let (_, edge_profile) = weather_deferred_contract_fixture();
         for native_ids in [json!({}), json!({tool_name: ""})] {
             let mut unbound_profile = edge_profile.clone();
             unbound_profile.insert(
@@ -31268,6 +31268,12 @@ mod tests {
                 "missing/invalid native identity must stay unbound"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn edge_profile_full_deferred_contract_reaches_search_admission_and_offer() {
+        let tool_name = "mcp__weather__forecast";
+        let (schema, mut edge_profile) = weather_deferred_contract_fixture();
         edge_profile.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_TOOL_NATIVE_IDS.to_string(),
             json!({tool_name: tool_name}),
@@ -34609,8 +34615,11 @@ mod tests {
         assert!(!crate::turn::agentic::tool_interception::runtime_allows_tool(&state, &key));
     }
 
-    #[test]
-    fn capability_source_production_loop_discovers_selects_invokes_and_records_exact_identity() {
+    fn assert_capability_source_production_loop(
+        skill: bool,
+        distinct_bindings: bool,
+        large_tool: bool,
+    ) {
         async fn run_case(
             catalog_size: usize,
             distinct_bindings: bool,
@@ -34824,22 +34833,20 @@ mod tests {
                         .any(|message| message.to_string().contains("account-read-complete"))
                 );
             }
-            let invocation_ids = if skill {
-                vec!["source-discover"]
-            } else {
-                vec!["source-discover", "source-select", "source-invoke"]
-            };
-            for invocation_id in invocation_ids {
-                let identity = astra_turn_types::ToolInvocationIdentity::new(
-                    &fixture.scope.user_id,
-                    &fixture.scope.session_id,
-                    &fixture.scope.run_id,
-                    "source-turn",
-                    invocation_id,
-                )
-                .unwrap();
+            let identities = state
+                .stall
+                .tool_call_records
+                .iter()
+                .filter_map(|record| record.invocation_identity.as_ref())
+                .collect::<Vec<_>>();
+            assert_eq!(identities.len(), if skill { 1 } else { 3 });
+            for identity in identities {
+                assert_eq!(identity.user_id, fixture.scope.user_id);
+                assert_eq!(identity.session_id, fixture.scope.session_id);
+                assert_eq!(identity.run_id, fixture.scope.run_id);
+                assert_eq!(identity.turn_chain_id, "source-turn");
                 let record = ledger
-                    .get(&identity)
+                    .get(identity)
                     .await
                     .unwrap()
                     .expect("canonical invocation receipt");
@@ -34906,27 +34913,45 @@ mod tests {
         std::thread::Builder::new()
             .name("capability-source-loop-test".into())
             .stack_size(astra_core::process_runtime::PROCESS_WORKER_STACK_BYTES)
-            .spawn(|| {
+            .spawn(move || {
                 tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                    if large_tool {
+                        run_case(1, false, false, true).await;
+                        return;
+                    }
                     let mut measurements = Vec::new();
-                    for skill in [false, true] {
-                    for distinct_bindings in [false, true] {
-                        for catalog_size in [10, 100, 1000] {
-                            let measured = run_case(catalog_size, distinct_bindings, skill, false).await;
-                            let selected_phase = if skill { "selected_skill_body" } else { "selected_schema" };
-                            for (phase, (bytes, tokens)) in ["initial", "candidate_page", selected_phase].into_iter().zip(measured) {
-                                eprintln!("capability_source inventory={catalog_size} distinct_bindings={distinct_bindings} skill={skill} phase={phase} bytes={bytes} estimated_tokens={tokens}");
-                            }
-                            measurements.push(measured);
-                        }
+                    for catalog_size in [10, 100, 1000] {
+                        measurements.push(run_case(catalog_size, distinct_bindings, skill, false).await);
                     }
-                    }
-                    for group in measurements.chunks(3) {
-                        assert!(group.iter().all(|value| *value == group[0]), "actual LLM-visible initial, bounded candidates and exact schema must not grow with the external catalog: {group:?}");
-                    }
-                    run_case(1, false, false, true).await;
+                    assert!(measurements.iter().all(|value| *value == measurements[0]),
+                        "actual LLM-visible initial, bounded candidates and exact schema must not grow with the external catalog: {measurements:?}");
                 });
             }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn capability_source_production_loop_tools_shared_binding() {
+        assert_capability_source_production_loop(false, false, false);
+    }
+
+    #[test]
+    fn capability_source_production_loop_tools_distinct_bindings() {
+        assert_capability_source_production_loop(false, true, false);
+    }
+
+    #[test]
+    fn capability_source_production_loop_skills_shared_binding() {
+        assert_capability_source_production_loop(true, false, false);
+    }
+
+    #[test]
+    fn capability_source_production_loop_skills_distinct_bindings() {
+        assert_capability_source_production_loop(true, true, false);
+    }
+
+    #[test]
+    fn capability_source_production_loop_large_schema() {
+        assert_capability_source_production_loop(false, false, true);
     }
 
     #[tokio::test]
@@ -36693,6 +36718,7 @@ mod tests {
             crate::turn::llm::client::provider_request_preserves_projected_canonical_suffix(
                 &attempt_messages,
                 &canonical_appended,
+                0,
             )
         );
     }
@@ -47524,12 +47550,13 @@ mod tests {
         .expect("canonical completed turn commit")
         .expect("completed selection has a delta");
         let committed_messages = committed_segments.concat();
-        assert!(
-            committed_messages.iter().any(|message| {
-                message["role"] == "tool" && message["tool_call_id"] == "call-search-git"
-            }),
-            "completed history must retain the selected invocation contract"
-        );
+        let selected_call = committed_messages.iter()
+            .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
+            .flatten().find(|call| call[astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD] == "call-search-git")
+            .expect("completed history retains original provider linkage");
+        assert!(committed_messages.iter().any(|message| {
+            message["role"] == "tool" && message["tool_call_id"] == selected_call["id"]
+        }), "completed history retains the canonical selected invocation pair");
         assert!(complete_tool_pairs(&committed_messages));
 
         // A second user turn is a new execution, not same-run custody recovery.
@@ -50816,28 +50843,43 @@ mod tests {
         host.always_load_tool_names.insert(public_name.to_owned());
         let mut state = loop_state(session, Vec::new(), "Revise the current agent.");
         host.prepare_model_selection(&mut state).await.unwrap();
-        let result = host
-            .execute_turn(&mut state)
-            .await
-            .expect("actual idless provider turn");
-        state.commit_volatile_attempt_lease();
-        let admission = AgenticLoopHost::admit_tool_calls(
-            &mut host,
-            &result.accum.tool_calls,
-            Some("tool_calls"),
+        let error = match host.execute_turn(&mut state).await {
+            Ok(_) => panic!("provider control without identity must fail at model acceptance"),
+            Err(error) => error,
+        };
+        state.restore_volatile_attempt_lease();
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+        assert!(
+            error
+                .message
+                .contains("provider tool-call identity is missing or malformed"),
+            "{error:?}"
         );
-        assert!(admission.admitted.is_empty());
-        assert_eq!(admission.rejected.len(), 1);
+        let details: Value = serde_json::from_str(
+            error
+                .details_json
+                .as_deref()
+                .expect("rejected provider usage"),
+        )
+        .unwrap();
+        assert_eq!(details["qualified_usage"]["input_tokens"], 8);
+        assert_eq!(details["qualified_usage"]["output_tokens"], 3);
+        assert!(state.stall.tool_call_records.is_empty());
+        assert!(state.tool_results.is_empty());
         assert!(host.take_terminal_control_outcome().is_none());
-        let delivered = host
-            .handle_admitted_tool_invocations(&mut state, &admission.admitted)
-            .await;
-        assert!(delivered.results.is_empty());
-        assert_eq!(delivered.control, AdmittedToolCallControl::Continue);
         assert!(host.edge_callback_ledger.lock().await.is_empty());
         assert!(host.take_emitted_events().iter().all(|event| !matches!(
             event["type"].as_str(),
-            Some("runtime.control.handoff.requested" | "tool_request" | "approval_request")
+            Some(
+                "runtime.control.handoff.requested"
+                    | "tool_call"
+                    | "tool_call_start"
+                    | "tool_call_end"
+                    | "tool_request"
+                    | "approval_request"
+                    | "approval_required"
+                    | "approval_batch_required"
+            )
         )));
         gateway.assert_complete();
         inference.assert_quiescent();
@@ -51784,6 +51826,132 @@ mod tests {
         assert!(host.take_terminal_control_outcome().is_none());
         inference_ledger.assert_quiescent();
         provider.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn accepted_provider_ids_are_unique_across_rounds_without_changing_wire_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let _journal = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let batches = [
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
+            vec![0, 8, 9, 10, 11, 12, 13],
+            vec![0, 14, 15, 16, 17, 18],
+            vec![0, 19, 20, 21, 1, 2],
+            vec![0, 1, 2, 3, 4, 5, 6],
+        ];
+        let calls = |batch: &[u32]| {
+            batch.iter().map(|id| json!({
+            "id": if *id == 0 { "bash:83".to_string() } else { format!("call-{id}") },
+            "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"fixture\"}"}
+        })).collect::<Vec<_>>()
+        };
+        let responses = batches.iter().map(|batch| ProviderResponse::OpenAi(json!({
+            "choices": [{"message": {"role":"assistant", "tool_calls":calls(batch)}, "finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":10,"completion_tokens":5}
+        }))).collect();
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "reused provider IDs",
+            |request| request.path == "/v1/chat/completions",
+            responses,
+        )])
+        .await;
+        let mut host = test_host_builder("identity-owner", "identity-session")
+            .with_edge_tools(sample_edge_tools())
+            .with_execution_binding_snapshot(edge_runtime_snapshot())
+            .with_test_inference_ledger(Default::default())
+            .with_admitted_model_execution(Some(test_gateway_execution(
+                format!("{}/v1/chat/completions", provider.base_url),
+                Some(2000),
+            )))
+            .build();
+        let mut state = create_durable_execution_test_state("identity-session");
+        state.canonical_turn_chain_id = Some("identity-chain".into());
+        state
+            .messages
+            .push(json!({"role":"user","content":"Read fixture files without changing anything."}));
+        state.message = "Read fixture files without changing anything.".into();
+        state.user_intent = state.message.clone();
+        let mut receipts = crate::turn::agentic_loop::host::ToolLedgerReceiptAccumulator::default();
+        let mut all_ids = HashSet::new();
+        for (round, batch) in batches.iter().enumerate() {
+            state.current_round_index = round as u32;
+            state.llm_rounds_completed = round as u32;
+            let result = host
+                .execute_turn(&mut state)
+                .await
+                .expect("accepted response");
+            state.commit_volatile_attempt_lease();
+            assert_eq!(result.accum.tool_calls.len(), batch.len());
+            state
+                .messages
+                .push(json!({"role":"assistant","tool_calls":result.accum.tool_calls}));
+            let accepted = state.messages.last().unwrap()["tool_calls"]
+                .as_array()
+                .unwrap()
+                .clone();
+            let records = accepted
+                .iter()
+                .map(|call| astra_services::session_journal::ToolCallRecord {
+                    tool_call_id: call["id"].as_str().map(str::to_owned),
+                    name: "read_file".into(),
+                    ok: true,
+                    round: Some(round as u32),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>();
+            let attempts = crate::turn::agentic_loop::host::ToolLedgerAttemptBatch::from_validated_provider_calls(&accepted);
+            receipts.observe_round(&attempts, &records);
+            receipts.observe_round(&attempts, &records); // Exact accepted replay closes once.
+            for call in &accepted {
+                let id = call["id"].as_str().unwrap();
+                all_ids.insert(id.to_string());
+                state
+                    .messages
+                    .push(json!({"role":"tool","tool_call_id":id,"content":"fixture result"}));
+            }
+        }
+        provider.assert_complete();
+        let requests = provider.requests.lock().await;
+        for (round, request) in requests.iter().enumerate() {
+            let wire_calls = request.body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|message| message["tool_calls"].as_array())
+                .flatten()
+                .collect::<Vec<_>>();
+            let original = batches[..round]
+                .iter()
+                .flat_map(|batch| calls(batch))
+                .collect::<Vec<_>>();
+            assert_eq!(wire_calls.len(), original.len());
+            for (wire, raw) in wire_calls.iter().zip(&original) {
+                assert_eq!(
+                    wire["id"], raw["id"],
+                    "provider linkage must stay unchanged"
+                );
+                assert_eq!(wire["function"], raw["function"]);
+            }
+            let results = request.body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .collect::<Vec<_>>();
+            assert_eq!(results.len(), original.len());
+            for (result, raw) in results.iter().zip(&original) {
+                assert_eq!(result["tool_call_id"], raw["id"]);
+            }
+        }
+        let receipt = receipts.receipt("identity-run", 0);
+        assert_eq!(receipt.attempted, 34);
+        assert_eq!(receipt.terminal, 34);
+        assert!(receipt.is_complete());
+        assert_eq!(
+            all_ids.len(),
+            34,
+            "distinct calls must not collapse to the 22 provider IDs"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -53380,6 +53548,38 @@ mod tests {
             .await
             .expect("a terminal progress drop must wake the bridge immediately");
         assert_eq!(gap.take_recovery_snapshot().0, 1);
+    }
+
+    #[test]
+    fn explain_gap_recovery_preserves_first_value_order_and_missing_id_failure() {
+        let gap = HostEventGapTracker::default();
+        let first = json!({"event_id": "z", "value": "first"});
+        let second = json!({"event_id": "a"});
+        assert!(gap.track_explain_analyze_event(first.clone()));
+        assert!(gap.track_explain_analyze_event(json!({"event_id": "z", "value": "duplicate"})));
+        gap.record_explain_analyze_drop(json!({"event_id": "z", "value": "dropped"}));
+        gap.record_explain_analyze_drop(second.clone());
+        gap.record_explain_analyze_drop(first.clone());
+        assert_eq!(
+            gap.pending_recovery_snapshot(),
+            (3, vec![first.clone(), second.clone()], true)
+        );
+        gap.acknowledge_recovery_batch(1, &[first]);
+        assert_eq!(
+            gap.pending_recovery_snapshot(),
+            (2, vec![second.clone()], true)
+        );
+        let missing = json!({"value": "missing identity"});
+        gap.record_explain_analyze_drop(missing.clone());
+        assert_eq!(
+            gap.pending_recovery_snapshot(),
+            (3, vec![second.clone()], false)
+        );
+        assert_eq!(
+            gap.take_recovery_snapshot(),
+            (3, vec![second, missing], false)
+        );
+        assert_eq!(gap.pending_recovery_snapshot(), (0, vec![], false));
     }
 
     #[test]

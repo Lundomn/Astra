@@ -1297,12 +1297,13 @@ async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
             "work_runtime_event_outbox",
             "work_item_attempts",
         ] {
-            let remaining: i64 =
-                sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE owner_id = ?"))
-                    .bind(&owner)
-                    .fetch_one(pool.get())
-                    .await
-                    .expect("verify cleanup of durable execution artifacts");
+            let remaining: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} WHERE owner_id = ?"
+            )))
+            .bind(&owner)
+            .fetch_one(pool.get())
+            .await
+            .expect("verify cleanup of durable execution artifacts");
             assert_eq!(remaining, 0, "Work cleanup left rows in {table}");
         }
         return;
@@ -1786,10 +1787,10 @@ async fn exercise_primary_continuation_entry(
         // Both the compacted turn and its restored successor keep real Work
         // authority without manufacturing answer-derived decisions or summaries.
         for table in ["session_state_items", "session_state_item_events"] {
-            let count: i64 = sqlx::query_scalar(&format!(
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ? \
                  AND category IN ('decision', 'summary')"
-            ))
+            )))
             .bind(owner)
             .bind(session)
             .fetch_one(pool.get())
@@ -13051,9 +13052,9 @@ async fn transcript_prompt_hydration_preserves_lineage_budget_and_owner_on_matri
         )
         .await;
     for table in ["session_transcript_items", "agent_runs"] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
-        ))
+        )))
         .bind(&user_id)
         .bind(&session_id)
         .execute(pool.get())
@@ -13597,10 +13598,10 @@ async fn cleanup_lifecycle_execution_binding(
         "session_execution_bindings",
         "session_context_heads",
     ] {
-        let _ = sqlx::query(&format!(
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? \
              AND session_id = ? AND branch_id = ?"
-        ))
+        )))
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
         .bind(&key.session_id)
@@ -15218,9 +15219,20 @@ async fn server_subrun_initializes_descendant_admission_identity_from_owned_run(
     assert_eq!(descendant_run.session_id, session);
     assert_eq!(descendant_run.parent_run_id.as_deref(), Some(run.as_str()));
     gateway.assert_complete();
-    let identity =
-        astra_turn_types::ToolInvocationIdentity::new(owner, &session, &run, &run, "nested-call")
-            .unwrap();
+    let invocation_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT invocation_id FROM tool_invocation_ledger WHERE user_id = ? AND session_id = ? AND run_id = ?")
+        .bind(owner).bind(&session).bind(&run).fetch_all(pool.get()).await.unwrap();
+    assert_eq!(invocation_ids.len(), 1, "one actual descendant admission");
+    assert_eq!(invocation_ids[0].len(), 64);
+    assert_ne!(invocation_ids[0], "nested-call");
+    let identity = astra_turn_types::ToolInvocationIdentity::new(
+        owner,
+        &session,
+        &run,
+        &run,
+        &invocation_ids[0],
+    )
+    .unwrap();
     let record = ledger
         .get(&identity)
         .await
@@ -24698,9 +24710,8 @@ fn agent_progress_is_live_only_while_agent_lifecycle_is_durable() {
 
 #[tokio::test]
 async fn production_fanout_flushes_sparse_event_before_terminal() {
-    // Keep the model open beyond the event deadline: a terminal-triggered
-    // flush must not make the sparse-event timer test pass accidentally.
-    let llm = spawn_incremental_terminal_test_llm(Duration::from_secs(1)).await;
+    // Completion is explicitly held until the sparse event is observed.
+    let llm = spawn_gated_terminal_test_llm().await;
     let store = Arc::new(
         FaultInjectedRunStateStore::new(&[], &[]).with_append_delay(Duration::from_millis(40)),
     );
@@ -24723,6 +24734,9 @@ async fn production_fanout_flushes_sparse_event_before_terminal() {
         astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled;
     let mut stream = ok(owner.stream_chat("user-1".to_owned(), request).await);
     let mut rx = stream.event_rx.take().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), llm.blocked_entered.notified())
+        .await
+        .expect("provider must be ready before measuring sparse delivery");
     owner
         .server_agent_progress_broadcaster
         .emit(test_agent_spawned(
@@ -24742,6 +24756,7 @@ async fn production_fanout_flushes_sparse_event_before_terminal() {
     })
     .await
     .expect("sparse durable event must flush within 500ms without capacity or terminal");
+    llm.release_blocked.notify_one();
     tokio::time::timeout(Duration::from_secs(5), async {
         let mut completed = false;
         while let Some(event) = rx.recv().await {
@@ -25045,6 +25060,134 @@ async fn committed_interactions_remain_immediate_delivery_boundaries() {
         })
     );
     assert!(pending.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn production_fanout_sparse_timer_flushes_only_after_deadline_and_commit() {
+    let append_delay = Duration::from_millis(40);
+    let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]).with_append_delay(append_delay));
+    let svc = test_service_with_store(store.clone());
+    svc.run_engine
+        .start_run("sparse-run", "owner", "session")
+        .await
+        .unwrap();
+    let (mut run, _, _, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
+        "sparse-run".into(),
+        "session".into(),
+        "owner".into(),
+    );
+    let mut host = server_loop_host::ServerAgenticLoopHostBuilder::new(
+        test_settings(),
+        test_encryptor(),
+        "owner".into(),
+        "session".into(),
+    )
+    .build();
+    let (tx, rx) = mpsc::channel(8);
+    let (delivery, mut events) = svc.prepare_stream_delivery(
+        "owner",
+        "session",
+        "sparse-run",
+        &mut run,
+        &mut host,
+        (tx.clone(), rx),
+    );
+    svc.runs.write().await.insert("sparse-run".into(), run);
+    let canary = json!({"type": "agent_spawned", "agent_id": "sparse-canary"});
+    let before = store.counters.lock().unwrap().append_calls;
+    tx.send(canary.clone()).await.unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(DURABLE_LIVE_BATCH_FLUSH_INTERVAL - Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(store.counters.lock().unwrap().append_calls, before);
+    assert!(events.try_recv().is_err());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        events.try_recv().is_err(),
+        "uncommitted event must remain private"
+    );
+    tokio::time::advance(append_delay).await;
+    let event = tokio::time::timeout(Duration::from_millis(1), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event, canary);
+    assert_eq!(store.counters.lock().unwrap().append_calls, before + 1);
+    assert!(
+        events.try_recv().is_err(),
+        "no terminal or capacity flush was injected"
+    );
+    delivery.host_event_bridge.abort();
+}
+
+#[tokio::test]
+async fn canonical_persistence_failure_control_is_live_only_and_sanitized() {
+    let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]));
+    let svc = test_service_with_store(store.clone());
+    svc.run_engine
+        .start_run("run-persist-error", "owner", "session")
+        .await
+        .unwrap();
+    let (mut run, _, _, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
+        "run-persist-error".into(),
+        "session".into(),
+        "owner".into(),
+    );
+    let mut host = server_loop_host::ServerAgenticLoopHostBuilder::new(
+        test_settings(),
+        test_encryptor(),
+        "owner".into(),
+        "session".into(),
+    )
+    .build();
+    let (delivery, mut events) = svc.prepare_stream_delivery(
+        "owner",
+        "session",
+        "run-persist-error",
+        &mut run,
+        &mut host,
+        mpsc::channel(8),
+    );
+    svc.runs
+        .write()
+        .await
+        .insert("run-persist-error".into(), run);
+    let before = store.counters.lock().unwrap().append_calls;
+    let (ack, received) = oneshot::channel();
+    delivery
+        .fanout_control_tx
+        .send(DurableLiveFanoutControl::PersistenceFailed {
+            detail: "synthetic-private SQL payload".into(),
+            ack,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), received)
+        .await
+        .unwrap()
+        .unwrap();
+    let event = events.recv().await.expect("live-only failure");
+    assert_eq!(event["type"], "run_error");
+    assert_eq!(event["run_id"], "run-persist-error");
+    assert_eq!(event["error_code"], "canonical_persistence_failed");
+    assert!(
+        event["error"]
+            .as_str()
+            .unwrap()
+            .contains("Reopen the session")
+    );
+    assert!(!event.to_string().contains("synthetic-private"));
+    assert_eq!(
+        store.counters.lock().unwrap().append_calls,
+        before,
+        "failure notification must not attempt another durable append"
+    );
+    assert!(
+        events.try_recv().is_err(),
+        "no successful terminal may follow"
+    );
+    delivery.host_event_bridge.abort();
 }
 
 #[tokio::test]
@@ -27726,6 +27869,9 @@ async fn stream_chat_plan_tools_refresh_host_prompt_and_gate() {
                     let tool = event["tool"].as_str().unwrap();
                     let request_id = event["request_id"].as_str().unwrap().to_owned();
                     if tool == "exit_plan_mode" {
+                        assert_eq!(request_id.len(), 76, "bounded approval correlation ID");
+                        assert!(format!("server-approval-required:{request_id}").len() <= 128);
+
                         assert!(
                             !workspace.join("proof.txt").exists(),
                             "plan write must be blocked before approval"
@@ -27768,7 +27914,13 @@ async fn stream_chat_plan_tools_refresh_host_prompt_and_gate() {
         "{events:?}"
     );
     assert_eq!(
-        std::fs::read_to_string(workspace.join("proof.txt")).unwrap(),
+        std::fs::read_to_string(workspace.join("proof.txt")).unwrap_or_else(|error| {
+            let writes: Vec<_> = events
+                .iter()
+                .filter(|event| event["type"] == "tool_call_end" && event["tool"] == "write_file")
+                .collect();
+            panic!("proof.txt: {error}; actual write receipts: {writes:?}")
+        }),
         "approved\n"
     );
     assert_eq!(
@@ -29023,11 +29175,13 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
     drop(control);
     tokio::time::sleep(Duration::from_millis(50)).await;
     for table in ["agent_runs", "agent_sessions"] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE user_id LIKE ?"))
-            .bind(format!("{prefix}-%"))
-            .execute(independent.get())
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE user_id LIKE ?"
+        )))
+        .bind(format!("{prefix}-%"))
+        .execute(independent.get())
+        .await
+        .unwrap();
     }
     independent.close().await;
     pool.close().await;
@@ -37062,9 +37216,9 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
             "unknown or refused input must not replay"
         );
         for table in ["tool_invocation_ledger", "edge_pending_dispatch"] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
-            ))
+            )))
             .bind(&user)
             .bind(&session)
             .execute(pool.get())

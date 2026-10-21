@@ -327,3 +327,64 @@ A user should be able to answer:
 - Browser disconnect does not imply cancellation.
 - Cancelled tasks disappear from active task board projection.
 - Resume reconstructs status without stale UI cache.
+
+A failed canonical terminal commit emits a live-only, root-scoped
+`run_error` with `error_code=canonical_persistence_failed`. It preserves partial
+answer text and advises reopening the Session to inspect recorded state before
+retrying. This notification is not a durable terminal or evidence that an
+uncertain transaction committed or rolled back; the canonical recovery owner
+still decides that state. No successful completion is published from this path.
+
+Web keeps one genuine text/reasoning projection for the selected message in its
+existing user-scoped chat state across observer connections. Reconnect initializes
+the browser from that projection and resumes at its captured cursor; rendered
+text and failure diagnostics never substitute for raw parser state. One observer
+may write that projection at a time. Conflicting observers or missing/ahead
+continuations return an explicit observation error without failing the Run or
+replacing the saved answer. Replay-only observation remains independent. This
+state has the same process lifetime as the Web chat projection; it adds no durable
+or cross-server transcript guarantee.
+
+The Web continuation cursor is the next event not represented by the selected
+message's genuine projection. Backend status polling updates control status,
+not parser progress; a durable event count is only a starting boundary when a
+new queued message is admitted. Public control responses expose a continuation
+cursor only for a matching Session, root Run and assistant projection. Resume
+uses that server-selected assistant, including a completed paused message;
+missing local bindings are refreshed once and reported as unavailable rather
+than creating a browser-only assistant.
+
+Web admits live Run observation only from the committed selected binding. Resume
+and queued input publish that selection; the existing lifecycle owner registers
+POST creation and admits GET observers using one chat/session/run/message lease.
+Replacement and unmount retire only observation, fencing late callbacks, queued
+patches and retries. Cursor and status progress do not replace a live observer.
+
+Deferred-input conflicts refresh the selected observation only while the initiating
+chat/session/run/message still owns it. A conflict never implicitly starts a new
+Run. Unconfirmed submissions report an error and retain the Composer draft for
+review and explicit resubmission; only accepted input receives queued feedback.
+
+Plan-review approvals derive bounded correlation IDs from the Session and tool
+invocation at the existing approval producer. Native invocation IDs are unchanged;
+the review ID and its durable event keys fit the existing interaction columns.
+
+Stop uses the same selected chat/Session/root/assistant binding as observation.
+The request requires the initiating Session, root and nullable assistant; a missing
+or malformed binding is rejected, and a changed binding is a conflict before any
+cancellation is dispatched. A runtime-only root has an explicit null assistant
+and never completes another message by fallback. After dispatch, cancellation
+continues only against its captured root; delayed responses, reconciliation and
+rollback cannot mutate a successor binding or newer root facts. Browser cleanup
+belongs to the initiating operation, and Stop status reads never overlap.
+Reconciliation follows the committed cancelling lifecycle independently of ACK
+latency, including roots without an assistant message. The `cancelPending`
+response flag describes the bounded acknowledgement wait, not execution
+settlement. A scheduled or in-flight status read occupies the same operation's
+single reconciliation slot until it settles.
+
+When a committed Stop outcome restores the same attachable binding, live
+observation recovers through the existing bounded GET retry owner. This includes
+reconciliation after a pending cancellation is rejected, not only an HTTP error.
+The handoff preserves the budget and cursor, never replays the turn, and leaves
+paused/terminal outcomes to their existing lifecycle semantics.

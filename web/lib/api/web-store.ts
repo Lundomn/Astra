@@ -1,3 +1,5 @@
+import type { StreamEventState } from "@/lib/api/stream-event-handler";
+import { resumeStreamProjection } from "@/lib/api/stream-event-helpers";
 import { isArtifactPublicationV1 } from "@astra/sdk";
 import { appendExplainFact, markExplainGap, beginExplainRepair, finishExplainRepair } from "@/lib/explain-analyze-observation";
 import type { RuntimeConfig } from "@/lib/runtime-config";
@@ -38,6 +40,7 @@ import {
 } from "@/lib/workspace-authority";
 import type {
   ChatDetail,
+  StopRunRequest,
   ChatListResponse,
   ChatMessage,
   ChatSummary,
@@ -54,7 +57,8 @@ import type {
 } from "@/lib/api/types";
 import {
   makeActiveRunRecord,
-  maxNextEventIndex,
+  sameRunBinding,
+  type ChatRunBinding,
   mergeRunStreamBinding,
   normalizeNextEventIndex,
   type ChatActiveRunRecord,
@@ -66,6 +70,7 @@ type ChatRecord = ChatSummary & {
   archivedAt?: string | null;
   backendSessionId?: string | null;
   messages: ChatMessage[];
+  streamProjection?: ChatStreamProjection;
   workspaceSelection?: WorkspaceSelection;
   activeRun?: ChatActiveRunRecord;
   locallyStoppedRuns?: Record<string, string>;
@@ -75,6 +80,69 @@ type ChatRecord = ChatSummary & {
     options: ComposerOptions;
   };
 };
+
+type ChatStreamProjection = {
+  assistantMessageId: string;
+  sessionId: string;
+  state: StreamEventState;
+  writer?: AbortController;
+};
+
+export type ChatStreamProjectionLease = {
+  ownerUserId: string;
+  chatId: string;
+  projection: ChatStreamProjection;
+  writer: AbortController;
+};
+
+export class ChatStreamProjectionError extends Error {
+  constructor(readonly code: "stream_projection_busy" | "stream_continuation_unavailable") {
+    super(code === "stream_projection_busy"
+      ? "This message is already being observed by another connection."
+      : "The complete stream continuation is unavailable. Reopen the session to inspect its recorded state.");
+  }
+}
+
+/** One current raw projection, owned by the existing chat rather than a physical reader. */
+export function claimChatStreamProjection(ownerUserId: string, chatId: string, assistantMessageId: string,
+  writer: AbortController, binding: { sessionId: string; runId?: string; nextEventIndex?: number }) {
+  const chat = getStore(ownerUserId).chats.find(item => item.id === chatId);
+  if (!chat?.messages.some(message => message.id === assistantMessageId && message.role === "assistant")) {
+    throw new ChatStreamProjectionError("stream_continuation_unavailable");
+  }
+  const projection = chat.streamProjection;
+  if (projection?.writer && !projection.writer.signal.aborted) {
+    throw new ChatStreamProjectionError("stream_projection_busy");
+  }
+  if (projection && (projection.assistantMessageId !== assistantMessageId ||
+    projection.sessionId && binding.sessionId && projection.sessionId !== binding.sessionId ||
+    binding.runId && projection.state.runId !== binding.runId)) {
+    throw new ChatStreamProjectionError("stream_continuation_unavailable");
+  }
+  if (!projection) throw new ChatStreamProjectionError("stream_continuation_unavailable");
+  if (projection.state.protocolError || (binding.nextEventIndex ?? 0) > (projection.state.nextEventIndex ?? 0)) {
+    throw new ChatStreamProjectionError("stream_continuation_unavailable");
+  }
+  projection.writer = writer;
+  return { ownerUserId, chatId, projection, writer } satisfies ChatStreamProjectionLease;
+}
+
+export function withChatStreamProjection(lease: ChatStreamProjectionLease, apply: () => void): boolean {
+  const chat = getStore(lease.ownerUserId).chats.find(item => item.id === lease.chatId);
+  if (chat?.streamProjection !== lease.projection || lease.projection.writer !== lease.writer ||
+    lease.writer.signal.aborted) return false;
+  try { apply(); } catch (error) { lease.projection.state.protocolError = true; throw error; }
+  return true;
+}
+
+export function releaseChatStreamProjection(lease: ChatStreamProjectionLease) {
+  if (lease.projection.writer === lease.writer) lease.projection.writer = undefined;
+}
+
+function discardChatStreamProjection(chat: ChatRecord) {
+  chat.streamProjection?.writer?.abort();
+  chat.streamProjection = undefined;
+}
 
 export class StaleDeferredRunError extends Error {
   constructor(message = "No active run is available for deferred input.") {
@@ -158,90 +226,36 @@ function isStoppableAssistantMessage(message: ChatMessage) {
   );
 }
 
-function findStoppableAssistantMessage(
-  chat: ChatRecord,
-  assistantMessageId?: string | null,
-) {
-  if (assistantMessageId) {
-    const matched = chat.messages.find(
-      (message) =>
-        message.id === assistantMessageId &&
-        isStoppableAssistantMessage(message),
-    );
-    if (matched) {
-      return matched;
-    }
-  }
-
-  for (let index = chat.messages.length - 1; index >= 0; index -= 1) {
-    const message = chat.messages[index];
-    if (message && isStoppableAssistantMessage(message)) {
-      return message;
-    }
-  }
-  return null;
-}
-
-function cloneChatMessage(message: ChatMessage): ChatMessage {
+function stoppedAssistantMessageController(assistantMessageId: string | null) {
+  let snapshot: { message: ChatMessage; applied: ChatMessage; lastMessageAt: string;
+    lastMessagePreview: ChatRecord["lastMessagePreview"]; appliedAt: string } | undefined;
   return {
-    ...message,
-    attachments: message.attachments
-      ? message.attachments.map((attachment) => ({ ...attachment }))
-      : undefined,
-    artifacts: message.artifacts
-      ? message.artifacts.map((artifact) => ({ ...artifact }))
-      : undefined,
-  };
-}
-
-function stoppedAssistantMessageController(
-  chat: ChatRecord,
-  assistantMessageId?: string | null,
-): {
-  complete: (currentChat: ChatRecord) => boolean;
-  restore: (currentChat: ChatRecord) => void;
-} {
-  const message = findStoppableAssistantMessage(chat, assistantMessageId);
-  const snapshot = message
-    ? {
-        message: cloneChatMessage(message),
-        lastMessageAt: chat.lastMessageAt,
-        lastMessagePreview: chat.lastMessagePreview,
-      }
-    : null;
-  return {
-    complete(currentChat) {
-      const currentMessage = findStoppableAssistantMessage(
-        currentChat,
-        assistantMessageId,
-      );
-      if (!currentMessage) {
-        return false;
-      }
-
-      currentMessage.content = currentMessage.content.trim()
-        ? `${currentMessage.content}${currentMessage.content.endsWith("\n") ? "" : "\n"}\nStopped.`
-        : "Stopped.";
-      currentMessage.status = "complete";
-      currentMessage.completedAt = nowIso();
-      currentMessage.reasoningStatus = "complete";
-      currentChat.lastMessageAt = nowIso();
-      currentChat.lastMessagePreview = currentMessage.content;
+    complete(chat: ChatRecord) {
+      if (snapshot || !assistantMessageId) return false;
+      const message = chat.messages.find(item => item.id === assistantMessageId && isStoppableAssistantMessage(item));
+      if (!message) return false;
+      const previous = { ...message };
+      const timestamp = nowIso();
+      Object.assign(message, {
+        content: message.content.trim()
+          ? `${message.content}${message.content.endsWith("\n") ? "" : "\n"}\nStopped.` : "Stopped.",
+        status: "complete", completedAt: timestamp, reasoningStatus: "complete",
+      });
+      snapshot = { message: previous, applied: { ...message }, lastMessageAt: chat.lastMessageAt,
+        lastMessagePreview: chat.lastMessagePreview, appliedAt: timestamp };
+      chat.lastMessageAt = timestamp;
+      chat.lastMessagePreview = message.content;
       return true;
     },
-    restore(currentChat) {
-      if (!snapshot) {
-        return;
-      }
-      const messageIndex = currentChat.messages.findIndex(
-        (message) => message.id === snapshot.message.id,
-      );
-      if (messageIndex === -1) {
-        return;
-      }
-      currentChat.messages[messageIndex] = cloneChatMessage(snapshot.message);
-      currentChat.lastMessageAt = snapshot.lastMessageAt;
-      currentChat.lastMessagePreview = snapshot.lastMessagePreview;
+    restore(chat: ChatRecord) {
+      if (!snapshot) return;
+      const { message: previous, applied } = snapshot;
+      const message = chat.messages.find(item => item.id === previous.id);
+      if (!message) return;
+      Object.assign(message, Object.fromEntries((["content", "status", "completedAt", "reasoningStatus"] as const)
+        .filter(key => message[key] === applied[key]).map(key => [key, previous[key]])));
+      if (chat.lastMessageAt === snapshot.appliedAt) chat.lastMessageAt = snapshot.lastMessageAt;
+      if (chat.lastMessagePreview === applied.content) chat.lastMessagePreview = snapshot.lastMessagePreview;
     },
   };
 }
@@ -343,89 +357,36 @@ function isLocallyStoppedRun(
 }
 
 async function reconcileStoppedRun(
-  ownerUserId: string,
-  chatId: string,
   runId: string,
-): Promise<ChatDetail["activeRun"]> {
-  const store = getStore(ownerUserId);
-  const chat = store.chats.find((item) => item.id === chatId);
-  if (!chat) {
-    return undefined;
-  }
+  ownedChat: () => ChatRecord | undefined,
+): Promise<void> {
+  if (!ownedChat()) return;
   const client = await getRuntimeClient({
-    auth: "required",
-    operation: `reconcile stopped run ${runId}`,
-  }).catch((error) => {
-    console.warn(
-      "Failed to initialize runtime client for stop reconciliation:",
-      runtimeErrorDetail(error),
-    );
-    return null;
-  });
-  if (!client) {
-    return publicActiveRun(chat.activeRun);
-  }
-
-  let runStatus: RunStatus;
+    auth: "required", operation: `reconcile stopped run ${runId}`,
+  }).catch(() => null);
+  if (!client || !ownedChat()) return;
+  let status: RunStatus;
   try {
-    runStatus = await client.sdk.getRunStatus(runId);
+    status = await client.sdk.getRunStatus(runId);
   } catch (error) {
-    if (
-      error instanceof RuntimeClientError &&
-      error.status &&
-      [404, 409, 410].includes(error.status)
-    ) {
+    const chat = ownedChat();
+    if (!chat) return;
+    if (error instanceof RuntimeClientError && error.status && [404, 409, 410].includes(error.status)) {
       forgetLocallyStoppedRun(chat, runId);
-      if (chat.activeRun?.runId === runId) {
-        chat.activeRun = undefined;
-      }
-      return publicActiveRun(chat.activeRun);
-    }
-    console.warn("Failed to reconcile stopped run:", runtimeErrorDetail(error));
-    return publicActiveRun(chat.activeRun);
-  }
-
-  if (runStatus.sessionId !== backendSessionIdForChat(chat)) {
-    forgetLocallyStoppedRun(chat, runId);
-    if (chat.activeRun?.runId === runId) {
       chat.activeRun = undefined;
+    } else {
+      console.warn("Failed to reconcile stopped run:", runtimeErrorDetail(error));
     }
-    return publicActiveRun(chat.activeRun);
+    return;
   }
-
-  if (isTerminalChatRunStatus(runStatus.status)) {
+  const chat = ownedChat();
+  if (!chat || status.runId !== runId || status.sessionId !== backendSessionIdForChat(chat)) return;
+  if (isTerminalChatRunStatus(status.status)) {
     forgetLocallyStoppedRun(chat, runId);
-    if (chat.activeRun?.runId === runId) {
-      chat.activeRun = undefined;
-    }
-    return publicActiveRun(chat.activeRun);
+    chat.activeRun = undefined;
   }
-
-  if (runBlocksChatTurn(runStatus.status) && chat.activeRun?.runId === runId) {
-    chat.activeRun = makeActiveRunRecord(
-      isLocallyStoppedRun(chat, runId)
-        ? {
-            runId,
-            status: "cancelling",
-            waitingFor: "cancel_requested",
-            assistantMessageId: chat.activeRun.assistantMessageId ?? null,
-            nextEventIndex: chat.activeRun.nextEventIndex ?? null,
-          }
-        : {
-            runId: runStatus.runId,
-            status: runStatus.status,
-            waitingFor: runStatus.waitingFor ?? null,
-            assistantMessageId: chat.activeRun.assistantMessageId ?? null,
-            nextEventIndex: maxNextEventIndex(
-              chat.activeRun.nextEventIndex,
-              runStatus.eventsCount,
-            ),
-          },
-      isLocallyStoppedRun(chat, runId) ? "local_mutation" : "backend_poll",
-    );
-  }
-
-  return publicActiveRun(chat.activeRun);
+  // Nonterminal polling cannot reverse an admitted local cancellation. The
+  // existing stopped-run marker and hydration owner retain that intent.
 }
 
 function compareActiveRunDeterministically(
@@ -479,21 +440,25 @@ function backendSessionIdForChat(chat: ChatRecord) {
 }
 
 function publicActiveRun(
-  activeRun?: ChatActiveRunRecord,
+  chat: ChatRecord,
 ): ChatDetail["activeRun"] {
+  const activeRun = chat.activeRun;
   if (!activeRun) {
     return undefined;
   }
+  const assistant = chat.messages.find(message =>
+    message.id === activeRun.assistantMessageId && message.role === "assistant");
+  const projection = chat.streamProjection;
+  const nextEventIndex = assistant && projection && !projection.state.protocolError &&
+    projection.assistantMessageId === assistant.id && projection.state.runId === activeRun.runId &&
+    projection.sessionId === backendSessionIdForChat(chat)
+    ? normalizeNextEventIndex(projection.state.nextEventIndex) : null;
   return {
     runId: activeRun.runId,
     status: activeRun.status,
     waitingFor: activeRun.waitingFor ?? null,
-    ...(activeRun.assistantMessageId
-      ? { assistantMessageId: activeRun.assistantMessageId }
-      : {}),
-    ...(normalizeNextEventIndex(activeRun.nextEventIndex) !== null
-      ? { nextEventIndex: normalizeNextEventIndex(activeRun.nextEventIndex) }
-      : {}),
+    ...(assistant ? { assistantMessageId: assistant.id } : {}),
+    ...(nextEventIndex !== null ? { nextEventIndex } : {}),
   };
 }
 
@@ -805,7 +770,7 @@ export function getChat(
       messageCount: chat.messages.length,
     },
     project: project ? { id: project.id, name: project.name } : undefined,
-    activeRun: publicActiveRun(chat.activeRun),
+    activeRun: publicActiveRun(chat),
     pendingTurn: chat.pendingTurn,
     workspaceSelection: chat.workspaceSelection,
     workspaceSelectionExplicit: Boolean(chat.workspaceSelection),
@@ -992,15 +957,8 @@ export function beginStreamingMessage(
   if (pendingUserMessage && payload.options?.activeSkills?.length) {
     pendingUserMessage.activeSkills = payload.options.activeSkills;
   }
-  const assistantMessage: ChatMessage = {
-    id: crypto.randomUUID(),
-    role: "assistant",
-    content: "",
-    createdAt: timestamp,
-    reasoning: "",
-    reasoningStatus: "streaming",
-    status: "streaming",
-  };
+  const assistantMessage = streamingAssistantMessage(chat, crypto.randomUUID(), timestamp,
+    { sessionId: chat.backendSessionId ?? "", nextEventIndex: 0 });
 
   if (pendingUserMessage) {
     chat.messages.push(assistantMessage);
@@ -1087,7 +1045,13 @@ function deferredRunInputIdempotencyKey(runId: string, userMessageId: string) {
   return `web-deferred:${runId}:${userMessageId}`;
 }
 
-function streamingAssistantMessage(id: string, createdAt: string): ChatMessage {
+function streamingAssistantMessage(chat: ChatRecord, id: string, createdAt: string,
+  binding: { sessionId: string; runId?: string; nextEventIndex: number }): ChatMessage {
+  discardChatStreamProjection(chat);
+  chat.streamProjection = { assistantMessageId: id, sessionId: binding.sessionId, state: {
+    assistantText: "", assistantRawText: "", reasoningText: "", lastStatus: "streaming",
+    protocolError: false, runLifecycle: "running", runId: binding.runId, nextEventIndex: binding.nextEventIndex,
+  } };
   return {
     id,
     role: "assistant",
@@ -1109,9 +1073,11 @@ function findAssistantMessageAfter(
   if (userIndex === -1) {
     return undefined;
   }
-  return messages
-    .slice(userIndex + 1)
-    .find((message) => message.role === "assistant");
+  for (const message of messages.slice(userIndex + 1)) {
+    if (message.role === "user") break;
+    if (message.role === "assistant") return message;
+  }
+  return undefined;
 }
 
 export async function queueDeferredRunInput(
@@ -1146,43 +1112,20 @@ export async function queueDeferredRunInput(
     payload.pendingMessageId.trim()
       ? payload.pendingMessageId.trim()
       : crypto.randomUUID();
-  const existingUserMessage = chat.messages.find(
-    (message) => message.id === userMessageId && message.role === "user",
-  );
-  if (existingUserMessage && chat.activeRun) {
-    let assistantMessage = findAssistantMessageAfter(
-      chat.messages,
-      existingUserMessage.id,
-    );
-    if (!assistantMessage) {
-      assistantMessage = streamingAssistantMessage(
-        crypto.randomUUID(),
-        nowIso(),
-      );
-      chat.messages.push(assistantMessage);
-    }
-    chat.activeRun = mergeRunStreamBinding(
-      makeActiveRunRecord(
-        {
-          ...chat.activeRun,
-          assistantMessageId: assistantMessage.id,
-        },
-        "local_mutation",
-      ),
-      chat.activeRun,
-    );
-    return {
-      userMessage: existingUserMessage,
-      assistantMessage,
-      activeRun: publicActiveRun(chat.activeRun),
-    };
-  }
+  const existingResponse = (current: ChatRecord) => {
+    const userMessage = current.messages.find(message => message.id === userMessageId && message.role === "user");
+    const assistantMessage = userMessage && findAssistantMessageAfter(current.messages, userMessageId);
+    // Idempotent acknowledgement must not reset a live projection or reselect an older message.
+    return userMessage && assistantMessage ? { userMessage, assistantMessage, activeRun: publicActiveRun(current) } : undefined;
+  };
+  const previous = existingResponse(chat);
+  if (previous) return previous;
 
+  const activeRunId = chat.activeRun.runId;
   const client = await requireRuntimeClient({
     auth: "required",
-    operation: `submit deferred run input for ${chat.activeRun.runId}`,
+    operation: `submit deferred run input for ${activeRunId}`,
   });
-  const activeRunId = chat.activeRun.runId;
 
   // Verify chat hasn't changed after obtaining the client.
   chat = findChat();
@@ -1214,26 +1157,23 @@ export async function queueDeferredRunInput(
   }
 
   if (
-    runStatus.sessionId !== backendSessionIdForChat(chat) ||
+    runStatus.runId !== activeRunId || runStatus.sessionId !== backendSessionIdForChat(chat) ||
     !runBlocksChatTurn(runStatus.status)
   ) {
     chat.activeRun = undefined;
     throw new StaleDeferredRunError("The previous run is no longer active.");
   }
-  // Final guard: another concurrent operation (e.g. stop) may have cleared
-  // or replaced chat.activeRun between findChat() and this mutation point.
-  if (chat.activeRun?.runId !== activeRunId) {
-    throw new StaleDeferredRunError(
-      "The run was superseded before input could be submitted.",
-    );
-  }
+  const nextEventIndex = normalizeNextEventIndex(runStatus.eventsCount);
+  if (nextEventIndex === null) throw new Error("The run did not supply a valid continuation cursor.");
+  const accepted = existingResponse(chat);
+  if (accepted) return accepted;
   chat.activeRun = makeActiveRunRecord(
     {
       runId: runStatus.runId,
       status: runStatus.status,
       waitingFor: runStatus.waitingFor ?? null,
       assistantMessageId: chat.activeRun.assistantMessageId ?? null,
-      nextEventIndex: normalizeNextEventIndex(runStatus.eventsCount),
+      nextEventIndex: chat.activeRun.nextEventIndex ?? null,
     },
     "backend_poll",
   );
@@ -1243,52 +1183,55 @@ export async function queueDeferredRunInput(
     payload.options?.activeTools,
     payload.options?.webSearch,
   );
-  try {
-    await client.sdk.submitRunInput(activeRunId, {
-      idempotencyKey: deferredRunInputIdempotencyKey(
-        activeRunId,
-        userMessageId,
-      ),
-      input: {
-        content: payload.content,
-        active_skills: activeSkills,
-        active_tools: activeTools,
-      },
-    });
-  } catch (error) {
-    if (
-      error instanceof RuntimeClientError &&
-      error.status &&
-      [404, 409, 410].includes(error.status)
-    ) {
-      chat.activeRun = undefined;
-      throw new StaleDeferredRunError("The previous run is no longer active.");
+  if (!chat.messages.some(message => message.id === userMessageId && message.role === "user")) {
+    try {
+      await client.sdk.submitRunInput(activeRunId, {
+        idempotencyKey: deferredRunInputIdempotencyKey(
+          activeRunId,
+          userMessageId,
+        ),
+        input: {
+          content: payload.content,
+          active_skills: activeSkills,
+          active_tools: activeTools,
+        },
+      });
+    } catch (error) {
+      if (
+        error instanceof RuntimeClientError &&
+        error.status &&
+        [404, 409, 410].includes(error.status)
+      ) {
+        chat.activeRun = undefined;
+        throw new StaleDeferredRunError("The previous run is no longer active.");
+      }
+      throw error;
     }
-    throw error;
   }
 
   // Final verification after submitRunInput.
   chat = findChat();
-  if (!chat?.activeRun || chat.activeRun.runId !== activeRunId) {
+  if (!chat?.activeRun || chat.activeRun.runId !== activeRunId ||
+    backendSessionIdForChat(chat) !== runStatus.sessionId) {
     throw new StaleDeferredRunError("The run changed after input submission.");
   }
 
+  const concurrent = existingResponse(chat);
+  if (concurrent) return concurrent;
+  const existingUser = chat.messages.find(message => message.id === userMessageId && message.role === "user");
+  if (existingUser && chat.messages.slice(chat.messages.indexOf(existingUser) + 1).some(message => message.role === "user")) {
+    throw new Error("The queued input was superseded by a newer message.");
+  }
   const timestamp = nowIso();
-  const userMessage: ChatMessage = {
-    id: userMessageId,
-    role: "user",
-    content: payload.content,
+  const userMessage: ChatMessage = existingUser ?? {
+    id: userMessageId, role: "user", content: payload.content,
     activeSkills: activeSkills.length ? activeSkills : undefined,
     activeTools: activeTools.length ? activeTools : undefined,
-    createdAt: timestamp,
-    status: "complete",
+    createdAt: timestamp, status: "complete",
   };
-  const assistantMessage = streamingAssistantMessage(
-    crypto.randomUUID(),
-    timestamp,
-  );
-
-  chat.messages.push(userMessage);
+  const assistantMessage = streamingAssistantMessage(chat, crypto.randomUUID(), timestamp,
+    { sessionId: runStatus.sessionId, runId: activeRunId, nextEventIndex });
+  if (!existingUser) chat.messages.push(userMessage);
   chat.messages.push(assistantMessage);
   chat.lastMessageAt = timestamp;
   chat.lastMessagePreview = payload.content;
@@ -1301,7 +1244,7 @@ export async function queueDeferredRunInput(
       status: "input-queued",
       waitingFor: "user_input",
       assistantMessageId: assistantMessage.id,
-      nextEventIndex: normalizeNextEventIndex(runStatus.eventsCount),
+      nextEventIndex,
     },
     "local_mutation",
   );
@@ -1309,134 +1252,83 @@ export async function queueDeferredRunInput(
   return {
     userMessage,
     assistantMessage,
-    activeRun: publicActiveRun(chat.activeRun),
+    activeRun: publicActiveRun(chat),
   };
+}
+
+function storedRunBinding(chat: ChatRecord): ChatRunBinding | null {
+  return chat.activeRun?.runId ? {
+    chatId: chat.id, sessionId: backendSessionIdForChat(chat), runId: chat.activeRun.runId,
+    assistantMessageId: chat.activeRun.assistantMessageId ?? null,
+  } : null;
+}
+
+export class StaleRunBindingError extends Error {
+  constructor() { super("The selected run changed while Stop was in progress."); }
 }
 
 export async function stopActiveRun(
   ownerUserId: string,
   chatId: string,
+  requested: StopRunRequest,
   options?: { skipSync?: boolean; cancelTimeoutMs?: number },
 ) {
-  if (!options?.skipSync) {
-    await syncBackendSessions(ownerUserId);
-  }
-  const store = getStore(ownerUserId);
-  const chat = store.chats.find((item) => item.id === chatId);
-  if (!chat) {
-    return null;
-  }
-  if (!chat.activeRun?.runId) {
-    throw new Error("No active run is available to stop.");
-  }
-
-  const previousActiveRun = chat.activeRun;
-  const runId = previousActiveRun.runId;
-  const stoppedMessage = stoppedAssistantMessageController(
-    chat,
-    previousActiveRun.assistantMessageId ?? null,
-  );
+  if (!options?.skipSync) await syncBackendSessions(ownerUserId);
+  const findChat = () => getStore(ownerUserId).chats.find(item => item.id === chatId);
+  if (!findChat()) return null;
+  const binding: ChatRunBinding = { ...requested, chatId };
+  const boundChat = () => {
+    const chat = findChat();
+    return chat && sameRunBinding(storedRunBinding(chat), binding) ? chat : undefined;
+  };
+  if (!boundChat()) throw new StaleRunBindingError();
   const client = await requireRuntimeClient({
-    auth: "required",
-    operation: `cancel active run ${runId}`,
+    auth: "required", operation: `cancel active run ${binding.runId}`,
   });
-
-  let stoppedMessageCompleted = false;
-  const persistStoppedAssistantMessage = () => {
-    if (stoppedMessageCompleted) {
-      return;
-    }
-    const currentStore = getStore(ownerUserId);
-    const currentChat = currentStore.chats.find((item) => item.id === chatId);
-    if (!currentChat) {
-      return;
-    }
-    stoppedMessageCompleted = stoppedMessage.complete(currentChat);
-    if (stoppedMessageCompleted && currentChat.projectId) {
-      touchProjectInStore(currentStore, currentChat.projectId);
+  const chat = boundChat();
+  if (!chat) throw new StaleRunBindingError();
+  const previousRun = chat.activeRun!;
+  const cancellingRun = makeActiveRunRecord({ ...previousRun, status: "cancelling" }, "local_mutation");
+  chat.activeRun = cancellingRun;
+  rememberLocallyStoppedRun(chat, binding.runId);
+  const ownedChat = () => {
+    const current = boundChat();
+    return current?.activeRun === cancellingRun ? current : undefined;
+  };
+  const message = stoppedAssistantMessageController(binding.assistantMessageId);
+  const completeMessage = () => {
+    const current = ownedChat();
+    if (!current) return;
+    if (message.complete(current) && current.projectId) {
+      touchProjectInStore(getStore(ownerUserId), current.projectId);
     }
   };
-
-  rememberLocallyStoppedRun(chat, runId);
-  chat.activeRun = makeActiveRunRecord(
-    {
-      runId,
-      status: "cancelling",
-      waitingFor: previousActiveRun.waitingFor ?? null,
-      assistantMessageId: previousActiveRun.assistantMessageId ?? null,
-      nextEventIndex: previousActiveRun.nextEventIndex ?? null,
-    },
-    "local_mutation",
-  );
-
-  const restorePreviousRun = () => {
-    const currentChat = getStore(ownerUserId).chats.find(
-      (item) => item.id === chatId,
-    );
-    if (currentChat?.activeRun?.runId !== runId) {
-      return;
-    }
-    forgetLocallyStoppedRun(currentChat, runId);
-    if (stoppedMessageCompleted) {
-      stoppedMessage.restore(currentChat);
-    }
-    currentChat.activeRun = makeActiveRunRecord(
-      {
-        runId,
-        status: previousActiveRun.status,
-        waitingFor: previousActiveRun.waitingFor ?? null,
-        assistantMessageId: previousActiveRun.assistantMessageId ?? null,
-        nextEventIndex: previousActiveRun.nextEventIndex ?? null,
-      },
-      "local_mutation",
-    );
+  const restore = () => {
+    const current = ownedChat();
+    if (!current) return;
+    forgetLocallyStoppedRun(current, binding.runId);
+    message.restore(current);
+    current.activeRun = previousRun;
   };
-
   let cancelPending: boolean;
   try {
-    cancelPending = await settleRuntimeCancel(
-      client.sdk.cancelRun(runId),
-      options?.cancelTimeoutMs,
-      (settled) => {
+    cancelPending = await settleRuntimeCancel(client.sdk.cancelRun(binding.runId), options?.cancelTimeoutMs,
+      settled => {
         if (settled.status === "completed") {
-          persistStoppedAssistantMessage();
-          void reconcileStoppedRun(ownerUserId, chatId, runId);
-          return;
-        }
-        restorePreviousRun();
-      },
-    );
+          completeMessage();
+          void reconcileStoppedRun(binding.runId, ownedChat);
+        } else restore();
+      });
   } catch (error) {
-    restorePreviousRun();
+    restore();
     throw error;
   }
-
-  if (cancelPending) {
-    const currentChat = getStore(ownerUserId).chats.find(
-      (item) => item.id === chatId,
-    );
-    if (currentChat?.activeRun?.runId === runId) {
-      currentChat.activeRun = makeActiveRunRecord(
-        {
-          runId,
-          status: "cancelling",
-          waitingFor: "cancel_requested",
-          assistantMessageId: previousActiveRun.assistantMessageId ?? null,
-          nextEventIndex: previousActiveRun.nextEventIndex ?? null,
-        },
-        "local_mutation",
-      );
-    }
-    persistStoppedAssistantMessage();
-  } else {
-    persistStoppedAssistantMessage();
-    await reconcileStoppedRun(ownerUserId, chatId, runId);
-  }
-
-  return {
-    activeRun: publicActiveRun(chat.activeRun),
-    cancelPending,
-  };
+  const current = ownedChat();
+  if (cancelPending && current) cancellingRun.waitingFor = "cancel_requested";
+  completeMessage();
+  if (!cancelPending) await reconcileStoppedRun(binding.runId, ownedChat);
+  const selected = findChat();
+  return selected ? { activeRun: publicActiveRun(selected), cancelPending } : null;
 }
 
 export async function resumeActiveRun(ownerUserId: string, chatId: string) {
@@ -1453,30 +1345,63 @@ export async function resumeActiveRun(ownerUserId: string, chatId: string) {
     throw new Error("Only paused runs can be resumed.");
   }
 
+  const runId = chat.activeRun.runId;
+  const sessionId = backendSessionIdForChat(chat);
+  const assistantMessageId = chat.activeRun.assistantMessageId;
+  const binding = storedRunBinding(chat)!;
+  const currentChat = () => {
+    const current = getStore(ownerUserId).chats.find(item => item.id === chatId);
+    if (!current || !sameRunBinding(storedRunBinding(current), binding)) {
+      throw new Error("The run changed while resume was in progress.");
+    }
+    return current;
+  };
   const client = await requireRuntimeClient({
     auth: "required",
-    operation: `resume active run ${chat.activeRun.runId}`,
+    operation: `resume active run ${runId}`,
   });
-
-  const resumed = await client.sdk.resumeRun(chat.activeRun.runId);
+  const beforeResume = currentChat();
+  const previousRun = beforeResume.activeRun;
+  const projection = beforeResume.streamProjection;
+  const lifecycle = projection?.state.runLifecycle;
+  const lastStatus = projection?.state.lastStatus;
+  const terminalStatus = projection?.state.terminalStatus;
+  const writer = projection?.writer;
+  const resumed = await client.sdk.resumeRun(runId);
+  const current = currentChat();
+  // Child observations can advance the shared cursor. Only newer root facts
+  // supersede this acknowledgement; metadata polling cannot retire parser state.
+  if (current.streamProjection !== projection ||
+    current.activeRun !== previousRun && current.activeRun?.source !== "backend_poll" ||
+    projection && (projection.state.runLifecycle !== lifecycle ||
+      projection.state.lastStatus !== lastStatus || projection.state.terminalStatus !== terminalStatus)) {
+    return { activeRun: publicActiveRun(current) };
+  }
   if (isArtifactPublicationV1(resumed.artifact_publication)) {
-    const message = chat.messages.find((item) => item.id === chat.activeRun?.assistantMessageId);
+    const message = current.messages.find(item => item.id === assistantMessageId && item.role === "assistant");
     if (message) message.artifactPublication = resumed.artifact_publication;
   }
-  chat.activeRun = makeActiveRunRecord(
+  current.activeRun = makeActiveRunRecord(
     {
-      runId: chat.activeRun.runId,
+      runId,
       status: resumed.status,
       waitingFor: null,
-      assistantMessageId: chat.activeRun.assistantMessageId ?? null,
-      nextEventIndex: chat.activeRun.nextEventIndex ?? null,
+      assistantMessageId: assistantMessageId ?? null,
+      nextEventIndex: current.activeRun!.nextEventIndex ?? null,
     },
     "local_mutation",
   );
+  if (resumed.status === "running" && projection && !projection.state.protocolError &&
+    projection.assistantMessageId === assistantMessageId && projection.sessionId === sessionId &&
+    projection.state.runId === runId && projection.state.runLifecycle === "paused") {
+    writer?.abort();
+    resumeStreamProjection(projection.state);
+    updateStreamingAssistantMessage(ownerUserId, chatId, projection.assistantMessageId, {
+      status: "streaming", reasoningStatus: projection.state.reasoningText ? "streaming" : undefined,
+    });
+  }
 
-  return {
-    activeRun: publicActiveRun(chat.activeRun),
-  };
+  return { activeRun: publicActiveRun(current) };
 }
 
 export function updateStreamingAssistantMessage(
@@ -1511,10 +1436,10 @@ export function updateStreamingAssistantMessage(
     message.content = patch.content;
     chat.lastMessagePreview = patch.content || chat.lastMessagePreview;
   }
-  if (patch.reasoning !== undefined) {
+  if ("reasoning" in patch) {
     message.reasoning = patch.reasoning;
   }
-  if (patch.reasoningStatus !== undefined) {
+  if ("reasoningStatus" in patch) {
     message.reasoningStatus = patch.reasoningStatus;
   }
   if (patch.status !== undefined) {
@@ -1651,6 +1576,7 @@ export async function deleteChat(
     return false;
   }
   await deleteBackendSession(chat);
+  discardChatStreamProjection(chat);
   store.chats = store.chats.filter((item) => item.id !== chatId);
   if (chat.projectId) {
     touchProjectInStore(store, chat.projectId);
@@ -1667,6 +1593,7 @@ export async function deleteArchivedChats(
   for (const chat of archivedChats) {
     await deleteBackendSession(chat);
   }
+  for (const chat of archivedChats) discardChatStreamProjection(chat);
   const archivedIds = new Set(archivedChats.map((chat) => chat.id));
   store.chats = store.chats.filter((chat) => !archivedIds.has(chat.id));
   const touchedProjectIds = new Set(
@@ -1917,6 +1844,9 @@ function chatRecordFromBackendSession(
       )
     : existing?.workspaceSelection;
 
+  if (existing?.streamProjection?.sessionId && existing.streamProjection.sessionId !== session.session_id) {
+    discardChatStreamProjection(existing);
+  }
   return {
     id:
       existing?.id ??
@@ -1931,6 +1861,7 @@ function chatRecordFromBackendSession(
     model,
     backendSessionId: session.session_id,
     messages: existing?.messages ?? [],
+    streamProjection: existing?.streamProjection,
     workspaceSelection,
     activeRun: existing?.activeRun,
     locallyStoppedRuns: existing?.locallyStoppedRuns,
@@ -2057,9 +1988,6 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
         runId: run.runId,
         status: run.status,
         waitingFor: run.waitingFor ?? null,
-        nextEventIndex: normalizeNextEventIndex(
-          (run as { eventsCount?: unknown }).eventsCount,
-        ),
       },
       "backend_poll",
       syncStartedAt,
@@ -2100,9 +2028,11 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
   // disappeared (for example after a developer resets the MatrixOne database).
   // Keeping those shells lets the UI send messages to non-existent sessions and
   // turns a clean 404 into a fake assistant error message.
-  store.chats = store.chats.filter(
-    (chat) => backendChatIds.has(chat.id) || isUnpersistedLocalChat(chat),
-  );
+  store.chats = store.chats.filter((chat) => {
+    const retained = backendChatIds.has(chat.id) || isUnpersistedLocalChat(chat);
+    if (!retained) discardChatStreamProjection(chat);
+    return retained;
+  });
   normalizeCanonicalChatIds(store);
   store.chats.sort((a, b) => b.lastMessageAt.localeCompare(a.lastMessageAt));
 }
@@ -2256,6 +2186,11 @@ async function syncBackendTranscript(
     activeRun.assistantMessageId = assistant.id;
   }
 
+  if (chat.streamProjection) {
+    const messageId = chat.streamProjection.assistantMessageId;
+    const prior = chat.messages.find(message => message.id === messageId);
+    if (!prior || !messages.includes(prior)) discardChatStreamProjection(chat);
+  }
   chat.messages = messages;
   const latest = messages[messages.length - 1];
   chat.lastMessageAt = latest?.createdAt ?? chat.lastMessageAt;
@@ -2405,15 +2340,18 @@ function normalizeCanonicalChatIds(store: Store) {
   const normalized: ChatRecord[] = [];
   for (const chat of store.chats) {
     if (LEGACY_LOCAL_CHAT_IDS.has(chat.id)) {
+      discardChatStreamProjection(chat);
       continue;
     }
     const backendSessionId =
       chat.backendSessionId ??
       (chat.id.startsWith("web-") ? undefined : chat.id);
     if (backendSessionId && seenBackendSessionIds.has(backendSessionId)) {
+      discardChatStreamProjection(chat);
       continue;
     }
     if (seen.has(chat.id)) {
+      discardChatStreamProjection(chat);
       continue;
     }
     seen.add(chat.id);

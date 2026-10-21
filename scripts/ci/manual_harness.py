@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-SCHEMA = "astra.harness_progress.v3"
+SCHEMA = "astra.harness_progress.v5"
 MAX_RECORD = 262_144
 MAX_FILE = 32 * 1024 * 1024
 STATUSES = ("passed", "failed", "cancelled", "unavailable")
@@ -48,7 +48,8 @@ ERROR_KINDS = {"rate_limit", "payment_required", "server_error", "auth", "contex
                "tool_rounds_exhausted", "network", "tool_not_found", "tool_invalid_args",
                "policy_denied", "tool_timeout", "tool_unavailable", "tool_binding",
                "tool_outcome_unknown", "resource_limit", "database_error", "stall",
-               "missing_model_selection", "cancelled", "unknown", "other", "not_reported",
+               "missing_model_selection", "cancelled", "unknown"}
+OUTCOME_ERROR_KINDS = ERROR_KINDS | {"other", "not_reported",
                "delegation_model_scope_unresolved", "delegation_model_unavailable",
                "delegation_preparation_unavailable", "delegation_model_assessment_unavailable",
                "invalid_delegation_model_scope", "execution_time_budget_exhausted"}
@@ -104,9 +105,9 @@ def safe_diagnostic(value, depth):
         return
     kind = value.get("kind")
     fields = {"count": {"min", "max", "actual"}, "exit": {"expected", "actual"},
-              "tool_count": {"min", "max", "actual", "considered", "expected_ok", "outcome_matches", "error_matches", "predicate_matches", "observed_outcomes", "outcomes_omitted"},
+              "tool_count": {"min", "max", "actual", "considered", "expected_ok", "outcome_matches", "error_matches", "predicate_matches", "predicate_mismatches", "observed_outcomes", "outcomes_omitted"},
               "sequence": {"matched", "expected"}, "proof": {"proven"},
-              "judge": {"threshold", "assessment"}, "unavailable": set(), "composite": {"checks"},
+              "judge": {"threshold", "assessment", "failure"}, "unavailable": set(), "composite": {"checks"},
               "child_adoption": {"status", "reason"}}
     fields["cache_scope"] = {"scope", "observations", "post_cold_cache_read_tokens", "executions", "executions_omitted"}
     if kind not in fields or set(value) != {"kind"} | fields[kind]:
@@ -156,6 +157,17 @@ def safe_diagnostic(value, depth):
             raise ValueError("invalid judge assessment")
         if type(value["threshold"]) not in (int, float) or not math.isfinite(value["threshold"]) or not 0 <= value["threshold"] <= 1:
             raise ValueError("invalid judge threshold")
+        failure = value["failure"]
+        if (value["assessment"] == "unavailable") != (failure is not None):
+            raise ValueError("inconsistent judge failure")
+        if failure is not None and (not isinstance(failure, dict)
+            or set(failure) != {"error_kind", "stage"}
+            or not isinstance(failure["error_kind"], str)
+            or failure["error_kind"] not in ERROR_KINDS
+            or not isinstance(failure["stage"], str)
+            or failure["stage"] not in {"request_preparation", "subprocess", "completion",
+                "response_validation", "assessment", "aggregation", "unknown"}):
+            raise ValueError("invalid judge failure")
     elif kind == "proof":
         if type(value["proven"]) is not bool:
             raise ValueError("invalid proof")
@@ -163,7 +175,7 @@ def safe_diagnostic(value, depth):
         if any(type(value[k]) is not int or not -(1 << 31) <= value[k] < (1 << 31) for k in fields[kind]):
             raise ValueError("invalid exit diagnostic")
     else:
-        for key in fields[kind] - {"expected_ok", "error_matches", "predicate_matches", "observed_outcomes"}:
+        for key in fields[kind] - {"expected_ok", "error_matches", "predicate_matches", "predicate_mismatches", "observed_outcomes"}:
             integer(value[key])
         if kind == "tool_count":
             if value["expected_ok"] is not None and type(value["expected_ok"]) is not bool:
@@ -174,6 +186,7 @@ def safe_diagnostic(value, depth):
                 raise ValueError("invalid predicate counts")
             for count in value["predicate_matches"]:
                 integer(count)
+            safe_predicate_mismatches(value)
             outcomes = value["observed_outcomes"]
             if (not isinstance(outcomes, list) or len(outcomes) > 16
                 or len(json.dumps(outcomes, separators=(",", ":"), ensure_ascii=False).encode()) > 8192):
@@ -187,7 +200,7 @@ def safe_diagnostic(value, depth):
                     or (outcome["ok"] is not None and type(outcome["ok"]) is not bool)
                     or outcome["disposition"] not in ("executed", "rejected", "reused", "suppressed", "deferred")
                     or outcome["status"] not in OUTCOME_STATUSES
-                    or outcome["error_kind"] not in ERROR_KINDS
+                    or outcome["error_kind"] not in OUTCOME_ERROR_KINDS
                     or outcome["execution"] not in ("executed", "not_executed", "unknown", "not_reported")):
                     raise ValueError("invalid outcome tags")
                 safe_validation(outcome["validation"])
@@ -196,6 +209,52 @@ def safe_diagnostic(value, depth):
                 observed += entry["count"]
             if observed != value["considered"]:
                 raise ValueError("incomplete outcome accounting")
+
+
+def safe_predicate_mismatches(value):
+    entries = value["predicate_mismatches"]
+    if not isinstance(entries, list) or len(entries) > 16:
+        raise ValueError("invalid predicate mismatches")
+    seen = set()
+    types = {"missing", "null", "boolean", "number", "string", "array", "object"}
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"predicate_index", "failure_count", "first_mismatch"}:
+            raise ValueError("invalid predicate mismatch")
+        index = integer(entry["predicate_index"])
+        if (index >= len(value["predicate_matches"]) or index in seen
+            or integer(entry["failure_count"]) == 0
+            or entry["failure_count"] != value["outcome_matches"] - value["predicate_matches"][index]):
+            raise ValueError("invalid predicate mismatch accounting")
+        seen.add(index)
+        detail = entry["first_mismatch"]
+        if not isinstance(detail, dict):
+            raise ValueError("invalid predicate mismatch detail")
+        reason = detail.get("reason")
+        if reason == "truncated":
+            if set(detail) != {"reason", "limit"} or detail["limit"] not in ("path", "structure"):
+                raise ValueError("invalid predicate truncation")
+            continue
+        fields = {"missing": {"expected_type", "actual_type"},
+                  "type_mismatch": {"expected_type", "actual_type"},
+                  "scalar_mismatch": {"expected_type", "actual_type"},
+                  "substring_absent": {"expected_type", "actual_type"},
+                  "unexpected_members": {"count"},
+                  "array_length_mismatch": {"expected_length", "actual_length"}}
+        if not isinstance(reason, str) or reason not in fields or set(detail) != {"reason", "path"} | fields[reason]:
+            raise ValueError("unexpected predicate mismatch detail")
+        path = detail["path"]
+        if (not isinstance(path, str) or len(path.encode()) > 512
+            or (path and not path.startswith("/"))):
+            raise ValueError("invalid predicate mismatch path")
+        for key in fields[reason]:
+            if key.endswith("_type"):
+                if not isinstance(detail[key], str) or detail[key] not in types:
+                    raise ValueError("invalid predicate JSON type")
+            else:
+                integer(detail[key])
+    failed = sum(count < value["outcome_matches"] for count in value["predicate_matches"])
+    if len(seen) != failed:
+        raise ValueError("incomplete predicate mismatch accounting")
 
 
 def safe_criteria(items, *, owner_passed, depth=0):
@@ -241,7 +300,9 @@ def check_lines(items, prefix):
             threshold = diagnostic.get("threshold", "unknown")
             assessment = diagnostic.get("assessment")
             if assessment == "unavailable":
-                reason = "LLM judge unavailable: evaluation failed; this is NOT a negative quality verdict"
+                failure = diagnostic["failure"]
+                reason = (f"LLM judge unavailable: {failure['error_kind']} at {failure['stage']}; "
+                          "this is NOT a negative quality verdict")
             elif assessment in ("accepted", "rejected"):
                 reason = f"LLM judge {assessment} the declared criterion (acceptance verdict, not a numeric grade)"
             elif check["evaluation"] == "scored":
@@ -259,6 +320,8 @@ def check_lines(items, prefix):
                     reason += f"; error-text matches={diagnostic['error_matches']}"
                 reason += f"; independent predicate matches (YAML order)={diagnostic['predicate_matches']}"
                 reason += "; all predicates must match the SAME call"
+                if diagnostic["predicate_mismatches"]:
+                    reason += "; first predicate mismatches=" + json.dumps(diagnostic["predicate_mismatches"], sort_keys=True)
                 reason += "; observed outcomes=" + json.dumps(diagnostic["observed_outcomes"], sort_keys=True)
                 if diagnostic["outcomes_omitted"]:
                     reason += f"; omitted observations={diagnostic['outcomes_omitted']}"
@@ -563,10 +626,12 @@ def run(root, command, timeout, grace, started_at=None):
             replay.read(root / "progress.jsonl", final=True, emit=True)
             return execution["exit_code"] or (0 if replay.summary(execution, "success")["success"] else 1)
     finally:
-        for sig, handler in handlers.items():
-            signal.signal(sig, handler)
-        write_json(root / "execution.json", execution)
-        write_json(root / "summary.json", replay.summary(execution))
+        try:
+            write_json(root / "execution.json", execution)
+            write_json(root / "summary.json", replay.summary(execution))
+        finally:
+            for sig, handler in handlers.items():
+                signal.signal(sig, handler)
 
 
 def publish(root):

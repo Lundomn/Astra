@@ -3354,6 +3354,15 @@ fn build_provider_request_body_with_cache_capability(
             || message
                 .get(astra_turn_core::tool::result::advisory::TOOL_RESULT_ADVISORIES_FIELD)
                 .is_some()
+            || message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| {
+                    calls.iter().any(|call| {
+                        call.get(astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD)
+                            .is_some()
+                    })
+                })
             || [
                 astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD,
                 astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD,
@@ -3926,8 +3935,73 @@ pub(crate) fn consolidate_system_messages_for_provider(
 const RETIRED_TOOL_RESULT_OPTIONAL_PROJECTION_FIELD: &str =
     "_astra_tool_result_optional_projection";
 
+fn provider_history_ids(messages: &[Value]) -> HashMap<String, String> {
+    use astra_turn_core::tool::args::shape::provider_tool_call_id;
+    messages
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|call| {
+            Some((
+                call.get("id")?.as_str()?.to_owned(),
+                provider_tool_call_id(call)?.to_owned(),
+            ))
+        })
+        .collect()
+}
+
 fn strip_internal_runtime_markers(messages: &mut [Value]) {
+    let provider_ids = provider_history_ids(messages);
+    strip_internal_runtime_markers_with_ids(messages, &provider_ids);
+}
+
+fn strip_internal_runtime_markers_with_ids(
+    messages: &mut [Value],
+    provider_ids: &HashMap<String, String>,
+) {
+    use astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD;
     for message in messages {
+        if message["role"] == "assistant" {
+            if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                for call in calls {
+                    if let Some(original) = call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| provider_ids.get(id))
+                    {
+                        call["id"] = Value::String(original.clone());
+                    }
+                    if let Some(object) = call.as_object_mut() {
+                        object.remove(PROVIDER_TOOL_CALL_ID_FIELD);
+                    }
+                }
+            }
+        } else if message["role"] == "tool" {
+            if let Some(original) = message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .and_then(|id| provider_ids.get(id))
+            {
+                message["tool_call_id"] = Value::String(original.clone());
+            }
+            // Cache annotations carry provider linkage in structural result
+            // blocks as well as the enclosing tool message. Leave result data
+            // and unknown/orphan identities to their existing owners.
+            if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
+                for block in blocks {
+                    if block["type"] == "tool_result" {
+                        if let Some(original) = block
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .and_then(|id| provider_ids.get(id))
+                        {
+                            block["tool_use_id"] = Value::String(original.clone());
+                        }
+                    }
+                }
+            }
+        }
         astra_turn_core::tool::result::advisory::project_advisories(message);
         crate::turn::wire_assembly::strip_required_runtime_preamble_marker(message);
         if let Some(object) = message.as_object_mut() {
@@ -3968,6 +4042,7 @@ fn strip_internal_runtime_markers(messages: &mut [Value]) {
 /// Provider requests render per-tool guidance and remove internal metadata.
 /// Equality checks across these representations must use this same projection,
 /// including its derived content, roles, ordering, and provider-visible fields.
+#[cfg(test)]
 fn project_provider_message_metadata(messages: &[Value]) -> Vec<Value> {
     let mut projected = messages.to_vec();
     for message in &mut projected {
@@ -3985,20 +4060,28 @@ fn project_provider_message_metadata(messages: &[Value]) -> Vec<Value> {
 /// presentation handled at the provider boundary.
 pub(crate) fn provider_request_preserves_projected_canonical_suffix(
     provider_messages: &[Value],
-    canonical_appended: &[Value],
+    canonical_history: &[Value],
+    append_cursor: usize,
 ) -> bool {
-    if canonical_appended.is_empty() {
-        return true;
-    }
-    let Some(suffix_start) = provider_messages
-        .len()
-        .checked_sub(canonical_appended.len())
-    else {
+    let Some(suffix_len) = canonical_history.len().checked_sub(append_cursor) else {
         return false;
     };
-    let provider_suffix = &provider_messages[suffix_start..];
-    project_provider_message_metadata(provider_suffix)
-        == project_provider_message_metadata(canonical_appended)
+    let Some(suffix_start) = provider_messages.len().checked_sub(suffix_len) else {
+        return false;
+    };
+    if suffix_len == 0 {
+        return true;
+    }
+    // Scan only IDs in the prefix; never clone earlier argument/output payloads.
+    // A tool-only suffix still needs its earlier assistant's wire-ID metadata.
+    let mut actual = provider_messages[suffix_start..].to_vec();
+    strip_internal_runtime_markers_with_ids(&mut actual, &provider_history_ids(provider_messages));
+    let mut expected = canonical_history[append_cursor..].to_vec();
+    strip_internal_runtime_markers_with_ids(
+        &mut expected,
+        &provider_history_ids(canonical_history),
+    );
+    actual == expected
 }
 
 fn consolidate_system_messages_inner(
@@ -4079,9 +4162,8 @@ fn consolidate_system_messages_inner(
         out.push(json!({"role": "system", "content": system_parts.join("\n\n")}));
     }
     out.extend(rest);
-    strip_internal_runtime_markers(&mut out);
-
     if !allow_suffix_dependent_history_repair {
+        strip_internal_runtime_markers(&mut out);
         return out;
     }
 
@@ -4148,6 +4230,7 @@ fn consolidate_system_messages_inner(
         }
     }
 
+    strip_internal_runtime_markers(&mut out);
     out
 }
 
@@ -8058,6 +8141,134 @@ pub(crate) fn parse_openai_sse_json_stream(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn annotated_tool_results_preserve_provider_linkage_and_cache_markers() {
+        use astra_turn_core::context::serializer::annotate_last_message_cache_breakpoint;
+        use astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD;
+        let mut messages = vec![json!({"role":"user","content":"Read twice"})];
+        for (id, output) in [
+            ("canonical-first", "first result"),
+            ("canonical-second", "second result"),
+        ] {
+            messages.push(json!({"role":"assistant","tool_calls":[{
+                "id":id,PROVIDER_TOOL_CALL_ID_FIELD:"Ab1234567","type":"function",
+                "function":{"name":"read_file","arguments":"{}"}}]}));
+            messages.push(json!({"role":"tool","tool_call_id":id,"content":output}));
+            annotate_last_message_cache_breakpoint(&mut messages);
+        }
+        let projected = project_provider_message_metadata(&messages);
+        assert_eq!(projected[4]["content"][0]["tool_use_id"], "Ab1234567");
+        assert_eq!(projected[4]["content"][0]["content"], "second result");
+        assert_eq!(
+            projected[4]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert!(provider_request_preserves_projected_canonical_suffix(
+            &projected, &messages, 4
+        ));
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "claude-test",
+            "anthropic",
+            None,
+            None,
+            true,
+            &ThinkingConfig::Off,
+        );
+        let wire = body["messages"].as_array().unwrap();
+        let results: Vec<_> = wire
+            .iter()
+            .filter_map(|m| m["content"].as_array())
+            .flatten()
+            .filter(|b| b["type"] == "tool_result")
+            .collect();
+        assert_eq!(
+            results.len(),
+            2,
+            "both genuine outputs must reach the provider: {body}"
+        );
+        assert!(results.iter().all(|b| b["tool_use_id"] == "Ab1234567"));
+        assert_eq!(results[1]["content"], "second result");
+        assert_eq!(results[1]["cache_control"]["type"], "ephemeral");
+        assert!(!body.to_string().contains(PROVIDER_TOOL_CALL_ID_FIELD));
+        // Structural linkage is projected; similarly named user data is not.
+        let mut with_data = messages.clone();
+        with_data[4]["content"][0]["content"] = json!({"tool_use_id":"canonical-second"});
+        with_data[4]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"tool_result","tool_use_id":"orphan","content":"unowned"}));
+        let projected = project_provider_message_metadata(&with_data);
+        assert_eq!(
+            projected[4]["content"][0]["content"]["tool_use_id"],
+            "canonical-second"
+        );
+        assert_eq!(projected[4]["content"][1]["tool_use_id"], "orphan");
+    }
+
+    #[test]
+    fn provider_id_projection_preserves_reused_wire_ids_and_tool_only_suffix() {
+        use astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD;
+        let canonical = vec![
+            json!({"role":"assistant","reasoning_content":"signed reasoning", "reasoning_signature":"signature",
+                "tool_calls":[{"id":"canonical-first",PROVIDER_TOOL_CALL_ID_FIELD:"Ab1234567", "type":"function", "function":{"name":"read_file","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"canonical-first","name":"read_file","content":"first result"}),
+            json!({"role":"assistant","tool_calls":[{"id":"canonical-second",PROVIDER_TOOL_CALL_ID_FIELD:"Ab1234567", "type":"function", "function":{"name":"read_file","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"canonical-second","name":"read_file","content":"second result"}),
+        ];
+        let projected = project_provider_message_metadata(&canonical);
+        for index in [0, 2] {
+            assert_eq!(projected[index]["tool_calls"][0]["id"], "Ab1234567");
+            assert!(
+                projected[index]["tool_calls"][0]
+                    .get(PROVIDER_TOOL_CALL_ID_FIELD)
+                    .is_none()
+            );
+            assert_eq!(projected[index + 1]["tool_call_id"], "Ab1234567");
+        }
+        assert_eq!(
+            projected[0]["reasoning_signature"],
+            canonical[0]["reasoning_signature"]
+        );
+        assert_eq!(project_provider_message_metadata(&projected), projected);
+        assert!(provider_request_preserves_projected_canonical_suffix(
+            &projected, &canonical, 3
+        ));
+        let mut corrupt = projected.clone();
+        corrupt[3]["tool_call_id"] = json!("wrong");
+        assert!(!provider_request_preserves_projected_canonical_suffix(
+            &corrupt, &canonical, 3
+        ));
+        // Plain unmarked runtime calls are unchanged by provider projection.
+        let native = vec![
+            json!({"role":"assistant","tool_calls":[{"id":"native","type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"native","content":"result"}),
+        ];
+        assert_eq!(project_provider_message_metadata(&native), native);
+        for provider in ["openai", "anthropic", "bedrock"] {
+            let body = build_provider_request_body(
+                &canonical,
+                &[],
+                "fixture",
+                provider,
+                None,
+                None,
+                false,
+                &ThinkingConfig::Off,
+            );
+            let wire = body.to_string();
+            assert!(wire.contains("Ab1234567"), "{provider}: {wire}");
+            assert!(!wire.contains("canonical-first"));
+            assert!(!wire.contains("canonical-second"));
+            assert!(!wire.contains(PROVIDER_TOOL_CALL_ID_FIELD));
+        }
+        let durable = astra_turn_core::runtime_scaffolding::sanitize_durable_message_values(
+            canonical.clone(),
+        );
+        assert_eq!(project_provider_message_metadata(&durable), projected);
+    }
+
+    #[test]
     fn payment_required_preserves_owner_codes_without_echoing_provider_secrets() {
         for code in ["insufficient_credit", "monthly_spend_limit_exceeded"] {
             let error = super::payment_required_error(
@@ -8637,6 +8848,8 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_request_without_catalog_timeout_obeys_total_budget() {
+        // This case targets an admitted request, not cold TLS/client initialization.
+        let _ = global_llm_client();
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
             .route(
@@ -9322,6 +9535,8 @@ mod tests {
 
     #[tokio::test]
     async fn retry_backoff_crossing_total_budget_does_not_create_ghost_attempt() {
+        // This case targets an admitted request, not cold TLS/client initialization.
+        let _ = global_llm_client();
         reset_rate_limit_cooldown_for_tests();
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
@@ -11993,6 +12208,8 @@ mod tests {
 
     #[tokio::test]
     async fn durable_admission_timeout_never_starts_provider_transport() {
+        // This case targets an admitted request, not cold TLS/client initialization.
+        let _ = global_llm_client();
         reset_rate_limit_cooldown_for_tests();
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
@@ -12037,6 +12254,7 @@ mod tests {
 
         assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
         assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(observer.began.load(Ordering::SeqCst), 1);
         assert!(!observer.dispatched.load(Ordering::SeqCst));
     }
 
@@ -16135,7 +16353,7 @@ mod tests {
         })];
         let projected = project_provider_message_metadata(&canonical);
         assert!(provider_request_preserves_projected_canonical_suffix(
-            &projected, &canonical
+            &projected, &canonical, 0
         ));
         assert_eq!(project_provider_message_metadata(&projected), projected);
         assert_eq!(canonical[0]["content"], r#"{"executed":false}"#);
@@ -16150,7 +16368,8 @@ mod tests {
         missing_guidance[0]["content"] = canonical[0]["content"].clone();
         assert!(!provider_request_preserves_projected_canonical_suffix(
             &missing_guidance,
-            &canonical
+            &canonical,
+            0
         ));
     }
 
@@ -16222,6 +16441,7 @@ mod tests {
         assert!(provider_request_preserves_projected_canonical_suffix(
             &provider_messages,
             &canonical_appended,
+            0
         ));
 
         let mut changed_content = canonical_appended.clone();
@@ -16229,6 +16449,7 @@ mod tests {
         assert!(!provider_request_preserves_projected_canonical_suffix(
             &provider_messages,
             &changed_content,
+            0
         ));
 
         let mut reordered = canonical_appended.clone();
@@ -16236,14 +16457,17 @@ mod tests {
         assert!(!provider_request_preserves_projected_canonical_suffix(
             &provider_messages,
             &reordered,
+            0
         ));
         assert!(!provider_request_preserves_projected_canonical_suffix(
             &provider_messages[..2],
             &canonical_appended,
+            0
         ));
         assert!(provider_request_preserves_projected_canonical_suffix(
             &provider_messages,
             &[],
+            0
         ));
     }
 
