@@ -28,7 +28,7 @@ Use these files as the canonical configuration references:
 
 - `ASTRA_ALLOW_INSECURE_DEFAULTS` — dev-only opt-in for bundled defaults on required keys
 - `RUST_LOG` — standard tracing filter (e.g. `warn,astra_runtime=info`)
-- `NO_COLOR` — when present, disables styles in CLI streaming Markdown, including code blocks and tables. `astra chat --no-color` also enables this behavior. Without it, Markdown bold, italic, and headings inherit the terminal foreground and use emphasis attributes so they remain readable on light and dark backgrounds.
+- `NO_COLOR` — when present (including an empty value), disables styles in CLI tool progress and streaming Markdown, including status icons, descriptions, durations, summaries, spinner text, code blocks and tables. Cursor movement and row-clearing commands retain their existing behavior. `astra chat --no-color` also enables this behavior. Without it, Markdown bold, italic, and headings inherit the terminal foreground and use emphasis attributes so they remain readable on light and dark backgrounds.
 
 ### API server
 

@@ -1211,3 +1211,155 @@ async fn one_shot_sigint_keeps_identity_failure_when_event_writer_also_fails() {
         );
     }
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_color_chat_preserves_plain_progress_and_answer() {
+    use axum::{
+        Router,
+        routing::{get, post},
+    };
+    use nix::pty::{Winsize, openpty};
+    use serde_json::json;
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let app = Router::new()
+        .route("/agents/edge", post(|| async { axum::Json(json!({"ok": true})) }))
+        .route("/sessions", post(|| async { axum::Json(json!({"id": "color-session"})) }))
+        .route("/skills", get(|| async { axum::Json(json!({"skills": [], "total": 0, "limit": 100, "next_cursor": null})) }))
+        .route("/models", get(|| async { pipe_model_catalog() }))
+        .route("/chat/stream", post(|| async {
+            let receipt = astra_turn_core::tool_ledger_receipt::ToolLedgerReceipt::new(
+                "color-run", 1, 1, 1, 0,
+                astra_turn_core::tool_ledger_receipt::ToolLedgerResultClassCounts { succeeded: 1, ..Default::default() },
+                1, astra_turn_core::tool_ledger_receipt::EMPTY_TOOL_LEDGER_ROOT, true,
+            );
+            let events = [
+                json!({"type": "session_info", "session_id": "color-session", "run_id": "color-run"}),
+                json!({"type": "tool_call_start", "call_id": "color-tool", "tool": "web_fetch", "arguments": {"url": "https://example.invalid/color-probe"}, "transport": "server_local", "executor": {"kind": "server_local"}}),
+                json!({"type": "tool_call_end", "call_id": "color-tool", "tool": "web_fetch", "status": "completed", "output": "# Offline fixture\n\ncolor-probe", "duration_ms": 125, "transport": "server_local", "executor": {"kind": "server_local"}}),
+                json!({"type": "text_delta", "content": "offline color answer"}),
+                json!({"type": "text_done", "full_text": "offline color answer"}),
+                json!({"type": "usage", "input_tokens": 1, "output_tokens": 3}),
+                json!({"type": "run_finished", "run_id": "color-run", "status": "completed", "owner_generation": 1}),
+                json!({"type": "turn_complete", "has_tool_calls": true, "continuation_owner": "server", "tool_calls_count": 1, "observation_tool_calls_count": 1, "tools_used": ["web_fetch"], "llm_rounds": 1, "tool_ledger_receipt": receipt}),
+            ];
+            let body = events.into_iter().map(|event| format!("data: {event}\n\n")).collect::<String>() + "data: [DONE]\n\n";
+            ([("content-type", "text/event-stream"), (astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER, astra_server_types::AGENT_INTERACTION_API_MAJOR)], body)
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let sgr = regex::Regex::new("\x1b\\[[0-9;:]*m").unwrap();
+    for (case, no_color, flag) in [
+        ("colored", None, false),
+        ("flag", None, true),
+        ("set", Some("1"), false),
+        ("empty", Some(""), false),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let pty = openpty(
+            Some(&Winsize {
+                ws_row: 24,
+                ws_col: 100,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            }),
+            None,
+        )
+        .unwrap();
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_astra"));
+        command.args([
+            "--api-url",
+            &base_url,
+            "--profile",
+            "pipe-e2e",
+            "--model",
+            "mock-model",
+            "--no-instructions",
+        ]);
+        command.arg("chat");
+        if flag {
+            command.arg("--no-color");
+        }
+        command
+            .args([
+                "--no-resume",
+                "--permission-mode",
+                "bypass",
+                "-m",
+                "exercise offline color rendering",
+            ])
+            .current_dir(home.path())
+            .env("HOME", home.path())
+            .env("ASTRA_LOCAL_STATE_ROOT", home.path().join(".astra"))
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env("XDG_CACHE_HOME", home.path().join(".cache"))
+            .env("XDG_DATA_HOME", home.path().join(".local/share"))
+            .env("ASTRA_ACCESS_TOKEN", "pipe-e2e-token")
+            .env("ASTRA_API_URL", &base_url)
+            .env("TERM", "xterm-256color")
+            .env_remove("NO_COLOR")
+            .stdin(Stdio::from(pty.slave.try_clone().unwrap()))
+            .stderr(Stdio::from(pty.slave))
+            .stdout(Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(value) = no_color {
+            command.env("NO_COLOR", value);
+        }
+        // stderr is a real terminal, so the control cannot pass merely because
+        // command_router automatically disables styles for redirected stderr.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let stderr = tokio::task::spawn_blocking(move || {
+            let mut file = std::fs::File::from(pty.master);
+            let mut bytes = Vec::new();
+            let result = file.read_to_end(&mut bytes);
+            if let Err(error) = result {
+                assert_eq!(error.raw_os_error(), Some(libc::EIO));
+            }
+            String::from_utf8(bytes).unwrap()
+        });
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            command.spawn().unwrap().wait_with_output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(command);
+        let stderr = tokio::time::timeout(std::time::Duration::from_secs(5), stderr)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{case}: status={} stdout={:?} stderr={stderr:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            stderr.contains("color-probe"),
+            "{case}: tool progress missing: {stderr}"
+        );
+        assert_eq!(
+            sgr.is_match(&stderr),
+            case == "colored",
+            "{case}: {stderr:?}"
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            stdout.trim(),
+            "offline color answer",
+            "{case}: stdout contract changed"
+        );
+    }
+    server.abort();
+}

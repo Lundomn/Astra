@@ -14696,6 +14696,22 @@ mod tests {
 
     #[test]
     fn test_style_tool_description() {
+        const CHILD: &str = "ASTRA_TEST_STYLED_DESCRIPTION";
+        if std::env::var_os(CHILD).is_none() {
+            let name = format!(
+                "{}::test_style_tool_description",
+                module_path!().split_once("::").unwrap().1
+            );
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env(CHILD, "1")
+                .env_remove("NO_COLOR")
+                .output()
+                .unwrap();
+            assert!(result.status.success(), "{result:?}");
+            assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+            return;
+        }
         // skill
         let s = style_tool_description("skill", "Running skill: code-review");
         assert!(s.contains("code-review"));
@@ -18683,3 +18699,6 @@ mod tests {
         assert_eq!(record.result_class.as_deref(), Some("validation_error"));
     }
 }
+
+#[cfg(test)]
+mod no_color_tests;
