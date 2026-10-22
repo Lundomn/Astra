@@ -9,6 +9,15 @@ use crate::cli::session::session_startup;
 use crate::cli::session::session_state::SessionState;
 use astra_services::session_journal;
 
+pub(crate) fn turn_failure_diagnostic(failure: &crate::TurnFailure) -> String {
+    match failure.partial.error_code.as_deref() {
+        Some(code) if failure.partial.server_admission_not_dispatched => {
+            format!("[{code}] {}", failure.error)
+        }
+        _ => failure.error.clone(),
+    }
+}
+
 pub(crate) async fn reconcile_and_report_turn_failure(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
@@ -290,7 +299,10 @@ pub(crate) fn report_turn_failure(
         &failure.partial,
     );
     {
-        let error_kind = astra_core::ClassifiedError::from(failure.error.clone()).kind;
+        let error_kind = failure
+            .partial
+            .failure_kind
+            .unwrap_or_else(|| astra_core::ClassifiedError::from(failure.error.clone()).kind);
         err_event.metadata = Some(serde_json::json!({
             "error_kind": error_kind.as_str(),
             "retryable": error_kind.is_retryable(),
