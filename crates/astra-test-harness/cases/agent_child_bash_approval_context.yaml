@@ -42,16 +42,18 @@ criteria:
     child: bash
     min: 1
     max: 1
-  - type: journal_tool_json
-    name: agent_fanout
-    document: result
-    path: /provenance/all_slots_delivered
-    equals: true
-  - type: journal_tool_json
-    name: agent_fanout
-    document: result
-    path: /work_unit_observation/status
-    equals: completed
+    min_distinct_child_runs: 1
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+  - type: session_child_result_adopted
+    expected_result: child-approval-ok
+  # Operational health still records rejected attempts. This journey proves
+  # successful child delivery, including recovery from a corrected parent call.
+  - type: session_event_count
+    event_type: turn_evaluation
+    min: 1
   - type: text_equals
     expected: child-approval-ok
   - type: turn_rounds_between

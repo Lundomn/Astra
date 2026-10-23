@@ -2,6 +2,8 @@
 
 Authentication owns identity, session issuance and credential binding. Request-authorized external providers keep their existing authorization protocol; verified scoped-key providers reuse the canonical identity mapping and Astra refresh-session lifecycle.
 
+External provider catalog and runtime-context requests carry the verified `provider_scope_id` and `external_subject` from the authorized principal. The adapter exposes request authorization and these scope-based operations. Current provider-request HMAC and Edge-token admission use local verification; Edge registration also checks revocation. Login, refresh and logout use Astra's canonical authenticated-session services; the retired password/session-handle adapter interfaces and their source-level exports are removed.
+
 ## Identity and provenance
 
 External principals are identified by issuer/provider and subject, never subject or email alone. Memoria's provider ID is `memoria:` followed by the SHA-256 of its normalized issuer URL. The issuer defaults to the configured API base URL; an explicitly stable `MEMORIA_ISSUER` lets administrators move the transport without changing the identity authority.
@@ -17,6 +19,16 @@ Every user operation resolves that user's persisted scoped credential first. An 
 Trusted self-hosted deployments may explicitly set `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1` together with `MEMORIA_MASTER_KEY` and no `MEMORIA_WEB_URL`. Only an active local account with password authentication, no scoped binding and no retained Memoria identity may use this fallback. Disconnect, account deactivation/deletion and lookup failure deny access; they never manufacture a deployment-master grant for an existing runtime. Astra binds an eligible local user to the master-key transport by the canonical Astra `user_id`. Data requests use Memoria's `Memoria-Owner` authorization scheme. Memoria validates the deployment secret but exposes a non-master principal, so ID-based reads and mutations retain atomic owner enforcement. The Server defaults to disabled and this fallback must not be activated for hosted/browser-login deployments. The self-hosted all-in-one example explicitly enables it and pins compatible Memoria 0.5.2. Existing env files are preserved; operators upgrading from the older pin must install a compatible Memoria image and explicitly enable access. Memoria v0.5.1 does not support this scheme.
 
 The provider verifies the scoped-key API contract through `/auth/whoami`: active non-master personal key, exact owner, nonempty key ID, API version 1, scopes capability and memory-filter capability. HTTP redirects are not followed. Identity, model-provider and Memoria secrets must not be logged.
+
+MOI native UC deployments may explicitly enable built-in memory with
+`ASTRA_UC_MEMORY_ENABLED=1`. This is a product authority, not an expansion of the
+local-password fallback. The same resolver accepts only the configured UC
+issuer's persisted identity, an active Astra account and a fresh active UC
+account-status response. It uses the owner-scoped deployment transport, a
+64-byte-compatible issuer/subject namespace, and no client-held memory key.
+Retained Memoria identities/credentials prevent a disconnected scoped account
+from acquiring this authority. Existing scoped consent remains authoritative.
+See [MOI native login](../guides/moi-native-login.md#built-in-memory).
 
 Memory proxy denials include additive `error_code` values without changing
 authorization policy: `memory_consent_denied` for a scoped permission denial,
@@ -44,9 +56,22 @@ Refresh validates the current Memoria credential online. Compare-and-revoke of t
 - Deactivated/deleted Astra accounts cannot resolve their scoped credential. Bounded maintenance removes their stored ciphertext. Existing external mappings do not automatically recreate a deleted local account.
 - Account-wide Work/history erasure remains governed by the account retention contract; sign-out, disconnect and temporary verification outages never erase it.
 
-## Legacy migration
+## Current-schema identity policy
 
-The old `auth_memoria_identities` table is a read-only migration source. Its missing issuer cannot safely be guessed. Administrators must set `MEMORIA_LEGACY_ISSUER` to the known original issuer, matching the configured issuer. A fresh verified login then moves that mapping to the canonical table, preserves the Astra user ID and its models/Work, replaces the credential, and revokes old sessions in one transaction. Without that assertion, login fails with 409 and legacy refresh sessions fail closed. Do not set this option when pointing an old Astra database at a different Memoria instance.
+Fresh schema bootstrap creates `auth_external_identities`. It does not import
+`auth_memoria_identities` or migrate an older database; unsupported schema
+versions require database recreation.
+
+Login resolves only the current verified issuer and subject. There is no
+issuerless identity adoption or relink migration. Retained Memoria identities
+and inactive credentials still deny deployment fallback; an absent current
+credential is not permission to change identity authority.
+
+Each resolution reads account state, scoped credentials, retained bindings and
+configured UC identity from one database statement snapshot. This snapshot is
+not cached: each memory operation rechecks current authority, and UC memory
+still verifies account status upstream. Inapplicable compaction performs no
+credential lookup.
 
 ## Fresh reauthentication
 
@@ -101,7 +126,55 @@ shared signing secret.
 
 `GET /auth/methods` advertises the Server's website and issuer. An unset website retains interactive password login, including all-in-one deployments. The CLI falls back to the older password journey only on discovery 404, not on outages or malformed configuration. Explicit username/password and manual scoped-key login remain available.
 
+`astra login` and the workbench `/login` share one discovery decision: UC when
+advertised without an explicit legacy profile, otherwise Memoria browser login,
+otherwise an explicitly enabled password form. `/register` in the workbench
+uses the same decision; hosted registration belongs to the discovered website,
+not a local password form. Discovery errors never select password authentication.
+The workbench remains responsive during discovery and browser waiting. Escape
+can cancel before credential exchange starts; once exchange starts it awaits
+the bounded result instead of claiming cancellation after a possible commit.
+Browser authentication closes the previous local conversation before credentials
+are replaced. Successful login binds the identity and refreshing transport,
+resynchronizes capabilities and resolves the server default model in the current
+workbench, without requiring a manual restart. Browser waiting and cancellation
+retain the previous identity-pinned Edge heartbeat. On completion, the workbench
+stops and joins it before rebinding local execution. Login completion registers
+the current checkout with the new identity before reporting chat readiness,
+then starts its heartbeat; registration failure is reported explicitly and does
+not initialize a ready runtime. Existing transports retain their old generation
+binding; they cannot silently adopt another account. Authentication
+changes are refused while local background tasks are running.
+
+At browser re-login the CLI drains and retires its old session-memory service
+before credential publication. Successful completion rebuilds that service with
+the authenticated identity, including when the process started signed out. It
+also replaces the remote skill registry and its private cache, restarts external
+discovery, and attaches both the workbench and runtime to the new registry.
+Same-account re-login still replaces these clients because the credential
+generation changed; previously created transports remain generation-pinned.
+Cancelling browser waiting restores the previous identity's memory service and
+external discovery through the same completion path as an unsuccessful login.
+Native CLI memory proxy operations use the selected environment's endpoint and
+refreshing generation-bound credential together, ignoring conflicting legacy
+URL configuration and refusing HTTP redirects. Legacy memory proxy routing is
+unchanged when no native identity is bound.
+
 Browser login URLs require HTTPS except for explicit loopback development addresses. Windows passes the URL as child-process environment data, not shell source.
+
+Terminal and workbench login share an asynchronous browser-opening boundary.
+On WSL, command-local `WSLENV` forwards the URL unchanged to one PowerShell
+invocation; the URL never becomes script source. Its completion is observed
+for up to five seconds, with one second for local cleanup. Failure or timeout
+produces a sanitized warning while the displayed manual URL and callback stay
+usable. There is no alternate automatic launcher. Failed or cancelled attempts
+signal their POSIX process group and collect the direct child. Owner destruction
+synchronously signals that group, even during runtime shutdown when asynchronous
+collection cannot run. This does not prove Windows-process termination or revoke
+a browser request already in flight.
+Successful handoffs and native desktop browsers retain their own lifetime.
+Workbench cancellation still vetoes credential exchange through `LoginControl`.
+Observers do not wait for processes, and opening results do not authorize login.
 
 ### Browser-delivered local authorization codes
 
@@ -199,7 +272,7 @@ password and manual-key login remain unchanged.
 
 ## Verification
 
-Focused coverage lives in `memoria_auth_db_it`, `memoria_auth_http`, CLI auth-flow tests and runtime consent-admission tests. It includes issuer separation, concurrent login/relink, post-write failure rollback, legacy migration, disconnect, inactive-account retention, source-configuration mismatch, read-only extraction and login discovery. Actual Windows browser launch and live OAuth callbacks require platform/deployment testing in addition to deterministic contracts.
+Focused coverage lives in `memoria_auth_db_it`, `memoria_auth_http`, CLI auth-flow tests and runtime consent-admission tests. It includes issuer separation, concurrent login/relink, post-write failure rollback, disconnect, inactive-account retention, source-configuration mismatch, read-only extraction and login discovery. Actual Windows browser launch and live OAuth callbacks require platform/deployment testing in addition to deterministic contracts.
 
 `memoria_live_contract_it` additionally runs against a real Memoria API implementing scoped-key API version 1. It creates disposable identity-only, read-only and read-write keys, verifies stable Astra account mapping, and revokes each key through Memoria before checking refresh rejection. Run only against an isolated Memoria test service and an explicitly designated test database:
 
@@ -213,3 +286,31 @@ make test-memoria-auth-online-contract
 ```
 
 The test issues and revokes upstream keys; never point it at a production service.
+
+## CLI in-flight credential ownership
+
+A CLI turn captures its admitted credential owner once, including when
+`--profile` is omitted and the stored default is selected. Tool result and
+approval acknowledgements, exact-run cleanup, wall-deadline cancellation and
+user cancellation resolve credentials through that captured binding. One
+reactive 401 refresh may repost the same callback or cancellation; it does not
+re-execute a tool or resubmit an admitted turn. Only typed model-catalog
+preflight authentication failures without admitted-run or effect evidence may
+retry turn admission.
+
+Stdio captures that owner before Edge registration can refresh its bearer,
+then resolves the usable admission token through the same checked binding.
+Selected-model and default-model catalog failures both preserve typed HTTP
+evidence. Proactive callback-auth rejection retains the callback run id and
+wakes the physical SSE reader so exact-run cleanup can begin; it does not
+cancel the parent/user token.
+
+Confirmed refresh rotations within that binding remain usable. Changing the
+ambient default profile does not change an in-flight owner. Logout, account or
+native generation changes, and unrecognized credential replacement fail closed;
+an environment bearer cannot borrow a stored profile's refresh authority.
+Bearer resolution and exact cancellation share one absolute cleanup deadline.
+Only `execution_settled: true` confirms execution settlement; a terminal status
+alone does not release an uncertain local execution lease. Internal transport
+detach retains the existing server recovery semantics and is not user cancel
+authority.

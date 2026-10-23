@@ -11,6 +11,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+const CLI_TERMINAL_RESERVE_SECONDS: u64 = 72;
+const CLI_PROCESS_CUSHION_SECONDS: u64 = 15;
+
 /// A single test case. One YAML file == one `Case`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,6 +44,11 @@ pub struct Case {
     #[serde(default)]
     pub models: Option<Vec<String>>,
 
+    /// Supplementary models needed by the journey (e.g. an explicitly selected
+    /// child model). These prerequisites are not replaced by --force-model.
+    #[serde(default)]
+    pub required_models: Vec<String>,
+
     /// Success criteria evaluated in order. All must pass for the
     /// case to PASS. Order matters — deterministic checks first,
     /// expensive LLM judger last.
@@ -68,6 +76,11 @@ pub struct Case {
     /// Caps runaway models without silently skewing matrix totals.
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
+
+    /// Optional explicit CLI wall deadline. Without one, only the outer
+    /// harness watchdog applies, preserving the full case execution budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_wall_time_seconds: Option<u64>,
 
     /// Capability dimension this case tests. Used for aggregated
     /// reporting by capability × model.
@@ -421,6 +434,11 @@ pub(crate) const RESERVED_CLI_ARGS: &[&str] = &[
     // Session ID — the harness manages --session-id for multi-turn
     // steps; a case overriding it would break session continuation.
     "--session-id",
+    // Defaults to on; only a validated on/off observation override is allowed.
+    "--explain",
+    // Cases may opt into an earlier CLI deadline via
+    // `cli_wall_time_seconds`; the harness retains the outer watchdog.
+    "--max-wall-time-seconds",
 ];
 
 /// Validate that `args` does not contain any reserved flag. Returns
@@ -428,8 +446,20 @@ pub(crate) const RESERVED_CLI_ARGS: &[&str] = &[
 /// exact form (`--model`) and `=` syntax (`--model=gpt-4`) so the
 /// denylist cannot be bypassed by appending `=value`.
 pub(crate) fn validate_extra_cli_args(args: &[String]) -> Result<(), String> {
-    for a in args {
+    let mut explain_seen = false;
+    for (index, a) in args.iter().enumerate() {
         let flag_part = a.split('=').next().unwrap_or(a);
+        if flag_part == "--explain" {
+            let value = a
+                .split_once('=')
+                .map(|(_, value)| value)
+                .or_else(|| args.get(index + 1).map(String::as_str));
+            if explain_seen || !matches!(value, Some("on" | "off")) {
+                return Err("--explain requires exactly one on/off observation mode".into());
+            }
+            explain_seen = true;
+            continue;
+        }
         for r in RESERVED_CLI_ARGS {
             if flag_part == *r {
                 return Err(format!(
@@ -459,6 +489,70 @@ pub fn matches_filter(name: &str, pattern: &str) -> bool {
 }
 
 impl Case {
+    /// Bind the resolved matrix model to prompts and assertions, not execution
+    /// configuration, hooks, environment or grader model overrides.
+    pub fn bind_model(&self, model: &str) -> anyhow::Result<Self> {
+        canonicalize_model_ids(&[model.to_owned()]).map_err(anyhow::Error::msg)?;
+        fn text(value: &mut String, model: &str) -> anyhow::Result<()> {
+            if value.replace("{{model}}", "").contains("{{") {
+                anyhow::bail!("unknown or malformed case binding; only {{{{model}}}} is supported");
+            }
+            *value = value.replace("{{model}}", model);
+            Ok(())
+        }
+        fn leaves(value: &mut serde_json::Value, model: &str) -> anyhow::Result<()> {
+            match value {
+                serde_json::Value::String(value) => text(value, model)?,
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        leaves(item, model)?;
+                    }
+                }
+                serde_json::Value::Object(fields) => {
+                    let grader = fields
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|kind| matches!(kind, "judger" | "hard_judger"));
+                    for (key, value) in fields {
+                        if grader && key == "model" {
+                            if value.as_str().is_some_and(|s| s.contains("{{")) {
+                                anyhow::bail!("grader model overrides must be literal model IDs");
+                            }
+                        } else {
+                            leaves(value, model)?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        fn criteria(
+            values: &mut Vec<super::criteria::Criterion>,
+            model: &str,
+        ) -> anyhow::Result<()> {
+            let mut value = serde_json::to_value(&*values)?;
+            leaves(&mut value, model)?;
+            *values = serde_json::from_value(value)?;
+            super::criteria::validate_criteria(values).map_err(anyhow::Error::msg)
+        }
+        let mut bound = self.clone();
+        text(&mut bound.prompt, model)?;
+        criteria(&mut bound.criteria, model)?;
+        for step in &mut bound.steps {
+            text(&mut step.prompt, model)?;
+            criteria(&mut step.criteria, model)?;
+        }
+        Ok(bound)
+    }
+
+    pub(crate) fn cli_wall_time_override_for(&self, timeout_seconds: u64) -> Option<u64> {
+        self.cli_wall_time_seconds.filter(|seconds| {
+            *seconds > CLI_TERMINAL_RESERVE_SECONDS
+                && *seconds <= timeout_seconds.saturating_sub(CLI_PROCESS_CUSHION_SECONDS)
+        })
+    }
+
     /// Whether this case needs the live Memoria contract and its durable
     /// post-loop settlement marker. Explicit opt-in, exact-record cleanup, or
     /// a post-loop memory health criterion enables it; a capability label
@@ -467,6 +561,30 @@ impl Case {
         self.requires_memoria
             || self.cleanup_memory_records
             || super::criteria::requires_memoria_subsystem_health(&self.criteria)
+    }
+
+    pub(crate) fn validate_execution_scope(&self) -> Result<(), String> {
+        super::criteria::validate_criteria(&self.criteria)?;
+        for (i, step) in self.steps.iter().enumerate() {
+            super::criteria::validate_criteria(&step.criteria)
+                .map_err(|error| format!("steps[{i}].{error}"))?;
+        }
+        if super::criteria::semantic_child_adoption(&self.criteria).is_some()
+            && !self.steps.is_empty()
+        {
+            return Err(
+                "semantic child adoption cannot be combined with steps; execution evidence must have one boundary"
+                    .into(),
+            );
+        }
+        for (i, step) in self.steps.iter().enumerate() {
+            if super::criteria::semantic_child_adoption(&step.criteria).is_some() {
+                return Err(format!(
+                    "steps[{i}] cannot contain semantic child adoption; move it to case-level criteria"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Load a case from a YAML file on disk.
@@ -521,6 +639,10 @@ impl Case {
                     .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?,
             );
         }
+        if !case.required_models.is_empty() {
+            case.required_models = canonicalize_model_ids(&case.required_models)
+                .map_err(|e| anyhow::anyhow!("parse {} required_models: {e}", path.display()))?;
+        }
         // Fail fast on reserved-flag abuse so a typo in one case
         // doesn't silently poison an entire suite run.
         validate_extra_cli_args(&case.extra_cli_args)
@@ -549,12 +671,31 @@ impl Case {
                 path.display(),
             );
         }
+        if let Some(cli_wall_time_seconds) = case.cli_wall_time_seconds {
+            if cli_wall_time_seconds <= CLI_TERMINAL_RESERVE_SECONDS {
+                anyhow::bail!(
+                    "case {}: cli_wall_time_seconds must exceed the CLI's 72-second terminal/request reserve",
+                    path.display(),
+                );
+            }
+            if cli_wall_time_seconds
+                > case
+                    .timeout_seconds
+                    .saturating_sub(CLI_PROCESS_CUSHION_SECONDS)
+            {
+                anyhow::bail!(
+                    "case {}: cli_wall_time_seconds ({cli_wall_time_seconds}) must leave at least {CLI_PROCESS_CUSHION_SECONDS} seconds before the harness watchdog timeout_seconds ({}) for termination and final output",
+                    path.display(),
+                    case.timeout_seconds,
+                );
+            }
+        }
         // Reject criteria with internally-inconsistent bounds
         // (min>max, threshold>1.0, empty expect lists, bad regex).
         // A case author's YAML typo would otherwise turn into a
         // permanent-FAIL / permanent-PASS that looks like a real
         // regression.
-        crate::criteria::validate_criteria(&case.criteria)
+        case.validate_execution_scope()
             .map_err(|e| anyhow::anyhow!("case {}: {e}", path.display()))?;
         for (i, step) in case.steps.iter().enumerate() {
             if step.prompt.trim().is_empty() {
@@ -568,10 +709,6 @@ impl Case {
                     "case {}: steps[{i}].timeout_seconds must be >= 1",
                     path.display()
                 );
-            }
-            // Validate step criteria at load time.
-            if let Err(e) = crate::criteria::validate_criteria(&step.criteria) {
-                anyhow::bail!("case {}: steps[{i}].{e}", path.display(),);
             }
             if crate::criteria::requires_session_capture(&step.criteria) {
                 anyhow::bail!(
@@ -639,8 +776,108 @@ impl Case {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selected_model_binding_preserves_strict_spawn_checks_and_case_configuration() {
+        use crate::criteria::{Criterion, evaluate_deterministic_with_session};
+        use crate::runner::RunOutcome;
+        use crate::session_capture::{JournalEvent, SessionCapture};
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/multi_turn_delegation_followup.yaml");
+        let mut original = Case::from_path(&path).unwrap();
+        original.setup_cmd = Some("literal {{model}}".into());
+        for model in ["glm-5.3", "another-provider/model", "quoted\"\\$()`模型"] {
+            let bound = original.bind_model(model).unwrap();
+            assert!(bound.prompt.contains(model));
+            assert_eq!(bound.setup_cmd, original.setup_cmd);
+            assert!(bound.required_models.is_empty());
+            let checks: Vec<_> = bound
+                .criteria
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c, Criterion::SessionEventCount { json_match: Some(_), event_type, .. }
+                        if event_type == "agent_spawned"
+                    )
+                })
+                .cloned()
+                .collect();
+            assert_eq!(checks.len(), 1);
+            let mut session = SessionCapture::default();
+            for (actual, passes) in [(model, true), ("wrong-model", false)] {
+                session.events = vec![JournalEvent {
+                    event_type: "agent_spawned".into(),
+                    raw: serde_json::json!({"metadata":{"model_configuration":{
+                        "prepared_selection":{"model_name":actual}
+                    }}}),
+                }];
+                assert_eq!(
+                    evaluate_deterministic_with_session(
+                        &checks,
+                        &RunOutcome::new(model),
+                        Some(&session)
+                    )[0]
+                    .passed,
+                    passes
+                );
+            }
+            let projection = serde_json::to_value(&bound).unwrap();
+            assert_eq!(projection["steps"][0]["criteria"][1]["needle"], model);
+            let adopted = bound
+                .criteria
+                .iter()
+                .find_map(|c| match c {
+                    Criterion::SessionChildResultAdopted { spawn_match, .. } => {
+                        spawn_match.as_ref()
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(adopted.equals, serde_json::json!(model));
+        }
+        assert!(original.prompt.contains("{{model}}"));
+        for model in ["", " ", " padded"] {
+            assert!(original.bind_model(model).is_err());
+        }
+        original.prompt = "use {{missing}}".into();
+        assert!(original.bind_model("m").is_err());
+        original.prompt = "use {{model".into();
+        assert!(original.bind_model("m").is_err());
+    }
+
+    #[test]
+    fn required_models_validate_at_the_case_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.yaml");
+        for (models, accepted) in [
+            ("[]", true),
+            ("[glm-5.2, glm-5.3]", true),
+            ("['']", false),
+            ("[' glm-5.2']", false),
+            ("[glm-5.2, glm-5.2]", false),
+        ] {
+            std::fs::write(
+                &path,
+                format!("name: model-prerequisite\nprompt: hello\nrequired_models: {models}\n"),
+            )
+            .unwrap();
+            assert_eq!(Case::from_path(&path).is_ok(), accepted, "{models}");
+        }
+    }
+
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn shipped_subagent_model_cases_parse_with_strict_criteria() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/subagent_model_selection");
+        let cases = Case::load_dir(&dir).expect("shipped DeepSeek Flash cases");
+        assert!(cases.iter().all(|case| !case.criteria.is_empty()));
+        assert!(
+            cases
+                .iter()
+                .any(|case| case.name == "flash_semantic_model_reference_glm")
+        );
+    }
 
     #[test]
     fn loads_minimal_case() {
@@ -652,7 +889,42 @@ mod tests {
         assert_eq!(c.prompt, "just say ok");
         assert!(c.criteria.is_empty());
         assert_eq!(c.timeout_seconds, 180);
+        assert_eq!(c.cli_wall_time_seconds, None);
+        assert_eq!(c.cli_wall_time_override_for(c.timeout_seconds), None);
         assert!(!c.debug_log);
+    }
+
+    #[test]
+    fn explicit_cli_wall_deadline_precedes_watchdog() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bounded-case.yaml");
+        std::fs::write(
+            &path,
+            "name: bounded\nprompt: finish\ntimeout_seconds: 360\ncli_wall_time_seconds: 310\n",
+        )
+        .unwrap();
+        let case = Case::from_path(&path).expect("independent inner deadline parses");
+        assert_eq!(case.cli_wall_time_seconds, Some(310));
+        assert_eq!(
+            case.cli_wall_time_override_for(case.timeout_seconds),
+            Some(310)
+        );
+        assert_eq!(case.cli_wall_time_override_for(320), None);
+        assert_eq!(case.cli_wall_time_override_for(325), Some(310));
+
+        for cli_wall_time_seconds in [72, 346, 360, 361] {
+            std::fs::write(
+                &path,
+                format!(
+                    "name: invalid\nprompt: finish\ntimeout_seconds: 360\ncli_wall_time_seconds: {cli_wall_time_seconds}\n"
+                ),
+            )
+            .unwrap();
+            assert!(
+                Case::from_path(&path).is_err(),
+                "invalid CLI wall deadline {cli_wall_time_seconds} must fail before execution"
+            );
+        }
     }
 
     #[test]
@@ -860,7 +1132,8 @@ criteria:
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/pipeline_cache_hit_multi_turn.yaml"),
         )
         .unwrap();
-        let mut valid = RunOutcome::new("fixture").with_exit_code(0);
+        let mut valid =
+            crate::exec::test_support::cache_outcome("fixture", 33787, 0).with_exit_code(0);
         valid.text = "ACK\n\nACK\n\nACK\n\nACK".into();
         valid.cached_input_tokens = 33787;
         valid.prompt_tokens = 1341;
@@ -871,13 +1144,15 @@ criteria:
         };
         assert!(
             passes(&valid),
-            "reasonable sub-98% inclusive cost is not a correctness failure"
+            "valid canonical cache bounds and exact behavior must pass"
         );
         let mut bad = valid.clone();
-        bad.cached_input_tokens = 9999;
+        bad.explain_capture =
+            crate::exec::test_support::cache_outcome("fixture", 9999, 0).explain_capture;
         assert!(!passes(&bad));
         bad = valid.clone();
-        bad.cache_creation_tokens = 25001;
+        bad.explain_capture =
+            crate::exec::test_support::cache_outcome("fixture", 33787, 25001).explain_capture;
         assert!(!passes(&bad));
         bad = valid.clone();
         bad.tool_calls_count = 1;
@@ -1012,25 +1287,25 @@ criteria:
                         && producer_filters.iter().any(|filter| {
                             filter.document == crate::criteria::JournalToolDocument::Arguments
                                 && filter.path == "/action"
-                                && filter.equals == serde_json::json!("remember")
+                                && filter.equals == Some(serde_json::json!("remember"))
                         })
                         && producer_filters.iter().any(|filter| {
                             filter.document == crate::criteria::JournalToolDocument::Arguments
                                 && filter.path == "/memory_type"
-                                && filter.equals == serde_json::json!("working")
+                                && filter.equals == Some(serde_json::json!("working"))
                         })
                     && *actual_consumer_document == consumer_document
                     && *actual_consumer_paths == consumer_paths
                         && consumer_filters.iter().any(|filter| {
                             filter.document == crate::criteria::JournalToolDocument::Arguments
                                 && filter.path == "/action"
-                                && filter.equals == serde_json::json!(action)
+                                && filter.equals == Some(serde_json::json!(action))
                         })
                         && (action != "recall"
                             || consumer_filters.iter().any(|filter| {
                                 filter.document == crate::criteria::JournalToolDocument::Arguments
                                     && filter.path == "/scope"
-                                    && filter.equals == serde_json::json!("session")
+                                    && filter.equals == Some(serde_json::json!("session"))
                             }))
                 )
             })
@@ -1084,7 +1359,62 @@ steps:
     }
 
     #[test]
-    fn bundled_active_run_tool_result_case_makes_efficiency_bounds_hard() {
+    fn semantic_child_adoption_requires_one_case_level_execution_boundary() {
+        let dir = tempdir().unwrap();
+        let valid = r#"name: semantic
+prompt: answer the task
+criteria:
+  - type: execution_child_results_adopted
+    children:
+      - model: test-model
+  - type: hard_judger
+    question: Does the child answer the task?
+"#;
+        let valid_path = dir.path().join("valid.yaml");
+        std::fs::write(&valid_path, valid).unwrap();
+        assert!(Case::from_path(&valid_path).is_ok());
+
+        for (name, source) in [
+            (
+                "top-level-with-step.yaml",
+                r#"name: semantic
+prompt: answer
+steps:
+  - prompt: follow up
+criteria:
+  - type: execution_child_results_adopted
+    children:
+      - model: test-model
+  - type: hard_judger
+    question: Does the child answer the task?
+"#,
+            ),
+            (
+                "step-semantic.yaml",
+                r#"name: semantic
+prompt: answer
+criteria:
+  - type: text_contains
+    needle: answer
+steps:
+  - prompt: follow up
+    criteria:
+      - type: execution_child_results_adopted
+        children:
+          - model: test-model
+      - type: hard_judger
+        question: Does the child answer the task?
+"#,
+            ),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, source).unwrap();
+            assert!(Case::from_path(&path).is_err(), "{name} must be rejected");
+        }
+    }
+
+    #[test]
+    fn bundled_active_run_tool_result_case_requires_exact_reads_not_round_budget() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("cases/active_run_tool_result_retention.yaml");
         let case = Case::from_path(&path).expect("bundled active-run case must parse");
@@ -1096,7 +1426,7 @@ steps:
                 crate::criteria::Criterion::AllOf { criteria } => Some(criteria),
                 _ => None,
             })
-            .expect("tool and round bounds must be nested in all_of");
+            .expect("exact tool count must be required");
 
         assert!(
             hard_group.iter().any(|criterion| matches!(
@@ -1106,11 +1436,11 @@ steps:
             "the scenario must fail when the model skips or invents tool work"
         );
         assert!(
-            hard_group.iter().any(|criterion| matches!(
+            case.criteria.iter().any(|criterion| matches!(
                 criterion,
                 crate::criteria::Criterion::TurnRoundsBetween { min: 2, max: 15 }
             )),
-            "the scenario must fail on an inefficient multi-round loop"
+            "round budget must remain an independent diagnostic"
         );
         let exact_read_paths = case
             .criteria
@@ -1237,9 +1567,11 @@ steps:
 
     #[test]
     fn every_bundled_case_parses_with_the_strict_criterion_schema() {
-        let cases_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases");
-        let cases = Case::load_dir(&cases_dir).expect("all bundled cases must parse");
-        assert!(!cases.is_empty());
+        for directory in ["cases", "fixtures/review_journey"] {
+            let cases_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(directory);
+            let cases = Case::load_dir(&cases_dir).expect("all bundled cases must parse");
+            assert!(!cases.is_empty());
+        }
     }
 
     #[test]
@@ -1300,6 +1632,7 @@ steps:
             "--auto-approve",
             "--permission-mode",
             "--system-prompt",
+            "--max-wall-time-seconds",
         ] {
             let dir = tempdir().unwrap();
             let path = dir.path().join("bad.yaml");
@@ -1331,17 +1664,17 @@ steps:
         let path = dir.path().join("c.yaml");
         std::fs::write(
             &path,
-            "name: c\nprompt: p\ncriteria:\n  - type: fork_cache_class\n    expect: [hit]\n",
+            "name: c\nprompt: p\ncriteria:\n  - type: fork_cache_outcome\n    expect: [hit]\n",
         )
         .unwrap();
-        let err = Case::from_path(&path).expect_err("old type name must fail");
+        let err = Case::from_path(&path).expect_err("retired criterion must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("unknown variant"),
             "serde's well-shaped error is preserved: {msg}"
         );
         assert!(
-            msg.contains("fork_cache_class"),
+            msg.contains("fork_cache_outcome"),
             "offending name must appear: {msg}"
         );
         assert!(
@@ -1396,14 +1729,11 @@ steps:
         let path = dir.path().join("ok.yaml");
         std::fs::write(
             &path,
-            "name: c\nprompt: p\nextra_cli_args: [\"--verbose\", \"--explain\"]\n",
+            "name: c\nprompt: p\nextra_cli_args: [\"--verbose\"]\n",
         )
         .unwrap();
         let c = Case::from_path(&path).expect("non-reserved flags should be accepted");
-        assert_eq!(
-            c.extra_cli_args,
-            vec!["--verbose".to_string(), "--explain".to_string()]
-        );
+        assert_eq!(c.extra_cli_args, vec!["--verbose".to_string()]);
     }
 
     #[test]
@@ -1433,7 +1763,17 @@ steps:
     #[test]
     fn non_reserved_flag_with_equals_accepted() {
         assert!(validate_extra_cli_args(&["--verbose=true".into()]).is_ok());
-        assert!(validate_extra_cli_args(&["--explain=yes".into()]).is_ok());
+        for args in [
+            vec!["--explain=yes"],
+            vec!["--explain"],
+            vec!["--explain=off", "--explain=on"],
+            vec!["--explain", "--model=other"],
+        ] {
+            assert!(
+                validate_extra_cli_args(&args.into_iter().map(str::to_owned).collect::<Vec<_>>())
+                    .is_err()
+            );
+        }
     }
 
     #[test]

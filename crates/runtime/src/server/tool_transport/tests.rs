@@ -111,240 +111,6 @@ impl ServerLocalToolTransport for PendingLocalTransport {
     }
 }
 
-struct StaticSandboxResidentAgentTransport {
-    calls: AtomicUsize,
-    error: Option<astra_runtime_env::RuntimeError>,
-    output: String,
-}
-
-impl StaticSandboxResidentAgentTransport {
-    fn new() -> Self {
-        Self {
-            calls: AtomicUsize::new(0),
-            error: None,
-            output: "resident-agent-result".to_string(),
-        }
-    }
-
-    fn with_error(error: astra_runtime_env::RuntimeError) -> Self {
-        Self {
-            error: Some(error),
-            ..Self::new()
-        }
-    }
-
-    fn with_output(output: impl Into<String>) -> Self {
-        Self {
-            output: output.into(),
-            ..Self::new()
-        }
-    }
-
-    fn calls(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
-    }
-}
-
-#[async_trait]
-impl ExternalTransport for StaticSandboxResidentAgentTransport {
-    async fn execute_tool(
-        &self,
-        request: ToolExecutionRequest,
-        binding: astra_runtime_env::RunBinding,
-    ) -> Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        if let Some(error) = self.error.clone() {
-            return Err(error);
-        }
-        Ok(runtime_outcome_for_request(
-            &request,
-            &binding,
-            &self.output,
-        ))
-    }
-}
-
-struct PendingSandboxResidentAgentTransport {
-    calls: AtomicUsize,
-    execute_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-}
-
-impl PendingSandboxResidentAgentTransport {
-    fn new(execute_started: tokio::sync::oneshot::Sender<()>) -> Self {
-        Self {
-            calls: AtomicUsize::new(0),
-            execute_started: Mutex::new(Some(execute_started)),
-        }
-    }
-
-    fn calls(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
-    }
-}
-
-#[async_trait]
-impl ExternalTransport for PendingSandboxResidentAgentTransport {
-    async fn execute_tool(
-        &self,
-        _request: ToolExecutionRequest,
-        _binding: astra_runtime_env::RunBinding,
-    ) -> Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let sender = self
-            .execute_started
-            .lock()
-            .expect("resident agent execute started lock")
-            .take();
-        if let Some(sender) = sender {
-            let _ = sender.send(());
-        }
-        std::future::pending::<()>().await;
-        unreachable!("pending resident agent execute never completes")
-    }
-}
-
-struct StaticGatewayRelayTransport {
-    calls: AtomicUsize,
-    output: String,
-}
-
-impl StaticGatewayRelayTransport {
-    fn new() -> Self {
-        Self {
-            calls: AtomicUsize::new(0),
-            output: "gateway-result".to_string(),
-        }
-    }
-
-    fn with_output(output: impl Into<String>) -> Self {
-        Self {
-            output: output.into(),
-            ..Self::new()
-        }
-    }
-
-    fn calls(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
-    }
-}
-
-#[async_trait]
-impl ExternalTransport for StaticGatewayRelayTransport {
-    async fn execute_tool(
-        &self,
-        request: ToolExecutionRequest,
-        binding: astra_runtime_env::RunBinding,
-    ) -> Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(runtime_outcome_for_request(
-            &request,
-            &binding,
-            &self.output,
-        ))
-    }
-}
-
-struct CapturingGatewayRelayTransport {
-    args: Mutex<Option<Value>>,
-}
-
-impl CapturingGatewayRelayTransport {
-    fn new() -> Self {
-        Self {
-            args: Mutex::new(None),
-        }
-    }
-
-    fn args(&self) -> Value {
-        self.args
-            .lock()
-            .expect("captured gateway args lock")
-            .clone()
-            .expect("captured gateway args")
-    }
-}
-
-#[async_trait]
-impl ExternalTransport for CapturingGatewayRelayTransport {
-    async fn execute_tool(
-        &self,
-        request: ToolExecutionRequest,
-        binding: astra_runtime_env::RunBinding,
-    ) -> Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError> {
-        *self.args.lock().expect("captured gateway args lock") = Some(request.args.clone());
-        Ok(runtime_outcome_for_request(
-            &request,
-            &binding,
-            "captured-gateway",
-        ))
-    }
-}
-
-struct PendingGatewayRelayTransport {
-    calls: AtomicUsize,
-    execute_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-}
-
-impl PendingGatewayRelayTransport {
-    fn new(execute_started: tokio::sync::oneshot::Sender<()>) -> Self {
-        Self {
-            calls: AtomicUsize::new(0),
-            execute_started: Mutex::new(Some(execute_started)),
-        }
-    }
-
-    fn calls(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
-    }
-}
-
-#[async_trait]
-impl ExternalTransport for PendingGatewayRelayTransport {
-    async fn execute_tool(
-        &self,
-        _request: ToolExecutionRequest,
-        _binding: astra_runtime_env::RunBinding,
-    ) -> Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let sender = self
-            .execute_started
-            .lock()
-            .expect("gateway execute started lock")
-            .take();
-        if let Some(sender) = sender {
-            let _ = sender.send(());
-        }
-        std::future::pending::<()>().await;
-        unreachable!("pending gateway execute never completes")
-    }
-}
-
-fn runtime_outcome_for_request(
-    request: &ToolExecutionRequest,
-    binding: &astra_runtime_env::RunBinding,
-    output: &str,
-) -> astra_runtime_env::RuntimeToolOutcome {
-    let spec = astra_runtime_env::RuntimeSessionSpec::new(
-        &request.session_id,
-        &request.run_id,
-        binding.clone(),
-    )
-    .with_requested_tools([request.tool_name.clone()]);
-    let session = astra_runtime_env::RuntimeSessionHandle::from_spec(&spec);
-    let invocation = astra_runtime_env::RuntimeToolInvocation::new(
-        &request.tool_call_id,
-        &request.tool_name,
-        request.args.clone(),
-        binding.clone(),
-        session.policy.revision,
-    )
-    .with_idempotency_key(format!(
-        "{}:{}:{}",
-        request.user_id, request.session_id, request.tool_call_id
-    ));
-    astra_runtime_env::RuntimeToolOutcome::completed(&invocation, output, &session)
-}
-
 struct StaticEdgeDispatch {
     inserted_edge_agent_ids: Mutex<Vec<String>>,
     inserted_identities: Mutex<Vec<EdgeDispatchIdentity>>,
@@ -540,7 +306,7 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
     async fn wait_result(
         &self,
         identity: &EdgeDispatchIdentity,
-        _timeout: std::time::Duration,
+        _timeout: Option<std::time::Duration>,
     ) -> Result<Option<String>, String> {
         if !self.return_result {
             return Ok(None);
@@ -636,7 +402,7 @@ impl astra_services::multi_agent::EdgeDispatchService for PendingEdgeDispatch {
     async fn wait_result(
         &self,
         _identity: &EdgeDispatchIdentity,
-        _timeout: std::time::Duration,
+        _timeout: Option<std::time::Duration>,
     ) -> Result<Option<String>, String> {
         let sender = self.wait_started.lock().expect("wait started lock").take();
         if let Some(sender) = sender {
@@ -797,9 +563,9 @@ impl astra_services::multi_agent::EdgeDispatchService for SharedNoStickyEdgeDisp
     async fn wait_result(
         &self,
         identity: &EdgeDispatchIdentity,
-        timeout: std::time::Duration,
+        timeout: Option<std::time::Duration>,
     ) -> Result<Option<String>, String> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
         loop {
             {
                 let rows = self.rows.lock().expect("shared dispatch rows");
@@ -812,7 +578,7 @@ impl astra_services::multi_agent::EdgeDispatchService for SharedNoStickyEdgeDisp
             }
             tokio::select! {
                 _ = self.terminal.notified() => {}
-                _ = tokio::time::sleep_until(deadline) => return Ok(None),
+                _ = async { match deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => return Ok(None),
             }
         }
     }
@@ -952,6 +718,7 @@ fn request(
         runtime_process_authorization_required: false,
         runtime_edge_dispatch_authorization: None,
         runtime_edge_dispatch_authorization_required: false,
+        provider_stage_dispatch: None,
         selected_offer: None,
         policy: ToolPolicySnapshot::default(),
     }
@@ -967,6 +734,296 @@ fn request_scoped_mcp_request(tool_name: &str) -> ToolExecutionRequest {
         tool_name,
         "request-scoped-mcp",
     ))
+}
+
+#[test]
+fn edge_provider_selection_requires_the_current_frozen_descriptor() {
+    use super::super::tool_execution_binding::{
+        ToolPermissionGrantSnapshot, ToolPermissionGrantSource,
+    };
+    use astra_turn_core::provider_resolution::{
+        ProviderClaimTrustPolicy, ResolvedProviderPolicyIndex, resolve_provider_snapshot,
+    };
+    use astra_turn_types::*;
+    let tool = ProviderToolDeclaration {
+        native_tool_id: NativeToolId::new("structured_worker").unwrap(),
+        native_tool_name: "structured_worker".into(),
+        stable_tool_alias: None,
+        title: None,
+        description: None,
+        input_schema: serde_json::json!({"type": "object"}),
+        output_schema: None,
+        claims: ProviderToolClaims::default(),
+        task_support: ProviderTaskSupport::Unspecified,
+        extension_fields: serde_json::Map::from_iter([(
+            PROVIDER_RUNTIME_REQUIREMENTS_KEY.into(),
+            serde_json::json!({"executable": "/usr/bin/worker", "read_paths": ["/usr/bin/worker", "/usr/lib"]}),
+        )]),
+    };
+    let discovery = ProviderDiscoverySnapshot::new(
+        ProviderIdentity::new("selected-runtime").unwrap(),
+        ProviderBindingRef::new(
+            astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                "materialization-edge-1",
+                "/Users/test/project",
+            ),
+        )
+        .unwrap(),
+        ProviderProtocolId::new("cli-local").unwrap(),
+        vec![tool],
+    )
+    .unwrap();
+    let aliases = std::collections::BTreeMap::from([(
+        NativeToolId::new("structured_worker").unwrap(),
+        PublicToolAlias::new("structured_worker").unwrap(),
+    )]);
+    let resolved =
+        resolve_provider_snapshot(&discovery, &ProviderClaimTrustPolicy::default(), &aliases)
+            .unwrap();
+    let index = ResolvedProviderPolicyIndex::from_snapshots(&[resolved]).unwrap();
+    let mut agent = edge_agent_record("edge-1");
+    let mut advert: astra_runtime_env::RuntimeEnvironmentAdvertisement =
+        serde_json::from_value(agent.capabilities.clone().unwrap()).unwrap();
+    advert.provider_discovery = vec![discovery.clone()];
+    agent.capabilities = Some(serde_json::to_value(&advert).unwrap());
+    let mut invocation = request(
+        "structured_worker",
+        WorkspaceBinding::edge_workspace(
+            "project",
+            "/Users/test/project",
+            WorkspaceAuthority::ReadWrite,
+        ),
+        ExecutorBinding::edge_agent(
+            "edge-1",
+            "Edge",
+            ToolTransportKind::EdgeLedger,
+            ExecutorStatus::Online,
+        ),
+    );
+    invocation.policy.resolved_provider_policy = index.resolve("structured_worker").cloned();
+    assert!(
+        EdgeBoundExecutionPlan::try_from_request_with_binding(&invocation, &advert.binding)
+            .is_err()
+    );
+    invocation.policy.permission_grant = Some(ToolPermissionGrantSnapshot {
+        source: ToolPermissionGrantSource::Policy,
+        reason: None,
+        updates_hash: None,
+    });
+    assert!(
+        EdgeBoundExecutionPlan::try_from_request_with_binding(&invocation, &advert.binding)
+            .is_err()
+    );
+    invocation.policy.execution_binding_generation = Some(7);
+    let plan = EdgeBoundExecutionPlan::try_from_request_with_binding(&invocation, &advert.binding)
+        .unwrap();
+    assert!(!plan.requires_live_provider_interaction());
+    assert!(plan.dispatch_payload_json().is_err());
+
+    let read_only_binding = astra_runtime_env::RunBinding::resolve(
+        astra_runtime_env::WorkspaceBinding::edge_workspace(
+            "/Users/test/project",
+            astra_runtime_env::WorkspaceAuthority::ReadOnly,
+        ),
+        astra_runtime_env::ExecutorBinding::edge_agent("edge-1"),
+        astra_runtime_env::RuntimeBinding::host_process("edge-host:edge-1"),
+        astra_runtime_env::PolicyIntent::read_only_review(),
+        &astra_runtime_env::ToolRegistry::builtins(),
+    );
+    let mut read_only_invocation = invocation.clone();
+    read_only_invocation.workspace.authority = WorkspaceAuthority::ReadOnly;
+    let read_only_plan = EdgeBoundExecutionPlan::try_from_request_with_binding(
+        &read_only_invocation,
+        &read_only_binding,
+    )
+    .unwrap();
+    assert_eq!(
+        read_only_binding.policy.isolation,
+        astra_runtime_env::IsolationIntent::ProviderEnforced
+    );
+    assert!(read_only_plan.execution_ceiling().is_some());
+
+    for filesystem in [
+        astra_runtime_env::FilesystemPolicy::NoAccess,
+        astra_runtime_env::FilesystemPolicy::ExplicitAllowList,
+    ] {
+        let mut restricted = advert.binding.clone();
+        restricted.policy.filesystem = filesystem;
+        assert!(
+            EdgeBoundExecutionPlan::try_from_request_with_binding(&invocation, &restricted)
+                .is_err()
+        );
+    }
+    assert!(
+        plan.bind_execution_ceiling(
+            "user-1",
+            "edge-1",
+            Some("/Users/test/project"),
+            None,
+            Some("replacement-checkout")
+        )
+        .is_err()
+    );
+    for (owner, executor, root, materialization) in [
+        (
+            "other-user",
+            "edge-1",
+            "/Users/test/project",
+            Some("materialization-edge-1"),
+        ),
+        (
+            "user-1",
+            "other-edge",
+            "/Users/test/project",
+            Some("materialization-edge-1"),
+        ),
+        (
+            "user-1",
+            "edge-1",
+            "/different",
+            Some("materialization-edge-1"),
+        ),
+        ("user-1", "edge-1", "/Users/test/project", None),
+    ] {
+        assert!(
+            plan.bind_execution_ceiling(owner, executor, Some(root), None, materialization)
+                .is_err()
+        );
+    }
+    let bound = plan
+        .bind_execution_ceiling(
+            "user-1",
+            "edge-1",
+            Some("/Users/test/project"),
+            None,
+            Some("materialization-edge-1"),
+        )
+        .unwrap();
+    let ceiling = bound.execution_ceiling().unwrap();
+    assert_eq!(ceiling.execution_binding_generation, 7);
+    assert_eq!(
+        ceiling.materialization_id.as_deref(),
+        Some("materialization-edge-1")
+    );
+    assert_eq!(ceiling.runtime_read_paths, ["/usr/bin/worker", "/usr/lib"]);
+    let payload: astra_server_types::EdgeServerMessage =
+        serde_json::from_str(&bound.dispatch_payload_json().unwrap()).unwrap();
+    let astra_server_types::EdgeServerMessage::ToolRequest {
+        execution_ceiling, ..
+    } = payload
+    else {
+        panic!("tool request required");
+    };
+    assert_eq!(execution_ceiling.as_deref(), Some(ceiling));
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let select = |agent: &astra_services::multi_agent::EdgeAgentRecord,
+                  invocation: &ToolExecutionRequest| {
+        super::super::tool_edge_selection::select_capable_edge_agent(
+            std::slice::from_ref(agent),
+            Some("edge-1"),
+            invocation,
+            &registry,
+        )
+        .map(|selected| selected.is_some())
+    };
+    assert!(select(&agent, &invocation).unwrap());
+    let mut unadmitted = invocation.clone();
+    unadmitted.policy.resolved_provider_policy = None;
+    assert!(select(&agent, &unadmitted).is_err());
+
+    let mut collaborator_tool = discovery.tool_declarations[0].clone();
+    collaborator_tool.task_support = ProviderTaskSupport::Required;
+    collaborator_tool
+        .extension_fields
+        .insert(PROVIDER_COLLABORATOR_STAGE_KEY.into(), Value::Bool(true));
+    collaborator_tool.extension_fields.insert(
+        astra_turn_core::provider_resolution::NativeCollaboratorProtocol::EXTENSION_KEY.into(),
+        Value::String(
+            astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer
+                .extension_value()
+                .into(),
+        ),
+    );
+    let collaborator_discovery = ProviderDiscoverySnapshot::new(
+        ProviderIdentity::new("selected-runtime").unwrap(),
+        ProviderBindingRef::new(
+            astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                "materialization-edge-1",
+                "/Users/test/project",
+            ),
+        )
+        .unwrap(),
+        ProviderProtocolId::new("cli-local").unwrap(),
+        vec![collaborator_tool],
+    )
+    .unwrap();
+    let collaborator_resolved = resolve_provider_snapshot(
+        &collaborator_discovery,
+        &ProviderClaimTrustPolicy::default(),
+        &aliases,
+    )
+    .unwrap();
+    let collaborator_index =
+        ResolvedProviderPolicyIndex::from_snapshots(&[collaborator_resolved]).unwrap();
+    let mut collaborator_invocation = invocation.clone();
+    collaborator_invocation.policy.resolved_provider_policy =
+        collaborator_index.resolve("structured_worker").cloned();
+    let collaborator_plan = EdgeBoundExecutionPlan::try_from_request(&collaborator_invocation)
+        .expect("collaborator policy should produce an edge plan");
+    assert!(collaborator_plan.requires_live_provider_interaction());
+    let mut command_binding = advert.binding.clone();
+    command_binding.policy.resources.max_execution_secs = Some(7.2);
+    let stage_plan = EdgeBoundExecutionPlan::try_from_request_with_binding(
+        &collaborator_invocation,
+        &command_binding,
+    )
+    .unwrap();
+    assert_eq!(stage_plan.execution_timeout_secs(), None);
+    assert_eq!(stage_plan.wait_timeout(), None);
+    assert_eq!(stage_plan.command_timeout_cap_ms(), Some(8_000));
+    collaborator_invocation.policy.admission_deadline =
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+    collaborator_invocation.policy.execution_deadline_unix_ms = Some(4_102_444_800_000);
+    let bounded_stage = EdgeBoundExecutionPlan::try_from_request_with_binding(
+        &collaborator_invocation,
+        &command_binding,
+    )
+    .unwrap();
+    assert_eq!(bounded_stage.execution_timeout_secs(), None);
+    assert!(bounded_stage.execution_timeout_ms().unwrap() <= 3_000);
+    assert_eq!(bounded_stage.command_timeout_cap_ms(), Some(8_000));
+    for change in [
+        "schema",
+        "root",
+        "executor",
+        "process",
+        "readable",
+        "reachable",
+    ] {
+        let mut changed = advert.clone();
+        match change {
+            "schema" => {
+                let old = &changed.provider_discovery[0];
+                let mut tools = old.tool_declarations.clone();
+                tools[0].input_schema = serde_json::json!({"type": "object", "required": ["new"]});
+                changed.provider_discovery[0] = ProviderDiscoverySnapshot::new(
+                    old.provider_identity.clone(),
+                    old.binding_ref.clone(),
+                    old.protocol.clone(),
+                    tools,
+                )
+                .unwrap();
+            }
+            "root" => changed.binding.workspace.cwd = Some("/different".into()),
+            "process" => changed.binding.capabilities.runtime.runtime_has_process = false,
+            "readable" => changed.binding.capabilities.workspace.readable = false,
+            "reachable" => changed.binding.capabilities.executor.reachable = false,
+            _ => changed.binding.executor.executor_id = "other-edge".into(),
+        }
+        let mut stale = agent.clone();
+        stale.capabilities = Some(serde_json::to_value(changed).unwrap());
+        assert!(select(&stale, &invocation).is_err(), "{change}");
+    }
 }
 
 #[test]
@@ -1547,7 +1604,10 @@ fn edge_bound_execution_plan_builds_dispatch_payload_and_delivery_metadata() {
 
     assert_eq!(plan.selected_executor_id(), Some("edge-1"));
     assert_eq!(plan.dispatch_request_id(), plan.identity().storage_key());
-    assert_eq!(plan.wait_timeout(), std::time::Duration::from_secs(310));
+    assert_eq!(
+        plan.wait_timeout(),
+        Some(std::time::Duration::from_secs(310))
+    );
 
     let payload: Value =
         serde_json::from_str(&plan.dispatch_payload_json().expect("dispatch payload"))
@@ -1607,6 +1667,101 @@ fn durable_edge_payload_never_contains_runtime_process_authorization() {
 }
 
 #[test]
+fn edge_dispatch_preserves_admitted_work_budget_without_rewriting_arguments() {
+    let mut request = request(
+        "native_codex",
+        WorkspaceBinding::edge_workspace(
+            "selected CLI",
+            "/selected",
+            WorkspaceAuthority::ReadWrite,
+        ),
+        ExecutorBinding::edge_agent(
+            "selected-cli",
+            "selected CLI",
+            ToolTransportKind::EdgeLedger,
+            ExecutorStatus::Online,
+        ),
+    );
+    request.args = serde_json::json!({"task":"review", "model":"luna"});
+    request.policy.admission_deadline =
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(600));
+    request.policy.execution_deadline_unix_ms = Some(4_102_444_800_000);
+    let plan = EdgeBoundExecutionPlan::try_from_request(&request).unwrap();
+    let payload: Value = serde_json::from_str(&plan.dispatch_payload_json().unwrap()).unwrap();
+    assert_eq!(
+        payload["identity"],
+        serde_json::to_value(plan.identity()).unwrap()
+    );
+    assert_eq!(payload["request_id"], plan.identity().storage_key());
+    assert_eq!(payload["args"], request.args);
+    assert_eq!(payload["execution_deadline_unix_ms"], 4_102_444_800_000u64);
+    assert!(payload["execution_timeout_ms"].as_u64().unwrap() <= 600_000);
+    assert!(payload["execution_timeout_ms"].as_u64().unwrap() > 590_000);
+    assert!(payload["command_timeout_cap_ms"].is_null());
+    assert_eq!(
+        plan.wait_timeout(),
+        Some(std::time::Duration::from_secs(310))
+    );
+    request.policy.max_execution_secs = Some(7.2);
+    let binding = request.runtime_environment_binding(&astra_runtime_env::ToolRegistry::builtins());
+    let governed =
+        EdgeBoundExecutionPlan::try_from_request_with_binding(&request, &binding).unwrap();
+    let governed: Value = serde_json::from_str(&governed.dispatch_payload_json().unwrap()).unwrap();
+    assert_eq!(governed["command_timeout_cap_ms"], 8_000);
+    assert!(
+        governed["execution_timeout_ms"].as_u64().unwrap() > 590_000,
+        "command policy must not replace native whole-stage budget"
+    );
+    let decoded: astra_server_types::EdgeServerMessage = serde_json::from_value(payload).unwrap();
+    let replay = serde_json::to_value(decoded).unwrap();
+    assert_eq!(replay["execution_deadline_unix_ms"], 4_102_444_800_000u64);
+    request.policy.admission_deadline = Some(std::time::Instant::now());
+    assert!(matches!(
+        EdgeBoundExecutionPlan::try_from_request(&request),
+        Err(astra_turn_types::ToolInvocationContractError::InvalidExecutionBudget)
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn admitted_edge_plan_remaining_never_renews_and_rejects_partial_pair() {
+    let mut request = request(
+        "native_codex",
+        WorkspaceBinding::edge_workspace("CLI", "/selected", WorkspaceAuthority::ReadWrite),
+        ExecutorBinding::edge_agent(
+            "cli",
+            "CLI",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        ),
+    );
+    request.policy.admission_deadline =
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(86_400));
+    request.policy.execution_deadline_unix_ms = Some(4_102_444_800_000);
+    let plan = EdgeBoundExecutionPlan::try_from_request(&request).unwrap();
+    let original = plan.execution_timeout_ms().unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(5430)).await;
+    let remaining = plan.execution_timeout_ms().unwrap();
+    assert_eq!(original - remaining, 5_430_000);
+    assert_eq!(
+        plan.wait_timeout(),
+        Some(std::time::Duration::from_secs(310))
+    );
+    let payload: Value = serde_json::from_str(&plan.dispatch_payload_json().unwrap()).unwrap();
+    assert_eq!(payload["execution_timeout_ms"], remaining);
+    tokio::time::advance(std::time::Duration::from_secs(86_400)).await;
+    assert_eq!(plan.execution_timeout_ms(), Some(0));
+    assert_eq!(
+        plan.wait_timeout(),
+        Some(std::time::Duration::from_secs(10))
+    );
+    request.policy.execution_deadline_unix_ms = None;
+    assert!(EdgeBoundExecutionPlan::try_from_request(&request).is_err());
+    request.policy.admission_deadline = None;
+    request.policy.execution_deadline_unix_ms = Some(4_102_444_800_000);
+    assert!(EdgeBoundExecutionPlan::try_from_request(&request).is_err());
+}
+
+#[test]
 fn edge_bound_execution_plan_uses_policy_timeout_from_binding() {
     let registry = astra_runtime_env::ToolRegistry::builtins();
     let mut request = request(
@@ -1631,7 +1786,10 @@ fn edge_bound_execution_plan_uses_policy_timeout_from_binding() {
 
     let plan = EdgeBoundExecutionPlan::try_from_request_with_binding(&request, &binding).unwrap();
 
-    assert_eq!(plan.wait_timeout(), std::time::Duration::from_secs(40));
+    assert_eq!(
+        plan.wait_timeout(),
+        Some(std::time::Duration::from_secs(40))
+    );
     let payload: Value =
         serde_json::from_str(&plan.dispatch_payload_json().expect("dispatch payload"))
             .expect("payload json");
@@ -1662,7 +1820,10 @@ fn edge_bound_execution_plan_uses_policy_snapshot_timeout_override() {
 
     let plan = EdgeBoundExecutionPlan::try_from_request_with_binding(&request, &binding).unwrap();
 
-    assert_eq!(plan.wait_timeout(), std::time::Duration::from_secs(18));
+    assert_eq!(
+        plan.wait_timeout(),
+        Some(std::time::Duration::from_secs(18))
+    );
     let payload: Value =
         serde_json::from_str(&plan.dispatch_payload_json().expect("dispatch payload"))
             .expect("payload json");
@@ -1695,19 +1856,24 @@ fn edge_bound_execution_plan_clamps_invalid_or_excessive_policy_timeout() {
     request.policy.max_execution_secs = Some(0.0);
     let binding = request.runtime_environment_binding(&registry);
     let plan = EdgeBoundExecutionPlan::try_from_request_with_binding(&request, &binding).unwrap();
-    assert_eq!(plan.execution_timeout_secs(), 1);
-    assert_eq!(plan.wait_timeout(), std::time::Duration::from_secs(11));
+    assert_eq!(plan.execution_timeout_secs(), Some(1));
+    assert_eq!(
+        plan.wait_timeout(),
+        Some(std::time::Duration::from_secs(11))
+    );
 
     request.policy.max_execution_secs = Some(9_999.0);
     let binding = request.runtime_environment_binding(&registry);
     let plan = EdgeBoundExecutionPlan::try_from_request_with_binding(&request, &binding).unwrap();
     assert_eq!(
         plan.execution_timeout_secs(),
-        astra_server_types::MAX_EDGE_TOOL_TIMEOUT_SECS
+        Some(astra_server_types::MAX_EDGE_TOOL_TIMEOUT_SECS)
     );
     assert_eq!(
         plan.wait_timeout(),
-        std::time::Duration::from_secs(astra_server_types::MAX_EDGE_TOOL_TIMEOUT_SECS + 10)
+        Some(std::time::Duration::from_secs(
+            astra_server_types::MAX_EDGE_TOOL_TIMEOUT_SECS + 10
+        ))
     );
 }
 
@@ -2037,7 +2203,7 @@ fn explicit_runtime_binding_overrides_executor_inference() {
 }
 
 #[tokio::test]
-async fn gateway_relay_transport_fails_closed_until_adapter_is_configured() {
+async fn gateway_relay_route_is_explicitly_unavailable() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
     let mut request = request(
@@ -2097,178 +2263,7 @@ async fn gateway_relay_transport_fails_closed_until_adapter_is_configured() {
 }
 
 #[tokio::test]
-async fn gateway_relay_executes_through_configured_transport() {
-    let gateway = Arc::new(StaticGatewayRelayTransport::new());
-    let service = ToolExecutionService::builder()
-        .gateway_relay_transport(gateway.clone())
-        .build();
-    let local = CountingLocalTransport::new();
-    let mut request = request(
-        "bash",
-        WorkspaceBinding {
-            kind: WorkspaceBindingKind::CloudWorkspace,
-            display_name: "OpenShell workspace".to_string(),
-            cwd: Some("/sandbox".to_string()),
-            authority: WorkspaceAuthority::ReadWrite,
-        },
-        ExecutorBinding {
-            kind: ExecutorBindingKind::OrchestratorManaged,
-            executor_id: "openshell-gateway".to_string(),
-            display_name: "OpenShell Gateway".to_string(),
-            transport: ToolTransportKind::GatewayRelay,
-            status: ExecutorStatus::Online,
-        },
-    );
-    request.runtime = Some(astra_runtime_env::RuntimeBinding::nvidia_openshell(
-        "openshell-runtime",
-    ));
-
-    let result = service.execute(request, &local).await;
-
-    assert!(!result.is_error, "{result:?}");
-    assert_eq!(result.output, "gateway-result");
-    assert_eq!(local.calls(), 0);
-    assert_eq!(gateway.calls(), 1);
-    let metadata = result.metadata.expect("gateway metadata");
-    assert_eq!(metadata["transport"], "gateway_relay");
-    assert_eq!(metadata["executor"]["transport"], "gateway_relay");
-    assert_eq!(metadata["runtime"]["session_manager"], "nvidia_open_shell");
-    assert_eq!(metadata["runtime"]["launch_driver"], "open_shell_gateway");
-}
-
-#[tokio::test]
-async fn gateway_relay_receives_args_without_internal_tool_metadata() {
-    let gateway = Arc::new(CapturingGatewayRelayTransport::new());
-    let service = ToolExecutionService::builder()
-        .gateway_relay_transport(gateway.clone())
-        .build();
-    let local = CountingLocalTransport::new();
-    let mut request = request(
-        "bash",
-        WorkspaceBinding {
-            kind: WorkspaceBindingKind::CloudWorkspace,
-            display_name: "OpenShell workspace".to_string(),
-            cwd: Some("/sandbox".to_string()),
-            authority: WorkspaceAuthority::ReadWrite,
-        },
-        ExecutorBinding {
-            kind: ExecutorBindingKind::OrchestratorManaged,
-            executor_id: "openshell-gateway".to_string(),
-            display_name: "OpenShell Gateway".to_string(),
-            transport: ToolTransportKind::GatewayRelay,
-            status: ExecutorStatus::Online,
-        },
-    );
-    request.runtime = Some(astra_runtime_env::RuntimeBinding::nvidia_openshell(
-        "openshell-runtime",
-    ));
-    request.args = serde_json::json!({
-        "command": "pwd",
-        "_tool_call_id": "call-gateway",
-        "_run_id": "run-gateway",
-    });
-
-    let result = service.execute(request, &local).await;
-
-    assert!(!result.is_error, "{result:?}");
-    assert_eq!(local.calls(), 0);
-    assert_eq!(gateway.args(), serde_json::json!({"command": "pwd"}));
-}
-
-#[tokio::test]
-async fn gateway_relay_oversized_output_is_blocked_at_transport_boundary() {
-    let oversized = "x".repeat(1_048_577);
-    let gateway = Arc::new(StaticGatewayRelayTransport::with_output(oversized));
-    let service = ToolExecutionService::builder()
-        .gateway_relay_transport(gateway.clone())
-        .build();
-    let local = CountingLocalTransport::new();
-    let mut request = request(
-        "read_file",
-        WorkspaceBinding::cloud_workspace("/snapshot", WorkspaceAuthority::ReadOnly),
-        ExecutorBinding {
-            kind: ExecutorBindingKind::OrchestratorManaged,
-            executor_id: "openshell-gateway-1".to_string(),
-            display_name: "OpenShell gateway".to_string(),
-            transport: ToolTransportKind::GatewayRelay,
-            status: ExecutorStatus::Online,
-        },
-    );
-    request.runtime = Some(astra_runtime_env::RuntimeBinding::nvidia_openshell(
-        "openshell-runtime",
-    ));
-
-    let result = service.execute(request, &local).await;
-
-    assert!(result.is_error, "{result:?}");
-    assert!(result.output.contains("output limit exceeded"));
-    assert!(!result.output.contains(&"x".repeat(128)));
-    assert_eq!(local.calls(), 0);
-    assert_eq!(gateway.calls(), 1);
-    let metadata = result.metadata.expect("output limit metadata");
-    assert_eq!(metadata["error_kind"], "output_limit_exceeded");
-    assert_eq!(metadata["execution_started"], true);
-    assert_eq!(metadata["side_effects_maybe"], true);
-    assert_eq!(metadata["output_bytes"], 1_048_577);
-    assert_eq!(metadata["max_output_bytes"], 1_048_576);
-    assert_eq!(metadata["transport"], "gateway_relay");
-}
-
-#[tokio::test(start_paused = true)]
-async fn gateway_relay_timeout_reports_side_effect_uncertainty() {
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let gateway = Arc::new(PendingGatewayRelayTransport::new(started_tx));
-    let service = ToolExecutionService::builder()
-        .gateway_relay_transport(gateway.clone())
-        .build();
-    let local = CountingLocalTransport::new();
-    let mut request = request(
-        "read_file",
-        WorkspaceBinding::cloud_workspace("/snapshot", WorkspaceAuthority::ReadOnly),
-        ExecutorBinding {
-            kind: ExecutorBindingKind::OrchestratorManaged,
-            executor_id: "openshell-gateway-1".to_string(),
-            display_name: "OpenShell gateway".to_string(),
-            transport: ToolTransportKind::GatewayRelay,
-            status: ExecutorStatus::Online,
-        },
-    );
-    request.runtime = Some(astra_runtime_env::RuntimeBinding::nvidia_openshell(
-        "openshell-runtime",
-    ));
-
-    let handle = tokio::spawn(async move { service.execute(request, &local).await });
-
-    started_rx
-        .await
-        .expect("gateway relay execute should start");
-    tokio::time::advance(std::time::Duration::from_secs(31)).await;
-    let result = handle
-        .await
-        .expect("gateway relay timeout task should not panic");
-
-    assert!(result.is_error, "{result:?}");
-    assert!(
-        result.output.contains("max_execution_secs"),
-        "{}",
-        result.output
-    );
-    assert_eq!(gateway.calls(), 1);
-    let metadata = result.metadata.expect("gateway timeout metadata");
-    assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
-    assert_eq!(metadata["reason"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
-    assert_eq!(metadata["blocked"], true);
-    assert_eq!(metadata["execution_started"], true);
-    assert_eq!(metadata["side_effects_maybe"], true);
-    assert_eq!(metadata["next_action"], "inspect_effects_before_retry");
-    assert_eq!(metadata["max_execution_secs"], 30.0);
-    assert_eq!(metadata["transport"], "gateway_relay");
-    assert_eq!(metadata["runtime"]["session_manager"], "nvidia_open_shell");
-    assert_eq!(metadata["runtime_error"]["kind"], "tool_timeout");
-}
-
-#[tokio::test]
-async fn sandbox_resident_agent_transport_fails_closed_until_adapter_is_configured() {
+async fn sandbox_resident_agent_route_is_explicitly_unavailable() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
     let mut request = request(
@@ -2328,46 +2323,6 @@ async fn sandbox_resident_agent_transport_fails_closed_until_adapter_is_configur
         metadata["next_action"],
         "change_workspace_executor_runtime_or_policy"
     );
-}
-
-#[tokio::test]
-async fn sandbox_resident_agent_executes_through_configured_transport() {
-    let resident = Arc::new(StaticSandboxResidentAgentTransport::new());
-    let service = ToolExecutionService::builder()
-        .sandbox_resident_agent_transport(resident.clone())
-        .build();
-    let local = CountingLocalTransport::new();
-    let mut request = request(
-        "bash",
-        WorkspaceBinding {
-            kind: WorkspaceBindingKind::CloudWorkspace,
-            display_name: "OpenShell workspace".to_string(),
-            cwd: Some("/sandbox".to_string()),
-            authority: WorkspaceAuthority::ReadWrite,
-        },
-        ExecutorBinding {
-            kind: ExecutorBindingKind::OrchestratorManaged,
-            executor_id: "openshell-agent".to_string(),
-            display_name: "OpenShell resident agent".to_string(),
-            transport: ToolTransportKind::SandboxResidentAgent,
-            status: ExecutorStatus::Online,
-        },
-    );
-    request.runtime = Some(astra_runtime_env::RuntimeBinding::nvidia_openshell(
-        "openshell-runtime",
-    ));
-
-    let result = service.execute(request, &local).await;
-
-    assert!(!result.is_error, "{result:?}");
-    assert_eq!(result.output, "resident-agent-result");
-    assert_eq!(local.calls(), 0);
-    assert_eq!(resident.calls(), 1);
-    let metadata = result.metadata.expect("resident agent metadata");
-    assert_eq!(metadata["transport"], "sandbox_resident_agent");
-    assert_eq!(metadata["executor"]["transport"], "sandbox_resident_agent");
-    assert_eq!(metadata["runtime"]["session_manager"], "nvidia_open_shell");
-    assert_eq!(metadata["runtime"]["launch_driver"], "open_shell_gateway");
 }
 
 fn cloud_snapshot_request(tool_name: &str) -> ToolExecutionRequest {
@@ -2448,138 +2403,6 @@ fn cloud_snapshot_workspace_record() -> astra_runtime_env::WorkspaceRecord {
 }
 
 #[tokio::test]
-async fn orchestrator_managed_executes_through_sandbox_resident_agent_transport() {
-    let resident = Arc::new(StaticSandboxResidentAgentTransport::new());
-    let _local = CountingLocalTransport::new();
-
-    let service = ToolExecutionService::builder()
-        .sandbox_resident_agent_transport(resident.clone())
-        .build();
-    let local = CountingLocalTransport::new();
-
-    let result = service
-        .execute(cloud_snapshot_request("read_file"), &local)
-        .await;
-
-    assert!(!result.is_error, "{result:?}");
-    assert_eq!(result.output, "resident-agent-result");
-    assert_eq!(local.calls(), 0);
-    assert_eq!(resident.calls(), 1);
-    let metadata = result.metadata.expect("resident metadata");
-    assert_eq!(metadata["transport"], "sandbox_resident_agent");
-    assert_eq!(metadata["executor"]["kind"], "orchestrator_managed");
-    assert_eq!(
-        metadata[astra_runtime_env::TOOL_RESULT_RUNTIME_SESSION]["executor_id"],
-        "orchestrator:snapshot-1"
-    );
-    assert_eq!(metadata["runtime"]["launch_driver"], "kubernetes");
-}
-
-#[tokio::test]
-async fn orchestrator_managed_oversized_output_is_blocked_at_transport_boundary() {
-    let oversized = "x".repeat(1_048_577);
-    let resident = Arc::new(StaticSandboxResidentAgentTransport::with_output(oversized));
-    let _local = CountingLocalTransport::new();
-
-    let service = ToolExecutionService::builder()
-        .sandbox_resident_agent_transport(resident.clone())
-        .build();
-    let local = CountingLocalTransport::new();
-
-    let result = service
-        .execute(cloud_snapshot_request("read_file"), &local)
-        .await;
-
-    assert!(result.is_error, "{result:?}");
-    assert!(result.output.contains("output limit exceeded"));
-    assert!(!result.output.contains(&"x".repeat(128)));
-    assert_eq!(local.calls(), 0);
-    assert_eq!(resident.calls(), 1);
-    let metadata = result.metadata.expect("output limit metadata");
-    assert_eq!(metadata["error_kind"], "output_limit_exceeded");
-    assert_eq!(metadata["execution_started"], true);
-    assert_eq!(metadata["side_effects_maybe"], true);
-    assert_eq!(metadata["output_bytes"], 1_048_577);
-    assert_eq!(metadata["max_output_bytes"], 1_048_576);
-    assert_eq!(metadata["transport"], "sandbox_resident_agent");
-}
-
-#[tokio::test]
-async fn orchestrator_managed_uses_policy_snapshot_output_limit_override() {
-    let resident = Arc::new(StaticSandboxResidentAgentTransport::with_output("abcd"));
-    let _local = CountingLocalTransport::new();
-    let _request = cloud_snapshot_request("read_file");
-    let service = ToolExecutionService::builder()
-        .sandbox_resident_agent_transport(resident.clone())
-        .build();
-    let local = CountingLocalTransport::new();
-    let mut request = cloud_snapshot_request("read_file");
-    request.policy.max_output_bytes = Some(3);
-
-    let result = service.execute(request, &local).await;
-
-    assert!(result.is_error, "{result:?}");
-    assert!(result.output.contains("output limit exceeded"));
-    assert_eq!(local.calls(), 0);
-    assert_eq!(resident.calls(), 1);
-    let metadata = result.metadata.expect("custom output limit metadata");
-    assert_eq!(metadata["error_kind"], "output_limit_exceeded");
-    assert_eq!(metadata["output_bytes"], 4);
-    assert_eq!(metadata["max_output_bytes"], 3);
-    assert_eq!(
-        metadata["policy"]["intent"]["resources"]["max_output_bytes"],
-        3
-    );
-    assert_eq!(
-        metadata[astra_runtime_env::TOOL_RESULT_RUNTIME_SESSION]["resources"]["max_output_bytes"],
-        3
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn orchestrator_managed_execute_timeout_reports_side_effect_uncertainty() {
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let resident = Arc::new(PendingSandboxResidentAgentTransport::new(started_tx));
-    let _request = cloud_snapshot_request("read_file");
-
-    let service = ToolExecutionService::builder()
-        .sandbox_resident_agent_transport(resident.clone())
-        .build();
-    let request = cloud_snapshot_request("read_file");
-
-    let handle = tokio::spawn(async move {
-        let local = CountingLocalTransport::new();
-        let result = service.execute(request, &local).await;
-        (result, local.calls())
-    });
-
-    started_rx.await.expect("resident execute should start");
-    tokio::time::advance(std::time::Duration::from_secs(31)).await;
-    let (result, local_calls) = handle
-        .await
-        .expect("resident timeout task should not panic");
-
-    assert!(result.is_error, "{result:?}");
-    assert!(
-        result.output.contains("max_execution_secs"),
-        "{}",
-        result.output
-    );
-    assert_eq!(local_calls, 0);
-    assert_eq!(resident.calls(), 1);
-    let metadata = result.metadata.expect("resident timeout metadata");
-    assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
-    assert_eq!(metadata["reason"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
-    assert_eq!(metadata["blocked"], true);
-    assert_eq!(metadata["execution_started"], true);
-    assert_eq!(metadata["side_effects_maybe"], true);
-    assert_eq!(metadata["next_action"], "inspect_effects_before_retry");
-    assert_eq!(metadata["max_execution_secs"], 30.0);
-    assert_eq!(metadata["transport"], "sandbox_resident_agent");
-    assert_eq!(metadata["runtime_error"]["kind"], "tool_timeout");
-}
-
-#[tokio::test]
 async fn orchestrator_managed_without_sandbox_resident_agent_transport_does_not_reroute_to_local() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
@@ -2605,37 +2428,6 @@ async fn orchestrator_managed_without_sandbox_resident_agent_transport_does_not_
     );
     assert_eq!(metadata["runtime_error"]["kind"], "transport_unavailable");
     assert_eq!(metadata["transport"], "sandbox_resident_agent");
-}
-
-#[tokio::test]
-async fn orchestrator_managed_transport_error_skips_local_reroute() {
-    let resident = Arc::new(StaticSandboxResidentAgentTransport::with_error(
-        astra_runtime_env::RuntimeError::runtime_unavailable("orchestrator denied execution"),
-    ));
-    let service = ToolExecutionService::builder()
-        .sandbox_resident_agent_transport(resident.clone())
-        .build();
-    let local = CountingLocalTransport::new();
-
-    let result = service
-        .execute(cloud_snapshot_request("read_file"), &local)
-        .await;
-
-    assert!(result.is_error, "{result:?}");
-    assert_eq!(local.calls(), 0);
-    assert_eq!(resident.calls(), 4); // 1 initial + 3 retries (runtime_unavailable is retryable)
-    let metadata = result.metadata.expect("resident error metadata");
-    assert_eq!(metadata["error_kind"], "runtime_unavailable");
-    assert_eq!(metadata["transport"], "sandbox_resident_agent");
-    assert_eq!(metadata["blocked"], true);
-    assert!(
-        metadata["runtime_error"]["message"]
-            .as_str()
-            .unwrap()
-            .starts_with("orchestrator denied execution"),
-        "unexpected message: {:?}",
-        metadata["runtime_error"]["message"]
-    );
 }
 
 #[tokio::test]
@@ -3829,7 +3621,7 @@ async fn edge_dispatch_waiter_poller_and_callback_do_not_require_sticky_pod() {
                 assert_eq!(request_id, row.request_id);
                 assert_eq!(tool, "bash");
                 assert_eq!(args, serde_json::json!({}));
-                assert!(timeout_secs > 0);
+                assert!(timeout_secs.is_some_and(|timeout| timeout > 0));
             }
             other => panic!("expected tool request payload, got {other:?}"),
         }
@@ -4795,114 +4587,6 @@ async fn request_scoped_mcp_cancel_reports_mcp_binding() {
 }
 
 #[tokio::test]
-async fn orchestrator_managed_cancel_during_execute_reports_side_effect_uncertainty() {
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let resident = Arc::new(PendingSandboxResidentAgentTransport::new(started_tx));
-    let cancel = Arc::new(CancellationToken::new());
-    let _cancel_for_task = cancel.clone();
-    let _request = cloud_snapshot_request("read_file");
-
-    let service = ToolExecutionService::builder()
-        .sandbox_resident_agent_transport(resident.clone())
-        .build();
-    let cancel = Arc::new(CancellationToken::new());
-    let cancel_for_task = cancel.clone();
-    let request = cloud_snapshot_request("read_file");
-
-    let handle = tokio::spawn(async move {
-        let local = CountingLocalTransport::new();
-        let result = service
-            .execute_with_cancel(request, &local, Some(cancel_for_task))
-            .await;
-        (result, local.calls())
-    });
-
-    tokio::time::timeout(std::time::Duration::from_secs(1), started_rx)
-        .await
-        .expect("resident agent execute should start")
-        .expect("resident agent execute start signal");
-    cancel.cancel();
-    let (result, local_calls) = tokio::time::timeout(std::time::Duration::from_secs(1), handle)
-        .await
-        .expect("resident agent cancel should resolve")
-        .expect("resident agent cancel task should not panic");
-
-    assert!(result.is_error, "{result:?}");
-    assert!(result.output.contains("cancelled"), "{}", result.output);
-    assert_eq!(local_calls, 0);
-    assert_eq!(resident.calls(), 1);
-    let metadata = result.metadata.expect("resident agent cancel metadata");
-    assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_CANCELLED);
-    assert_eq!(metadata["reason"], TOOL_ERROR_KIND_CANCELLED);
-    assert_eq!(metadata["cancelled"], true);
-    assert_eq!(metadata["blocked"], true);
-    assert_eq!(metadata["execution_started"], true);
-    assert_eq!(metadata["side_effects_maybe"], true);
-    assert_eq!(metadata["next_action"], "inspect_effects_before_retry");
-    assert_eq!(metadata["transport"], "sandbox_resident_agent");
-    assert_eq!(metadata["executor"]["kind"], "orchestrator_managed");
-    assert_eq!(metadata["runtime"]["isolation_backend"], "provider_managed");
-    assert_eq!(
-        metadata["runtime_environment"]["runtime"]["runtime_id"],
-        "snapshot-runtime"
-    );
-}
-
-#[tokio::test]
-async fn gateway_relay_cancel_during_execute_reports_side_effect_uncertainty() {
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let gateway = Arc::new(PendingGatewayRelayTransport::new(started_tx));
-    let cancel = Arc::new(CancellationToken::new());
-    let _cancel_for_task = cancel.clone();
-    let _request = openshell_gateway_request("bash");
-
-    let service = ToolExecutionService::builder()
-        .gateway_relay_transport(gateway.clone())
-        .build();
-    let cancel = Arc::new(CancellationToken::new());
-    let cancel_for_task = cancel.clone();
-    let request = openshell_gateway_request("bash");
-
-    let handle = tokio::spawn(async move {
-        let local = CountingLocalTransport::new();
-        let result = service
-            .execute_with_cancel(request, &local, Some(cancel_for_task))
-            .await;
-        (result, local.calls())
-    });
-
-    tokio::time::timeout(std::time::Duration::from_secs(1), started_rx)
-        .await
-        .expect("gateway relay execute should start")
-        .expect("gateway relay execute start signal");
-    cancel.cancel();
-    let (result, local_calls) = tokio::time::timeout(std::time::Duration::from_secs(1), handle)
-        .await
-        .expect("gateway relay cancel should resolve")
-        .expect("gateway relay cancel task should not panic");
-
-    assert!(result.is_error, "{result:?}");
-    assert!(result.output.contains("cancelled"), "{}", result.output);
-    assert_eq!(local_calls, 0);
-    assert_eq!(gateway.calls(), 1);
-    let metadata = result.metadata.expect("gateway cancel metadata");
-    assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_CANCELLED);
-    assert_eq!(metadata["reason"], TOOL_ERROR_KIND_CANCELLED);
-    assert_eq!(metadata["cancelled"], true);
-    assert_eq!(metadata["blocked"], true);
-    assert_eq!(metadata["execution_started"], true);
-    assert_eq!(metadata["side_effects_maybe"], true);
-    assert_eq!(metadata["next_action"], "inspect_effects_before_retry");
-    assert_eq!(metadata["transport"], "gateway_relay");
-    assert_eq!(metadata["executor"]["transport"], "gateway_relay");
-    assert_eq!(metadata["runtime"]["session_manager"], "nvidia_open_shell");
-    assert_eq!(
-        metadata["runtime_environment"]["runtime"]["runtime_id"],
-        "openshell-runtime"
-    );
-}
-
-#[tokio::test]
 async fn edge_dispatch_cancel_during_wait_reports_side_effect_uncertainty() {
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let dispatch = Arc::new(PendingEdgeDispatch::new(started_tx));
@@ -5055,6 +4739,7 @@ fn edge_executor_id_returns_none_for_empty_id() {
         runtime_process_authorization_required: false,
         runtime_edge_dispatch_authorization: None,
         runtime_edge_dispatch_authorization_required: false,
+        provider_stage_dispatch: None,
         tool_name: "bash".to_string(),
         args: serde_json::json!({"cmd": "ls"}),
         user_id: "test-user".to_string(),
@@ -5095,6 +4780,7 @@ fn edge_executor_id_rejects_whitespace_only_id() {
         runtime_process_authorization_required: false,
         runtime_edge_dispatch_authorization: None,
         runtime_edge_dispatch_authorization_required: false,
+        provider_stage_dispatch: None,
         tool_name: "bash".to_string(),
         args: serde_json::json!({"cmd": "ls"}),
         user_id: "test-user".to_string(),
@@ -5135,6 +4821,7 @@ fn edge_executor_id_returns_some_for_valid_id() {
         runtime_process_authorization_required: false,
         runtime_edge_dispatch_authorization: None,
         runtime_edge_dispatch_authorization_required: false,
+        provider_stage_dispatch: None,
         tool_name: "bash".to_string(),
         args: serde_json::json!({"cmd": "ls"}),
         user_id: "test-user".to_string(),
@@ -5146,206 +4833,6 @@ fn edge_executor_id_returns_some_for_valid_id() {
         policy: ToolPolicySnapshot::default(),
     };
     assert_eq!(edge_executor_id(&request), Some("valid-edge-123"));
-}
-
-// ─── ExternalTransport health-check boundary tests ──────────────────────────
-
-/// Transport health states for boundary tests.
-#[derive(Clone)]
-enum HealthState {
-    Healthy,
-    Unhealthy(&'static str),
-    /// First health_check fails, reconnect succeeds, then healthy.
-    Reconnectable(&'static str),
-    /// First health_check fails, reconnect also fails.
-    Unrecoverable(&'static str, &'static str),
-}
-
-struct HealthStateTransport {
-    state: Mutex<HealthState>,
-    calls: AtomicUsize,
-    output: String,
-}
-
-impl HealthStateTransport {
-    fn new(state: HealthState) -> Self {
-        Self {
-            state: Mutex::new(state),
-            calls: AtomicUsize::new(0),
-            output: "health-state-result".to_string(),
-        }
-    }
-}
-
-#[async_trait]
-impl ExternalTransport for HealthStateTransport {
-    async fn execute_tool(
-        &self,
-        request: ToolExecutionRequest,
-        binding: astra_runtime_env::RunBinding,
-    ) -> Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(runtime_outcome_for_request(
-            &request,
-            &binding,
-            &self.output,
-        ))
-    }
-
-    async fn health_check(&self) -> Result<(), String> {
-        let mut state = self.state.lock().unwrap();
-        match *state {
-            HealthState::Healthy => Ok(()),
-            HealthState::Unhealthy(reason) => Err(reason.to_string()),
-            HealthState::Reconnectable(reason) => {
-                // After reconnect succeeds, transition to Healthy
-                *state = HealthState::Healthy;
-                Err(reason.to_string())
-            }
-            HealthState::Unrecoverable(reason, _) => Err(reason.to_string()),
-        }
-    }
-
-    async fn reconnect(&self) -> Result<(), String> {
-        let state = self.state.lock().unwrap();
-        match *state {
-            HealthState::Reconnectable(_) => Ok(()),
-            HealthState::Unrecoverable(_, reconnect_err) => Err(reconnect_err.to_string()),
-            _ => Ok(()),
-        }
-    }
-}
-
-#[tokio::test]
-async fn external_transport_health_check_failure_returns_transport_unavailable() {
-    let transport = Arc::new(HealthStateTransport::new(HealthState::Unhealthy(
-        "connection refused",
-    )));
-    let service = ToolExecutionService::builder()
-        .sandbox_resident_agent_transport(transport)
-        .build();
-    let local = CountingLocalTransport::new();
-
-    let result = service
-        .execute(cloud_snapshot_request("read_file"), &local)
-        .await;
-
-    assert!(result.is_error, "{result:?}");
-    assert_eq!(local.calls(), 0, "must not fall back locally");
-    let metadata = result.metadata.expect("transport metadata");
-    assert_eq!(metadata["error_kind"], "transport_unavailable");
-    assert!(
-        metadata["runtime_error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("transport is unhealthy")
-    );
-    assert!(
-        metadata["runtime_error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("connection refused")
-    );
-}
-
-#[tokio::test]
-async fn external_transport_reconnect_after_health_failure_succeeds() {
-    let transport = Arc::new(HealthStateTransport::new(HealthState::Reconnectable(
-        "stale connection",
-    )));
-    let service = ToolExecutionService::builder()
-        .sandbox_resident_agent_transport(transport.clone())
-        .build();
-    let local = CountingLocalTransport::new();
-
-    let result = service
-        .execute(cloud_snapshot_request("read_file"), &local)
-        .await;
-
-    // After reconnect, the transport should be healthy and execute normally.
-    assert!(!result.is_error, "{result:?}");
-    assert_eq!(result.output, "health-state-result");
-    assert_eq!(local.calls(), 0, "must not fall back locally");
-}
-
-#[tokio::test]
-async fn external_transport_reconnect_failure_returns_transport_unavailable() {
-    let transport = Arc::new(HealthStateTransport::new(HealthState::Unrecoverable(
-        "connection refused",
-        "reconnect failed: timeout",
-    )));
-    let service = ToolExecutionService::builder()
-        .sandbox_resident_agent_transport(transport)
-        .build();
-    let local = CountingLocalTransport::new();
-
-    let result = service
-        .execute(cloud_snapshot_request("read_file"), &local)
-        .await;
-
-    assert!(result.is_error, "{result:?}");
-    assert_eq!(local.calls(), 0, "must not fall back locally");
-    let metadata = result.metadata.expect("transport metadata");
-    assert_eq!(metadata["error_kind"], "transport_unavailable");
-    assert!(
-        metadata["runtime_error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("transport is unhealthy")
-    );
-}
-
-// ─── ExternalTransport exit_semantics boundary tests ────────────────────────
-
-#[tokio::test]
-async fn external_transport_cancelled_result_carries_execution_error_semantics() {
-    let local = CountingLocalTransport::new();
-    let cancel_token = CancellationToken::new();
-    cancel_token.cancel();
-
-    // Use gateway relay path — it exercises the external route code.
-    let transport = Arc::new(StaticGatewayRelayTransport::new());
-    let service = ToolExecutionService::builder()
-        .gateway_relay_transport(transport)
-        .build();
-
-    let result = service
-        .execute_with_cancel(
-            openshell_gateway_request("bash"),
-            &local,
-            Some(Arc::new(cancel_token)),
-        )
-        .await;
-
-    assert!(result.is_error, "{result:?}");
-    assert_eq!(
-        result.exit_semantics,
-        Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
-        "cancelled transport result must carry ExecutionError exit semantics"
-    );
-}
-
-#[tokio::test]
-async fn external_transport_timeout_result_carries_execution_error_semantics() {
-    // Verify that output_limit_exceeded also carries ExecutionError.
-    let oversized = "x".repeat(1_048_577);
-    let transport = Arc::new(StaticGatewayRelayTransport::with_output(oversized));
-    let service = ToolExecutionService::builder()
-        .gateway_relay_transport(transport)
-        .build();
-    let local = CountingLocalTransport::new();
-
-    let mut request = openshell_gateway_request("bash");
-    request.policy.max_output_bytes = Some(1024);
-
-    let result = service.execute(request, &local).await;
-
-    assert!(result.is_error, "{result:?}");
-    assert_eq!(
-        result.exit_semantics,
-        Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
-        "output-limit-exceeded result must carry ExecutionError exit semantics"
-    );
 }
 
 #[tokio::test]
@@ -5366,310 +4853,28 @@ async fn external_transport_not_configured_result_carries_execution_error_semant
     );
 }
 
-// ─── ExternalTransport retry & recovery boundary tests ──────────────────────
-
-/// A transport that replays a pre-configured sequence of responses.
-/// Each call to `execute_tool` consumes the next response in the queue.
-struct ReplayTransport {
-    responses:
-        Mutex<Vec<Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError>>>,
-    calls: AtomicUsize,
-    healthy: AtomicBool,
-}
-
-impl ReplayTransport {
-    fn new(
-        responses: Vec<
-            Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError>,
-        >,
-    ) -> Self {
-        Self {
-            responses: Mutex::new(responses),
-            calls: AtomicUsize::new(0),
-            healthy: AtomicBool::new(true),
-        }
-    }
-
-    fn with_health(healthy: bool) -> Self {
-        Self {
-            healthy: AtomicBool::new(healthy),
-            ..Self::new(vec![])
-        }
-    }
-
-    fn calls(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
-    }
-}
-
-#[async_trait]
-impl ExternalTransport for ReplayTransport {
-    async fn execute_tool(
-        &self,
-        _request: ToolExecutionRequest,
-        _binding: astra_runtime_env::RunBinding,
-    ) -> Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let mut responses = self.responses.lock().unwrap();
-        if responses.is_empty() {
-            return Err(astra_runtime_env::RuntimeError::new(
-                astra_runtime_env::RuntimeErrorKind::RuntimeUnavailable,
-                "no more responses in replay queue",
-            ));
-        }
-        responses.remove(0)
-    }
-
-    async fn health_check(&self) -> Result<(), String> {
-        if self.healthy.load(Ordering::SeqCst) {
-            Ok(())
-        } else {
-            Err("transport is unhealthy".to_string())
-        }
-    }
-}
-
-/// A transport that blocks forever (simulates a hung connection / timeout).
-struct PendingExternalTransport {
-    execute_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    calls: AtomicUsize,
-}
-
-impl PendingExternalTransport {
-    fn new(execute_started: tokio::sync::oneshot::Sender<()>) -> Self {
-        Self {
-            execute_started: Mutex::new(Some(execute_started)),
-            calls: AtomicUsize::new(0),
-        }
-    }
-}
-
-#[async_trait]
-impl ExternalTransport for PendingExternalTransport {
-    async fn execute_tool(
-        &self,
-        _request: ToolExecutionRequest,
-        _binding: astra_runtime_env::RunBinding,
-    ) -> Result<astra_runtime_env::RuntimeToolOutcome, astra_runtime_env::RuntimeError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let sender = self.execute_started.lock().unwrap().take();
-        if let Some(sender) = sender {
-            let _ = sender.send(());
-        }
-        std::future::pending::<()>().await;
-        unreachable!("pending external transport never completes")
-    }
-}
-
 #[tokio::test]
-async fn external_transport_retryable_error_retries_then_succeeds() {
-    // Transport returns retryable errors on first 2 calls, success on 3rd.
-    let request = cloud_snapshot_request("read_file");
-    let binding = astra_runtime_env::RunBinding::resolve(
-        astra_runtime_env::WorkspaceBinding::server_sandbox("session-r1"),
-        astra_runtime_env::ExecutorBinding::local_cli(),
-        astra_runtime_env::RuntimeBinding::host_process("test-host"),
-        astra_runtime_env::PolicyIntent::local_developer(),
-        &astra_runtime_env::ToolRegistry::default(),
-    );
-    let success_outcome = runtime_outcome_for_request(&request, &binding, "retry-succeeded");
-    let retryable_err = astra_runtime_env::RuntimeError::runtime_unavailable("temporary outage");
-
-    let transport = Arc::new(ReplayTransport::new(vec![
-        Err(retryable_err.clone()),
-        Err(retryable_err.clone()),
-        Ok(success_outcome),
-    ]));
-    let service = ToolExecutionService::builder()
-        .sandbox_resident_agent_transport(transport.clone())
-        .build();
-    let local = CountingLocalTransport::new();
-
-    let result = service.execute(request, &local).await;
-
-    assert!(
-        !result.is_error,
-        "retry should eventually succeed: {result:?}"
-    );
-    assert_eq!(result.output, "retry-succeeded");
-    assert_eq!(
-        transport.calls(),
-        3,
-        "should have retried 2 times, total 3 calls"
-    );
-    assert_eq!(local.calls(), 0, "must not fall back locally");
-}
-
-#[tokio::test]
-async fn external_transport_retryable_error_exhausts_retries() {
-    // Transport always returns retryable errors — all retries exhausted.
-    let request = cloud_snapshot_request("read_file");
-    let retryable_err = astra_runtime_env::RuntimeError::runtime_unavailable("persistent outage");
-
-    let transport = Arc::new(ReplayTransport::new(vec![
-        Err(retryable_err.clone()),
-        Err(retryable_err.clone()),
-        Err(retryable_err.clone()),
-        Err(retryable_err.clone()),
-        // 4 calls: initial + retry1 + retry2 + retry3 → exhausted
-    ]));
-    let service = ToolExecutionService::builder()
-        .sandbox_resident_agent_transport(transport.clone())
-        .build();
-    let local = CountingLocalTransport::new();
-
-    let result = service.execute(request, &local).await;
-
-    assert!(
-        result.is_error,
-        "all retries exhausted, should error: {result:?}"
-    );
-    assert_eq!(transport.calls(), 4, "initial + 3 retries = 4 total calls");
-    assert!(
-        result.output.contains("retried 3 time(s)"),
-        "error should mention retry count: {result:?}"
-    );
-    let metadata = result.metadata.as_ref().expect("retry metadata");
-    assert_eq!(metadata["retryable"], true);
-    assert_eq!(metadata["execution_started"], false);
-    assert_eq!(metadata["side_effects_maybe"], false);
-    assert_eq!(
-        metadata["next_action"],
-        "change_workspace_executor_runtime_or_policy"
-    );
-    assert_eq!(local.calls(), 0, "must not fall back locally");
-    assert_eq!(
-        result.exit_semantics,
-        Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
-        "exhausted retries must carry ExecutionError exit semantics"
-    );
-}
-
-#[tokio::test]
-async fn external_transport_retryable_error_after_start_does_not_retry() {
-    // A disconnected transport after execution started is retryable at the
-    // run/session level, but replaying the same tool call can duplicate
-    // side effects. The transport dispatch layer must fail closed and report
-    // uncertainty instead of issuing another execute_tool call.
-    let request = cloud_snapshot_request("read_file");
-    let error = astra_runtime_env::RuntimeError::transport_disconnected("lost after tool start");
-
-    let transport = Arc::new(ReplayTransport::new(vec![
-        Err(error),
-        Ok(runtime_outcome_for_request(
-            &request,
-            &astra_runtime_env::RunBinding::resolve(
-                astra_runtime_env::WorkspaceBinding::server_sandbox("session-r-side-effect"),
-                astra_runtime_env::ExecutorBinding::local_cli(),
-                astra_runtime_env::RuntimeBinding::host_process("test-host"),
-                astra_runtime_env::PolicyIntent::local_developer(),
-                &astra_runtime_env::ToolRegistry::default(),
-            ),
-            "must-not-run",
-        )),
-    ]));
-    let service = ToolExecutionService::builder()
-        .sandbox_resident_agent_transport(transport.clone())
-        .build();
-    let local = CountingLocalTransport::new();
-
-    let result = service.execute(request, &local).await;
-
-    assert!(
-        result.is_error,
-        "side-effect-uncertain transport error should fail closed: {result:?}"
-    );
-    assert_eq!(transport.calls(), 1, "must not replay after start");
-    assert_eq!(local.calls(), 0, "must not fall back locally");
-    let metadata = result.metadata.as_ref().expect("transport metadata");
-    assert_eq!(metadata["error_kind"], "transport_disconnected");
-    assert_eq!(metadata["retryable"], true);
-    assert_eq!(metadata["execution_started"], true);
-    assert_eq!(metadata["side_effects_maybe"], true);
-    assert_eq!(metadata["next_action"], "inspect_effects_before_retry");
-}
-
-#[tokio::test(start_paused = true)]
-async fn external_transport_timeout_then_second_call_transport_unavailable() {
-    // Scenario: a transport hangs and times out.  After the timeout the
-    // connection is considered lost.  A subsequent call hits the health
-    // gate and receives transport_unavailable with ExecutionError semantics.
-    let request = cloud_snapshot_request("read_file");
-    let local = CountingLocalTransport::new();
-
-    // ── First call: transport hangs → timeout ──
-    let (tx1, rx1) = tokio::sync::oneshot::channel();
-    let pending = Arc::new(PendingExternalTransport::new(tx1));
-    let service = ToolExecutionService::builder()
-        .sandbox_resident_agent_transport(pending.clone())
-        .build();
-
-    // Spawn the first call; it will hang inside the transport.
-    let handle = tokio::spawn({
-        let request = request.clone();
-        async move {
-            let local = CountingLocalTransport::new();
-            service.execute(request, &local).await
-        }
-    });
-
-    // Wait for the transport to start, then advance past the 30 s timeout.
-    rx1.await.expect("transport execute should start");
-    tokio::time::advance(std::time::Duration::from_secs(31)).await;
-    let first_result = handle.await.expect("timeout task should not panic");
-    assert!(first_result.is_error, "{first_result:?}");
-    let first_meta = first_result.metadata.as_ref().expect("timeout metadata");
-    assert_eq!(first_meta["error_kind"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
-
-    // ── Second call: transport is now unhealthy ──
-    let unhealthy = Arc::new(ReplayTransport::with_health(false));
-    let service2 = ToolExecutionService::builder()
-        .sandbox_resident_agent_transport(unhealthy)
-        .build();
-
-    let result = service2.execute(request, &local).await;
-
-    assert!(result.is_error, "{result:?}");
-    assert_eq!(local.calls(), 0, "must not fall back locally");
-    let metadata = result.metadata.expect("transport metadata");
-    assert_eq!(metadata["error_kind"], "transport_unavailable");
-    assert_eq!(
-        result.exit_semantics,
-        Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
-        "transport-unavailable must carry ExecutionError exit semantics"
-    );
-}
-
-#[tokio::test]
-async fn external_transport_concurrent_cancel_two_transport_paths() {
-    // Cancel two different transport paths (gateway relay + sandbox resident
-    // agent) concurrently and verify both report ExecutionError.
-    let cancel_token = Arc::new(CancellationToken::new());
-
-    let gateway_transport = Arc::new(StaticGatewayRelayTransport::new());
-    let sandbox_transport = Arc::new(StaticSandboxResidentAgentTransport::new());
-    let service = ToolExecutionService::builder()
-        .gateway_relay_transport(gateway_transport)
-        .sandbox_resident_agent_transport(sandbox_transport)
-        .build();
-    let local = CountingLocalTransport::new();
-
-    cancel_token.cancel();
-
-    let gateway_req = openshell_gateway_request("bash");
-    let sandbox_req = cloud_snapshot_request("read_file");
-
-    let (r1, r2) = tokio::join!(
-        service.execute_with_cancel(gateway_req, &local, Some(cancel_token.clone())),
-        service.execute_with_cancel(sandbox_req, &local, Some(cancel_token.clone())),
-    );
-
-    for (label, result) in [("gateway relay", &r1), ("sandbox resident agent", &r2)] {
-        assert!(result.is_error, "{label}: {result:?}");
+async fn unavailable_provider_routes_preserve_pre_dispatch_cancellation() {
+    for request in [
+        openshell_gateway_request("bash"),
+        cloud_snapshot_request("read_file"),
+    ] {
+        let service = ToolExecutionService::new_for_test();
+        let local = CountingLocalTransport::new();
+        let cancel = Arc::new(CancellationToken::new());
+        cancel.cancel();
+        let result = service
+            .execute_with_cancel(request, &local, Some(cancel))
+            .await;
+        assert!(result.is_error);
+        assert_eq!(local.calls(), 0);
         assert_eq!(
             result.exit_semantics,
-            Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
-            "{label}: cancelled transport result must carry ExecutionError exit semantics"
+            Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError)
         );
+        let metadata = result.metadata.expect("cancel metadata");
+        assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_CANCELLED);
+        assert_eq!(metadata["execution_started"], false);
+        assert_eq!(metadata["side_effects_maybe"], false);
     }
 }

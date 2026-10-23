@@ -23,6 +23,8 @@
 
 #![allow(dead_code)]
 
+pub mod collaborator_fixture;
+
 use astra_core::{MatrixOneSettings, SharedPool};
 use astra_services::storage::ensure_core_schema;
 
@@ -108,4 +110,169 @@ pub fn work_genesis(
         criteria: Vec::new(),
     })
     .expect("Work genesis")
+}
+
+/// Returns an owner-scoped identifier for database integration fixtures.
+///
+/// Work tests deliberately use random owners so cleanup can be strict without
+/// touching another test's rows, even when several test binaries share a
+/// MatrixOne catalog.
+pub fn id(prefix: &str) -> String {
+    format!("{prefix}-{}", uuid::Uuid::new_v4())
+}
+
+/// Removes every canonical Work row and the directly-owned runtime/artifact
+/// row used by the Work integration fixtures.
+///
+/// The individual test files used to carry slightly different copies of this
+/// list. Keeping one superset here makes cleanup deterministic as the Work
+/// schema grows: a test can add a new assertion without having to remember to
+/// update a private cleanup copy. All entries are owner-scoped and the schema
+/// currently has no foreign-key constraints between these projections.
+pub async fn cleanup_work_owner(pool: &SharedPool, owner_id: &str) {
+    for (table, owner_column) in [
+        ("work_establishment_operations", "owner_id"),
+        ("work_branch_creation_operations", "owner_id"),
+        ("work_branch_control_operations", "owner_id"),
+        ("work_branch_deletion_operations", "owner_id"),
+        ("work_proposal_trigger_attempts", "owner_id"),
+        ("work_runtime_event_outbox_slots", "owner_id"),
+        ("work_runtime_event_outbox", "owner_id"),
+        ("work_terminal_cuts", "owner_id"),
+        ("work_item_attempts", "owner_id"),
+        ("work_current_gap_acceptances", "owner_id"),
+        ("work_acceptance_decisions", "owner_id"),
+        ("work_check_runs", "owner_id"),
+        ("work_recovery_points", "owner_id"),
+        ("work_patch_materialization_operations", "owner_id"),
+        ("work_patch_commit_operations", "owner_id"),
+        ("work_patch_artifacts", "owner_id"),
+        ("work_attention_receipts", "owner_id"),
+        ("work_event_sequences", "owner_id"),
+        ("work_events", "owner_id"),
+        ("work_proposals", "owner_id"),
+        ("work_proposal_sequences", "owner_id"),
+        ("work_branch_subjects", "owner_id"),
+        ("work_item_edges", "owner_id"),
+        ("work_item_revisions", "owner_id"),
+        ("work_items", "owner_id"),
+        ("work_graph_revisions", "owner_id"),
+        ("work_graph_sequences", "owner_id"),
+        ("work_criterion_sets", "owner_id"),
+        ("work_criterion_revisions", "owner_id"),
+        ("work_criteria", "owner_id"),
+        ("work_goal_revisions", "owner_id"),
+        ("work_branches", "owner_id"),
+        ("works", "owner_id"),
+        ("agent_run_events", "user_id"),
+        ("run_checkpoints", "user_id"),
+        ("run_display_projections", "user_id"),
+        ("agent_session_execution_slots", "user_id"),
+        ("agent_runs", "user_id"),
+        ("session_context_operation_receipts", "owner_user_id"),
+        ("session_context_authority_events", "owner_user_id"),
+        ("session_context_heads", "owner_user_id"),
+        ("session_artifact_references", "user_id"),
+        ("session_artifacts", "user_id"),
+        ("agent_sessions", "user_id"),
+    ] {
+        let statement = format!("DELETE FROM {table} WHERE {owner_column} = ?");
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .bind(owner_id)
+            .execute(pool.get())
+            .await
+            .unwrap_or_else(|error| panic!("clean {table}: {error}"));
+    }
+}
+
+/// Builds an acceptance using the exact identity and basis returned by the real proposal entrypoint.
+pub fn criteria_acceptance(
+    proposed: &astra_services::work::RecordedWorkCriteriaProposal,
+    resolution_ref: &str,
+) -> astra_services::work::WorkCriteriaProposalAcceptance {
+    use astra_services::work::{WorkChangeRef, WorkCriteriaProposalAcceptance};
+    WorkCriteriaProposalAcceptance {
+        owner_id: proposed.proposal.owner_id.clone(),
+        work_id: proposed.proposal.work_id.clone(),
+        branch_id: proposed.proposal.branch_id.clone(),
+        proposal_id: proposed.proposal.proposal_id.clone(),
+        payload_hash: proposed.payload_hash.clone(),
+        expected_work_revision: proposed.proposal.expected_work_revision,
+        expected_goal_revision: proposed.proposal.expected_goal_revision,
+        expected_criteria_set_revision: proposed.proposal.expected_criteria_set_revision,
+        expected_branch_revision: proposed.proposal.expected_branch_revision,
+        expected_graph_revision: proposed.proposal.expected_graph_revision,
+        resolution_ref: WorkChangeRef::parse(resolution_ref).expect("resolution"),
+    }
+}
+
+/// Repeats the immutable identity and basis of a recorded graph proposal.
+pub fn plan_acceptance(
+    recorded: &astra_services::work::RecordedWorkPlanProposal,
+    resolution_ref: &str,
+) -> astra_services::work::WorkPlanProposalAcceptance {
+    use astra_services::work::{WorkChangeRef, WorkPlanProposalAcceptance};
+    WorkPlanProposalAcceptance {
+        owner_id: recorded.proposal.owner_id.clone(),
+        work_id: recorded.proposal.work_id.clone(),
+        branch_id: recorded.proposal.branch_id.clone(),
+        proposal_id: recorded.proposal.proposal_id.clone(),
+        payload_hash: recorded.payload_hash.clone(),
+        expected_work_revision: recorded.proposal.expected_work_revision,
+        expected_goal_revision: recorded.proposal.expected_goal_revision,
+        expected_criteria_set_revision: recorded.proposal.expected_criteria_set_revision,
+        expected_branch_revision: recorded.proposal.expected_branch_revision,
+        expected_graph_revision: recorded.proposal.expected_graph_revision,
+        resolution_ref: WorkChangeRef::parse(resolution_ref).expect("resolution"),
+    }
+}
+
+use astra_turn_types::{
+    ActorContextV1, SESSION_ATTACHMENT_SCHEMA_VERSION, SessionAttachmentModeV1,
+    SessionAttachmentV1, SessionKeyV1, SessionPlacementV1,
+};
+use uuid::Uuid;
+
+pub async fn controller_attachment(
+    pool: &astra_core::SharedPool,
+    key: &SessionKeyV1,
+    actor: ActorContextV1,
+) -> SessionAttachmentV1 {
+    let attachment = SessionAttachmentV1 {
+        schema_version: SESSION_ATTACHMENT_SCHEMA_VERSION,
+        attachment_id: Uuid::new_v4().to_string(),
+        attachment_epoch: 1,
+        key: key.clone(),
+        actor,
+        mode: SessionAttachmentModeV1::Controller,
+        placement: SessionPlacementV1::Server,
+        observed_cursor: None,
+        observed_manifest_root: None,
+        workspace: None,
+        attached_at_unix_ms: 1,
+        expires_at_unix_ms: i64::MAX,
+    };
+    sqlx::query(
+        "INSERT INTO session_attachments
+         (isolation_domain, owner_user_id, session_id, branch_id, attachment_id,
+          attachment_epoch, idempotency_hash, request_hash, actor_id, mode,
+          placement, attachment_json, expires_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'controller', 'server', ?, ?)",
+    )
+    .bind(&key.isolation_domain)
+    .bind(&key.owner_user_id)
+    .bind(&key.session_id)
+    .bind(&key.branch_id)
+    .bind(&attachment.attachment_id)
+    .bind(attachment.attachment_epoch as i64)
+    .bind("a".repeat(64))
+    .bind("b".repeat(64))
+    .bind(&attachment.actor.actor_id)
+    .bind(serde_json::to_string(&attachment).expect("encode attachment"))
+    .bind(attachment.expires_at_unix_ms)
+    .execute(pool.get())
+    .await
+    .expect("insert controller attachment");
+
+    attachment
 }

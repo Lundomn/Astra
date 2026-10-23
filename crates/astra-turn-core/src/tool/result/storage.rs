@@ -1,10 +1,8 @@
 //! Disk persistence for large tool results.
 //!
-//! When a tool result exceeds [`PERSIST_THRESHOLD_CHARS`], the full output is
-//! written to `~/.astra/sessions/<session_id>/tool-results/<tool_call_id>.txt`
-//! and the in-memory content is replaced with a compact preview + file
-//! reference.  This prevents oversized tool outputs from bloating the LLM
-//! context window while still preserving the full output for later retrieval.
+//! Runtime persistence writes immutable, run-bound tool documents and returns
+//! a compact preview with a typed artifact handle. The journal descriptor
+//! preserves the exact result identity for verified recovery and paging.
 //!
 //! The model-facing reference is a logical session artifact handle, not a
 //! physical path. Paths contain runtime-specific user scopes and are easy for
@@ -75,11 +73,13 @@ const PERSISTED_TAG_CLOSE: &str = "</persisted-output>";
 /// Subdirectory under the session folder for tool result files.
 const TOOL_RESULTS_SUBDIR: &str = "tool-results";
 
-/// Immutable, journal-addressed results live below a separate namespace from
-/// the call-id projection used by the active model-facing artifact handle.
-/// A provider call id is unique only within a run, so the physical authority
-/// must include both identities.
+/// Immutable, journal-addressed results are partitioned by run. A provider
+/// call id is unique only within a run, so physical authority includes both
+/// identities.
 const RUN_SCOPED_RESULTS_SUBDIR: &str = "runs";
+const ARTIFACT_MANIFESTS_SUBDIR: &str = "manifests";
+/// Descriptor metadata has a separate bound from the pageable result payload.
+const MAX_ARTIFACT_MANIFEST_BYTES: usize = 64 * 1024;
 
 static NEXT_IMMUTABLE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -97,6 +97,8 @@ pub const TOOL_RESULT_RUN_ID_FIELD: &str = "_astra_tool_result_run_id";
 /// result that has already been moved out of the prompt.  Compression layers
 /// use this typed marker instead of classifying the rendered body.
 pub const TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD: &str = "_astra_tool_result_artifact";
+
+pub const TOOL_RESULT_TOOL_NAME_FIELD: &str = "_tool_name";
 
 /// Default payload size for one model-requested artifact window.
 pub const DEFAULT_TOOL_RESULT_WINDOW_BYTES: usize = 8 * 1024;
@@ -121,17 +123,6 @@ impl PersistedToolResultWindow {
     pub fn is_complete(&self) -> bool {
         self.next_offset >= self.total_bytes
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PersistedFormat {
-    PlainText,
-    PrettyJson,
-}
-
-struct PersistedContent {
-    text: String,
-    format: PersistedFormat,
 }
 
 /// Persisted model projection plus the journal-only authority for its full
@@ -268,8 +259,8 @@ pub fn artifact_descriptor_matches_identity(
 }
 
 /// Parse and validate one descriptor value carried in canonical message
-/// metadata.  Keeping this parser separate lets typed compression layers
-/// inspect `Message::extra` without reserializing the complete message.
+/// metadata. Consumers inspect the typed identity without reserializing
+/// the complete canonical message.
 #[must_use]
 pub fn parse_tool_result_artifact_descriptor(
     value: &Value,
@@ -360,6 +351,23 @@ struct RunBoundArtifactHandle {
     sha256: String,
 }
 
+enum ArtifactReference {
+    Inline(astra_services::session_journal::ToolResultArtifactDescriptor),
+    Stored {
+        kind: astra_services::session_journal::ToolResultDocumentKind,
+        digest: String,
+    },
+}
+
+impl ArtifactReference {
+    fn is_result(&self) -> bool {
+        match self {
+            Self::Inline(descriptor) => descriptor.document_kind.is_result(),
+            Self::Stored { kind, .. } => kind.is_result(),
+        }
+    }
+}
+
 /// FNV-1a 64-bit hash — stable and deterministic across processes and Rust versions.
 fn fnv1a_64(data: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -373,44 +381,6 @@ fn fnv1a_64(data: &[u8]) -> u64 {
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
-
-/// If `content` exceeds the persistence threshold, write it to disk and return
-/// a compact replacement string with a preview and stable session artifact id.
-///
-/// Returns `None` if the content is small enough to keep inline, or if disk
-/// persistence fails (in which case the caller should use the original content).
-///
-/// `session_dir` is `~/.astra/sessions/<session_id>/`.
-pub fn maybe_persist_tool_result(
-    session_dir: &Path,
-    tool_call_id: &str,
-    tool_name: &str,
-    content: &str,
-) -> Option<String> {
-    if content.chars().count() <= PERSIST_THRESHOLD_CHARS {
-        return None;
-    }
-
-    persist_tool_result_with_replacement(session_dir, tool_call_id, tool_name, content)
-}
-
-/// Persist a tool result and return the standard bounded model-facing
-/// replacement, regardless of the result's size.
-///
-/// Callers use this when an earlier presentation boundary has already made
-/// the inline result lossy. In that situation the persistence threshold is
-/// irrelevant: the omitted evidence must remain recoverable even when the
-/// original result happens to be smaller than [`PERSIST_THRESHOLD_CHARS`].
-pub fn persist_tool_result_with_replacement(
-    session_dir: &Path,
-    tool_call_id: &str,
-    tool_name: &str,
-    content: &str,
-) -> Option<String> {
-    persist_tool_result(session_dir, None, tool_call_id, tool_name, content)
-        .ok()
-        .map(|persisted| persisted.replacement)
-}
 
 /// Persist a result and return its typed, run-bound journal authority.
 ///
@@ -452,7 +422,7 @@ pub fn persist_tool_document_with_descriptor(
     }
     let persisted = persist_tool_document(
         session_dir,
-        Some(run_id),
+        run_id,
         tool_call_id,
         tool_name,
         content,
@@ -488,8 +458,7 @@ pub fn persist_tool_result_for_compaction(
     content: &str,
 ) -> Result<PersistedToolResult, ToolResultPersistenceError> {
     let prepared = prepare_tool_result_for_compaction(run_id, tool_call_id, tool_name, content)?;
-    let persisted =
-        persist_tool_result(session_dir, Some(run_id), tool_call_id, tool_name, content)?;
+    let persisted = persist_tool_result(session_dir, run_id, tool_call_id, tool_name, content)?;
     Ok(PersistedToolResult {
         replacement: prepared.replacement,
         descriptor: astra_services::session_journal::ToolResultArtifactDescriptor {
@@ -519,8 +488,7 @@ pub fn prepare_tool_result_for_compaction(
             "run_id and tool_call_id must be valid non-empty identifiers",
         )));
     }
-    let persisted = persistable_content(content);
-    let persisted_bytes = persisted.text.as_bytes();
+    let persisted_bytes = content.as_bytes();
     let byte_len = u64::try_from(persisted_bytes.len()).map_err(|_| {
         ToolResultPersistenceError::Io(io::Error::other(
             "persisted tool result exceeds supported byte length",
@@ -541,24 +509,9 @@ pub fn prepare_tool_result_for_compaction(
     })
 }
 
-/// Threshold-aware variant of [`persist_tool_result_with_descriptor`].
-pub fn maybe_persist_tool_result_with_descriptor(
-    session_dir: &Path,
-    run_id: &str,
-    tool_call_id: &str,
-    tool_name: &str,
-    content: &str,
-) -> Result<Option<PersistedToolResult>, ToolResultPersistenceError> {
-    if content.chars().count() <= PERSIST_THRESHOLD_CHARS {
-        return Ok(None);
-    }
-    persist_tool_result_with_descriptor(session_dir, run_id, tool_call_id, tool_name, content)
-        .map(Some)
-}
-
 fn persist_tool_result(
     session_dir: &Path,
-    run_id: Option<&str>,
+    run_id: &str,
     tool_call_id: &str,
     tool_name: &str,
     content: &str,
@@ -575,89 +528,69 @@ fn persist_tool_result(
 
 fn persist_tool_document(
     session_dir: &Path,
-    run_id: Option<&str>,
+    run_id: &str,
     tool_call_id: &str,
     tool_name: &str,
     content: &str,
     document_kind: astra_services::session_journal::ToolResultDocumentKind,
 ) -> Result<PersistedWrite, ToolResultPersistenceError> {
-    if let Some(run_id) = run_id
-        && !is_valid_tool_result_run_id(run_id)
-    {
+    if !is_valid_tool_result_run_id(run_id) {
         return Err(ToolResultPersistenceError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
             "run_id is not a valid durable identifier",
         )));
     }
-    let dir = session_dir.join(TOOL_RESULTS_SUBDIR);
-    std::fs::create_dir_all(&dir).map_err(ToolResultPersistenceError::Io)?;
-
-    // Sanitize tool_call_id for filesystem safety (with hash suffix to avoid collisions)
-    let safe_id = safe_filename_stem(tool_call_id);
-    let file_path = dir.join(format!("{safe_id}.txt"));
-
-    let persisted = persistable_content(content);
-    if let Some(run_id) = run_id {
-        let authoritative_path =
-            run_scoped_document_path(session_dir, run_id, tool_call_id, document_kind);
-        match write_immutable_result(&authoritative_path, persisted.text.as_bytes()) {
-            Ok(()) => {}
-            Err(ImmutableWriteError::IdentityConflict) => {
-                return Err(ToolResultPersistenceError::IdentityConflict {
-                    run_id: run_id.to_string(),
-                    call_id: tool_call_id.to_string(),
-                    document_kind,
-                });
-            }
-            Err(ImmutableWriteError::Io(error)) => {
-                return Err(ToolResultPersistenceError::Io(error));
-            }
-        }
-    }
-
-    // Keep the call-id projection for local readers that still inspect a
-    // session directory.  It is neither journal nor model-handle authority:
-    // a later run may reuse the provider call id without changing either
-    // run-scoped file.  Once a run-bound file exists, failure of this mutable
-    // convenience projection must not invalidate the immutable artifact.
-    if document_kind.is_result()
-        && let Err(error) = std::fs::write(&file_path, persisted.text.as_str())
-    {
-        if run_id.is_none() {
-            return Err(ToolResultPersistenceError::Io(error));
-        }
-        tracing::debug!(
-            path = %file_path.display(),
-            error = %error,
-            "tool-result mutable call-id projection unavailable; immutable run artifact remains authoritative"
-        );
-    }
-
-    let persisted_bytes = persisted.text.as_bytes();
+    let persisted_bytes = content.as_bytes();
     let byte_len = u64::try_from(persisted_bytes.len()).map_err(|_| {
         ToolResultPersistenceError::Io(io::Error::other(
             "persisted tool result exceeds supported byte length",
         ))
     })?;
     let content_sha256 = format!("{:x}", Sha256::digest(persisted_bytes));
-    let artifact_uri = run_id.map_or_else(
-        || session_tool_result_artifact_uri(tool_call_id),
-        |run_id| {
-            session_tool_result_artifact_uri_for_descriptor(
-                &astra_services::session_journal::ToolResultArtifactDescriptor {
-                    document_kind,
-                    version:
-                        astra_services::session_journal::TOOL_RESULT_ARTIFACT_DESCRIPTOR_VERSION,
-                    call_id: tool_call_id.to_string(),
-                    run_id: run_id.to_string(),
-                    byte_len,
-                    content_sha256: content_sha256.clone(),
-                },
-            )
-        },
-    );
+    let descriptor = astra_services::session_journal::ToolResultArtifactDescriptor {
+        document_kind,
+        version: astra_services::session_journal::TOOL_RESULT_ARTIFACT_DESCRIPTOR_VERSION,
+        call_id: tool_call_id.to_string(),
+        run_id: run_id.to_string(),
+        byte_len,
+        content_sha256: content_sha256.clone(),
+    };
+    let (manifest, digest) = encoded_artifact_manifest(&descriptor);
+    if manifest.len() > MAX_ARTIFACT_MANIFEST_BYTES {
+        return Err(ToolResultPersistenceError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tool-result manifest exceeds the descriptor size limit",
+        )));
+    }
+    let authoritative_path =
+        run_scoped_document_path(session_dir, run_id, tool_call_id, document_kind);
+    match write_immutable_result(&authoritative_path, persisted_bytes) {
+        Ok(()) => {}
+        Err(ImmutableWriteError::IdentityConflict) => {
+            return Err(ToolResultPersistenceError::IdentityConflict {
+                run_id: run_id.to_string(),
+                call_id: tool_call_id.to_string(),
+                document_kind,
+            });
+        }
+        Err(ImmutableWriteError::Io(error)) => {
+            return Err(ToolResultPersistenceError::Io(error));
+        }
+    }
+    match write_immutable_result(&artifact_manifest_path(session_dir, &digest), &manifest) {
+        Ok(()) => {}
+        Err(ImmutableWriteError::IdentityConflict) => {
+            return Err(ToolResultPersistenceError::IdentityConflict {
+                run_id: run_id.to_string(),
+                call_id: tool_call_id.to_string(),
+                document_kind,
+            });
+        }
+        Err(ImmutableWriteError::Io(error)) => return Err(ToolResultPersistenceError::Io(error)),
+    }
+    let artifact_uri = session_tool_result_artifact_uri_for_descriptor(&descriptor);
     Ok(PersistedWrite {
-        replacement: build_replacement(tool_call_id, tool_name, content, &persisted, &artifact_uri),
+        replacement: build_replacement(tool_call_id, tool_name, content, &artifact_uri),
         byte_len,
         content_sha256,
     })
@@ -745,11 +678,9 @@ fn write_immutable_result_with(
 
     let published = match std::fs::hard_link(&temp_path, path) {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => match std::fs::read(path) {
-            Ok(existing) if existing == content => Ok(()),
-            Ok(_) => Err(ImmutableWriteError::IdentityConflict),
-            Err(error) => Err(ImmutableWriteError::Io(error)),
-        },
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            verify_immutable_replay(path, content)
+        }
         Err(error) => Err(ImmutableWriteError::Io(error)),
     };
     if let Err(error) = published {
@@ -766,52 +697,27 @@ fn write_immutable_result_with(
     sync.map_err(ImmutableWriteError::Io)
 }
 
-/// Persist a tool result to disk unconditionally (no size threshold).
-///
-/// Used by compaction to save full content before clearing. Unlike
-/// `maybe_persist_tool_result`, this always writes regardless of content size.
-/// Returns `true` on success.
-pub fn maybe_persist_tool_result_unconditional(
-    session_dir: &Path,
-    tool_call_id: &str,
-    // tool_name is reserved for future metadata embedding in the persisted file header.
-    // Currently unused because the file is identified solely by tool_call_id.
-    _tool_name: &str,
-    content: &str,
-) -> bool {
-    let dir = session_dir.join(TOOL_RESULTS_SUBDIR);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!(
-            dir = %dir.display(),
-            error = %e,
-            "tool_result_storage: failed to create dir"
-        );
-        return false;
+fn verify_immutable_replay(path: &Path, content: &[u8]) -> Result<(), ImmutableWriteError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(ImmutableWriteError::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ImmutableWriteError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "immutable tool document is not a regular owner-scoped file",
+        )));
     }
-
-    let safe_id = safe_filename_stem(tool_call_id);
-    let file_path = dir.join(format!("{safe_id}.txt"));
-
-    if let Err(e) = std::fs::write(&file_path, content) {
-        tracing::warn!(
-            path = %file_path.display(),
-            error = %e,
-            "tool_result_storage: failed to write"
-        );
-        return false;
+    if metadata.len() != content.len() as u64 {
+        return Err(ImmutableWriteError::IdentityConflict);
     }
-    true
-}
-
-/// Read a previously-persisted tool result back from disk.
-///
-/// Returns `None` if the file doesn't exist or can't be read.
-pub fn read_persisted_result(session_dir: &Path, tool_call_id: &str) -> Option<String> {
-    let safe_id = safe_filename_stem(tool_call_id);
-    let file_path = session_dir
-        .join(TOOL_RESULTS_SUBDIR)
-        .join(format!("{safe_id}.txt"));
-    std::fs::read_to_string(file_path).ok()
+    let mut existing = Vec::new();
+    std::fs::File::open(path)
+        .map_err(ImmutableWriteError::Io)?
+        .take((content.len() as u64).saturating_add(1))
+        .read_to_end(&mut existing)
+        .map_err(ImmutableWriteError::Io)?;
+    if existing != content {
+        return Err(ImmutableWriteError::IdentityConflict);
+    }
+    Ok(())
 }
 
 /// Read and verify the complete bytes named by a typed journal descriptor.
@@ -901,7 +807,7 @@ fn valid_artifact_descriptor(
 /// identities directly. The opaque payload carries the complete immutable
 /// descriptor; a call id alone is not a physical artifact identity.
 #[must_use]
-pub fn parse_session_tool_result_artifact_uri(
+fn parse_inline_artifact_uri(
     value: &str,
 ) -> Option<astra_services::session_journal::ToolResultArtifactDescriptor> {
     let encoded = value.strip_prefix(SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX)?;
@@ -925,15 +831,91 @@ pub fn parse_session_tool_result_artifact_uri(
     valid_artifact_descriptor(&descriptor).then_some(descriptor)
 }
 
-/// Parse the descriptor from a runtime-generated model projection.  This is a
+fn parse_artifact_reference(value: &str) -> Option<ArtifactReference> {
+    let token = value.strip_prefix(SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX)?;
+    if let Some((kind, digest)) = token.split_once('_')
+        && matches!(kind, "result" | "guidance")
+    {
+        let kind = match kind {
+            "result" => astra_services::session_journal::ToolResultDocumentKind::Result,
+            "guidance" => astra_services::session_journal::ToolResultDocumentKind::RuntimeGuidance,
+            _ => return None,
+        };
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+        {
+            return None;
+        }
+        return Some(ArtifactReference::Stored {
+            kind,
+            digest: digest.to_string(),
+        });
+    }
+    // Published inline descriptors remain readable in durable histories.
+    parse_inline_artifact_uri(value).map(ArtifactReference::Inline)
+}
+
+fn artifact_manifest_path(session_dir: &Path, digest: &str) -> PathBuf {
+    tool_results_dir(session_dir)
+        .join(ARTIFACT_MANIFESTS_SUBDIR)
+        .join(format!("{digest}.json"))
+}
+
+/// Resolve a reference only inside the already-authorized owner/session store.
+/// A stored descriptor is immutable and must match the digest and document kind
+/// in the reference before the existing byte-verifying reader can use it.
+fn resolve_session_tool_result_artifact_uri(
+    session_dir: &Path,
+    value: &str,
+) -> Result<Option<astra_services::session_journal::ToolResultArtifactDescriptor>, String> {
+    let reference = parse_artifact_reference(value)
+        .ok_or_else(|| "artifact must be a valid artifact://session/tool-result/<opaque_token> handle; urn:astra:observation:* and urn:astra:evidence:* values are evidence citations, not artifact handles—omit artifact for live introspect or use the returned artifact://session/tool-result/<opaque_token> handle".to_string())?;
+    let (kind, digest) = match reference {
+        ArtifactReference::Inline(descriptor) => return Ok(Some(descriptor)),
+        ArtifactReference::Stored { kind, digest } => (kind, digest),
+    };
+    let path = artifact_manifest_path(session_dir, &digest);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("failed to inspect tool-result manifest: {error}")),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("tool-result manifest is not a regular owner-scoped file".to_string());
+    }
+    if metadata.len() > MAX_ARTIFACT_MANIFEST_BYTES as u64 {
+        return Err("tool-result manifest exceeds the descriptor size limit".to_string());
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&path)
+        .map_err(|error| format!("failed to open tool-result manifest: {error}"))?
+        .take(MAX_ARTIFACT_MANIFEST_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("failed to read tool-result manifest: {error}"))?;
+    if bytes.len() > MAX_ARTIFACT_MANIFEST_BYTES {
+        return Err("tool-result manifest exceeds the descriptor size limit".to_string());
+    }
+    if format!("{:x}", Sha256::digest(&bytes)) != digest {
+        return Err("tool-result manifest digest does not match its reference".to_string());
+    }
+    let descriptor: astra_services::session_journal::ToolResultArtifactDescriptor =
+        serde_json::from_slice(&bytes)
+            .map_err(|error| format!("invalid tool-result manifest: {error}"))?;
+    if !valid_artifact_descriptor(&descriptor) || descriptor.document_kind != kind {
+        return Err("tool-result manifest identity does not match its reference".to_string());
+    }
+    Ok(Some(descriptor))
+}
+
+/// Parse a result reference from a runtime-generated model projection. This is a
 /// strict codec for the two persisted-output grammars emitted by this module;
 /// it is not a classifier over arbitrary model text.  Typed message metadata
 /// remains the preferred path, while this parser protects older in-memory
 /// projections that have not yet been round-tripped through `Message`.
 #[must_use]
-pub fn parse_tool_result_artifact_projection(
-    content: &str,
-) -> Option<astra_services::session_journal::ToolResultArtifactDescriptor> {
+pub fn parse_tool_result_artifact_projection(content: &str) -> Option<&str> {
     let body = content
         .trim()
         .strip_prefix(PERSISTED_TAG_OPEN)?
@@ -947,31 +929,13 @@ pub fn parse_tool_result_artifact_projection(
         } else {
             continue;
         };
-        if let Some(descriptor) = parse_session_tool_result_artifact_uri(uri)
-            && descriptor.document_kind.is_result()
+        if let Some(reference) = parse_artifact_reference(uri)
+            && reference.is_result()
         {
-            return Some(descriptor);
+            return Some(uri);
         }
     }
     None
-}
-
-/// Read one UTF-8-safe byte window from a persisted result.
-///
-/// The caller owns the session directory, so a logical handle can never cross
-/// session ownership boundaries. `next_offset` is always a valid UTF-8
-/// boundary and is the only continuation cursor a model needs to retain.
-pub fn read_persisted_result_window(
-    session_dir: &Path,
-    tool_call_id: &str,
-    offset: usize,
-    max_bytes: usize,
-) -> Result<Option<PersistedToolResultWindow>, String> {
-    let safe_id = safe_filename_stem(tool_call_id);
-    let file_path = session_dir
-        .join(TOOL_RESULTS_SUBDIR)
-        .join(format!("{safe_id}.txt"));
-    read_persisted_result_window_at_path(&file_path, offset, max_bytes)
 }
 
 fn read_persisted_result_window_at_path(
@@ -1154,14 +1118,14 @@ pub fn resolve_session_tool_result_artifact_request(
             ));
         }
     };
-    let descriptor = match parse_session_tool_result_artifact_uri(artifact) {
-        Some(descriptor) => descriptor,
-        None => {
+    let descriptor = match resolve_session_tool_result_artifact_uri(session_dir, artifact) {
+        Ok(Some(descriptor)) => descriptor,
+        Ok(None) => {
             return Some(Err(
-                "artifact must be a valid artifact://session/tool-result/<opaque_token> handle"
-                    .to_string(),
+                "tool-result artifact was not found in the active session".to_string(),
             ));
         }
+        Err(error) => return Some(Err(error)),
     };
     let offset = match args.get("offset") {
         Some(value) => match value.as_u64().and_then(|value| usize::try_from(value).ok()) {
@@ -1183,7 +1147,9 @@ pub fn resolve_session_tool_result_artifact_request(
             let Some(window) = window else {
                 return Err("tool-result artifact was not found in the active session".to_string());
             };
-            let handle = session_tool_result_artifact_uri_for_descriptor(&descriptor);
+            // Keep the caller's reference: old durable inline handles may not
+            // have a compact manifest, and reading must not manufacture one.
+            let handle = artifact;
             let continuation = if window.is_complete() {
                 "Complete.".to_string()
             } else {
@@ -1216,55 +1182,32 @@ pub fn tool_results_dir(session_dir: &Path) -> PathBuf {
     session_dir.join(TOOL_RESULTS_SUBDIR)
 }
 
-/// Return the model-facing logical artifact URI for a persisted tool result.
-#[must_use]
-pub fn session_tool_result_artifact_uri(tool_call_id: &str) -> String {
-    format!(
-        "{SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(tool_call_id)
-    )
-}
-
 /// Return the canonical model-facing handle for one immutable artifact.
 #[must_use]
 pub fn session_tool_result_artifact_uri_for_descriptor(
     descriptor: &astra_services::session_journal::ToolResultArtifactDescriptor,
 ) -> String {
-    let payload = RunBoundArtifactHandle {
-        kind: descriptor.document_kind,
-        v: descriptor.version,
-        run: descriptor.run_id.clone(),
-        call: descriptor.call_id.clone(),
-        len: descriptor.byte_len,
-        sha256: descriptor.content_sha256.clone(),
+    let (_, digest) = encoded_artifact_manifest(descriptor);
+    let kind = if descriptor.document_kind.is_result() {
+        "result"
+    } else {
+        "guidance"
     };
-    let encoded = serde_json::to_vec(&payload)
-        .expect("tool-result artifact handle serialization must be infallible");
-    format!(
-        "{SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(encoded)
-    )
+    format!("{SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX}{kind}_{digest}")
+}
+
+fn encoded_artifact_manifest(
+    descriptor: &astra_services::session_journal::ToolResultArtifactDescriptor,
+) -> (Vec<u8>, String) {
+    let bytes = serde_json::to_vec(descriptor)
+        .expect("tool-result artifact descriptor serialization must be infallible");
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    (bytes, digest)
 }
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-fn persistable_content(content: &str) -> PersistedContent {
-    if content.lines().count() <= 1
-        && let Ok(value) = serde_json::from_str::<Value>(content)
-        && let Ok(pretty) = serde_json::to_string_pretty(&value)
-    {
-        return PersistedContent {
-            text: pretty,
-            format: PersistedFormat::PrettyJson,
-        };
-    }
-    PersistedContent {
-        text: content.to_string(),
-        format: PersistedFormat::PlainText,
-    }
-}
 
 /// Return the encoded length of a valid UTF-8 scalar from its first byte.
 /// Continuation bytes and invalid leading bytes deliberately return `None`.
@@ -1281,13 +1224,11 @@ fn utf8_scalar_len(first: u8) -> Option<usize> {
 fn build_replacement(
     tool_call_id: &str,
     tool_name: &str,
-    original_content: &str,
-    persisted: &PersistedContent,
+    persisted_content: &str,
     artifact_uri: &str,
 ) -> String {
-    let total_chars = original_content.chars().count();
-    let stored_chars = persisted.text.chars().count();
-    let preview = model_preview(&persisted.text, PREVIEW_CHARS);
+    let total_chars = persisted_content.chars().count();
+    let preview = model_preview(persisted_content, PREVIEW_CHARS);
 
     // Try to cut at a newline for cleaner preview
     let preview = if let Some(nl_pos) = preview.rfind('\n') {
@@ -1299,13 +1240,6 @@ fn build_replacement(
     } else {
         &preview
     };
-    let format_note = match persisted.format {
-        PersistedFormat::PlainText => String::new(),
-        PersistedFormat::PrettyJson => format!(
-            "Stored as pretty JSON for readable line ranges ({stored_chars} chars on disk; semantic JSON unchanged).\n         "
-        ),
-    };
-
     format!(
         "{PERSISTED_TAG_OPEN}\n\
          Tool `{tool_name}` produced {total_chars} chars of output.\n\
@@ -1313,7 +1247,6 @@ fn build_replacement(
          Artifact handle: {artifact_uri}\n\
          Storage: session tool-result artifact.\n\
          Reading retained output requires an authorized artifact reader; the handle does not grant access. Do not search, copy, or read physical local session paths.\n\
-         {format_note}\
          \n\
          Preview (~{prev_len} chars; structured head/tail when available):\n\
          {preview}\n\
@@ -1423,71 +1356,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn small_result_returns_none() {
-        let dir = std::env::temp_dir().join("trs_small");
-        let _ = std::fs::create_dir_all(&dir);
-        let content = "hello world";
-        assert!(maybe_persist_tool_result(&dir, "call-1", "bash", content).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn large_result_persisted_and_replaced() {
-        let dir = std::env::temp_dir().join("trs_large");
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::create_dir_all(&dir);
-
+        let dir = tempfile::tempdir().unwrap();
         let content = "x".repeat(PERSIST_THRESHOLD_CHARS + 100);
-        let replacement = maybe_persist_tool_result(&dir, "call-42", "bash", &content).unwrap();
-
-        // Replacement contains the tag
+        let persisted = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-large",
+            "call-42",
+            "bash",
+            &content,
+        )
+        .unwrap();
+        let replacement = &persisted.replacement;
         assert!(replacement.contains(PERSISTED_TAG_OPEN));
         assert!(replacement.contains(PERSISTED_TAG_CLOSE));
         assert!(replacement.contains("bash"));
         assert!(replacement.contains("Tool result id: call-42"));
         assert!(replacement.contains(&format!(
             "Artifact handle: {}",
-            session_tool_result_artifact_uri("call-42")
+            session_tool_result_artifact_uri_for_descriptor(&persisted.descriptor)
         )));
         assert!(replacement.contains("session tool-result artifact"));
         assert!(replacement.contains("requires an authorized artifact reader"));
-        assert!(!replacement.contains("introspect(artifact="));
-        assert!(!replacement.contains("read_file"));
-        assert!(!replacement.contains("File:"));
-        assert!(!replacement.contains("tool-results"));
-        assert!(!replacement.contains("~/.astra"));
-
-        // File was written (name is `<safe_id>-<hash>.txt` to avoid collisions)
-        let results_dir = dir.join(TOOL_RESULTS_SUBDIR);
-        let entries: Vec<_> = std::fs::read_dir(&results_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
-        assert_eq!(entries.len(), 1);
-        let file_path = entries[0].path();
-        let fname = file_path.file_name().unwrap().to_string_lossy();
-        assert!(fname.starts_with("call-42-"));
-        assert!(fname.ends_with(".txt"));
-        let stored = std::fs::read_to_string(&file_path).unwrap();
-        assert_eq!(stored.len(), content.len());
-
-        // Roundtrip read via public API
-        let recovered = read_persisted_result(&dir, "call-42").unwrap();
-        assert_eq!(recovered, content);
-
-        // Replacement is much smaller than original
+        for forbidden in [
+            "introspect(artifact=",
+            "read_file",
+            "File:",
+            "tool-results",
+            "~/.astra",
+        ] {
+            assert!(!replacement.contains(forbidden));
+        }
+        assert_eq!(
+            resolve_session_tool_result_artifact_uri(
+                dir.path(),
+                &session_tool_result_artifact_uri_for_descriptor(&persisted.descriptor)
+            )
+            .unwrap(),
+            Some(persisted.descriptor.clone())
+        );
+        assert_eq!(
+            read_verified_persisted_result(dir.path(), &persisted.descriptor, content.len() as u64)
+                .unwrap(),
+            content
+        );
         assert!(replacement.len() < content.len() / 5);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn typed_descriptor_verifies_exact_persisted_bytes_with_run_bound_handle() {
         let dir = tempfile::tempdir().unwrap();
         let content = "first line\nsecond line\n";
-        let ordinary =
-            persist_tool_result_with_replacement(dir.path(), "call-authority", "agent", content)
-                .unwrap();
         let typed = persist_tool_result_with_descriptor(
             dir.path(),
             "run-authority",
@@ -1497,7 +1416,6 @@ mod tests {
         )
         .unwrap();
 
-        assert_ne!(typed.replacement, ordinary);
         assert_eq!(typed.descriptor.version, 1);
         assert_eq!(typed.descriptor.call_id, "call-authority");
         assert_eq!(typed.descriptor.run_id, "run-authority");
@@ -1507,13 +1425,29 @@ mod tests {
         let handle = session_tool_result_artifact_uri_for_descriptor(&typed.descriptor);
         assert!(typed.replacement.contains(&handle));
         assert_eq!(
-            parse_session_tool_result_artifact_uri(&handle),
+            resolve_session_tool_result_artifact_uri(dir.path(), &handle).unwrap(),
             Some(typed.descriptor.clone())
         );
         assert_eq!(
             read_verified_persisted_result(dir.path(), &typed.descriptor, 1024).unwrap(),
             content
         );
+    }
+
+    #[test]
+    fn observation_reference_is_not_accepted_as_artifact_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = resolve_session_tool_result_artifact_request(
+            dir.path(),
+            &serde_json::json!({
+                "artifact": "urn:astra:observation:durable:introspect:invocation_lifecycle"
+            }),
+        )
+        .expect("present artifact must be validated")
+        .expect_err("observation references are not artifact handles");
+        assert!(error.contains("artifact://session/tool-result/<opaque_token>"));
+        assert!(error.contains("evidence citations"));
+        assert!(error.contains("omit artifact"));
     }
 
     #[test]
@@ -1562,7 +1496,7 @@ mod tests {
         );
         let handle = session_tool_result_artifact_uri_for_descriptor(&guidance.descriptor);
         assert_eq!(
-            parse_session_tool_result_artifact_uri(&handle),
+            resolve_session_tool_result_artifact_uri(dir.path(), &handle).unwrap(),
             Some(guidance.descriptor.clone())
         );
         let first = resolve_session_tool_result_artifact_request(
@@ -1624,7 +1558,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(replay.descriptor, guidance.descriptor);
-        // Ordinary result handles retain their original wire shape and paths.
+        // Durable typed result metadata retains its result document identity.
         assert!(
             serde_json::to_value(&result.descriptor)
                 .unwrap()
@@ -1632,12 +1566,10 @@ mod tests {
                 .is_none()
         );
         let result_handle = session_tool_result_artifact_uri_for_descriptor(&result.descriptor);
-        let encoded = result_handle
-            .strip_prefix(SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX)
-            .unwrap();
-        let payload: Value =
-            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded).unwrap()).unwrap();
-        assert!(payload.get("kind").is_none());
+        assert_eq!(
+            resolve_session_tool_result_artifact_uri(dir.path(), &result_handle).unwrap(),
+            Some(result.descriptor)
+        );
     }
 
     #[test]
@@ -1826,15 +1758,10 @@ mod tests {
             read_verified_persisted_result(dir.path(), &first.descriptor, 1024).unwrap(),
             "first immutable bytes"
         );
-        assert_eq!(
-            read_persisted_result(dir.path(), "call-stable").as_deref(),
-            Some("first immutable bytes"),
-            "a rejected identity conflict must not overwrite the mutable model projection"
-        );
     }
 
     #[test]
-    fn exact_replay_repairs_projection_after_artifact_before_descriptor_crash_window() {
+    fn exact_replay_recovers_descriptor_after_artifact_publish() {
         let dir = tempfile::tempdir().unwrap();
         let first = persist_tool_result_with_descriptor(
             dir.path(),
@@ -1844,12 +1771,6 @@ mod tests {
             "acknowledged immutable bytes",
         )
         .unwrap();
-        let projection = dir
-            .path()
-            .join(TOOL_RESULTS_SUBDIR)
-            .join(format!("{}.txt", safe_filename_stem("call-replay")));
-        std::fs::remove_file(&projection).unwrap();
-
         let replay = persist_tool_result_with_descriptor(
             dir.path(),
             "run-replay",
@@ -1858,16 +1779,25 @@ mod tests {
             "acknowledged immutable bytes",
         )
         .unwrap();
-
         assert_eq!(replay.descriptor, first.descriptor);
+        assert_eq!(replay.replacement, first.replacement);
+        let artifact = run_scoped_result_path(dir.path(), "run-replay", "call-replay");
+        assert_eq!(
+            std::fs::read_dir(artifact.parent().unwrap())
+                .unwrap()
+                .count(),
+            1,
+            "replay must retain one immutable file and no temporary residue"
+        );
         assert_eq!(
             read_verified_persisted_result(dir.path(), &replay.descriptor, 1024).unwrap(),
             "acknowledged immutable bytes"
         );
-        assert_eq!(
-            std::fs::read_to_string(projection).unwrap(),
-            "acknowledged immutable bytes",
-            "same-byte replay must repair the non-authoritative projection"
+        assert!(
+            !tool_results_dir(dir.path())
+                .join(format!("{}.txt", safe_filename_stem("call-replay")))
+                .exists(),
+            "replay must not recreate a second mutable result"
         );
     }
 
@@ -1930,7 +1860,11 @@ mod tests {
 
         for projection in [&stored.replacement, &compact.replacement] {
             assert_eq!(
-                parse_tool_result_artifact_projection(projection),
+                resolve_session_tool_result_artifact_uri(
+                    dir.path(),
+                    parse_tool_result_artifact_projection(projection).unwrap()
+                )
+                .unwrap(),
                 Some(stored.descriptor.clone()),
                 "neutral projection must retain the exact artifact identity"
             );
@@ -1960,8 +1894,15 @@ mod tests {
             "truncated": true
         });
         let raw = serde_json::to_string(&value).unwrap();
-        let replacement = maybe_persist_tool_result(dir.path(), "structured-call", "reader", &raw)
-            .expect("large web result should be persisted");
+        let replacement = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-structured",
+            "structured-call",
+            "reader",
+            &raw,
+        )
+        .expect("web result should be persisted")
+        .replacement;
 
         assert!(replacement.contains("https://example.test/article"));
         assert!(replacement.contains("page tail marker"));
@@ -1969,22 +1910,7 @@ mod tests {
     }
 
     #[test]
-    fn read_persisted_result_roundtrip() {
-        let dir = std::env::temp_dir().join("trs_read");
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::create_dir_all(&dir);
-
-        let content = "y".repeat(PERSIST_THRESHOLD_CHARS + 50);
-        let _ = maybe_persist_tool_result(&dir, "call-99", "grep", &content);
-
-        let recovered = read_persisted_result(&dir, "call-99").unwrap();
-        assert_eq!(recovered, content);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn large_single_line_json_is_persisted_as_pretty_json() {
+    fn large_single_line_json_is_persisted_without_rewriting_source_bytes() {
         let dir = std::env::temp_dir().join("trs_pretty_json");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
@@ -2002,68 +1928,50 @@ mod tests {
             "test setup must cross persistence threshold"
         );
 
-        let replacement =
-            maybe_persist_tool_result(&dir, "call-json", "agent_fanout", &content).unwrap();
-        let recovered = read_persisted_result(&dir, "call-json").unwrap();
+        let persisted = persist_tool_result_with_descriptor(
+            &dir,
+            "run-json",
+            "call-json",
+            "agent_fanout",
+            &content,
+        )
+        .unwrap();
+        let replacement = persisted.replacement;
+        let recovered =
+            read_verified_persisted_result(&dir, &persisted.descriptor, content.len() as u64)
+                .unwrap();
 
-        assert!(
-            replacement.contains("Stored as pretty JSON"),
-            "{replacement}"
-        );
         assert!(replacement.contains("\"results\""), "{replacement}");
-        assert!(
-            recovered.lines().count() > 100,
-            "persisted JSON must be readable by line range, got {} lines",
-            recovered.lines().count()
-        );
         assert_eq!(
-            serde_json::from_str::<Value>(&recovered).unwrap(),
-            serde_json::from_str::<Value>(&content).unwrap()
+            recovered, content,
+            "artifact ranges must address exact source bytes"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn read_persisted_result_missing_returns_none() {
-        let dir = std::env::temp_dir().join("trs_missing");
-        let _ = std::fs::create_dir_all(&dir);
-        assert!(read_persisted_result(&dir, "nonexistent").is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn session_artifact_uri_is_stable_and_path_free() {
-        let uri = session_tool_result_artifact_uri("call_abc123");
-
-        assert_eq!(uri, "artifact://session/tool-result/Y2FsbF9hYmMxMjM");
-        assert!(!uri.contains(".astra"));
-        assert!(!uri.contains("tool-results/"));
-        assert!(
-            parse_session_tool_result_artifact_uri(&uri).is_none(),
-            "a legacy call-only token is not immutable artifact authority"
-        );
     }
 
     #[test]
     fn artifact_handles_are_opaque_and_round_trip_every_provider_call_id() {
         let provider_id = "call/with spaces: provider-owned 😀";
-        let descriptor = astra_services::session_journal::ToolResultArtifactDescriptor {
-            document_kind: Default::default(),
-            version: astra_services::session_journal::TOOL_RESULT_ARTIFACT_DESCRIPTOR_VERSION,
-            call_id: provider_id.to_string(),
-            run_id: "run/with spaces: runtime-owned 😀".to_string(),
-            byte_len: 42,
-            content_sha256: "a".repeat(64),
-        };
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run/with spaces: runtime-owned 😀",
+            provider_id,
+            "read_file",
+            "provider evidence",
+        )
+        .unwrap()
+        .descriptor;
         let uri = session_tool_result_artifact_uri_for_descriptor(&descriptor);
         assert_eq!(
-            parse_session_tool_result_artifact_uri(&uri),
+            resolve_session_tool_result_artifact_uri(dir.path(), &uri).unwrap(),
             Some(descriptor.clone())
         );
         assert!(!uri.contains(provider_id));
         assert!(!uri.contains(&descriptor.run_id));
         for invalid in [
+            "artifact://session/tool-result/Y2FsbF9hYmMxMjM",
             "artifact://session/tool-result/",
             "artifact://session/tool-result/../other-session",
             "artifact://session/tool-result/call/child",
@@ -2071,18 +1979,285 @@ mod tests {
             "artifact://session/tool-result/call_abc-123",
             "file:///tmp/result.txt",
         ] {
-            assert_eq!(
-                parse_session_tool_result_artifact_uri(invalid),
-                None,
+            assert!(
+                resolve_session_tool_result_artifact_uri(dir.path(), invalid).is_err(),
                 "{invalid}"
             );
         }
     }
 
     #[test]
+    fn compact_manifest_rejects_oversized_files_before_decoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let persisted = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-bounded",
+            "call-bounded",
+            "read_file",
+            "evidence",
+        )
+        .unwrap();
+        let reference = session_tool_result_artifact_uri_for_descriptor(&persisted.descriptor);
+        let (_, digest) = encoded_artifact_manifest(&persisted.descriptor);
+        std::fs::File::create(artifact_manifest_path(dir.path(), &digest))
+            .unwrap()
+            .set_len(32 * 1024 * 1024)
+            .unwrap();
+        let error = resolve_session_tool_result_artifact_request(
+            dir.path(),
+            &serde_json::json!({"artifact":reference,"max_bytes":1}),
+        )
+        .unwrap()
+        .unwrap_err();
+        assert!(error.contains("manifest exceeds"), "{error}");
+    }
+
+    #[test]
+    fn compact_manifest_publication_rejects_oversized_descriptors() {
+        let dir = tempfile::tempdir().unwrap();
+        let Err(error) = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-bounded",
+            &"call".repeat(32 * 1024),
+            "read_file",
+            "evidence",
+        ) else {
+            panic!("oversized descriptor must not publish a reference");
+        };
+        assert!(
+            matches!(error, ToolResultPersistenceError::Io(ref error)
+            if error.kind() == io::ErrorKind::InvalidInput),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn immutable_manifest_replay_recovers_after_nonregular_path_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let stored = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-recovery",
+            "call-recovery",
+            "read_file",
+            "recoverable evidence",
+        )
+        .unwrap();
+        let (_, digest) = encoded_artifact_manifest(&stored.descriptor);
+        let path = artifact_manifest_path(dir.path(), &digest);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let error = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-recovery",
+            "call-recovery",
+            "read_file",
+            "recoverable evidence",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, ToolResultPersistenceError::Io(ref error)
+            if error.kind() == io::ErrorKind::InvalidData),
+            "{error}"
+        );
+        std::fs::remove_dir(path).unwrap();
+        let replay = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-recovery",
+            "call-recovery",
+            "read_file",
+            "recoverable evidence",
+        )
+        .unwrap();
+        assert_eq!(replay.descriptor, stored.descriptor);
+        let result = resolve_session_tool_result_artifact_request(
+            dir.path(),
+            &serde_json::json!({"artifact":session_tool_result_artifact_uri_for_descriptor(&replay.descriptor)}),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(result.contains("recoverable evidence"), "{result}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_replay_rejects_symlinks_for_payload_and_manifest() {
+        for manifest in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let persisted = persist_tool_result_with_descriptor(
+                dir.path(),
+                "run-replay",
+                "call-replay",
+                "read_file",
+                "evidence",
+            )
+            .unwrap();
+            let path = if manifest {
+                let (_, digest) = encoded_artifact_manifest(&persisted.descriptor);
+                artifact_manifest_path(dir.path(), &digest)
+            } else {
+                run_scoped_result_path(dir.path(), "run-replay", "call-replay")
+            };
+            let target = dir.path().join("replay-target");
+            let expected = std::fs::read(&path).unwrap();
+            std::fs::rename(&path, &target).unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            let error = persist_tool_result_with_descriptor(
+                dir.path(),
+                "run-replay",
+                "call-replay",
+                "read_file",
+                "evidence",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, ToolResultPersistenceError::Io(ref error)
+                if error.kind() == io::ErrorKind::InvalidData),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(target).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn compact_reference_recovers_persisted_evidence_in_its_own_session() {
+        let owner = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let content = "Bounded evidence 日本語 😀\n".repeat(50);
+        let persisted = persist_tool_result_with_descriptor(
+            owner.path(),
+            "run-reference",
+            "call-reference",
+            "read_file",
+            &content,
+        )
+        .unwrap();
+        let manifest = serde_json::to_vec(&persisted.descriptor).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&manifest));
+        let reference = format!("{SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX}result_{digest}");
+        let request = serde_json::json!({"artifact":reference,"max_bytes":65536});
+        let recovered = resolve_session_tool_result_artifact_request(owner.path(), &request)
+            .unwrap()
+            .expect("a compact reference must recover its immutable result");
+        assert!(recovered.contains(&content), "{recovered}");
+        let denied = resolve_session_tool_result_artifact_request(other.path(), &request)
+            .unwrap()
+            .expect_err("another session cannot resolve the reference");
+        assert!(
+            denied.contains("not found in the active session"),
+            "{denied}"
+        );
+    }
+
+    #[test]
+    fn compact_reference_rejects_corrupt_or_missing_manifest_without_rebinding() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-first",
+            "call-shared",
+            "read_file",
+            "FIRST",
+        )
+        .unwrap();
+        let second = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-second",
+            "call-shared",
+            "read_file",
+            "SECOND",
+        )
+        .unwrap();
+        let first_ref = session_tool_result_artifact_uri_for_descriptor(&first.descriptor);
+        let second_ref = session_tool_result_artifact_uri_for_descriptor(&second.descriptor);
+        for (reference, expected) in [(&first_ref, "FIRST"), (&second_ref, "SECOND")] {
+            let output = resolve_session_tool_result_artifact_request(
+                dir.path(),
+                &serde_json::json!({"artifact":reference}),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(output.contains(expected), "{output}");
+        }
+        let (_, digest) = encoded_artifact_manifest(&first.descriptor);
+        let path = artifact_manifest_path(dir.path(), &digest);
+        std::fs::write(&path, serde_json::to_vec(&second.descriptor).unwrap()).unwrap();
+        let error = resolve_session_tool_result_artifact_request(
+            dir.path(),
+            &serde_json::json!({"artifact":first_ref}),
+        )
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "tool-result manifest digest does not match its reference"
+        );
+        std::fs::remove_file(path).unwrap();
+        let error = resolve_session_tool_result_artifact_request(
+            dir.path(),
+            &serde_json::json!({"artifact":first_ref}),
+        )
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "tool-result artifact was not found in the active session"
+        );
+        assert_eq!(
+            read_verified_persisted_result(dir.path(), &first.descriptor, 1024).unwrap(),
+            "FIRST"
+        );
+    }
+
+    #[test]
+    fn published_inline_reference_pages_without_a_compact_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "legacy evidence 日本語 😀\n".repeat(10);
+        let stored = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-old",
+            "call-old",
+            "read_file",
+            &content,
+        )
+        .unwrap();
+        let descriptor = &stored.descriptor;
+        let legacy = RunBoundArtifactHandle {
+            kind: descriptor.document_kind,
+            v: descriptor.version,
+            run: descriptor.run_id.clone(),
+            call: descriptor.call_id.clone(),
+            len: descriptor.byte_len,
+            sha256: descriptor.content_sha256.clone(),
+        };
+        let reference = format!(
+            "{SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&legacy).unwrap())
+        );
+        let (_, digest) = encoded_artifact_manifest(descriptor);
+        std::fs::remove_file(artifact_manifest_path(dir.path(), &digest)).unwrap();
+        let first = resolve_session_tool_result_artifact_request(
+            dir.path(),
+            &serde_json::json!({"artifact":reference,"max_bytes":16}),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            first.contains(&reference),
+            "legacy pagination must retain its available reference: {first}"
+        );
+        let tail = resolve_session_tool_result_artifact_request(
+            dir.path(),
+            &serde_json::json!({"artifact":reference,"offset":16,"max_bytes":65536}),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(tail.contains("日本語 😀"), "{tail}");
+    }
+
+    #[test]
     fn artifact_windows_round_trip_unicode_without_exposing_paths() {
         let dir = tempfile::tempdir().unwrap();
-        let content = "前缀😀\n".repeat(10_000);
+        let content = "前缀😀\n".repeat(128);
         let persisted = persist_tool_result_with_descriptor(
             dir.path(),
             "run-unicode",
@@ -2095,9 +2270,10 @@ mod tests {
         let mut offset = 0;
         let mut recovered = String::new();
         while offset < content.len() {
-            let window = read_persisted_result_window(dir.path(), "call-unicode", offset, 7)
-                .unwrap()
-                .expect("persisted result exists");
+            let window =
+                read_verified_persisted_result_window(dir.path(), &persisted.descriptor, offset, 7)
+                    .unwrap()
+                    .expect("persisted result exists");
             assert!(window.next_offset > offset, "window must make progress");
             assert!(content.is_char_boundary(window.offset));
             assert!(content.is_char_boundary(window.next_offset));
@@ -2128,63 +2304,80 @@ mod tests {
         let owner = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
         let content = "évidence\n".repeat(6_000);
-        assert!(
-            maybe_persist_tool_result(owner.path(), "call-boundary", "grep", &content).is_some()
-        );
-
-        let window = read_persisted_result_window(owner.path(), "call-boundary", 1, 32)
-            .expect("a stale cursor should be normalized to a safe boundary")
-            .expect("persisted result exists");
+        let persisted = persist_tool_result_with_descriptor(
+            owner.path(),
+            "run-boundary",
+            "call-boundary",
+            "grep",
+            &content,
+        )
+        .unwrap();
+        let window =
+            read_verified_persisted_result_window(owner.path(), &persisted.descriptor, 1, 32)
+                .expect("a stale cursor should be normalized")
+                .expect("persisted result exists");
         assert_eq!(
             window.offset, 0,
             "the cursor must floor to the scalar start"
         );
         assert!(window.content.starts_with('é'));
-        assert!(
-            read_persisted_result_window(other.path(), "call-boundary", 0, 32)
-                .unwrap()
-                .is_none()
-        );
+        let request = serde_json::json!({
+            "artifact": session_tool_result_artifact_uri_for_descriptor(&persisted.descriptor),
+            "offset": 1, "max_bytes": 32,
+        });
+        let rendered = resolve_session_tool_result_artifact_request(owner.path(), &request)
+            .expect("typed artifact request")
+            .expect("owner artifact exists");
+        assert!(rendered.contains("Bytes: [0.."), "{rendered}");
+        let error = resolve_session_tool_result_artifact_request(other.path(), &request)
+            .expect("typed artifact request")
+            .expect_err("another session cannot read the artifact");
+        assert!(error.contains("not found in the active session"), "{error}");
     }
 
     #[test]
     fn artifact_windows_fail_closed_for_corrupt_content() {
         let dir = tempfile::tempdir().unwrap();
-        let results = tool_results_dir(dir.path());
-        std::fs::create_dir_all(&results).unwrap();
-        let path = results.join(format!("{}.txt", safe_filename_stem("call-corrupt")));
-        std::fs::write(path, b"valid prefix\xff").unwrap();
-
-        let error = read_persisted_result_window(dir.path(), "call-corrupt", 0, 64)
-            .expect_err("a corrupt artifact must not yield a partial evidence window");
+        let content = b"valid prefix\xff";
+        let path = run_scoped_result_path(dir.path(), "run-corrupt", "call-corrupt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+        let descriptor = astra_services::session_journal::ToolResultArtifactDescriptor {
+            document_kind: Default::default(),
+            version: astra_services::session_journal::TOOL_RESULT_ARTIFACT_DESCRIPTOR_VERSION,
+            call_id: "call-corrupt".into(),
+            run_id: "run-corrupt".into(),
+            byte_len: content.len() as u64,
+            content_sha256: format!("{:x}", Sha256::digest(content)),
+        };
+        let error = read_verified_persisted_result_window(dir.path(), &descriptor, 0, 64)
+            .expect_err("corrupt artifact must not yield partial evidence");
         assert!(error.contains("not valid UTF-8"), "{error}");
     }
 
     #[test]
     fn sanitizes_tool_call_id_for_filesystem() {
-        let dir = std::env::temp_dir().join("trs_sanitize");
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::create_dir_all(&dir);
-
+        let dir = tempfile::tempdir().unwrap();
         let content = "z".repeat(PERSIST_THRESHOLD_CHARS + 10);
-        let replacement =
-            maybe_persist_tool_result(&dir, "call/../../etc/passwd", "bash", &content);
-        assert!(replacement.is_some());
-
-        // Verify the file was created (with sanitized name)
-        let results_dir = dir.join(TOOL_RESULTS_SUBDIR);
-        assert!(results_dir.exists());
-        let entries: Vec<_> = std::fs::read_dir(&results_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
-        assert_eq!(entries.len(), 1);
-        // The filename should not contain path separators
-        let filename = entries[0].file_name().to_string_lossy().to_string();
+        let call_id = "call/../../etc/passwd";
+        let persisted = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-sanitize",
+            call_id,
+            "bash",
+            &content,
+        )
+        .unwrap();
+        let path = run_scoped_result_path(dir.path(), "run-sanitize", call_id);
+        let filename = path.file_name().unwrap().to_string_lossy();
         assert!(!filename.contains('/'));
         assert!(!filename.contains(".."));
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(path.starts_with(dir.path()));
+        assert_eq!(
+            read_verified_persisted_result(dir.path(), &persisted.descriptor, content.len() as u64)
+                .unwrap(),
+            content
+        );
     }
 
     #[test]
@@ -2199,7 +2392,10 @@ mod tests {
             content.push_str(&format!("line {i}\n"));
         }
 
-        let replacement = maybe_persist_tool_result(&dir, "call-nl", "bash", &content).unwrap();
+        let replacement =
+            persist_tool_result_with_descriptor(&dir, "run-nl", "call-nl", "bash", &content)
+                .unwrap()
+                .replacement;
         // Preview should end at a clean newline
         assert!(replacement.contains("Preview"));
         assert!(replacement.contains("line "));
@@ -2213,22 +2409,6 @@ mod tests {
         assert_eq!(super::fnv1a_64(b""), 0xcbf29ce484222325);
         // "a" → well-known FNV-1a-64 value
         assert_eq!(super::fnv1a_64(b"a"), 0xaf63dc4c8601ec8c);
-    }
-
-    #[test]
-    fn threshold_boundary_exact() {
-        let dir = std::env::temp_dir().join("trs_boundary");
-        let _ = std::fs::create_dir_all(&dir);
-
-        // Exactly at threshold → not persisted
-        let at_limit = "a".repeat(PERSIST_THRESHOLD_CHARS);
-        assert!(maybe_persist_tool_result(&dir, "c1", "bash", &at_limit).is_none());
-
-        // One over → persisted
-        let over_limit = "a".repeat(PERSIST_THRESHOLD_CHARS + 1);
-        assert!(maybe_persist_tool_result(&dir, "c2", "bash", &over_limit).is_some());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2305,15 +2485,11 @@ mod tests {
             &"evidence\n".repeat(500),
         )
         .unwrap();
-        assert_eq!(
-            persisted
-                .replacement
-                .matches("artifact://session/tool-result/")
-                .count(),
-            1
-        );
-        let descriptor = parse_tool_result_artifact_projection(&persisted.replacement)
+        let reference = parse_tool_result_artifact_projection(&persisted.replacement)
             .expect("compact projection must use the canonical handle grammar");
+        let descriptor = resolve_session_tool_result_artifact_uri(dir.path(), reference)
+            .unwrap()
+            .unwrap();
         assert_eq!(descriptor, persisted.descriptor);
         assert_eq!(
             read_verified_persisted_result(dir.path(), &descriptor, 64 * 1024).unwrap(),

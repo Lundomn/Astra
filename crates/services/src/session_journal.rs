@@ -30,8 +30,7 @@ use astra_turn_types::{
 };
 
 use crate::interaction_contract::{
-    InteractionContract, InteractionIdentity, InteractionKind, InteractionStatus,
-    approval_decision_status, ask_user_response_status,
+    InteractionContract, InteractionIdentity, InteractionKind, approval_decision_status,
 };
 use crate::{OwnerScope, SessionArtifactStore};
 
@@ -293,7 +292,7 @@ fn event_type_tiebreak_rank(event_type: &JournalEventType) -> u8 {
     }
 }
 
-fn stabilize_event_order(events: &mut [JournalEvent]) {
+pub fn stabilize_event_order(events: &mut [JournalEvent]) {
     // Fast path: already chronological by file layout, no same-timestamp
     // boundary tiebreak inversion, no leading SessionStart that needs to be
     // lifted.  `read_journal` is in the steady-state hot path — re-sorting
@@ -634,6 +633,16 @@ fn open_unlocked_journal_file_with_creation(path: &Path) -> std::io::Result<Open
 fn serialize_journal_events(events: &[JournalEvent]) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     for event in events {
+        let redacted_event = if matches!(&event.event_type, JournalEventType::AgentTerminated)
+            && journal_content_redact_enabled()
+        {
+            let mut redacted = event.clone();
+            redact_agent_terminated_content(&mut redacted);
+            Some(redacted)
+        } else {
+            None
+        };
+        let event = redacted_event.as_ref().unwrap_or(event);
         let mut line = serde_json::to_vec(event)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         line.push(b'\n');
@@ -652,6 +661,48 @@ fn serialize_journal_events(events: &[JournalEvent]) -> std::io::Result<Vec<u8>>
         buf.extend(line);
     }
     Ok(buf)
+}
+
+fn redact_agent_terminated_content(event: &mut JournalEvent) {
+    let Some(metadata) = event
+        .metadata
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+
+    if let Some(full_text) = metadata.get_mut("full_text") {
+        redact_journal_value(full_text);
+    }
+    if let Some(intents) = metadata.get_mut("applied_user_intents") {
+        match intents {
+            serde_json::Value::Array(intents) => {
+                for intent in intents {
+                    if let Some(content) = intent
+                        .as_object_mut()
+                        .and_then(|fields| fields.get_mut("content"))
+                    {
+                        redact_journal_value(content);
+                    } else if !intent.is_object() {
+                        redact_journal_value(intent);
+                    }
+                }
+            }
+            intents => redact_journal_value(intents),
+        }
+    }
+}
+
+fn redact_journal_value(value: &mut serde_json::Value) {
+    if let Some(raw) = value.as_str() {
+        if !is_journal_content_marker(raw) {
+            *value = serde_json::Value::String(journal_content_marker(raw));
+        }
+    } else {
+        let raw = value.to_string();
+        *value = serde_json::Value::String(journal_content_marker(&raw));
+    }
 }
 
 fn sync_directory(path: &Path) -> std::io::Result<()> {
@@ -766,315 +817,6 @@ impl Drop for ProcessJournalDirGuard {
     }
 }
 
-/// Session state change tracking for edge-cloud sync.
-/// Records mutations as deltas instead of overwriting full state.
-pub mod state_delta {
-    use serde::{Deserialize, Serialize};
-    use std::collections::HashMap;
-
-    /// Change operation type for session state mutations.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum StateChangeOp {
-        Create,
-        Update,
-        Delete,
-    }
-
-    /// A single state change entry for session mutations.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct StateChange {
-        /// Monotonic version number within the session.
-        pub version: u64,
-        /// Timestamp in milliseconds.
-        pub timestamp_ms: u64,
-        /// The state key being mutated.
-        pub key: String,
-        /// The operation type.
-        pub op: StateChangeOp,
-        /// The value (None for Delete).
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub value: Option<serde_json::Value>,
-        /// Turn number when the change occurred.
-        pub turn: u32,
-    }
-
-    /// Accumulates session state changes for delta sync.
-    pub struct SessionStateAccumulator {
-        version_counter: u64,
-        entries: Vec<StateChange>,
-        current_state: HashMap<String, serde_json::Value>,
-    }
-
-    impl Default for SessionStateAccumulator {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    impl SessionStateAccumulator {
-        /// Create a new state accumulator starting at version 1.
-        pub fn new() -> Self {
-            Self {
-                version_counter: 1,
-                entries: Vec::new(),
-                current_state: HashMap::new(),
-            }
-        }
-
-        fn next_version(&mut self) -> u64 {
-            let v = self.version_counter;
-            self.version_counter += 1;
-            v
-        }
-
-        fn now_ms() -> u64 {
-            use std::time::SystemTime;
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64
-        }
-
-        /// Record a state creation.
-        pub fn create(
-            &mut self,
-            key: impl Into<String>,
-            value: impl Serialize,
-            turn: u32,
-        ) -> Result<u64, String> {
-            let key = key.into();
-            if self.current_state.contains_key(&key) {
-                return Err(format!("Key '{}' already exists", key));
-            }
-
-            let version = self.next_version();
-            let json_value = serde_json::to_value(value).map_err(|e| e.to_string())?;
-
-            self.current_state.insert(key.clone(), json_value.clone());
-            self.entries.push(StateChange {
-                version,
-                timestamp_ms: Self::now_ms(),
-                key,
-                op: StateChangeOp::Create,
-                value: Some(json_value),
-                turn,
-            });
-
-            Ok(version)
-        }
-
-        /// Record a state update.
-        pub fn update(
-            &mut self,
-            key: impl Into<String>,
-            value: impl Serialize,
-            turn: u32,
-        ) -> Result<u64, String> {
-            let key = key.into();
-            if !self.current_state.contains_key(&key) {
-                return Err(format!("Key '{}' not found", key));
-            }
-
-            let version = self.next_version();
-            let json_value = serde_json::to_value(value).map_err(|e| e.to_string())?;
-
-            self.current_state.insert(key.clone(), json_value.clone());
-            self.entries.push(StateChange {
-                version,
-                timestamp_ms: Self::now_ms(),
-                key,
-                op: StateChangeOp::Update,
-                value: Some(json_value),
-                turn,
-            });
-
-            Ok(version)
-        }
-
-        /// Record a state deletion.
-        pub fn delete(&mut self, key: impl Into<String>, turn: u32) -> Result<u64, String> {
-            let key = key.into();
-            if !self.current_state.contains_key(&key) {
-                return Err(format!("Key '{}' not found", key));
-            }
-
-            let version = self.next_version();
-            self.current_state.remove(&key);
-            self.entries.push(StateChange {
-                version,
-                timestamp_ms: Self::now_ms(),
-                key,
-                op: StateChangeOp::Delete,
-                value: None,
-                turn,
-            });
-
-            Ok(version)
-        }
-
-        /// Get the current value for a key.
-        pub fn get(&self, key: &str) -> Option<&serde_json::Value> {
-            self.current_state.get(key)
-        }
-
-        /// Get all changes since a version (exclusive).
-        pub fn changes_since(&self, since_version: u64) -> Vec<&StateChange> {
-            self.entries
-                .iter()
-                .filter(|e| e.version > since_version)
-                .collect()
-        }
-        /// Get current state snapshot.
-        pub fn snapshot(&self) -> &HashMap<String, serde_json::Value> {
-            &self.current_state
-        }
-
-        /// Get the latest version number.
-        pub fn latest_version(&self) -> u64 {
-            self.version_counter.saturating_sub(1)
-        }
-
-        /// Get the number of change entries.
-        pub fn change_count(&self) -> usize {
-            self.entries.len()
-        }
-        /// Compact by keeping only latest change per key.
-        pub fn compact(&mut self) {
-            let mut latest: HashMap<String, StateChange> = HashMap::new();
-
-            for entry in &self.entries {
-                if entry.op == StateChangeOp::Delete {
-                    latest.remove(&entry.key);
-                } else {
-                    latest.insert(entry.key.clone(), entry.clone());
-                }
-            }
-
-            let mut new_entries: Vec<StateChange> = latest.into_values().collect();
-            new_entries.sort_by_key(|e| e.version);
-            self.entries = new_entries;
-        }
-
-        /// Calculate memory overhead of changes vs full state.
-        pub fn overhead_percentage(&self) -> f64 {
-            let changes_bytes: usize = self
-                .entries
-                .iter()
-                .map(|e| {
-                    let base = e.key.len() + std::mem::size_of::<StateChange>();
-                    let val_bytes = e
-                        .value
-                        .as_ref()
-                        .map(|v| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
-                        .unwrap_or(0);
-                    base + val_bytes
-                })
-                .sum();
-
-            let state_bytes: usize = self
-                .current_state
-                .iter()
-                .map(|(k, v)| k.len() + serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
-                .sum();
-
-            if state_bytes == 0 {
-                0.0
-            } else {
-                (changes_bytes as f64 / state_bytes as f64) * 100.0
-            }
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn test_create_and_get() {
-            let mut acc = SessionStateAccumulator::new();
-            let v = acc.create("key1", "value1", 1).unwrap();
-
-            assert_eq!(v, 1);
-            assert_eq!(acc.get("key1"), Some(&serde_json::json!("value1")));
-            assert_eq!(acc.change_count(), 1);
-        }
-
-        #[test]
-        fn test_update_existing() {
-            let mut acc = SessionStateAccumulator::new();
-            acc.create("key1", "value1", 1).unwrap();
-            let v = acc.update("key1", "value2", 2).unwrap();
-
-            assert_eq!(v, 2);
-            assert_eq!(acc.get("key1"), Some(&serde_json::json!("value2")));
-            assert_eq!(acc.change_count(), 2);
-        }
-
-        #[test]
-        fn test_delete_existing() {
-            let mut acc = SessionStateAccumulator::new();
-            acc.create("key1", "value1", 1).unwrap();
-            let v = acc.delete("key1", 2).unwrap();
-
-            assert_eq!(v, 2);
-            assert_eq!(acc.get("key1"), None);
-            assert_eq!(acc.change_count(), 2);
-        }
-
-        #[test]
-        fn test_changes_since_version() {
-            let mut acc = SessionStateAccumulator::new();
-            acc.create("a", 1, 1).unwrap();
-            acc.create("b", 2, 1).unwrap();
-            acc.update("a", 3, 2).unwrap();
-
-            let changes = acc.changes_since(1);
-            assert_eq!(changes.len(), 2); // b, a-update
-        }
-
-        #[test]
-        fn test_compact_reduces_entries() {
-            let mut acc = SessionStateAccumulator::new();
-            acc.create("key", "v1", 1).unwrap();
-            acc.update("key", "v2", 1).unwrap();
-            acc.update("key", "v3", 1).unwrap();
-
-            assert_eq!(acc.change_count(), 3);
-            acc.compact();
-            assert_eq!(acc.change_count(), 1);
-            assert_eq!(acc.get("key"), Some(&serde_json::json!("v3")));
-        }
-
-        #[test]
-        fn test_overhead_with_updates() {
-            let mut acc = SessionStateAccumulator::new();
-
-            // Create many entries
-            for i in 0..100 {
-                acc.create(format!("key{}", i), "x".repeat(100), 1).unwrap();
-            }
-
-            // Update many times
-            for _ in 0..5 {
-                for i in 0..50 {
-                    acc.update(format!("key{}", i), "y".repeat(100), 1).unwrap();
-                }
-            }
-
-            let overhead = acc.overhead_percentage();
-            // After many updates, overhead will be high until compaction
-            // This verifies the measurement works
-            assert!(overhead > 0.0, "Should have overhead after updates");
-
-            // After compaction, overhead should be reduced
-            acc.compact();
-            let after = acc.overhead_percentage();
-            assert!(after < overhead, "Compaction should reduce overhead");
-        }
-    }
-}
-
 /// Parent session linkage when forking or branching a session (edge-local audit + cloud sync).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionLineage {
@@ -1109,6 +851,8 @@ pub struct CoordinationMeta {
 /// and pagination; consumers must never use message text as an identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JournalTranscriptItem {
+    /// The accepted model item, distinct from this journal receipt's identity.
+    pub model_item_id: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source_event_id: String,
     pub run_id: String,
@@ -1163,9 +907,31 @@ pub struct ToolResultArtifactDescriptor {
     pub content_sha256: String,
 }
 
+/// Runtime-only semantic receipt for the lifecycle decision made by
+/// `start_work`. It is captured before the model/journal presentation can be
+/// replaced by an artifact reference; the provider call id remains the
+/// invocation identity on [`ToolCallRecord`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeWorkEstablishmentReceipt {
+    Started,
+    Continued,
+    Deferred { operation_id: String },
+}
+
 /// Per-tool-call audit record, embedded in turn events for granular tracking.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ToolCallRecord {
+    /// Producer-frozen invocation equality, never execution or storage authority.
+    /// Invalid optional identity must not discard the surrounding audit record.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_observed_invocation_identity"
+    )]
+    pub invocation_identity: Option<astra_turn_types::ToolInvocationIdentity>,
+    /// Producer-owned causality frozen before dispatch; never execution authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_attribution: Option<crate::runs::WorkInvocationAttribution>,
     /// Runtime-only ledger binding; restored evidence must be checked against
     /// the authoritative invocation ledger, never reconstructed from display.
     #[serde(skip)]
@@ -1242,6 +1008,20 @@ pub struct ToolCallRecord {
     /// cannot persist model-supplied credentials.
     #[serde(skip)]
     pub runtime_args_full: Option<String>,
+    /// Exact sanitized result projection delivered at the live model
+    /// boundary. This is separate from `result_full`: the durable field may
+    /// be an owner-scoped artifact replacement, which is a storage pointer
+    /// rather than observation evidence. The live lane is skipped on
+    /// serialization and is only used while the current runtime evaluates
+    /// feedback.
+    #[serde(skip)]
+    pub runtime_model_result_full: Option<String>,
+    /// Semantic `start_work` outcome captured before artifact presentation.
+    /// This is live reconciliation authority, not journal data or model
+    /// context; the exact call identity and executed disposition are checked
+    /// separately before it can settle an establishment.
+    #[serde(skip)]
+    pub runtime_work_establishment_receipt: Option<RuntimeWorkEstablishmentReceipt>,
     /// Full tool result text (untruncated, after per-tool output limit).
     /// Enables debugging tool failures without re-execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1294,17 +1074,12 @@ pub struct ToolCallRecord {
     /// journal boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_mutation_receipt: Option<serde_json::Value>,
-    /// Executor-owned observation that explicitly declared state outside the
-    /// bound workspace changed during this invocation. This is separate from
-    /// workspace evidence so neither scope can satisfy the other's contract.
+    /// Trusted executor's narrower fact that a direct typed writer committed
+    /// inside its bound workspace while full attribution was unavailable.
+    /// Not a current-state, stable-mutation, or observation receipt. Only live
+    /// completion may consume it; restoration retains it for audit alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_effect_observed: Option<bool>,
-    /// Scope bound into `external_effect_receipt`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_effect_scope: Option<String>,
-    /// Compact, validated executor receipt for the declared external targets.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_effect_receipt: Option<serde_json::Value>,
+    pub workspace_writer_applied_bound: Option<bool>,
     /// A multi-target writer committed a strict prefix before failing. This
     /// is a quarantine/barrier fact, never successful mutation evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1329,6 +1104,16 @@ pub struct ToolCallRecord {
     /// cannot establish that dispatch did not happen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_dispatch_rejection: Option<ToolPreDispatchRejection>,
+}
+
+fn deserialize_observed_invocation_identity<'de, D>(
+    deserializer: D,
+) -> Result<Option<astra_turn_types::ToolInvocationIdentity>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 impl fmt::Debug for ToolCallRecord {
@@ -1370,6 +1155,17 @@ pub enum ToolPreDispatchRejection {
 }
 
 impl ToolCallDisposition {
+    pub fn terminal_event_type(self, ok: bool) -> &'static str {
+        match self {
+            Self::Executed if ok => "tool_call_completed",
+            Self::Executed => "tool_call_failed",
+            Self::Rejected => "tool_call_rejected",
+            Self::Reused => "tool_call_reused",
+            Self::Suppressed => "tool_call_suppressed",
+            Self::Deferred => "tool_call_deferred",
+        }
+    }
+
     /// Shared projection of executor-owned metadata. A route dispatch is not
     /// proof that the requested operation started; explicit non-execution must
     /// not be promoted to execution by a caller's fallback.
@@ -1475,14 +1271,7 @@ impl ToolCallRecord {
     /// trace persistence, transcripts, and audit analytics from inventing
     /// incompatible interpretations of the same disposition.
     pub fn canonical_terminal_event_type(&self) -> &'static str {
-        match self.effective_disposition() {
-            ToolCallDisposition::Executed if self.ok => "tool_call_completed",
-            ToolCallDisposition::Executed => "tool_call_failed",
-            ToolCallDisposition::Rejected => "tool_call_rejected",
-            ToolCallDisposition::Reused => "tool_call_reused",
-            ToolCallDisposition::Suppressed => "tool_call_suppressed",
-            ToolCallDisposition::Deferred => "tool_call_deferred",
-        }
+        self.effective_disposition().terminal_event_type(self.ok)
     }
 
     pub fn effective_disposition(&self) -> ToolCallDisposition {
@@ -2123,9 +1912,16 @@ pub struct SessionExecutionLease {
 
 impl SessionExecutionLease {
     pub fn try_acquire(session_id: &str) -> Result<Self, SessionExecutionLeaseError> {
-        let owner_scope = OwnerScope::local_user();
+        Self::try_acquire_for_owner(&OwnerScope::local_user(), session_id)
+    }
+
+    /// Acquire the same execution fence for an already captured local owner.
+    pub fn try_acquire_for_owner(
+        owner_scope: &OwnerScope,
+        session_id: &str,
+    ) -> Result<Self, SessionExecutionLeaseError> {
         let journal_path =
-            journal_file_path_for_owner(&owner_scope, session_id).map_err(|source| {
+            journal_file_path_for_owner(owner_scope, session_id).map_err(|source| {
                 SessionExecutionLeaseError::Io {
                     session_id: session_id.to_string(),
                     source,
@@ -2136,7 +1932,7 @@ impl SessionExecutionLease {
         // macOS relies on the stable owner-local file fence and returns unit.
         #[allow(clippy::let_unit_value)]
         let _kernel_authority =
-            acquire_execution_kernel_authority(&owner_scope, &journal_path, session_id)?;
+            acquire_execution_kernel_authority(owner_scope, &journal_path, session_id)?;
         let created_parent_dirs = journal_path
             .parent()
             .map(missing_directories_before_create)
@@ -2300,7 +2096,13 @@ fn execution_lease_path(journal_path: &Path, session_id: &str) -> PathBuf {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CanonicalCommitCasOutcome {
-    Committed { persistence_warning: Option<String> },
+    Committed {
+        persistence_warning: Option<String>,
+    },
+    /// A durable terminal record exists, but content policy omitted continuation.
+    ContentOmitted {
+        persistence_warning: Option<String>,
+    },
     NotCommitted(String),
     Conflict(String),
     Unknown(String),
@@ -2375,6 +2177,70 @@ fn classify_canonical_commit_presence(
         ))
     } else {
         CanonicalCommitPresence::Absent
+    }
+}
+
+/// An explicit local privacy boundary. No local snapshot can recover a turn
+/// after its canonical content was intentionally omitted, until a later
+/// complete canonical settlement restores local continuation.
+pub fn has_content_omitted_turn(events: &[JournalEvent]) -> bool {
+    for event in events.iter().rev() {
+        if event.conversation_commit.is_some() {
+            return false;
+        }
+        if event.event_type == JournalEventType::Turn
+            && event
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("local_continuation"))
+                .and_then(serde_json::Value::as_str)
+                == Some("omitted_by_policy")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn classify_content_omitted_turn_presence(
+    events: &[JournalEvent],
+    malformed_lines: usize,
+    turn: u32,
+    intended: &JournalEvent,
+) -> CanonicalCommitPresence {
+    if malformed_lines > 0 {
+        return CanonicalCommitPresence::Unknown(
+            "privacy settlement journal contains malformed records".into(),
+        );
+    }
+    let matches = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_type,
+                JournalEventType::Turn | JournalEventType::TurnError
+            ) && event.turn == Some(turn)
+        })
+        .collect::<Vec<_>>();
+    let intended = match serde_json::to_value(intended) {
+        Ok(value) => value,
+        Err(error) => {
+            return CanonicalCommitPresence::Unknown(format!(
+                "cannot verify privacy settlement: {error}"
+            ));
+        }
+    };
+    match matches.as_slice() {
+        [] => CanonicalCommitPresence::Absent,
+        [event] if serde_json::to_value(event).is_ok_and(|value| value == intended) => {
+            CanonicalCommitPresence::Exact
+        }
+        [_] => CanonicalCommitPresence::Conflict(
+            "privacy settlement turn identity already exists".into(),
+        ),
+        _ => CanonicalCommitPresence::Unknown(
+            "privacy settlement has duplicate terminal records".into(),
+        ),
     }
 }
 
@@ -2466,6 +2332,31 @@ impl JournalWriter {
         Ok(())
     }
 
+    /// Commit an end boundary. A retry after an ambiguous fsync failure syncs
+    /// the existing end instead of appending a duplicate (or a new start).
+    pub fn append_session_end(&self, turn: u32) -> std::io::Result<()> {
+        self.append_session_end_with_sync(turn, std::fs::File::sync_data)
+    }
+
+    fn append_session_end_with_sync(
+        &self,
+        turn: u32,
+        sync: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = open_locked_journal_file(&self.path)?;
+        if read_last_event_type(&self.path)? != Some(JournalEventType::SessionEnd) {
+            let event = JournalEvent::session_end(Some(&self.session_id), turn);
+            let events = prepend_session_start_if_needed(&self.path, std::slice::from_ref(&event))?;
+            file.write_all(&serialize_journal_events(events.as_ref())?)?;
+            sync(&file)?;
+            update_cached_session_start_state_from_events(&self.path, events.as_ref());
+        } else {
+            sync(&file)?;
+        }
+        Ok(())
+    }
+
     /// Get the path to this journal file.
     pub fn path(&self) -> &PathBuf {
         &self.path
@@ -2554,9 +2445,63 @@ impl JournalWriter {
             intended,
             events,
             &lease.created_parent_dirs,
+            None,
         )
     }
 
+    /// Settle a content-redacted terminal turn through the same lease, base,
+    /// generation and durability fences as canonical commits. The intended
+    /// canonical commit is used only for validation and is never serialized.
+    pub fn append_content_omitted_turn_cas(
+        &self,
+        lease: &SessionExecutionLease,
+        expected_base_cursor: Option<&SessionCursorV1>,
+        turn: u32,
+        intended: &ConversationCommitV1,
+        event: &JournalEvent,
+    ) -> CanonicalCommitCasOutcome {
+        if lease.session_id != self.session_id
+            || lease.lock_path != execution_lease_path(&self.path, &self.session_id)
+        {
+            return CanonicalCommitCasOutcome::NotCommitted(
+                "privacy settlement requires the matching active session execution lease".into(),
+            );
+        }
+        if !journal_content_redact_enabled()
+            || event.conversation_commit.is_some()
+            || !has_content_omitted_turn(std::slice::from_ref(event))
+            || !event
+                .user_input
+                .as_deref()
+                .is_some_and(is_journal_content_marker)
+            || !event
+                .assistant_output
+                .as_deref()
+                .is_some_and(is_journal_content_marker)
+            || event.session_id.as_deref() != Some(self.session_id.as_str())
+        {
+            return CanonicalCommitCasOutcome::NotCommitted(
+                "privacy settlement requires an explicitly content-redacted turn".into(),
+            );
+        }
+        match self.append_canonical_commit_cas_locked(
+            expected_base_cursor,
+            turn,
+            intended,
+            std::slice::from_ref(event),
+            &lease.created_parent_dirs,
+            Some(event),
+        ) {
+            CanonicalCommitCasOutcome::Committed {
+                persistence_warning,
+            } => CanonicalCommitCasOutcome::ContentOmitted {
+                persistence_warning,
+            },
+            outcome => outcome,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn append_canonical_commit_cas_locked(
         &self,
         expected_base_cursor: Option<&SessionCursorV1>,
@@ -2564,6 +2509,7 @@ impl JournalWriter {
         intended: &ConversationCommitV1,
         events: &[JournalEvent],
         lease_created_dirs: &[PathBuf],
+        content_omitted: Option<&JournalEvent>,
     ) -> CanonicalCommitCasOutcome {
         use fs2::FileExt;
         use std::io::{Read, Seek, SeekFrom, Write};
@@ -2578,7 +2524,8 @@ impl JournalWriter {
             .filter(|event| {
                 event.event_type == JournalEventType::Turn
                     && event.turn == Some(turn)
-                    && event.conversation_commit.as_ref() == Some(intended)
+                    && (event.conversation_commit.as_ref() == Some(intended)
+                        || content_omitted.is_some())
             })
             .count();
         let terminal_turn_events = events
@@ -2653,7 +2600,13 @@ impl JournalWriter {
                     ));
                 }
             };
-        match classify_canonical_commit_presence(&current_events, malformed_lines, turn, intended) {
+        let classify = |events: &[JournalEvent], malformed_lines| match content_omitted {
+            Some(event) => {
+                classify_content_omitted_turn_presence(events, malformed_lines, turn, event)
+            }
+            None => classify_canonical_commit_presence(events, malformed_lines, turn, intended),
+        };
+        match classify(&current_events, malformed_lines) {
             CanonicalCommitPresence::Exact => {
                 if let Err(error) = file.sync_data() {
                     return CanonicalCommitCasOutcome::Unknown(format!(
@@ -2664,7 +2617,7 @@ impl JournalWriter {
                     Ok(true) => {
                         if let Err(error) = self.sync_creation_metadata_if_needed(
                             journal_created,
-                            false,
+                            content_omitted.is_some() && expected_base_cursor.is_none(),
                             lease_created_dirs,
                         ) {
                             CanonicalCommitCasOutcome::Unknown(format!(
@@ -2757,12 +2710,7 @@ impl JournalWriter {
                     ));
                 }
             };
-        match classify_canonical_commit_presence(
-            &verified_events,
-            verified_malformed_lines,
-            turn,
-            intended,
-        ) {
+        match classify(&verified_events, verified_malformed_lines) {
             CanonicalCommitPresence::Exact => {
                 match open_journal_file_is_current(&file, &self.path) {
                     Ok(true) => {}
@@ -3012,6 +2960,7 @@ const TURN_EVENT_BUFFER_CAP: usize = 1000;
 const TURN_EVENT_DROPPED_META_KEY: &str = "dropped_events_before";
 
 pub struct TurnEventBuffer {
+    trace_ingestion: Option<(String, String, u64, crate::event_ingestion::IngestionSender)>,
     events: std::collections::VecDeque<JournalEvent>,
     dropped_events: u64,
     turn_start: std::time::Instant,
@@ -3045,6 +2994,7 @@ impl TurnEventBuffer {
     /// Start collecting events for a new turn at a specific round offset.
     pub fn begin_turn_with_round(session_id: Option<&str>, turn: u32, round: u32) -> Self {
         Self {
+            trace_ingestion: None,
             events: std::collections::VecDeque::new(),
             dropped_events: 0,
             turn_start: std::time::Instant::now(),
@@ -3066,6 +3016,7 @@ impl TurnEventBuffer {
     /// is retained in metadata while `JournalEvent::turn` remains unset.
     pub fn begin_producer_turn(session_id: Option<&str>, producer_turn: u32) -> Self {
         Self {
+            trace_ingestion: None,
             events: std::collections::VecDeque::new(),
             dropped_events: 0,
             turn_start: std::time::Instant::now(),
@@ -3298,12 +3249,8 @@ impl TurnEventBuffer {
         if self.events.is_empty() {
             return Ok(());
         }
-        let events = self.events.make_contiguous();
-        annotate_dropped_turn_events(events, self.dropped_events);
-        writer.append_bulk(events)?;
-        self.events.clear();
-        self.dropped_events = 0;
-        Ok(())
+        self.enqueue_traces(false);
+        self.append_prepared(writer, false)
     }
 
     /// Best-effort flush on interruption: no fsync, marks events as partial.
@@ -3311,7 +3258,99 @@ impl TurnEventBuffer {
         if self.events.is_empty() {
             return Ok(());
         }
-        for event in &mut self.events {
+        self.enqueue_traces(true);
+        self.append_prepared(writer, true)
+    }
+
+    /// Bind a trusted runtime execution once; never reattribute a retained batch.
+    pub fn bind_trace_ingestion(
+        &mut self,
+        user: &str,
+        session: &str,
+        generation: u64,
+        sender: crate::event_ingestion::IngestionSender,
+    ) -> Result<(), &'static str> {
+        if user.is_empty() || self.session_id.as_deref() != Some(session) {
+            return Err("trace ingestion owner/session mismatch");
+        }
+        if let Some((owner, bound_session, bound_generation, _)) = &self.trace_ingestion {
+            return if owner == user && bound_session == session && *bound_generation == generation {
+                Ok(())
+            } else {
+                Err("trace ingestion execution already bound")
+            };
+        }
+        self.trace_ingestion = Some((user.into(), session.into(), generation, sender));
+        Ok(())
+    }
+
+    fn enqueue_traces(&mut self, interrupted: bool) {
+        let sink = self.trace_ingestion.clone();
+        let batch = self.prepare_flush(interrupted);
+        if let Some((user, session, _, sender)) = sink {
+            for event in batch {
+                if event.event_type == JournalEventType::TraceSpan
+                    && event.session_id.as_deref() == Some(session.as_str())
+                    && let Ok(event) =
+                        crate::event_ingestion::IngestionEvent::from_journal_event_with_redact(
+                            event, &user, true,
+                        )
+                {
+                    sender.enqueue(event);
+                }
+            }
+        }
+    }
+
+    /// Flush at the canonical owner boundary; enqueue survives local writer initialization failure.
+    pub fn flush_for_owner(
+        &mut self,
+        user: Option<&str>,
+        session: &str,
+        interrupted: bool,
+    ) -> std::io::Result<()> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        if self.session_id.as_deref() != Some(session)
+            || self
+                .trace_ingestion
+                .as_ref()
+                .is_some_and(|(owner, sid, _, _)| user != Some(owner.as_str()) || sid != session)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "trace flush scope mismatch",
+            ));
+        }
+        self.enqueue_traces(interrupted);
+        let writer = match user {
+            Some(user) => JournalWriter::for_user(user, session)?,
+            None => JournalWriter::new(session)?,
+        };
+        self.append_prepared(&writer, interrupted)
+    }
+
+    fn append_prepared(
+        &mut self,
+        writer: &JournalWriter,
+        interrupted: bool,
+    ) -> std::io::Result<()> {
+        let batch = self.events.make_contiguous();
+        if interrupted {
+            writer.append_bulk_no_sync(batch)?;
+        } else {
+            writer.append_bulk(batch)?;
+        }
+        self.events.clear();
+        self.dropped_events = 0;
+        Ok(())
+    }
+
+    /// Prepare one canonical batch for local and remote sinks without consuming it.
+    /// Repeated preparation is idempotent; a failed local write retains the batch.
+    pub fn prepare_flush(&mut self, interrupted: bool) -> &[JournalEvent] {
+        for event in self.events.iter_mut().filter(|_| interrupted) {
             let meta = event.metadata.get_or_insert_with(|| serde_json::json!({}));
             if let Some(obj) = meta.as_object_mut() {
                 obj.insert("partial".into(), serde_json::json!(true));
@@ -3319,10 +3358,7 @@ impl TurnEventBuffer {
         }
         let events = self.events.make_contiguous();
         annotate_dropped_turn_events(events, self.dropped_events);
-        writer.append_bulk_no_sync(events)?;
-        self.events.clear();
-        self.dropped_events = 0;
-        Ok(())
+        events
     }
 
     /// Drain collected events (for callers that persist elsewhere, e.g. DB).
@@ -3439,6 +3475,21 @@ fn read_journal_from_path(path: &Path) -> std::io::Result<Vec<JournalEvent>> {
         events.len(),
     );
     Ok(events)
+}
+
+/// Read a complete current-generation local journal without creating files or
+/// directories. Recovery/policy decisions must not silently skip malformed or
+/// unterminated records that may contain a privacy boundary.
+pub fn read_complete_journal_append_order(session_id: &str) -> std::io::Result<Vec<JournalEvent>> {
+    let owner_scope = OwnerScope::local_user();
+    let path = journal_file_path_for_owner(&owner_scope, session_id)?;
+    JournalWriter {
+        path,
+        owner_scope,
+        session_id: session_id.to_string(),
+        created_parent_dirs: Vec::new(),
+    }
+    .complete_append_order_snapshot()
 }
 
 /// Read a session journal in physical append order.
@@ -4221,257 +4272,6 @@ fn find_latest_approval_required_impl(
     Ok(None)
 }
 
-fn ask_user_metadata_str(metadata: &serde_json::Value, field: &str) -> Option<String> {
-    metadata
-        .get("ask_user")
-        .and_then(|ask_user| ask_user.get(field))
-        .and_then(|value| value.as_str())
-        .map(ToString::to_string)
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct AskUserJournalResponse {
-    pub request_id: String,
-    pub run_id: Option<String>,
-    pub status: String,
-    pub answers: Option<serde_json::Value>,
-}
-
-/// Canonical durable ask-user request.  Responses must be bound to one of
-/// these records before they can affect a run; a bearer token alone does not
-/// authorize a caller to invent a questionnaire request id.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AskUserJournalRequest {
-    pub request_id: String,
-    pub run_id: Option<String>,
-    pub turn: Option<u32>,
-    pub prompt: serde_json::Value,
-}
-
-/// Result of atomically recording the terminal answer for an ask-user
-/// request.  This mirrors approval decisions: retrying the exact callback is
-/// safe, but a conflicting late answer never overwrites the first outcome.
-#[derive(Debug, Clone, PartialEq)]
-pub enum AskUserResponseAppendOutcome {
-    Appended,
-    Idempotent,
-    Conflict(AskUserJournalResponse),
-}
-
-impl AskUserJournalResponse {
-    pub fn interaction_contract(
-        &self,
-        session_id: &str,
-        user_id: Option<&str>,
-    ) -> Option<InteractionContract> {
-        let run_id = self.run_id.as_deref()?;
-        let identity =
-            InteractionIdentity::new(user_id, session_id, run_id, self.request_id.as_str());
-        if !identity.is_run_scoped() {
-            return None;
-        }
-        Some(InteractionContract::new(
-            InteractionKind::UserPrompt,
-            identity,
-            ask_user_response_status(&self.status),
-            Some("session_journal.ask_user_response".to_string()),
-        ))
-    }
-}
-
-pub fn find_latest_ask_user_response(
-    session_id: &str,
-    request_id: &str,
-) -> std::io::Result<Option<AskUserJournalResponse>> {
-    find_latest_ask_user_response_impl(session_id, request_id, None)
-}
-
-pub fn find_latest_ask_user_response_for_run(
-    session_id: &str,
-    request_id: &str,
-    run_id: &str,
-) -> std::io::Result<Option<AskUserJournalResponse>> {
-    find_latest_ask_user_response_impl(session_id, request_id, Some(run_id))
-}
-
-pub fn find_latest_ask_user_prompted_for_run(
-    session_id: &str,
-    request_id: &str,
-    run_id: &str,
-) -> std::io::Result<Option<AskUserJournalRequest>> {
-    validate_session_id(session_id)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let events = read_journal(session_id)?;
-    for event in events.into_iter().rev() {
-        if event.event_type != JournalEventType::AskUserPrompted {
-            continue;
-        }
-        let Some(metadata) = event.metadata.as_ref() else {
-            continue;
-        };
-        let Some(found_request_id) = ask_user_metadata_str(metadata, "request_id") else {
-            continue;
-        };
-        if found_request_id != request_id {
-            continue;
-        }
-        let found_run_id = ask_user_metadata_str(metadata, "run_id");
-        if found_run_id.as_deref() != Some(run_id) {
-            continue;
-        }
-        let Some(prompt) = metadata
-            .get("ask_user")
-            .and_then(|ask_user| ask_user.get("prompt"))
-            .cloned()
-        else {
-            continue;
-        };
-        return Ok(Some(AskUserJournalRequest {
-            request_id: found_request_id,
-            run_id: found_run_id,
-            turn: event.turn,
-            prompt,
-        }));
-    }
-    Ok(None)
-}
-
-fn ask_user_response_from_event(
-    event: &JournalEvent,
-    request_id: &str,
-    run_id: &str,
-) -> Option<AskUserJournalResponse> {
-    if event.event_type != JournalEventType::AskUserResponse {
-        return None;
-    }
-    let metadata = event.metadata.as_ref()?;
-    let found_request_id = ask_user_metadata_str(metadata, "request_id")?;
-    if found_request_id != request_id {
-        return None;
-    }
-    let found_run_id = ask_user_metadata_str(metadata, "run_id");
-    if found_run_id.as_deref() != Some(run_id) {
-        return None;
-    }
-    let status = ask_user_metadata_str(metadata, "status")?;
-    let answers = metadata
-        .get("ask_user")
-        .and_then(|ask_user| ask_user.get("answers"))
-        .filter(|answers| !answers.is_null())
-        .cloned();
-    Some(AskUserJournalResponse {
-        request_id: found_request_id,
-        run_id: found_run_id,
-        status,
-        answers,
-    })
-}
-
-/// Append a terminal ask-user response while holding the journal lock.
-///
-/// This is intentionally not `find + JournalWriter::append`: responses may
-/// be retried across pods or race the timeout closer, and that split protocol
-/// would leave two contradictory answers in durable history.
-pub fn append_ask_user_response_for_run_if_absent(
-    session_id: &str,
-    turn: Option<u32>,
-    request_id: &str,
-    run_id: &str,
-    status: &str,
-    answers: Option<serde_json::Value>,
-) -> std::io::Result<AskUserResponseAppendOutcome> {
-    use std::io::{Read, Seek, SeekFrom, Write};
-
-    validate_session_id(session_id)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    if run_id.trim().is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "run_id required",
-        ));
-    }
-
-    let path = journal_file_path(session_id);
-    let mut file = open_locked_journal_file(&path)?;
-    let mut content = String::new();
-    file.seek(SeekFrom::Start(0))?;
-    file.read_to_string(&mut content)?;
-    let events = parse_journal_text(&content).0;
-    for event in events.iter().rev() {
-        let Some(existing) = ask_user_response_from_event(event, request_id, run_id) else {
-            continue;
-        };
-        if ask_user_response_status(&existing.status) == InteractionStatus::Pending {
-            continue;
-        }
-        return if existing.status == status && existing.answers == answers {
-            Ok(AskUserResponseAppendOutcome::Idempotent)
-        } else {
-            Ok(AskUserResponseAppendOutcome::Conflict(existing))
-        };
-    }
-
-    let event = JournalEvent::ask_user_response(
-        Some(session_id),
-        turn,
-        request_id,
-        Some(run_id),
-        status,
-        answers,
-    );
-    let events = prepend_session_start_if_needed(&path, std::slice::from_ref(&event))?;
-    let buf = serialize_journal_events(events.as_ref())?;
-    file.write_all(&buf)?;
-    file.sync_data()?;
-    update_cached_session_start_state_from_events(&path, events.as_ref());
-    Ok(AskUserResponseAppendOutcome::Appended)
-}
-
-fn find_latest_ask_user_response_impl(
-    session_id: &str,
-    request_id: &str,
-    run_id: Option<&str>,
-) -> std::io::Result<Option<AskUserJournalResponse>> {
-    validate_session_id(session_id)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let events = read_journal(session_id)?;
-    for event in events.into_iter().rev() {
-        if event.event_type != JournalEventType::AskUserResponse {
-            continue;
-        }
-        let Some(metadata) = event.metadata.as_ref() else {
-            continue;
-        };
-        let Some(found_request_id) = ask_user_metadata_str(metadata, "request_id") else {
-            continue;
-        };
-        if found_request_id != request_id {
-            continue;
-        }
-        let found_run_id = ask_user_metadata_str(metadata, "run_id");
-        if let Some(expected_run_id) = run_id
-            && found_run_id.as_deref() != Some(expected_run_id)
-        {
-            continue;
-        }
-        let Some(status) = ask_user_metadata_str(metadata, "status") else {
-            continue;
-        };
-        let answers = metadata
-            .get("ask_user")
-            .and_then(|ask_user| ask_user.get("answers"))
-            .filter(|answers| !answers.is_null())
-            .cloned();
-        return Ok(Some(AskUserJournalResponse {
-            request_id: found_request_id,
-            run_id: found_run_id,
-            status,
-            answers,
-        }));
-    }
-    Ok(None)
-}
-
 /// Read journal for offline analysis tools. Returns an error if the JSONL file is missing.
 ///
 /// Second element: non-empty physical lines; third: lines that failed JSON parse.
@@ -4495,6 +4295,23 @@ pub fn read_journal_for_digest_for_user(
 fn read_journal_digest_from_path(
     path: &Path,
 ) -> std::io::Result<(Vec<JournalEvent>, usize, usize)> {
+    let (mut events, lines, malformed) = read_journal_source_from_path(path)?;
+    stabilize_event_order(&mut events);
+    Ok((events, lines, malformed))
+}
+
+/// Raw owner-scoped diagnostic source in physical append order, with non-empty
+/// and malformed line counts. Missing files return NotFound, distinct from empty files.
+pub fn read_journal_source_for_owner(
+    owner: &OwnerScope,
+    session_id: &str,
+) -> std::io::Result<(Vec<JournalEvent>, usize, usize)> {
+    read_journal_source_from_path(&journal_file_path_for_owner(owner, session_id)?)
+}
+
+fn read_journal_source_from_path(
+    path: &Path,
+) -> std::io::Result<(Vec<JournalEvent>, usize, usize)> {
     if !path.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -4502,7 +4319,7 @@ fn read_journal_digest_from_path(
         ));
     }
     let content = std::fs::read_to_string(path)?;
-    let parsed = parse_journal_text(&content);
+    let parsed = parse_journal_text_in_append_order(&content);
     record_journal_read(
         astra_core::history_work::HistoryWorkSite::SessionJournalDigestRead,
         content.len(),
@@ -4725,10 +4542,19 @@ struct JournalTailEntry {
 }
 
 fn read_journal_tail_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec<String>> {
+    read_bounded_tail_lines(path, max_lines, RECOVERY_TAIL_MAX_BYTES, false).map(|(lines, _)| lines)
+}
+
+fn read_bounded_tail_lines(
+    path: &Path,
+    max_lines: usize,
+    max_bytes: usize,
+    discard_clipped_record: bool,
+) -> std::io::Result<(Vec<String>, bool)> {
     use std::io::{Read, Seek};
 
     if max_lines == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), true));
     }
 
     let mut file = std::fs::File::open(path)?;
@@ -4737,8 +4563,10 @@ fn read_journal_tail_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec
     let mut bytes_read = 0usize;
     let mut newline_count = 0usize;
 
-    while pos > 0 && newline_count <= max_lines && bytes_read < RECOVERY_TAIL_MAX_BYTES {
-        let read_len = usize::min(RECOVERY_TAIL_CHUNK_BYTES, pos as usize);
+    while pos > 0 && newline_count <= max_lines && bytes_read < max_bytes {
+        let read_len = RECOVERY_TAIL_CHUNK_BYTES
+            .min(pos as usize)
+            .min(max_bytes - bytes_read);
         pos -= read_len as u64;
         file.seek(std::io::SeekFrom::Start(pos))?;
         let mut chunk = vec![0; read_len];
@@ -4754,7 +4582,19 @@ fn read_journal_tail_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec
         bytes.extend_from_slice(&chunk);
     }
 
-    let text = String::from_utf8_lossy(&bytes);
+    // Observation callers conservatively omit the boundary record, even if it
+    // happens to be complete. Recovery retains its historical line semantics.
+    let start = if discard_clipped_record && pos > 0 {
+        bytes
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(bytes.len(), |i| i + 1)
+    } else {
+        0
+    };
+    let text = String::from_utf8_lossy(&bytes[start..]);
+    let truncated =
+        pos > 0 || text.lines().filter(|line| !line.trim().is_empty()).count() > max_lines;
     let mut lines: Vec<String> = text
         .lines()
         .rev()
@@ -4768,7 +4608,55 @@ fn read_journal_tail_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec
         bytes.len(),
         lines.len(),
     );
-    Ok(lines)
+    Ok((lines, truncated))
+}
+
+/// Authorized owner-local observation window, not a complete journal or recovery image.
+pub struct JournalObservationWindow {
+    pub events: Vec<JournalEvent>,
+    pub available: bool,
+    pub truncated: bool,
+    pub malformed_records: usize,
+}
+
+/// Hard bounds apply before JSON decoding, including arbitrarily large records.
+pub fn read_journal_observation_window(
+    owner: &OwnerScope,
+    session_id: &str,
+) -> std::io::Result<JournalObservationWindow> {
+    let path = journal_file_path_for_owner(owner, session_id)?;
+    read_journal_observation_window_from_path(&path)
+}
+
+fn read_journal_observation_window_from_path(
+    path: &Path,
+) -> std::io::Result<JournalObservationWindow> {
+    let (lines, truncated) = match read_bounded_tail_lines(path, 512, 256 * 1024, true) {
+        Ok(window) => window,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(JournalObservationWindow {
+                events: vec![],
+                available: false,
+                truncated: false,
+                malformed_records: 0,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let mut events = Vec::new();
+    let mut malformed_records = 0;
+    for line in lines {
+        match serde_json::from_str(&line) {
+            Ok(event) => events.push(event),
+            Err(_) => malformed_records += 1,
+        }
+    }
+    Ok(JournalObservationWindow {
+        events,
+        available: true,
+        truncated,
+        malformed_records,
+    })
 }
 
 /// Read an exact logical tail without scanning from the beginning of the
@@ -4946,8 +4834,8 @@ pub fn classify_session_end_state(session_id: &str) -> std::io::Result<SessionEn
 
     // Gate "Completed" results on plan state: if a plan is still mid-flight
     // (execution_started with no matching terminal event), treat the session
-    // as Interrupted(plan_mid_flight) so find_stale_sessions / the reaper
-    // notices. Computed up-front so the early returns below can consult it.
+    // as Interrupted(plan_mid_flight) so session resume and listing expose the
+    // unfinished plan. Computed up-front for the early returns below.
     let mid_flight = mid_flight_plan_id(&tail_lines);
     let completed_or_mid_flight = || {
         if mid_flight.is_some() {
@@ -5013,74 +4901,7 @@ fn extract_json_str(line: &str, needle: &str) -> Option<String> {
     Some(rest[..end].replace("\\\"", "\"").replace("\\n", " "))
 }
 
-// ── Session listing with metadata ────────────────────────────────────────────
-
 // ── Session cleanup / lifecycle ──────────────────────────────────────────────
-
-/// Metadata about a session that's a candidate for cleanup.
-#[derive(Debug, Clone)]
-pub struct StaleSessionInfo {
-    pub session_id: String,
-    /// File modification time of the journal.
-    pub last_modified: std::time::SystemTime,
-    /// Journal file size in bytes.
-    pub journal_bytes: u64,
-    /// Turn count (fast count, not full parse).
-    pub turns: u32,
-    /// Total disk usage: journal + workspace dir (recursive).
-    pub total_bytes: u64,
-}
-
-/// Find sessions whose journal file hasn't been modified in `max_age`.
-///
-/// `exclude_id` — the currently active session (never returned).
-pub fn find_stale_sessions(
-    max_age: std::time::Duration,
-    exclude_id: Option<&str>,
-) -> std::io::Result<Vec<StaleSessionInfo>> {
-    let dir = journal_dir();
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let cutoff = std::time::SystemTime::now()
-        .checked_sub(max_age)
-        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-
-    let mut stale = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let Some(sid) = name.strip_suffix(".jsonl") else {
-            continue;
-        };
-        if sid.starts_with("test-") || sid.starts_with("new-sess-") {
-            continue;
-        }
-        if exclude_id == Some(sid) {
-            continue;
-        }
-        let meta = entry.metadata()?;
-        let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        if mtime >= cutoff {
-            continue; // still fresh
-        }
-        let journal_bytes = meta.len();
-        let turns = count_turns(sid);
-        let ws_dir = crate::session_workspace::workspace_dir_for(sid);
-        let ws_bytes = dir_size_recursive(&ws_dir);
-        stale.push(StaleSessionInfo {
-            session_id: sid.to_string(),
-            last_modified: mtime,
-            journal_bytes,
-            turns,
-            total_bytes: journal_bytes + ws_bytes,
-        });
-    }
-    // Sort oldest first
-    stale.sort_by_key(|s| s.last_modified);
-    Ok(stale)
-}
 
 /// Delete a session's journal file and workspace directory.
 ///
@@ -5152,89 +4973,6 @@ fn walkdir_bounded(path: &std::path::Path, depth: u32) -> u64 {
         }
     }
     total
-}
-
-/// Compress a session's `.jsonl` journal to `.jsonl.gz` and remove the original.
-///
-/// Returns `Ok((original_bytes, compressed_bytes))` on success.
-/// Only archives if the session has a `session_end` event (i.e., completed).
-pub fn archive_journal(session_id: &str) -> std::io::Result<(u64, u64)> {
-    use flate2::Compression;
-    use flate2::write::GzEncoder;
-    use std::io::Write;
-
-    validate_session_id(session_id)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let src = journal_file_path(session_id);
-    if !src.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("journal file not found for {session_id}"),
-        ));
-    }
-    // Check the journal has a session_end (don't archive active sessions)
-    let content = std::fs::read(&src)?;
-    if !content
-        .windows(b"\"session_end\"".len())
-        .any(|w| w == b"\"session_end\"")
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "session has no session_end event — still active?",
-        ));
-    }
-    let original_bytes = content.len() as u64;
-    let dst = src.with_extension("jsonl.gz");
-    let out_file = std::fs::File::create(&dst)?;
-    let mut encoder = GzEncoder::new(out_file, Compression::default());
-    encoder.write_all(&content)?;
-    let out_file = encoder.finish()?;
-    // Ensure compressed data is durable before deleting the original.
-    out_file.sync_all()?;
-    let compressed_bytes = std::fs::metadata(&dst)?.len();
-    std::fs::remove_file(&src)?;
-    Ok((original_bytes, compressed_bytes))
-}
-
-/// Find completed sessions eligible for archival (have session_end, not yet compressed).
-///
-/// `exclude_id` — the currently active session.
-pub fn find_archivable_sessions(exclude_id: Option<&str>) -> std::io::Result<Vec<(String, u64)>> {
-    let dir = journal_dir();
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut result = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let Some(sid) = name.strip_suffix(".jsonl") else {
-            continue;
-        };
-        // Skip already-compressed (.jsonl.gz would not match .jsonl suffix)
-        if sid.ends_with(".jsonl") {
-            continue; // double extension guard
-        }
-        if sid.starts_with("test-") || sid.starts_with("new-sess-") {
-            continue;
-        }
-        if exclude_id == Some(sid) {
-            continue;
-        }
-        let meta = entry.metadata()?;
-        let bytes = meta.len();
-        // Quick check: has session_end?
-        let path = entry.path();
-        let has_end = std::fs::read_to_string(&path)
-            .map(|c| c.contains("\"session_end\""))
-            .unwrap_or(false);
-        if has_end {
-            result.push((sid.to_string(), bytes));
-        }
-    }
-    result.sort_by_key(|b| std::cmp::Reverse(b.1)); // largest first
-    Ok(result)
 }
 
 /// Resolve a session id to an exact journal filename stem.
@@ -5603,8 +5341,11 @@ impl JournalEvent {
         } else {
             message.clone()
         };
+        // Redacted projections retain receipt identity, not model coverage.
+        let model_item_id = astra_turn_types::model_item_id(&message).map(str::to_string);
         let mut event = Self::base(JournalEventType::TranscriptItem, Some(session_id));
         event.transcript_item = Some(JournalTranscriptItem {
+            model_item_id,
             source_event_id: local_transcript_source_event_id(
                 session_id, run_id, agent_id, item_seq,
             ),
@@ -6058,6 +5799,38 @@ impl JournalEvent {
         }
         if cache_creation > 0 {
             self.cache_creation_tokens = Some(cache_creation);
+        }
+        self
+    }
+
+    /// Replace observed subtotals with qualified accounting evidence.
+    /// An empty sample needs a presence witness; known lanes are not mirrored.
+    pub fn with_qualified_usage(
+        mut self,
+        usage: Option<astra_turn_types::CanonicalTokenUsage>,
+    ) -> Self {
+        self.tokens_in = usage.and_then(|usage| usage.input_tokens());
+        self.tokens_out = usage.and_then(|usage| usage.output_tokens());
+        self.cache_read_tokens = usage.and_then(|usage| usage.cached_input_tokens());
+        self.cache_creation_tokens = usage.and_then(|usage| usage.cache_creation_tokens());
+        if let Some(metadata) = self
+            .metadata
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            metadata.remove("qualified_usage");
+        }
+        if usage.is_some()
+            && self.tokens_in.is_none()
+            && self.tokens_out.is_none()
+            && self.cache_read_tokens.is_none()
+            && self.cache_creation_tokens.is_none()
+        {
+            let metadata = self.metadata.get_or_insert_with(|| serde_json::json!({}));
+            if !metadata.is_object() {
+                *metadata = serde_json::json!({ "previous_metadata": metadata.clone() });
+            }
+            metadata["qualified_usage"] = serde_json::json!({});
         }
         self
     }
@@ -6960,77 +6733,6 @@ impl JournalEvent {
         evt.metadata = Some(metadata);
         evt
     }
-    /// Focus drift detected — emitted when drift analysis finds significant drift.
-    pub fn drift_detected(
-        session_id: Option<&str>,
-        turn: u32,
-        severity: f64,
-        cause: astra_core::DriftCause,
-        evidence: Vec<astra_core::DriftEvidence>,
-        recovery_suggestion: &str,
-    ) -> Self {
-        let mut evt = Self::base(JournalEventType::DriftDetected, session_id);
-        evt.turn = Some(turn);
-        evt.metadata = Some(serde_json::json!({
-            "severity": severity,
-            "cause": cause,
-            "evidence_count": evidence.len(),
-            "evidence": evidence,
-            "recovery_suggestion": recovery_suggestion,
-        }));
-        evt
-    }
-
-    /// Adaptive scenario applied — emitted once per session when the adaptive
-    /// profile selects a scenario and applies config adjustments.
-    #[allow(clippy::too_many_arguments)]
-    pub fn adaptive_scenario_applied(
-        session_id: Option<&str>,
-        turn: u32,
-        scenario: &str,
-        confidence: f64,
-        config_changes: Vec<(String, String, String)>, // (key, from, to)
-        experiment_id: Option<&str>,
-        variant_id: Option<&str>,
-        baseline_applied: bool,
-    ) -> Self {
-        let mut evt = Self::base(JournalEventType::AdaptiveScenarioApplied, session_id);
-        evt.turn = Some(turn);
-        let changes: Vec<serde_json::Value> = config_changes
-            .iter()
-            .map(|(k, from, to)| serde_json::json!({"key": k, "from": from, "to": to}))
-            .collect();
-        evt.metadata = Some(serde_json::json!({
-            "scenario": scenario,
-            "confidence": confidence,
-            "config_changes": changes,
-            "experiment_id": experiment_id,
-            "variant_id": variant_id,
-            "baseline_applied": baseline_applied,
-        }));
-        evt
-    }
-
-    /// Per-turn micro-adaptation applied — emitted when per-turn adaptation
-    /// modifies runtime config based on immediate signals.
-    pub fn adaptive_per_turn_applied(
-        session_id: Option<&str>,
-        turn: u32,
-        changes: Vec<(String, String, String)>, // (key, from, to)
-        triggers: Vec<String>,                  // reason strings
-    ) -> Self {
-        let mut evt = Self::base(JournalEventType::AdaptivePerTurnApplied, session_id);
-        evt.turn = Some(turn);
-        let change_vals: Vec<serde_json::Value> = changes
-            .iter()
-            .map(|(k, from, to)| serde_json::json!({"key": k, "from": from, "to": to}))
-            .collect();
-        evt.metadata = Some(serde_json::json!({
-            "changes": change_vals,
-            "triggers": triggers,
-        }));
-        evt
-    }
 
     /// Record a structured interruption (budget exhaustion, rate limit, cancel, etc.).
     pub fn interruption_recorded(
@@ -7243,6 +6945,27 @@ pub fn journal_content_marker(raw: &str) -> String {
     format!("<redacted: len={} sha={:016x}>", raw.len(), h.finish())
 }
 
+/// Returns true only for the exact privacy marker emitted by
+/// [`journal_content_marker`]. A marker is evidence that source content was
+/// deliberately omitted, not a recoverable transcript value.
+pub fn is_journal_content_marker(value: &str) -> bool {
+    let Some(payload) = value
+        .strip_prefix("<redacted: len=")
+        .and_then(|value| value.strip_suffix('>'))
+    else {
+        return false;
+    };
+    let Some((length, digest)) = payload.split_once(" sha=") else {
+        return false;
+    };
+    !length.is_empty()
+        && length.bytes().all(|byte| byte.is_ascii_digit())
+        && digest.len() == 16
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 // ═══════════════════════════ Session Lifecycle ════════════════════════════
 
 /// Result of a single session lifecycle maintenance run.
@@ -7265,15 +6988,22 @@ pub struct SessionMaintenanceResult {
 ///
 /// Both thresholds use the journal file's modification time. This function is
 /// idempotent and safe to call at every REPL startup.
-pub fn run_session_maintenance(
+pub fn run_session_maintenance_for_owner(
+    owner: &OwnerScope,
+    protected_session_id: Option<&str>,
     ttl_days: u64,
     compress_after_days: u64,
-) -> SessionMaintenanceResult {
-    let dir = journal_dir();
+) -> std::io::Result<SessionMaintenanceResult> {
+    let dir = journal_dir_for_owner(owner)?;
     if !dir.exists() {
-        return SessionMaintenanceResult::default();
+        return Ok(SessionMaintenanceResult::default());
     }
-    run_session_maintenance_in(dir, ttl_days, compress_after_days)
+    Ok(run_session_maintenance_in(
+        dir,
+        ttl_days,
+        compress_after_days,
+        protected_session_id,
+    ))
 }
 
 #[cfg(test)]
@@ -7980,202 +7710,6 @@ mod approval_tests {
     }
 
     #[test]
-    fn find_latest_ask_user_response_reads_latest_matching_entry() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
-        let writer = JournalWriter::new("sess-ask-user").unwrap();
-
-        writer
-            .append(&JournalEvent::ask_user_prompted(
-                Some("sess-ask-user"),
-                Some(5),
-                "ask-1",
-                Some("run-1"),
-                serde_json::json!({"questions": []}),
-            ))
-            .unwrap();
-        writer
-            .append(&JournalEvent::ask_user_response(
-                Some("sess-ask-user"),
-                Some(5),
-                "ask-1",
-                Some("run-1"),
-                "submitted",
-                Some(serde_json::json!({
-                    "answers": [{
-                        "question": "Continue?",
-                        "answers": ["yes"],
-                        "multi_select": false
-                    }]
-                })),
-            ))
-            .unwrap();
-
-        let found = find_latest_ask_user_response("sess-ask-user", "ask-1")
-            .unwrap()
-            .expect("ask_user response");
-        assert_eq!(found.request_id, "ask-1");
-        assert_eq!(found.run_id.as_deref(), Some("run-1"));
-        assert_eq!(found.status, "submitted");
-        assert_eq!(
-            found.answers.unwrap()["answers"][0]["answers"][0].as_str(),
-            Some("yes")
-        );
-    }
-
-    #[test]
-    fn ask_user_prompt_lookup_and_terminal_append_are_run_scoped_and_atomic() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
-        let writer = JournalWriter::new("sess-ask-user-atomic").unwrap();
-        let prompt = serde_json::json!({
-            "questions": [{"question": "Continue?", "options": []}]
-        });
-        writer
-            .append(&JournalEvent::ask_user_prompted(
-                Some("sess-ask-user-atomic"),
-                Some(7),
-                "ask-atomic",
-                Some("run-a"),
-                prompt.clone(),
-            ))
-            .unwrap();
-
-        let required =
-            find_latest_ask_user_prompted_for_run("sess-ask-user-atomic", "ask-atomic", "run-a")
-                .unwrap()
-                .expect("canonical ask_user request");
-        assert_eq!(required.turn, Some(7));
-        assert_eq!(required.prompt, prompt);
-        assert!(
-            find_latest_ask_user_prompted_for_run("sess-ask-user-atomic", "ask-atomic", "run-b",)
-                .unwrap()
-                .is_none(),
-            "a request id may not cross run boundaries"
-        );
-
-        let answers = serde_json::json!({"answers": []});
-        assert_eq!(
-            append_ask_user_response_for_run_if_absent(
-                "sess-ask-user-atomic",
-                required.turn,
-                "ask-atomic",
-                "run-a",
-                "submitted",
-                Some(answers.clone()),
-            )
-            .unwrap(),
-            AskUserResponseAppendOutcome::Appended
-        );
-        assert_eq!(
-            append_ask_user_response_for_run_if_absent(
-                "sess-ask-user-atomic",
-                required.turn,
-                "ask-atomic",
-                "run-a",
-                "submitted",
-                Some(answers),
-            )
-            .unwrap(),
-            AskUserResponseAppendOutcome::Idempotent
-        );
-        let conflict = append_ask_user_response_for_run_if_absent(
-            "sess-ask-user-atomic",
-            required.turn,
-            "ask-atomic",
-            "run-a",
-            "timeout",
-            None,
-        )
-        .unwrap();
-        assert!(matches!(
-            conflict,
-            AskUserResponseAppendOutcome::Conflict(AskUserJournalResponse { status, .. })
-                if status == "submitted"
-        ));
-
-        let terminal_events = read_journal("sess-ask-user-atomic")
-            .unwrap()
-            .into_iter()
-            .filter(|event| event.event_type == JournalEventType::AskUserResponse)
-            .count();
-        assert_eq!(terminal_events, 1);
-    }
-
-    #[test]
-    fn ask_user_response_projects_to_run_scoped_interaction_contract() {
-        let response = AskUserJournalResponse {
-            request_id: "ask-contract".into(),
-            run_id: Some("run-contract".into()),
-            status: "cancelled".into(),
-            answers: None,
-        };
-
-        let contract = response
-            .interaction_contract("sess-contract", Some("user-contract"))
-            .expect("run-scoped ask_user response should become an interaction contract");
-
-        assert_eq!(contract.kind, InteractionKind::UserPrompt);
-        assert_eq!(
-            contract.durable_store,
-            InteractionDurableStore::SessionJournal
-        );
-        assert_eq!(contract.status, InteractionStatus::Cancelled);
-        assert_eq!(contract.identity.user_id.as_deref(), Some("user-contract"));
-        assert_eq!(contract.identity.session_id, "sess-contract");
-        assert_eq!(contract.identity.run_id, "run-contract");
-        assert_eq!(contract.identity.request_id, "ask-contract");
-        assert!(contract.is_wait_satisfied());
-    }
-
-    #[test]
-    fn ask_user_response_lookup_for_run_ignores_other_run_same_request_id() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
-        let writer = JournalWriter::new("sess-ask-user-run").unwrap();
-
-        writer
-            .append(&JournalEvent::ask_user_response(
-                Some("sess-ask-user-run"),
-                Some(1),
-                "ask-shared",
-                Some("run-a"),
-                "submitted",
-                Some(serde_json::json!({"answers": [{"question": "A?", "answers": ["a"]}]})),
-            ))
-            .unwrap();
-        writer
-            .append(&JournalEvent::ask_user_response(
-                Some("sess-ask-user-run"),
-                Some(2),
-                "ask-shared",
-                Some("run-b"),
-                "cancelled",
-                None,
-            ))
-            .unwrap();
-
-        let found =
-            find_latest_ask_user_response_for_run("sess-ask-user-run", "ask-shared", "run-a")
-                .unwrap()
-                .expect("run-a ask_user response");
-        assert_eq!(found.run_id.as_deref(), Some("run-a"));
-        assert_eq!(found.status, "submitted");
-        assert_eq!(
-            found.answers.unwrap()["answers"][0]["answers"][0].as_str(),
-            Some("a")
-        );
-
-        let cancelled =
-            find_latest_ask_user_response_for_run("sess-ask-user-run", "ask-shared", "run-b")
-                .unwrap()
-                .expect("run-b ask_user response");
-        assert_eq!(cancelled.run_id.as_deref(), Some("run-b"));
-        assert_eq!(cancelled.status, "cancelled");
-        assert!(cancelled.answers.is_none());
-    }
-
-    #[test]
     fn permission_audit_event_round_trips_metadata() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
@@ -8332,6 +7866,7 @@ fn run_session_maintenance_in(
     dir: PathBuf,
     ttl_days: u64,
     compress_after_days: u64,
+    protected_session_id: Option<&str>,
 ) -> SessionMaintenanceResult {
     use std::time::{Duration, SystemTime};
 
@@ -8362,6 +7897,9 @@ fn run_session_maintenance_in(
             Some(sid) => sid.to_string(),
             None => continue,
         };
+        if protected_session_id == Some(session_id.as_str()) {
+            continue;
+        }
         // Skip .jsonl.gz — already compressed
         if name_str.ends_with(".jsonl.gz") {
             continue;
@@ -8392,6 +7930,9 @@ fn run_session_maintenance_in(
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if let Some(sid) = name_str.strip_suffix(".jsonl.gz") {
+                if protected_session_id == Some(sid) {
+                    continue;
+                }
                 let mtime = match entry.metadata().and_then(|m| m.modified()) {
                     Ok(t) => t,
                     Err(_) => continue,
@@ -8489,8 +8030,56 @@ fn dir_size(path: &Path) -> std::io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_core::{DriftCause, DriftEvidence, EvidenceType};
     use tempfile::tempdir;
+
+    #[test]
+    fn observation_window_distinguishes_missing_empty_and_clipped_records() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        assert!(
+            !read_journal_observation_window_from_path(&path)
+                .unwrap()
+                .available
+        );
+        std::fs::write(&path, "").unwrap();
+        let empty = read_journal_observation_window_from_path(&path).unwrap();
+        assert!(empty.available && !empty.truncated);
+        let event = TraceSpanBuilder::default()
+            .span_id("tail".into())
+            .name("test".into())
+            .start_us(0)
+            .end_us(0)
+            .build();
+        let line = serde_json::to_string(&event).unwrap();
+        std::fs::write(
+            &path,
+            format!("{}\ninvalid\n{line}\n", "x".repeat(300 * 1024)),
+        )
+        .unwrap();
+        let window = read_journal_observation_window_from_path(&path).unwrap();
+        assert!(window.truncated);
+        assert_eq!(window.events.len(), 1);
+        assert_eq!(window.malformed_records, 1);
+        std::fs::write(&path, format!("{line}\n").repeat(600)).unwrap();
+        let window = read_journal_observation_window_from_path(&path).unwrap();
+        assert!(window.truncated);
+        assert_eq!(window.events.len(), 512);
+    }
+
+    #[test]
+    fn bounded_tail_preserves_recovery_boundary_semantics() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        std::fs::write(&path, "old\nfirst\nlast\n").unwrap();
+        // The byte window starts exactly on a complete record. Recovery must
+        // retain it; observation may conservatively omit it with coverage loss.
+        let (recovery, clipped) = read_bounded_tail_lines(&path, 10, 11, false).unwrap();
+        assert_eq!(recovery, vec!["first", "last"]);
+        assert!(clipped);
+        let (observation, clipped) = read_bounded_tail_lines(&path, 10, 11, true).unwrap();
+        assert_eq!(observation, vec!["last"]);
+        assert!(clipped);
+    }
 
     const REAL_SESSION_0AC769_FIXTURE: &str =
         include_str!("../fixtures/real_session_0ac769_min.jsonl");
@@ -8755,22 +8344,11 @@ mod tests {
 
     #[test]
     fn journal_event_drift_detected_round_trips_structured_cause_and_evidence() {
-        let evt = JournalEvent::drift_detected(
-            Some("sid-drift"),
-            7,
-            0.75,
-            DriftCause::MemoryMiss {
-                expected_but_not_retrieved: vec!["session history".into(), "repo context".into()],
-                query_used: "debug repeated session start".into(),
-            },
-            vec![DriftEvidence {
-                turn: 6,
-                evidence_type: EvidenceType::MemoryMismatch,
-                description: "Retrieved unrelated CI memories instead of resume context".into(),
-                confidence: 0.9.into(),
-            }],
-            "Re-query with explicit session-resume terms",
-        );
+        let evt: JournalEvent = serde_json::from_value(serde_json::json!({
+            "type": "drift_detected", "ts": "2026-10-03T00:00:00Z", "session_id": "sid-drift", "turn": 7,
+            "metadata": {"severity": 0.75, "cause": {"type": "MemoryMiss", "expected_but_not_retrieved": ["session history", "repo context"], "query_used": "debug repeated session start"}, "evidence_count": 1,
+             "evidence": [{"turn": 6, "evidence_type": "MemoryMismatch", "description": "Retrieved unrelated CI memories instead of resume context", "confidence": 0.9}], "recovery_suggestion": "Re-query with explicit session-resume terms"}
+        })).unwrap();
 
         assert_eq!(evt.event_type, JournalEventType::DriftDetected);
         assert_eq!(evt.turn, Some(7));
@@ -9270,6 +8848,54 @@ mod tests {
         let metadata = evt.metadata.as_ref().expect("metadata");
         assert_eq!(metadata["run_id"], "run-22");
         assert_eq!(evt.budget_pressure, Some(0.4));
+    }
+
+    #[test]
+    fn qualified_usage_replaces_observations_and_stale_witness() {
+        use astra_turn_types::CanonicalTokenUsage;
+        let unknown = CanonicalTokenUsage::new(None, None, None, None).unwrap();
+        for usage in [
+            None,
+            Some(unknown),
+            Some(CanonicalTokenUsage::new(Some(12), None, None, Some(2)).unwrap()),
+            Some(CanonicalTokenUsage::new(Some(0), Some(0), Some(0), Some(0)).unwrap()),
+        ] {
+            let mut event = JournalEvent::turn(Some("s"), 1, None, "in", "out", 0, 999, 888, 1)
+                .with_cache_tokens(777, 666)
+                .with_run_id(Some("run"));
+            event.metadata.as_mut().unwrap()["partial"] = serde_json::json!(true);
+            let event = event
+                .with_qualified_usage(Some(unknown))
+                .with_qualified_usage(usage);
+            let restored: JournalEvent =
+                serde_json::from_value(serde_json::to_value(event).unwrap()).unwrap();
+            let metadata = restored.metadata.as_ref().unwrap();
+            assert_eq!(metadata["run_id"], "run");
+            assert_eq!(metadata["partial"], true);
+            assert_eq!(
+                metadata.get("qualified_usage").is_some(),
+                usage == Some(unknown)
+            );
+            let ingestion =
+                crate::event_ingestion::IngestionEvent::from_journal_event(&restored, "user")
+                    .unwrap();
+            assert_eq!(ingestion.token_usage, usage.map(|usage| usage.to_json()));
+        }
+    }
+
+    #[test]
+    fn qualified_usage_preserves_non_object_metadata() {
+        let mut event = JournalEvent::turn(None, 1, None, "in", "out", 0, 0, 0, 1);
+        event.metadata = Some(serde_json::json!("diagnostic"));
+        let event = event.with_qualified_usage(Some(
+            astra_turn_types::CanonicalTokenUsage::new(None, None, None, None).unwrap(),
+        ));
+        assert_eq!(
+            event.metadata.unwrap(),
+            serde_json::json!({
+                "previous_metadata": "diagnostic", "qualified_usage": {}
+            })
+        );
     }
 
     #[test]
@@ -10323,6 +9949,69 @@ mod tests {
     }
 
     #[test]
+    fn session_end_retry_after_sync_failure_commits_only_once() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let journal = JournalWriter::new("end-sync-retry").unwrap();
+        assert!(
+            journal
+                .append_session_end_with_sync(1, |_| Err(std::io::Error::other("sync fault")))
+                .is_err()
+        );
+        journal.append_session_end(1).unwrap();
+        let events = read_journal("end-sync-retry").unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == JournalEventType::SessionEnd)
+                .count(),
+            1
+        );
+        journal
+            .append(&JournalEvent::turn(
+                Some("end-sync-retry"),
+                2,
+                None,
+                "continue",
+                "done",
+                1,
+                1,
+                1,
+                1,
+            ))
+            .unwrap();
+        journal.append_session_end(2).unwrap();
+        assert_eq!(
+            read_journal("end-sync-retry")
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == JournalEventType::SessionEnd)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn maintenance_preserves_resume_target_and_workspace_for_both_journal_formats() {
+        for suffix in ["jsonl", "jsonl.gz"] {
+            let tmp = tempdir().unwrap();
+            let path = tmp.path().join(format!("resume.{suffix}"));
+            std::fs::write(&path, "journal").unwrap();
+            let mtime = filetime::FileTime::from_system_time(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86400),
+            );
+            filetime::set_file_mtime(&path, mtime).unwrap();
+            std::fs::create_dir(tmp.path().join("resume")).unwrap();
+            let result =
+                run_session_maintenance_in(tmp.path().to_path_buf(), 30, 7, Some("resume"));
+            assert_eq!(result.sessions_deleted, 0);
+            assert_eq!(result.journals_compressed, 0);
+            assert!(path.exists());
+            assert!(tmp.path().join("resume").exists());
+        }
+    }
+
+    #[test]
     fn session_maintenance_all_scenarios() {
         let tmp = tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
@@ -10344,7 +10033,7 @@ mod tests {
         std::fs::create_dir_all(session_dir.join("step_checkpoints")).unwrap();
         std::fs::write(session_dir.join("workspace.yaml"), "session_id: test").unwrap();
         create_aged_journal(&dir, "new-session", 1);
-        let result = run_session_maintenance_in(dir.clone(), 30, 7);
+        let result = run_session_maintenance_in(dir.clone(), 30, 7, None);
         assert_eq!(result.sessions_deleted, 1);
         assert!(!dir.join("old-session.jsonl").exists());
         assert!(!dir.join("old-session").exists());
@@ -10352,14 +10041,14 @@ mod tests {
 
         // Compress old journals (10 days, compress_after=7)
         create_aged_journal(&dir, "mid-session", 10);
-        let result = run_session_maintenance_in(dir.clone(), 30, 7);
+        let result = run_session_maintenance_in(dir.clone(), 30, 7, None);
         assert_eq!(result.journals_compressed, 1);
         assert!(!dir.join("mid-session.jsonl").exists());
         assert!(dir.join("mid-session.jsonl.gz").exists());
 
         // Skip recent sessions (fresh, 0 days)
         std::fs::write(dir.join("fresh.jsonl"), r#"{"type":"session_start"}"#).unwrap();
-        let result = run_session_maintenance_in(dir.clone(), 30, 7);
+        let result = run_session_maintenance_in(dir.clone(), 30, 7, None);
         assert_eq!(result.sessions_deleted, 0);
         assert_eq!(result.journals_compressed, 0);
         assert!(dir.join("fresh.jsonl").exists());
@@ -10371,13 +10060,13 @@ mod tests {
             std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86400 + 3600),
         );
         filetime::set_file_mtime(&gz_path, mtime).unwrap();
-        let result = run_session_maintenance_in(dir.clone(), 30, 7);
+        let result = run_session_maintenance_in(dir.clone(), 30, 7, None);
         assert_eq!(result.sessions_deleted, 1);
         assert!(!gz_path.exists());
 
         // Empty dir returns defaults
         let tmp2 = tempdir().unwrap();
-        let result = run_session_maintenance_in(tmp2.path().to_path_buf(), 30, 7);
+        let result = run_session_maintenance_in(tmp2.path().to_path_buf(), 30, 7, None);
         assert_eq!(result.sessions_deleted, 0);
         assert_eq!(result.journals_compressed, 0);
         assert_eq!(result.bytes_freed, 0);
@@ -10390,9 +10079,17 @@ mod tests {
         let a = journal_content_marker("hello world");
         let b = journal_content_marker("hello world");
         assert_eq!(a, b);
+        assert!(is_journal_content_marker(&a));
         assert!(a.starts_with("<redacted: len=11 sha="));
         assert!(a.ends_with('>'));
         assert!(!a.contains("hello"));
+        for not_marker in [
+            "<redacted: len=11 sha=123>",
+            "<redacted: len=11 sha=0123456789ABCDEF>",
+            "assistant output",
+        ] {
+            assert!(!is_journal_content_marker(not_marker));
+        }
         assert_ne!(
             journal_content_marker("hello"),
             journal_content_marker("world")
@@ -10429,8 +10126,23 @@ mod tests {
         assert!(user.starts_with("<redacted:"));
         assert!(asst.starts_with("<redacted:"));
 
+        let mut message = serde_json::json!({"role":"assistant", "content":"secret answer"});
+        astra_turn_types::mark_model_message(&mut message, Some("model-A"));
+        let redacted = JournalEvent::transcript_item("s1", "r1", "a1", 1, &message)
+            .unwrap()
+            .transcript_item
+            .unwrap();
+        assert!(redacted.model_item_id.is_none());
+        assert!(!redacted.message.to_string().contains("secret answer"));
+
         // ── Turn event keeps content when env unset ──
         unsafe { std::env::remove_var("ASTRA_JOURNAL_CONTENT_REDACT") };
+        let visible = JournalEvent::transcript_item("s1", "r1", "a1", 1, &message)
+            .unwrap()
+            .transcript_item
+            .unwrap();
+        assert_eq!(visible.model_item_id.as_deref(), Some("model-A"));
+        assert_eq!(visible.source_event_id, redacted.source_event_id);
         let evt = JournalEvent::turn(
             Some("s1"),
             1,
@@ -10449,6 +10161,7 @@ mod tests {
         let message = serde_json::json!({
             "role": "assistant",
             "content": "child answer",
+            "model_item_id": "accepted-A",
             "reasoning_content": "checked the invariant",
         });
         let evt =
@@ -10465,6 +10178,7 @@ mod tests {
         assert_eq!(payload.run_id, "local-run");
         assert_eq!(payload.agent_id, "reviewer");
         assert_eq!(payload.item_seq, 7);
+        assert_eq!(payload.model_item_id.as_deref(), Some("accepted-A"));
         assert_eq!(payload.message, message);
         let retry = JournalEvent::transcript_item(
             "parent-session",
@@ -10509,6 +10223,57 @@ mod tests {
         assert!(!user.contains("secret query"));
         assert!(user.starts_with("<redacted:"));
         assert_eq!(evt.error.as_deref(), Some("boom"));
+
+        // The terminal producer appends these fields after constructing the
+        // typed event. The journal writer is the storage boundary, so raw
+        // child output and applied guidance must still be redacted there.
+        let tmp = tempdir().unwrap();
+        let _journal_dir = JournalDirGuard::new(tmp.path());
+        let session_id = "redacted-child-terminal";
+        let writer = JournalWriter::new(session_id).unwrap();
+        let mut terminal = JournalEvent::agent_terminated(
+            Some(session_id),
+            "child-1",
+            "run-1",
+            "task",
+            "completed",
+            Some("normal"),
+            Some(1),
+            2,
+            100,
+            20,
+            300,
+            None,
+        );
+        terminal.metadata.as_mut().unwrap()["full_text"] =
+            serde_json::json!("private child result");
+        terminal.metadata.as_mut().unwrap()["applied_user_intents"] = serde_json::json!([{
+            "intent_id": "intent-1",
+            "delivery": "guide_current_run",
+            "status": "applied",
+            "event_index": 3,
+            "content": "private user guidance"
+        }]);
+        writer.append(&terminal).unwrap();
+        let persisted = std::fs::read_to_string(writer.path()).unwrap();
+        assert!(!persisted.contains("private child result"));
+        assert!(!persisted.contains("private user guidance"));
+        let terminal = read_journal_append_order(session_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == JournalEventType::AgentTerminated)
+            .expect("terminal event is durably readable");
+        let metadata = terminal.metadata.unwrap();
+        assert!(is_journal_content_marker(
+            metadata["full_text"].as_str().unwrap()
+        ));
+        assert!(is_journal_content_marker(
+            metadata["applied_user_intents"][0]["content"]
+                .as_str()
+                .unwrap()
+        ));
+        assert_eq!(metadata["run_id"], "run-1");
+        assert_eq!(metadata["status"], "completed");
 
         unsafe { std::env::remove_var("ASTRA_JOURNAL_CONTENT_REDACT") };
     }
@@ -11207,8 +10972,8 @@ mod tests {
                 !ToolCallRecord {
                     name: "read_file".to_string(),
                     ok: true,
-                    error: Some("cached_cross_turn".into()),
-                    result_preview: Some("[cached_cross_turn: reused 200 bytes]".into()),
+                    error: Some("cached_same_invocation".into()),
+                    result_preview: Some("[cached_same_invocation: replayed 200 bytes]".into()),
                     ..Default::default()
                 }
                 .is_noop_or_cached_result(),
@@ -11722,6 +11487,51 @@ mod turn_event_buffer_tests {
     }
 
     #[test]
+    fn tool_call_identity_is_optional_validated_observation() {
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "owner", "session", "run", "chain", "call",
+        )
+        .unwrap();
+        let record = ToolCallRecord {
+            name: "bash".into(),
+            ok: false,
+            tool_call_id: Some("call".into()),
+            invocation_identity: Some(identity.clone()),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(&record).unwrap();
+        let restored: ToolCallRecord = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(restored.invocation_identity, Some(identity));
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!("bad"),
+            serde_json::json!({"user_id":"owner", "session_id":"session",
+                "run_id":"run", "turn_chain_id":" ", "invocation_id":"call"}),
+        ] {
+            let mut raw = encoded.clone();
+            raw["invocation_identity"] = invalid;
+            let retained: ToolCallRecord = serde_json::from_value(raw).unwrap();
+            assert!(retained.invocation_identity.is_none());
+            assert!(retained.was_executed());
+            assert_eq!(retained.name, "bash");
+        }
+        let mut absent = encoded;
+        absent
+            .as_object_mut()
+            .unwrap()
+            .remove("invocation_identity");
+        let retained: ToolCallRecord = serde_json::from_value(absent).unwrap();
+        assert!(retained.invocation_identity.is_none());
+        assert!(
+            serde_json::to_value(retained)
+                .unwrap()
+                .get("invocation_identity")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn tool_call_record_keeps_live_authority_out_of_durable_json() {
         let raw = r#"{"command":"tool --token secret-token-value"}"#;
         let safe = r#"{"command":"tool --token [REDACTED:TOKEN_ARGUMENT]"}"#;
@@ -12230,6 +12040,26 @@ mod turn_event_buffer_tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn explicit_owner_execution_lease_uses_the_existing_owner_local_fence() {
+        let root = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(root.path());
+        let sid = "execution-lease-explicit-owner";
+        let current = OwnerScope::local_user();
+        let captured = SessionExecutionLease::try_acquire_for_owner(&current, sid).unwrap();
+        assert!(matches!(
+            SessionExecutionLease::try_acquire(sid),
+            Err(SessionExecutionLeaseError::Conflict { .. })
+        ));
+        let other = OwnerScope::user("independent-explicit-lease-owner").unwrap();
+        assert_ne!(current, other);
+        let independent = SessionExecutionLease::try_acquire_for_owner(&other, sid).unwrap();
+        drop(captured);
+        assert!(SessionExecutionLease::try_acquire(sid).is_ok());
+        drop(independent);
+    }
+
+    #[test]
     fn session_execution_lease_rejects_second_instance_before_mock_invocation() {
         let tmp = tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
@@ -12380,6 +12210,73 @@ mod turn_event_buffer_tests {
     }
 
     #[test]
+    fn content_omitted_cas_preserves_base_conflict_and_directory_durability() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "privacy-cas-fences";
+        let writer = JournalWriter::new(sid).unwrap();
+        let commit = canonical_cas_test_commit(sid, "private-message");
+        let mut event = JournalEvent::turn(Some(sid), 1, None, "", "", 0, 0, 0, 0);
+        event.user_input = Some(journal_content_marker("private-input"));
+        event.assistant_output = Some(journal_content_marker("private-output"));
+        event.metadata = Some(serde_json::json!({"local_continuation": "omitted_by_policy"}));
+        // A stale base fails before writing even though no canonical content
+        // is being retained. The privacy path shares the canonical CAS fence.
+        assert!(matches!(
+            writer.append_canonical_commit_cas_locked(
+                Some(&commit.cursor),
+                1,
+                &commit,
+                std::slice::from_ref(&event),
+                &[],
+                Some(&event),
+            ),
+            CanonicalCommitCasOutcome::Conflict(_)
+        ));
+        assert!(writer.complete_append_order_snapshot().unwrap().is_empty());
+        fail_next_journal_directory_sync();
+        assert!(matches!(writer.append_canonical_commit_cas_locked(
+            None, 1, &commit, std::slice::from_ref(&event), &[], Some(&event),
+        ), CanonicalCommitCasOutcome::Unknown(reason) if reason.contains("creation metadata")));
+        // Exact retry must repeat the creation fence after uncertainty, even
+        // when reopening an existing file and retaining no created-dir list.
+        fail_next_journal_directory_sync();
+        assert!(matches!(writer.append_canonical_commit_cas_locked(
+            None, 1, &commit, std::slice::from_ref(&event), &[], Some(&event),
+        ), CanonicalCommitCasOutcome::Unknown(reason) if reason.contains("creation metadata")));
+        // A successful fence establishes authority without duplicating the turn.
+        assert!(matches!(
+            writer.append_canonical_commit_cas_locked(
+                None,
+                1,
+                &commit,
+                std::slice::from_ref(&event),
+                &[],
+                Some(&event),
+            ),
+            CanonicalCommitCasOutcome::Committed { .. }
+        ));
+        let events = writer.complete_append_order_snapshot().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == JournalEventType::Turn)
+                .count(),
+            1
+        );
+        assert!(has_content_omitted_turn(&events));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.conversation_commit.is_none())
+        );
+        let bytes = std::fs::read_to_string(writer.path()).unwrap();
+        for content in ["private-message", "private-input", "private-output"] {
+            assert!(!bytes.contains(content));
+        }
+    }
+
+    #[test]
     fn first_canonical_commit_requires_parent_directory_durability() {
         let tmp = tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
@@ -12525,6 +12422,7 @@ mod turn_event_buffer_tests {
                     &first_commit,
                     &[first_event],
                     &[],
+                    None,
                 )
             });
             let second_barrier = barrier.clone();
@@ -12539,6 +12437,7 @@ mod turn_event_buffer_tests {
                     &second_commit,
                     &[second_event],
                     &[],
+                    None,
                 )
             });
             vec![first.join().unwrap(), second.join().unwrap()]
@@ -12606,7 +12505,7 @@ mod turn_event_buffer_tests {
             let _guard = JournalDirGuard::new(&thread_dir);
             JournalWriter::new(session_id)
                 .unwrap()
-                .append_canonical_commit_cas_locked(None, 1, &commit, &[event], &[])
+                .append_canonical_commit_cas_locked(None, 1, &commit, &[event], &[], None)
         });
 
         opened_rx.recv().unwrap();

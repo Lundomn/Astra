@@ -31,6 +31,13 @@ export const PATH_RUNS = "/runs";
 export const PATH_WORKS = "/v1/works";
 export const ASTRA_WORK_API_MAJOR_HEADER = "x-astra-work-api-major";
 export const ASTRA_WORK_API_MAJOR = "1";
+/**
+ * Major version of the interactive Server/Web/CLI stream contract.
+ * Keep this aligned with `astra_server_types::AGENT_INTERACTION_API_MAJOR`.
+ */
+export const ASTRA_AGENT_INTERACTION_API_MAJOR_HEADER =
+  "x-astra-agent-interaction-api-major";
+export const ASTRA_AGENT_INTERACTION_API_MAJOR = "3";
 
 export const PATH_EVENTS = "/events";
 
@@ -130,6 +137,14 @@ export function workBranchTurnsPath(workId: string, branchId: string): string {
   return `${workBranchPath(workId, branchId)}/turns`;
 }
 
+export function workBranchInteractionsPath(workId: string, branchId: string): string {
+  return `${workBranchPath(workId, branchId)}/interactions`;
+}
+
+export function workBranchInteractionRespondPath(workId: string, branchId: string): string {
+  return `${workBranchInteractionsPath(workId, branchId)}/respond`;
+}
+
 export function workBranchActionsPath(workId: string, branchId: string): string {
   return `${workBranchPath(workId, branchId)}/actions`;
 }
@@ -140,6 +155,78 @@ export function workBranchExecutionPath(workId: string, branchId: string): strin
 
 export function workBranchExecutionTargetsPath(workId: string, branchId: string): string {
   return `${workBranchExecutionPath(workId, branchId)}/targets`;
+}
+
+export function workBranchRecoveryPointsPath(workId: string, branchId: string): string {
+  return `${workBranchPath(workId, branchId)}/recovery-points`;
+}
+
+export function workBranchWorkspaceRecoveryArtifactsPath(
+  workId: string,
+  branchId: string,
+): string {
+  return `${workBranchPath(workId, branchId)}/workspace-recovery-artifacts`;
+}
+
+export function workBranchWorkspaceRecoveryBasisPath(
+  workId: string,
+  branchId: string,
+): string {
+  return `${workBranchPath(workId, branchId)}/workspace-recovery-basis`;
+}
+
+export function workBranchWorkspaceRecoveryArtifactPath(
+  workId: string,
+  branchId: string,
+  artifactId: string,
+): string {
+  if (
+    artifactId === "." ||
+    artifactId === ".." ||
+    artifactId.length === 0 ||
+    Array.from(artifactId).length > 64 ||
+    !/^[A-Za-z0-9._-]+$/u.test(artifactId)
+  ) {
+    throw new TypeError("artifactId is not a canonical workspace artifact identity");
+  }
+  return `${workBranchWorkspaceRecoveryArtifactsPath(workId, branchId)}/${encodeURIComponent(artifactId)}`;
+}
+
+export function workBranchWorkspaceRecoveryChunkPath(
+  workId: string,
+  branchId: string,
+  artifactId: string,
+  digest: string,
+): string {
+  if (!/^sha256:[0-9a-f]{64}$/u.test(digest)) {
+    throw new TypeError("digest is not a canonical content digest");
+  }
+  return `${workBranchWorkspaceRecoveryArtifactPath(workId, branchId, artifactId)}/chunks/${encodeURIComponent(digest)}`;
+}
+
+export function workBranchWorkspaceRecoverySealPath(
+  workId: string,
+  branchId: string,
+  artifactId: string,
+): string {
+  return `${workBranchWorkspaceRecoveryArtifactPath(workId, branchId, artifactId)}/seal`;
+}
+
+export function workBranchRecoveryPointPath(
+  workId: string,
+  branchId: string,
+  recoveryPointId: string,
+): string {
+  if (
+    recoveryPointId === "." ||
+    recoveryPointId === ".." ||
+    recoveryPointId.length === 0 ||
+    Array.from(recoveryPointId).length > 128 ||
+    !/^[A-Za-z0-9._-]+$/u.test(recoveryPointId)
+  ) {
+    throw new TypeError("recoveryPointId is not a canonical recovery point identity");
+  }
+  return `${workBranchRecoveryPointsPath(workId, branchId)}/${encodeURIComponent(recoveryPointId)}`;
 }
 
 export function workBranchExecutionSwitchesPath(workId: string, branchId: string): string {
@@ -555,22 +642,6 @@ export function buildQueryString(
   }
   const s = q.toString();
   return s ? `?${s}` : "";
-}
-
-export function taskLeasePath(taskId: string): string {
-  return `/tasks/${encodeURIComponent(taskId)}/lease`;
-}
-
-export function taskLeaseClaimPath(taskId: string): string {
-  return `/tasks/${encodeURIComponent(taskId)}/lease/claim`;
-}
-
-export function taskLeaseReleasePath(taskId: string): string {
-  return `/tasks/${encodeURIComponent(taskId)}/lease/release`;
-}
-
-export function taskLeaseRenewPath(taskId: string): string {
-  return `/tasks/${encodeURIComponent(taskId)}/lease/renew`;
 }
 
 /** HTTP header for edge transport instance id (matches Rust `ASTRA_EDGE_ID_HEADER`). */

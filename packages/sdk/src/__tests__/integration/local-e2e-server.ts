@@ -249,12 +249,26 @@ export async function startLocalE2eServer(pathPrefix = ''): Promise<LocalE2eServ
 
           if (method === 'GET' && action === 'audit' && subAction === 'summary') {
             const sessionRuns = [...runs.values()].filter((run) => run.session_id === sessionId);
+            const lane = (tokens: number) => ({
+              known_tokens: sessionRuns.length ? tokens : null,
+              observed_attempts: sessionRuns.length,
+            });
             sendJson(res, 200, {
               session_id: sessionId,
               status: session.status,
               turn_count: sessionRuns.length,
               tokens_in: sessionRuns.length * 10,
               tokens_out: sessionRuns.length * 20,
+              request_usage: {
+                scope: 'session_all_runs',
+                request_count: sessionRuns.length,
+                nonterminal_attempt_count: 0,
+                fresh_input_tokens: lane(sessionRuns.length * 10),
+                cache_read_tokens: lane(0),
+                cache_creation_tokens: lane(0),
+                output_tokens: lane(sessionRuns.length * 20),
+              },
+              cost: { unavailable_reason: 'historical_attempt_coverage_incomplete' },
               tool_calls_total: sessionRuns
                 .flatMap((run) => run.events)
                 .filter((event) => event.type === 'tool_call_start').length,

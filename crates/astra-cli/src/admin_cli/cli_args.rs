@@ -62,9 +62,9 @@ pub enum Command {
 pub enum ConfigCmd {
     /// List all admin config keys and values.
     List,
-    /// Read a single admin config value (e.g. `get reasoning_offering_id`).
+    /// Read a server setting (e.g. `get judgment_model`).
     Get(ConfigKeyArgs),
-    /// Set an admin config value (e.g. `set reasoning_offering_id <offering-id>`).
+    /// Set a server setting (e.g. `set judgment_model jev-1.13.0`).
     Set(ConfigSetArgs),
     /// Delete an admin config value.
     #[command(visible_alias = "delete")]
@@ -125,6 +125,8 @@ pub struct UserRoleArgs {
 #[derive(Subcommand, Debug)]
 pub enum ModelCmd {
     List,
+    /// Compare batched judgments using two Offerings and your existing login; deployment settings are unchanged.
+    Compare(ModelCompareArgs),
     Add(ModelAddArgs),
     Show(ModelShowArgs),
     Delete(ModelDeleteArgs),
@@ -135,6 +137,23 @@ pub enum ModelCmd {
     Load(ModelLoadArgs),
     /// Update model fields (api-key, base-url, quirks, active status).
     Update(ModelUpdateArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ModelCompareArgs {
+    /// Baseline Offering ID from `astra admin model list`.
+    pub baseline: String,
+    /// Candidate Offering ID (e.g. your registered Jev Offering).
+    pub candidate: String,
+    /// JSON case file. Omit to compare the built-in memory judgment cases.
+    #[arg(long)]
+    pub cases: Option<std::path::PathBuf>,
+    /// Repetitions; backend order alternates between repetitions.
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..))]
+    pub repeat: u32,
+    /// New report directory. Defaults to a unique directory under /tmp.
+    #[arg(long)]
+    pub output: Option<std::path::PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -159,7 +178,7 @@ pub struct ModelUpdateArgs {
     /// Set stored `is_active` without re-probing. Prefer `model check` to activate only when connectivity succeeds.
     #[arg(long)]
     pub active: Option<bool>,
-    /// JSON string for quirks, e.g. '{"fallback_chain":["gpt-4o-mini"]}'
+    /// JSON string for quirks, e.g. '{"fixed_temperature":0.7}'
     #[arg(long)]
     pub quirks: Option<String>,
 }
@@ -254,16 +273,7 @@ pub struct PromptOptimizeArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum FeedbackCmd {
-    Stats(FeedbackStatsArgs),
     Export(FeedbackExportArgs),
-}
-
-#[derive(Args, Debug)]
-pub struct FeedbackStatsArgs {
-    #[arg(long)]
-    pub agent_id: Option<String>,
-    #[arg(long)]
-    pub since: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -278,6 +288,18 @@ pub struct FeedbackExportArgs {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn retired_feedback_stats_is_not_a_command() {
+        assert!(Cli::try_parse_from(["admin", "feedback", "stats"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["admin", "feedback", "export"])
+                .unwrap()
+                .args
+                .command,
+            Some(Command::Feedback(FeedbackCmd::Export(_)))
+        ));
+    }
 
     #[test]
     fn parse_simple_commands() {

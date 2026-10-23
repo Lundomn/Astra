@@ -1,17 +1,10 @@
 mod test_support;
 
+use test_support::require_db_it_env;
+
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use uuid::Uuid;
-
-fn require_db_it_env() -> astra_core::MatrixOneSettings {
-    assert_eq!(
-        std::env::var("ASTRA_TEST_DB_IT").as_deref(),
-        Ok("1"),
-        "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
-    );
-    astra_core::MatrixOneSettings::from_env()
-}
 
 static SHARED_BOOTSTRAP: tokio::sync::OnceCell<astra_core::SharedPool> =
     tokio::sync::OnceCell::const_new();
@@ -120,7 +113,7 @@ async fn insert_device_lease(
           status, last_monotonic_id, expires_at, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, 'new_device', 'active', 7, {expires_sql}, NOW(6), NOW(6))"
     );
-    sqlx::query(&sql)
+    sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(lease_id)
         .bind(user_id)
         .bind(session_id)

@@ -28,11 +28,14 @@ Use these files as the canonical configuration references:
 
 - `ASTRA_ALLOW_INSECURE_DEFAULTS` — dev-only opt-in for bundled defaults on required keys
 - `RUST_LOG` — standard tracing filter (e.g. `warn,astra_runtime=info`)
-- `NO_COLOR` — when present, disables styles in CLI streaming Markdown, including code blocks and tables. `astra chat --no-color` also enables this behavior. Without it, Markdown bold, italic, and headings inherit the terminal foreground and use emphasis attributes so they remain readable on light and dark backgrounds.
+- `NO_COLOR` — when present (including an empty value), disables styles in CLI tool progress and streaming Markdown, including status icons, descriptions, durations, summaries, spinner text, code blocks and tables. Cursor movement and row-clearing commands retain their existing behavior. `astra chat --no-color` also enables this behavior. Without it, Markdown bold, italic, and headings inherit the terminal foreground and use emphasis attributes so they remain readable on light and dark backgrounds.
 
 ### API server
 
 - `ASTRA_API_HOST`, `ASTRA_API_PORT`, `ASTRA_CORS_ORIGINS`
+- `ASTRA_POD_ID` — unique durable execution identity for this Server instance. Set a stable identity when its managed workspace directory survives restarts; never share one identity between concurrently running instances. Without it, the process uses a fresh UUID and cannot adopt a previous instance's local workspace.
+- `ASTRA_SERVER_WORKSPACES` — base directory for the selected Server sandbox provider, captured when the lifecycle is constructed; defaults to the system temporary directory's `astra-workspaces` child. A persisted Server sandbox belongs to its recorded executor and exact session directory, not to any instance that can read the same database row.
+
 
 `ASTRA_API_HOST` defaults to `127.0.0.1`. Container deployments set
 `0.0.0.0` explicitly inside the container and control external exposure at the
@@ -64,6 +67,20 @@ Without this declaration, `web_search` and `web_fetch` can still become
 available through a ready bound Edge provider. Capability availability does
 not enable either tool for a user turn; Web and SDK clients must explicitly
 select optional tools separately.
+
+### Outbound HTTPS trust
+
+Astra HTTP clients using the workspace reqwest transport trust both bundled
+public CA roots and the process platform trust store. This supports managed
+private CAs, including certificates used by an HTTPS inspection proxy, while
+retaining certificate-chain and hostname verification and existing proxy routing.
+
+For a process-specific CA configuration, set `SSL_CERT_FILE` to a PEM CA bundle
+and/or `SSL_CERT_DIR` to a directory of PEM CA files before starting Astra. These
+variables select the native-root source instead of platform discovery; bundled
+public roots remain available. Configure them only in the selected CLI, User
+Runner, or Server process environment. They do not transfer a user machine’s
+trust store to the Server. Restart the process after changing its trust settings.
 
 ### Auth secrets (REQUIRED in production)
 
@@ -130,12 +147,89 @@ If `reasoning_offering_id` is not set, the server applies its governed default a
 - `MEMORIA_SELF_HOSTED_MASTER_ACCESS` — exact value `1` explicitly allows active local password accounts with no scoped binding or retained Memoria identity to use owner-scoped master authentication when `MEMORIA_WEB_URL` is unset. Existing scoped owner/consent always wins; disconnect, inactive/deleted accounts and lookup errors never fall back. Requires a Memoria release containing `matrixorigin/Memoria#250` (available in 0.5.2, not 0.5.1). The Server default remains disabled; the self-hosted all-in-one example explicitly enables it with a compatible pinned image. Existing env files are not automatically upgraded.
 - `MEMORIA_ISSUER` — stable identity issuer URL; defaults to normalized `MEMORIA_BASE_URL`. Changing the issuer creates a different identity namespace. Keep it stable when changing only the service transport address.
 - `MEMORIA_WEB_URL` — Server-owned browser sign-in website, advertised through `GET /auth/methods`. Unset preserves password login. Requires HTTPS except for explicit loopback development URLs. The CLI does not read this environment variable.
-- `MEMORIA_LEGACY_ISSUER` — explicit administrator assertion of the issuer that owned pre-issuer Memoria identities. Migration is allowed only when it equals the configured issuer, after fresh key verification. Leave unset unless the provenance of the old database is known.
 - `MEMORIA_EMBEDDING_PROVIDER`, `MEMORIA_EMBEDDING_MODEL`, `MEMORIA_EMBEDDING_DIM`, `MEMORIA_EMBEDDING_API_KEY`, `MEMORIA_EMBEDDING_BASE_URL`
 
 Scoped credentials drive login, refresh, memory proxy, explicit tools, recall, extraction and session-end governance. Self-hosted master access is an explicit per-user fallback on those same paths, never a replacement for a scoped binding or failed lookup. Runtime builders receive this policy from composition rather than independently reading environment variables. See [authentication](../design/authentication.md).
 
 ### Runtime tuning (optional)
+
+`tool_policy` owns workflow guard limits and model profiles for root runs,
+children, skill runs and automatic model changes. The duplicate `tool_selection`
+configuration section is retired. The default per-round tool limit is 100;
+built-in Opus, Sonnet-4, Haiku and GPT-5 profiles use 128, 100, 48 and 128.
+Explicit `tool_policy.model_profiles` take precedence over built-in profiles.
+Each execution selects its tool policy once. Subsequent rounds and automatic
+model changes use that selected policy; edits apply to newly admitted executions.
+The execution circuit breaker uses the same admitted policy, including its
+resolved default thresholds and absolute round limit. Reassembling an active
+execution preserves its existing breaker observations.
+Child and skill executions select their own policy. This does not change the
+process-level selection of their Server execution-round ceilings.
+
+
+Runtime configuration exposes controls consumed by execution: compression,
+retrieval, tool policy and tracing. The retired `verification`,
+`memory_pressure`, `context_window`, `token_budget` and `budget_policy` sections
+are not supported. Execution capacity uses the admitted limits and canonical
+adaptive renewal; the retired outcome-streak policy never controlled it.
+Execution input budgets belong to RuntimeLimits (`ASTRA_MAX_TURN_INPUT_TOKENS`)
+and the admitted model context window; self budget views report observed budget
+state instead of an inactive configuration cap. Model context
+window metadata and tool verification contracts retain their existing owners.
+
+Unknown top-level runtime fields are rejected by the configuration parser.
+User and project files, environment values and CLI settings apply in that order.
+Local cache and credential-directory overrides do not relocate the canonical
+physical-device identity. Local CLI/Edge execution requires
+`~/.astra/edge-materializations/device.id` and its canonical checkout identity
+files under the default home state root. Initialize Astra on the same device
+with that directory writable before running in a restricted home environment;
+retain the canonical identity files alongside any isolated cache. A writable
+`ASTRA_LOCAL_STATE_ROOT` or credential directory alone is insufficient. The
+existing identity preflight reports this prerequisite before turn admission;
+do not delete identity files or login credentials as a repair step.
+
+The configuration editor saves user defaults under `ASTRA_LOCAL_STATE_ROOT/config/runtime.toml`
+when that root is set, otherwise under `~/.astra/config/runtime.toml`; local versions
+live in the adjacent `versions` directory. Saving defaults retains invocation CLI settings
+and any complete configuration snapshot belonging to the current session. The current
+session version identifies its effective configuration, not the saved defaults file.
+Server execution-round limits are configured on the Server; the CLI `/config`
+editor does not expose controls for the remote Server’s `runtime_limits`.
+File and JSON layers retain only explicitly supplied fields: missing fields preserve
+lower layers, while defaults, `false`, zero and empty arrays replace them. JSON `null`
+clears optional values and is rejected for non-optional fields. When a layer supplies a model-routing policy, it must declare it completely. CLI trace flags take precedence
+over `--settings`; level/category flags preserve unspecified trace fields, while
+production/dev profile flags select their complete presets. Compression presets and
+trace normalization still run after configuration selection. Non-finite environment
+compression thresholds are rejected with a warning and preserve the configured value;
+an invalid environment value cannot discard explicit CLI settings.
+`--settings` reports the parse error. A saved session configuration is a complete snapshot, not an overlay: restoring
+it replaces the execution configuration before deriving context budgets and the observability projection,
+including values equal to built-in defaults. The configuration version identifies the effective
+snapshot; an explicit `/explain --format` choice for the current CLI session retains precedence.
+Starting a new conversation with `/clear` selects the current process configuration,
+rather than inheriting a restored session snapshot. Explicit CLI Explain preferences and the
+selected model remain in effect; budgets, configuration version and observability are derived again.
+Cold startup, new conversations, no-snapshot recovery and telemetry select profile identity from the
+account identity installed at entry, not ingestion metadata. An account without stored
+preferences uses its own default profile; only a CLI without an installed account identity uses
+anonymous preferences.
+`astra self mutate preview/apply` uses the process configuration when no complete
+session snapshot exists. Applying one setting preserves the other snapshot values.
+A snapshot is cleared only when the complete result equals the process baseline.
+Profile identity, preferences and statistics do not override runtime configuration.
+Preview reports failed configuration checks without writing. Apply rejects an
+invalid candidate before changing the snapshot, revision or journal. A valid
+candidate may repair an existing invalid configuration.
+Authentication changes select preferences for the verified target account after credentials are saved;
+re-authenticating the same account without resetting its conversation retains that session configuration.
+A saved snapshot must parse and satisfy the current invariants before resume changes the active session; invalid
+snapshots remain unchanged and are not migrated or filtered. This also rejects
+full snapshots that contain the retired sections, even if their values were defaults.
+The existing disk
+configuration loader reports a warning and skips an invalid user/project layer.
+
 
 - `ASTRA_MAX_TURNS` — optional positive ordinary execution-round cap. Bounded settlement/closing allowances remain separate, so this is not an absolute cap on all model calls or cost. Unset means renewable slices without an implicit round cap; it does not disable cancellation, execution-health checks, or individual operation timeouts.
 - `ASTRA_PLAN_SUBTASK_MAX_TURNS` — optional positive plan-subtask cap; unset inherits `ASTRA_MAX_TURNS`. Explicit zero or malformed round caps are rejected, not treated as unlimited.
@@ -146,8 +240,8 @@ Scoped credentials drive login, refresh, memory proxy, explicit tools, recall, e
 - `ASTRA_RETRIEVAL_TOP_K`, `ASTRA_MAX_TURN_INPUT_TOKENS`
 - `ASTRA_LLM_PROVIDER_ADMISSION_MODE` — provider admission mode; unset/`disabled` by default, `db_fixed_window` enables MatrixOne-backed RPM/TPM claims before outbound LLM attempts
 - `ASTRA_LLM_PROVIDER_ADMISSION_RPM`, `ASTRA_LLM_PROVIDER_ADMISSION_TPM` — provider budget used by admission; at least one is required when admission is enabled
-- `ASTRA_LLM_CONNECT_TIMEOUT_S`, `ASTRA_LLM_NONSTREAM_TIMEOUT_S`, `ASTRA_LLM_TOTAL_BUDGET_S`, `ASTRA_LLM_ACTION_PROGRESS_TIMEOUT_S` — provider transport/progress bounds. The `300s` total-budget default is per provider call including retries, not an end-to-end session limit; turn profiles and resource policy still bound the overall run. Interactive resource policy is 30s for a single tool execution, while long-session profiles explicitly allow 300s.
-- `ASTRA_AUX_LLM_POLICY` — policy for bounded auxiliary LLM calls. When unset, Astra uses `capacity_aware`: every eligible primary turn receives one bounded Work-admission decision, while provider admission accounts for its quota like any other inference; unrelated optional judges remain capacity-gated. Set `boundary_only` when a deployment deliberately prefers admission only at an executable boundary. An unavailable auxiliary decision is recorded as typed degradation and does not discard a primary response that already passed the canonical tool/lifecycle boundary; an explicitly `disabled` policy under Auto still fails closed before action or completion, and a client that deliberately omits classification must explicitly request `FixedDefault`. Set `always` to require all eligible auxiliary calls regardless of capacity policy.
+- `ASTRA_LLM_CONNECT_TIMEOUT_S`, `ASTRA_LLM_NONSTREAM_TIMEOUT_S`, `ASTRA_LLM_TOTAL_BUDGET_S`, `ASTRA_LLM_SEMANTIC_PROGRESS_TIMEOUT_S` — provider transport/progress bounds. The semantic-progress timeout defaults to `300s`; non-whitespace text, reasoning, and advancing authorized tool arguments refresh it, but SSE heartbeats and empty deltas do not. Explicit positive overrides remain supported. The independent `300s` total-budget default is per logical provider call including retries, not an end-to-end session limit. Provider work leaves a tail reserve for durable terminalization (10s at the default total budget), so a silent interval is not guaranteed another full five minutes after the last token. Neither heartbeats nor semantic progress extend the total budget. Turn profiles and resource policy still bound the overall run. Interactive resource policy is 30s for a single tool execution, while long-session profiles explicitly allow 300s.
+- `ASTRA_AUX_LLM_POLICY` — policy for bounded auxiliary LLM calls. When unset, Astra uses `capacity_aware`: Work admission is evaluated at an existing typed effect/topology boundary, where the result has an immediate admission consumer; ordinary unbound primary turns stay on the single-request path, while unrelated optional judges remain capacity-gated. `boundary_only` keeps the same Work boundary but also suppresses unrelated optional auxiliary judges. An unavailable auxiliary decision is recorded as typed degradation and does not discard a primary response that already passed the canonical tool/lifecycle boundary; an explicitly `disabled` policy under Auto still fails closed before action or completion, and a client that deliberately omits classification must explicitly request `FixedDefault`. Set `always` only when a deployment deliberately wants speculative Work admission on ordinary turns and all eligible auxiliary calls regardless of capacity policy.
 - `ASTRA_CAPTURE_TRACES`
 - `ASTRA_RUN_CONCURRENCY_LIMIT` — positive agentic loop slots per Astra Server process. For a multi-server deployment, set `ASTRA_CAPACITY_POD_COUNT` to the number of equivalent server processes sharing the same durable admission scope; the cross-pod weighted budget is derived from both values and is fenced when a server presents a different capacity snapshot. Change the declared budget only after active reservations have drained, and use one snapshot across all participating servers.
 - `ASTRA_CAPACITY_POD_COUNT` — positive server process count used for the cluster capacity model and durable canonical-turn admission. This is an operator declaration, not service discovery; keep it identical across pods that share a database.
@@ -161,12 +255,16 @@ does not hide the conversation. Configure the row budget in
 ```toml
 [explain]
 live_rows = 5 # 1–5, default 5
+report_format = "html" # html, markdown, or text; default html
 ```
 
 The same setting is available in the `/config` editor as **Live Explain
 Analyze rows (1–5)** and takes effect for the next live capture immediately.
-The settled Explain cell and the local Markdown report are not truncated by
-this live-row setting.
+The settled Explain cell and the local report are not truncated by this
+live-row setting. HTML is the default because it keeps the report readable
+across terminals and browsers; `/explain --format markdown` and
+`/explain --format text` select a different derived companion for the next
+capture.
 
 Diagnostic DB history is controlled through `runtime.toml` trace categories, not separate environment variables. Production defaults keep high-volume diagnostic tables off; `trace.profile = "dev"` enables them. For custom profiles, enable `context_assembly` for context manifests, `prompt_assembly` for prompt request deltas, and `harness_snapshots` for durable harness snapshot history.
 
@@ -201,3 +299,12 @@ Server-loop Memoria observer and post-loop memory cleanup are fixed internal asy
 make dev-init
 make check
 ```
+
+Saved configuration versions are inspected locally with `astra config version`
+(`list`, `show`, `diff`, and `current`). There is no configuration cloud-pull
+command. Configuration changes retain their version IDs in the canonical
+journal; full configuration bodies remain in the local version store. The old
+cloud body mirror and its dedicated ingestion protocol are retired.
+
+The local version index uses one JSON record per nonempty line. Inspection
+reports a corrupt row instead of returning a partially decoded index.

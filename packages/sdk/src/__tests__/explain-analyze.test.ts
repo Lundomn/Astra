@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   explainAnalyzeFactFingerprint,
+  explainAnalyzeAuxiliaryDetailsLines,
+  explainAnalyzeAuxiliaryUsageLines,
   explainAnalyzeMaxConcurrency,
   explainAnalyzeTurnOutcome,
   isExplainAnalyzeEventV1,
@@ -59,6 +61,56 @@ function finished(
 }
 
 describe("Explain Analyze graph reducer", () => {
+  it("keeps bounded delegation-catalog evidence through admission replay and renderers", () => {
+    const detail = {
+      kind: "delegation_catalog_resolution" as const,
+      requirement_index: 0,
+      match_count: 3,
+    };
+    const terminal = finished("admission-agent", "admission", 4, 9, {
+      outcome: "blocked",
+      decision_detail: detail,
+    });
+    expect(isExplainAnalyzeEventV1(terminal)).toBe(true);
+    expect(isExplainAnalyzeEventV1({ ...terminal, kind: "tool_call" })).toBe(false);
+    expect(isExplainAnalyzeEventV1({ ...terminal, decision_detail: { ...detail, match_count: 1 } })).toBe(false);
+    expect(isExplainAnalyzeEventV1({
+      ...started("admission-agent", "admission", 4),
+      decision_detail: detail,
+    })).toBe(false);
+
+    const duplicate = { ...terminal, event_id: "admission-agent:replay" };
+    const graph = reduceExplainAnalyzeEvents([terminal, duplicate]);
+    expect(graph.integrity).toBe("consistent");
+    expect(graph.nodes[0].decisionDetail).toEqual(detail);
+    expect(renderExplainAnalyzeHtml([terminal])).toContain(
+      "3 active authorized Chat-capable catalog entries matched exactly",
+    );
+
+    const conflict = reduceExplainAnalyzeEvents([
+      terminal,
+      { ...duplicate, decision_detail: { ...detail, match_count: 2 } },
+    ]);
+    expect(conflict.conflictedNodeIds).toEqual(["admission-agent"]);
+  });
+
+  it("accepts and renders a terminal judgment stage", () => {
+    const judgment = finished("tool-result-judgment", "judgment", 10, 25, {
+      round_index: 0,
+      label: "Tool-result judgment · jev-1.13.0 · selected 1/2 chunks",
+    });
+
+    expect(isExplainAnalyzeEventV1(judgment)).toBe(true);
+    const graph = reduceExplainAnalyzeEvents([judgment]);
+    expect(graph.integrity).toBe("consistent");
+    expect(graph.nodes).toHaveLength(1);
+    expect(graph.nodes[0]).toMatchObject({
+      kind: "judgment",
+      terminalObserved: true,
+    });
+    expect(renderExplainAnalyzeHtml([judgment])).toContain("jev-1.13.0");
+  });
+
   it("canonicalizes empty dependencies the same way for live and indexed replay facts", () => {
     const live = started("attempt", "provider_attempt", 0, {
       round_index: 0,
@@ -422,6 +474,47 @@ describe("context facts", () => {
     expect(html).toContain("Not billed usage");
   });
 
+  it("preserves memory decisions in replay and renders their limits without private text", () => {
+    const report = { session_id: "s", turn: 1, operation: "relevance" as const,
+      method: "model" as const, reason: "completed" as const, model: "jev-test", elapsed_ms: 398, selection_order: [0],
+      candidates: [{ index: 0, selected: true, probability_bps: 9000 }, { index: 1, selected: false, probability_bps: 1000 }] };
+    const event = finished("context", "context_assembly", 0, 10, { context: { assembly: { ...assembly, edge_memory_selection: [report] } } });
+    expect(isExplainAnalyzeEventV1(event)).toBe(true);
+    const graph = reduceExplainAnalyzeEvents([event, event]);
+    expect(graph.nodes[0].context?.assembly?.edge_memory_selection).toEqual([report]);
+    const html = renderExplainAnalyzeHtml([event]);
+    expect(html).toContain("2 candidates → 1 selected");
+    expect(html).toContain("90.00%");
+    expect(html).toContain("final request projection unavailable");
+    for (const bad of [
+      { ...report, reason: "no_candidates" }, { ...report, method: "lexical" },
+      { ...report, session_id: "" }, { ...report, turn: 0 },
+      { ...report, candidates: [{ index: 0, selected: true, probability_bps: 10001 }] },
+      { ...report, candidates: [{ index: 1, selected: true, probability_bps: 9000 }] },
+      { ...report, raw_response: "private memory" },
+      { ...report, selection_order: [1] }, { ...report, selection_order: [0, 0] },
+    ]) {
+      expect(isExplainAnalyzeEventV1({ ...event, context: { assembly: { ...assembly, edge_memory_selection: [bad] } } })).toBe(false);
+    }
+  });
+
+  it("preserves bounded memory coverage and distinguishes known from unknown prompt inclusion", () => {
+    const base = { session_id: "s", turn: 1, operation: "relevance" as const,
+      method: "model" as const, reason: "completed" as const, model: "jev-test", elapsed_ms: 398, selection_order: [0],
+      candidates: [{ index: 0, selected: true, probability_bps: 9000 }],
+      candidate_coverage: { source_items: 20, evaluated_candidates: 1, truncated: true } };
+    for (const [included_candidates, expected] of [[1, "1/1 entered request"], [null, "request inclusion unknown"]] as const) {
+      const report = { ...base, prompt_projection: { selected_candidates: 1, included_candidates } };
+      const event = finished("context", "context_assembly", 0, 10, { context: { assembly: { ...assembly, edge_memory_selection: [report] } } });
+      expect(isExplainAnalyzeEventV1(event)).toBe(true);
+      expect(reduceExplainAnalyzeEvents([event]).nodes[0].context?.assembly?.edge_memory_selection).toEqual([report]);
+      const html = renderExplainAnalyzeHtml([event]);
+      expect(html).toContain("bounded 20 source items to 1 candidates");
+      expect(html).toContain(expected);
+      expect(html).toContain("final request projection measured");
+    }
+  });
+
   it.each([
     { budget: { ...budget, raw_prompt: "private" } },
     { budget: { ...budget, estimated_input_tokens: Number.MAX_SAFE_INTEGER + 1 } },
@@ -609,4 +702,312 @@ it("keeps external delivery gaps inside the HTML report's copyable text", () => 
   const copyable = html.match(/<textarea[^>]*>([\s\S]*?)<\/textarea>/)?.[1];
   expect(copyable).toContain("Incomplete observation: delivery gap");
   expect(copyable).toContain("No execution facts recorded");
+});
+
+
+describe("auxiliary provider usage", () => {
+  const auxiliary = {
+    available: true,
+    attempts: [{attempt_id: "aux-1", provider: "typesafe", offering_id: "jev-1", model_name: "jev1", purpose: "memory_retrieval_rerank", operation_id: "relevance", usage_status: "provider_partial" as const, usage: {basis: "provider_partial" as const, fresh_input_tokens: 42}}],
+  };
+  it("keeps overflowing captures visible with explicit lower-bound totals", () => {
+    const event = finished("turn", "turn", 0, 100, {auxiliary_usage: {...auxiliary, truncated: true}});
+    expect(isExplainAnalyzeEventV1(event)).toBe(true);
+    const lines = explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([event]));
+    expect(lines[0]).toContain("in at least 42");
+    expect(lines[1]).toContain("capture truncated");
+    expect(lines[1]).toContain("counts cover captured attempts only");
+    expect(renderExplainAnalyzeHtml([event])).toContain("in at least 42");
+    expect(isExplainAnalyzeEventV1(finished("bad", "turn", 0, 100, {
+      auxiliary_usage: {available: false, truncated: true, attempts: []},
+    }))).toBe(false);
+    const empty = finished("empty", "turn", 0, 100, {
+      auxiliary_usage: {available: true, truncated: true, attempts: []},
+    });
+    expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([empty]))).toEqual([
+      "Auxiliary tokens · capture truncated; request counts cover captured attempts only; token sums are lower bounds",
+    ]);
+  });
+  it("treats token lanes as lower bounds when a captured peer or segment has unknown usage", () => {
+    const event = finished("turn", "turn", 0, 100, {auxiliary_usage: {
+      ...auxiliary, attempts: [...auxiliary.attempts, {...auxiliary.attempts[0], attempt_id: "aux-2", usage_status: "unavailable", usage: undefined}],
+    }});
+    expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([event]))[0]).toContain("in at least 42");
+    const missing = finished("missing", "turn", 100, 200, {auxiliary_usage: {available: false, attempts: []}});
+    const known = finished("known", "turn", 0, 100, {auxiliary_usage: auxiliary});
+    expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([known, missing]))[0]).toContain("in at least 42");
+  });
+  it("exports Jev separately, deduplicates physical attempts across segments, and preserves unknown lanes", () => {
+    const first = finished("turn", "turn", 0, 100, {auxiliary_usage: auxiliary});
+    const second = finished("segment", "turn", 100, 200, {auxiliary_usage: auxiliary});
+    expect(isExplainAnalyzeEventV1(first)).toBe(true);
+    const graph = reduceExplainAnalyzeEvents([first, second]);
+    const lines = explainAnalyzeAuxiliaryUsageLines(graph);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("Jev");
+    expect(lines[0]).toContain("in 42");
+    expect(lines[0]).toContain("out unknown");
+    expect(lines[0]).toContain("1/1 requests reported · partial");
+    expect(renderExplainAnalyzeHtml([first, second])).toContain("Auxiliary tokens");
+  });
+  it("keeps same-model request classification, skill selection, and Work planning usage separate", () => {
+    const operations = [
+      ["request_judgment", "Request classification", 10],
+      ["skill_auto_route", "Skill selection", 20],
+      ["work_plan", "Work planning", 30],
+      ["custom_judgment", "Request analysis", 40],
+    ] as const;
+    const event = finished("turn", "turn", 0, 100, {auxiliary_usage: {
+      available: true,
+      attempts: operations.map(([operation, , tokens]) => ({
+        attempt_id: `aux-${operation}`, provider: "openai", offering_id: "same-offering", model_name: "same-model",
+        purpose: "introspection", operation_id: operation, usage_status: "provider_exact" as const,
+        usage: {basis: "provider_exact" as const, fresh_input_tokens: tokens, output_tokens: 1},
+      })),
+    }});
+    expect(isExplainAnalyzeEventV1(event)).toBe(true);
+    const lines = explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([event]));
+    expect(lines).toHaveLength(4);
+    const html = renderExplainAnalyzeHtml([event]);
+    for (const [operation, label, tokens] of operations) {
+      const line = lines.find(line => line.includes(label));
+      expect(line).toContain(`operation ${operation} · offering same-offering`);
+      expect(line).toContain(`in ${tokens} ·`);
+      expect(line).toContain("1/1 requests reported");
+      expect(line).toContain("cache read unknown");
+      expect(html).toContain(label);
+    }
+  });
+  it("isolates Jev and LLM counters and deduplicates repeated capture segments in text and HTML", () => {
+    const usage = {
+      available: true,
+      attempts: [
+        {attempt_id:"jev-decision", provider:"typesafe", offering_id:"jev-offering", model_name:"jev-model", purpose:"introspection", operation_id:"request_judgment", usage_status:"provider_exact" as const, usage:{basis:"provider_exact" as const, fresh_input_tokens:100, output_tokens:3}},
+        {attempt_id:"llm-decision", provider:"openai", offering_id:"llm-offering", model_name:"llm-model", purpose:"introspection", operation_id:"request_judgment", usage_status:"provider_exact" as const, usage:{basis:"provider_exact" as const, fresh_input_tokens:40, cache_read_tokens:60, cache_creation_tokens:0, output_tokens:5}},
+        {attempt_id:"llm-plan", provider:"openai", offering_id:"llm-offering", model_name:"llm-model", purpose:"introspection", operation_id:"work_plan", usage_status:"provider_exact" as const, usage:{basis:"provider_exact" as const, fresh_input_tokens:200, cache_read_tokens:10, cache_creation_tokens:7, output_tokens:20}},
+      ],
+    };
+    const events = [
+      finished("first", "turn", 0, 100, {auxiliary_usage:usage}),
+      finished("second", "turn", 100, 200, {auxiliary_usage:usage}),
+    ];
+    expect(events.every(isExplainAnalyzeEventV1)).toBe(true);
+    const lines = explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents(events));
+    expect(lines).toHaveLength(3);
+    const html = renderExplainAnalyzeHtml(events);
+    for (const [identity, label, counts] of [
+      ["Jev (jev-model)", "Request classification", "in 100 · cache read unknown · cache write unknown · out 3"],
+      ["openai (llm-model)", "Request classification", "in 40 · cache read 60 · cache write 0 · out 5"],
+      ["openai (llm-model)", "Work planning", "in 200 · cache read 10 · cache write 7 · out 20"],
+    ]) {
+      const line = lines.find(line => line.includes(identity) && line.includes(label));
+      expect(line).toContain(counts);
+      expect(line).toContain("1/1 requests reported");
+      expect(line).not.toContain("partial");
+      expect(html).toContain(line);
+    }
+  });
+  it("uses purpose for completion proxy and a neutral label for unknown operations", () => {
+    for (const [operation, purpose, label] of [
+      ["completion_proxy:verification_judge", "verification_judge", "Verification"],
+      ["completion_proxy:introspection", "introspection", "Request analysis"],
+      ["unrecognized", "introspection", "Request analysis"],
+      ["__proto__", "introspection", "Request analysis"],
+      ["unrecognized", "unrecognized", "Auxiliary inference"],
+    ]) {
+      const event = finished("turn", "turn", 0, 100, {auxiliary_usage: {...auxiliary, attempts: [{...auxiliary.attempts[0], operation_id: operation, purpose}]}});
+      const line = explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([event]))[0];
+      expect(line).toContain(label);
+      expect(line).not.toContain("Request decisions");
+    }
+  });
+  it("rejects usage facts on nonterminal events and duplicated physical identities", () => {
+    expect(isExplainAnalyzeEventV1(started("turn", "turn", 0, {auxiliary_usage: auxiliary}))).toBe(false);
+    expect(isExplainAnalyzeEventV1(finished("turn", "turn", 0, 100, {auxiliary_usage: {...auxiliary, attempts: [auxiliary.attempts[0], auxiliary.attempts[0]]}}))).toBe(false);
+  });
+  it("keeps unavailable and all-zero partial usage distinct from known zero", () => {
+    const partial = finished("turn", "turn", 0, 100, {auxiliary_usage: {...auxiliary, attempts: [{...auxiliary.attempts[0], usage: undefined}]}});
+    expect(isExplainAnalyzeEventV1(partial)).toBe(true);
+    expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([partial]))[0]).toContain("usage unavailable");
+    const unavailable = finished("turn", "turn", 0, 100, {auxiliary_usage: {available: false, attempts: []}});
+    expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([unavailable]))).toEqual(["Auxiliary tokens · capture unavailable"]);
+  });
+});
+
+describe("auxiliary execution details", () => {
+  it("accepts the runtime terminal payload and carries it through SDK projections", () => {
+    const classifier = {
+      result: "decided" as const,
+      classification: {
+        work_required: true,
+        activation_deferred: false,
+        domain: null,
+        mutation: "read_only" as const,
+        scope: "unknown" as const,
+        parallel_subruns: false,
+        capabilities: [] as const,
+      },
+    };
+    const reconciled = {
+      ...classifier,
+      classification: { ...classifier.classification, activation_deferred: true },
+    };
+    const event = finished("turn", "turn", 0, 100, {
+      auxiliary_details: {
+        calls: [{
+          call_id: "request/初期:0",
+          operation_id: "request_judgment",
+          stage: "initial",
+          start_elapsed_ms: 12,
+          duration_ms: 8,
+          outcome: "succeeded",
+        }],
+        admission: {
+          status: "accepted",
+          reason: { kind: "accepted" },
+          classification: classifier,
+          decision: reconciled,
+        },
+      },
+    });
+
+    expect(isExplainAnalyzeEventV1(event)).toBe(true);
+    const graph = reduceExplainAnalyzeEvents([event]);
+    expect(graph.integrity).toBe("consistent");
+    expect(graph.nodes[0].auxiliaryDetails?.admission?.decision).toEqual(reconciled);
+    expect(explainAnalyzeAuxiliaryDetailsLines(graph)).toEqual([
+      "Auxiliary scope · turn",
+      "Auxiliary timing · request_judgment · call request/初期:0 · operation request_judgment · stage initial · 8 ms · client outcome succeeded · starts +12 ms · logical client interval; overlapping intervals are not added",
+      expect.stringContaining("Admission settlement · status accepted"),
+    ]);
+    expect(renderExplainAnalyzeHtml([event])).toContain("Auxiliary execution details");
+    expect(isExplainAnalyzeEventV1({
+      ...event,
+      event_id: "turn:no-call-interval",
+      auxiliary_details: { admission: event.auxiliary_details!.admission },
+    })).toBe(true);
+  });
+
+  it("rejects a terminal detail with unknown nested fields", () => {
+    const event = finished("turn", "turn", 0, 100, {
+      auxiliary_details: {
+        calls: [],
+        admission: {
+          status: "accepted",
+          reason: { kind: "accepted", extra: true } as never,
+          decision: {
+            result: "decided",
+            classification: {
+              work_required: true,
+              activation_deferred: false,
+              domain: null,
+              mutation: "read_only",
+              scope: "unknown",
+              parallel_subruns: false,
+              capabilities: [],
+            },
+          },
+        },
+      },
+    });
+    expect(isExplainAnalyzeEventV1(event)).toBe(false);
+
+    const accepted = {
+      ...event.auxiliary_details!.admission!,
+      reason: { kind: "accepted" as const },
+    };
+    const invalidProvenance = {
+      result: "abstained",
+      uncertain_fields: ["required"],
+      assessment: {
+        provenance: ["discrete_decision"],
+        fields: [{ field: "required", score: 0.5 }],
+      },
+    } as never;
+    expect(isExplainAnalyzeEventV1({
+      ...event,
+      event_id: "turn:invalid-provenance-type",
+      auxiliary_details: { admission: { ...accepted, classification: invalidProvenance } },
+    })).toBe(false);
+
+    const invalidDiscreteScore = {
+      ...invalidProvenance,
+      assessment: {
+        provenance: "discrete_decision",
+        fields: [{ field: "required", score: 0.2 }],
+      },
+    } as never;
+    expect(isExplainAnalyzeEventV1({
+      ...event,
+      event_id: "turn:invalid-discrete-score",
+      auxiliary_details: { admission: { ...accepted, classification: invalidDiscreteScore } },
+    })).toBe(false);
+  });
+});
+
+describe("auxiliary conflict parity", () => {
+  const attempt = {attempt_id: "same", provider: "typesafe", offering_id: "jev", model_name: "jev", purpose: "introspection", operation_id: "request_judgment", usage_status: "provider_exact" as const, usage: {basis: "provider_exact" as const, fresh_input_tokens: 100}};
+  type Attempt = NonNullable<ExplainAnalyzeEventV1["auxiliary_usage"]>["attempts"][number];
+  const event = (id: string, a: Attempt = attempt) => finished(id, "turn", 0, 10, {auxiliary_usage: {available: true, attempts: [a]}});
+  for (const field of ["provider", "offering_id", "model_name", "purpose", "operation_id", "fresh_input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens"]) {
+    it(`rejects conflicting ${field} in either segment order`, () => {
+      const bucket = field.endsWith("tokens");
+      const first = bucket ? {...attempt, usage: {...attempt.usage, [field]: 100}} : attempt;
+      const second = bucket ? {...attempt, usage: {...attempt.usage, [field]: 200}} : {...attempt, [field]: "different"};
+      const events = [event("one", first), event("two", second)];
+      for (const order of [events, [...events].reverse()]) {
+        const graph = reduceExplainAnalyzeEvents(order);
+        const lines = explainAnalyzeAuxiliaryUsageLines(graph);
+        expect(lines).toEqual([expect.stringContaining("capture unavailable")]);
+        expect(lines.join()).not.toContain("requests reported");
+        const html = renderExplainAnalyzeHtml(order);
+        expect(html).toContain("totals unavailable");
+        expect(html).not.toContain("1/1 requests reported");
+      }
+    });
+  }
+  it("retains same-node and reused-event conflicts even when incoming usage is discarded", () => {
+    for (const sameEventId of [false, true]) {
+      const without = finished("one", "preparation", 0, 10);
+      const withUsage = {...event("one"), event_id: sameEventId ? without.event_id : "other-event"};
+      const replay = event("independent");
+      for (const order of [[without, withUsage, replay], [withUsage, without, replay], [replay, without, withUsage]]) {
+        expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents(order))).toEqual([expect.stringContaining("capture unavailable")]);
+        expect(renderExplainAnalyzeHtml(order)).toContain("totals unavailable");
+      }
+      for (const order of [[without, withUsage], [withUsage, without]]) {
+        const html = renderExplainAnalyzeHtml(order);
+        expect(html).toContain("capture unavailable");
+        expect(html).not.toContain("requests reported");
+      }
+      const sameTurn = finished("one", "turn", 0, 10);
+      for (const order of [[sameTurn, withUsage, replay], [withUsage, sameTurn, replay]]) {
+        expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents(order))).toEqual([expect.stringContaining("capture unavailable")]);
+      }
+    }
+  });
+  it("keeps weaker known buckets as conflict evidence without merging them into exact usage", () => {
+    const partial = event("partial", {...attempt, usage_status: "provider_partial", usage: {basis: "provider_partial", fresh_input_tokens: 100, output_tokens: 3}});
+    const exact = event("exact");
+    const conflicting = event("conflicting", {...attempt, usage: {...attempt.usage, output_tokens: 4}});
+    for (const order of [[partial, exact], [exact, partial]]) {
+      expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents(order))[0]).toContain("out unknown");
+      expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([...order, conflicting]))[0]).toContain("capture unavailable");
+    }
+  });
+});
+
+it("upgrades auxiliary usage from unavailable through partial to exact across segments", () => {
+  const attempt = {attempt_id: "aux-1", provider: "typesafe", offering_id: "jev-1", model_name: "jev1", purpose: "verification_judge", operation_id: "verification_judge"};
+  const missing = finished("one", "turn", 0, 10, {auxiliary_usage: {available: true, attempts: [{...attempt, usage_status: "unavailable"}]}});
+  const partial = finished("two", "turn", 10, 20, {auxiliary_usage: {available: true, attempts: [{...attempt, usage_status: "provider_partial"}]}});
+  expect(explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents([missing, partial]))[0]).toContain("partial");
+  const exact = finished("three", "turn", 20, 30, {auxiliary_usage: {available: true, attempts: [{...attempt, usage_status: "provider_exact", usage: {basis: "provider_exact", fresh_input_tokens: 100, output_tokens: 0}}]}});
+  for (const order of [[missing, partial, exact], [exact, partial, missing]]) {
+    const output = explainAnalyzeAuxiliaryUsageLines(reduceExplainAnalyzeEvents(order))[0];
+    expect(output).toContain("in 100");
+    expect(output).toContain("out 0");
+    expect(output).toContain("cache read unknown");
+    expect(output).not.toContain("partial");
+  }
 });

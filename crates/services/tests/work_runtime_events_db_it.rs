@@ -7,11 +7,6 @@ use astra_services::{
         WorkId, WorkOwnerId, WorkRepository, project_pending_runtime_events,
     },
 };
-use uuid::Uuid;
-
-fn id(prefix: &str) -> String {
-    format!("{prefix}-{}", Uuid::new_v4())
-}
 
 fn work_run(
     owner_id: &str,
@@ -42,7 +37,7 @@ fn work_run(
         checkpoint_json: None,
         error_code: None,
         error_message: None,
-        retry_count: 0,
+
         total_prompt_tokens: 0,
         total_completion_tokens: 0,
         total_tool_calls: 0,
@@ -64,53 +59,18 @@ fn work_run(
     }
 }
 
-async fn cleanup_owner(pool: &astra_core::SharedPool, owner_id: &str) {
-    for (table, owner_column) in [
-        ("run_display_projections", "user_id"),
-        ("run_checkpoints", "user_id"),
-        ("agent_run_events", "user_id"),
-        ("agent_session_execution_slots", "user_id"),
-        ("agent_runs", "user_id"),
-        ("work_runtime_event_outbox", "owner_id"),
-        ("work_runtime_event_outbox_slots", "owner_id"),
-        ("work_events", "owner_id"),
-        ("work_attention_receipts", "owner_id"),
-        ("work_event_sequences", "owner_id"),
-        ("work_proposals", "owner_id"),
-        ("work_proposal_sequences", "owner_id"),
-        ("work_branches", "owner_id"),
-        ("work_item_edges", "owner_id"),
-        ("work_item_revisions", "owner_id"),
-        ("work_items", "owner_id"),
-        ("work_graph_revisions", "owner_id"),
-        ("work_graph_sequences", "owner_id"),
-        ("work_criterion_sets", "owner_id"),
-        ("work_goal_revisions", "owner_id"),
-        ("works", "owner_id"),
-        ("agent_sessions", "user_id"),
-    ] {
-        let statement = format!("DELETE FROM {table} WHERE {owner_column} = ?");
-        sqlx::query(&statement)
-            .bind(owner_id)
-            .execute(pool.get())
-            .await
-            .unwrap_or_else(|error| panic!("clean {table}: {error}"));
-    }
-}
-
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn root_run_terminal_fact_is_atomic_bounded_idempotent_and_projected() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
     let store = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("work-event-it");
-    let owner_id = id("runtime-event-owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let session_id = id("session");
-    let first_run_id = id("run");
-    let overflow_run_id = id("run");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("runtime-event-owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let session_id = common::id("session");
+    let first_run_id = common::id("run");
+    let overflow_run_id = common::id("run");
 
     repository
         .create_genesis(common::work_genesis(
@@ -118,7 +78,7 @@ async fn root_run_terminal_fact_is_atomic_bounded_idempotent_and_projected() {
             &work_id,
             &branch_id,
             &session_id,
-            &id("intent"),
+            &common::id("intent"),
             "Project durable Run outcomes into Work activity.",
         ))
         .await
@@ -196,7 +156,17 @@ async fn root_run_terminal_fact_is_atomic_bounded_idempotent_and_projected() {
 
     assert!(
         store
-            .update_run_status(&owner_id, &session_id, &first_run_id, "failed", None, None,)
+            .update_run_status_with_events_if_current(
+                &owner_id,
+                &session_id,
+                &first_run_id,
+                &["failed"],
+                None,
+                "failed",
+                None,
+                None,
+                &[]
+            )
             .await
             .expect("idempotent terminal status replay")
     );
@@ -231,13 +201,16 @@ async fn root_run_terminal_fact_is_atomic_bounded_idempotent_and_projected() {
     .expect("simulate a projector lagging beyond the bounded ring");
     assert!(
         store
-            .update_run_status(
+            .update_run_status_with_events_if_current(
                 &owner_id,
                 &session_id,
                 &overflow_run_id,
+                &["running"],
+                None,
                 "completed",
                 None,
                 None,
+                &[]
             )
             .await
             .expect("terminal fact must survive projection overflow")
@@ -270,5 +243,5 @@ async fn root_run_terminal_fact_is_atomic_bounded_idempotent_and_projected() {
         overflow_page.events[0].kind,
         WorkEventKind::RuntimeEventsExpired
     );
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }

@@ -59,11 +59,39 @@ identify the bottleneck, critical path, token attribution, or parallel overlap
 with adequate coverage, it must say the result is unavailable and why. Never
 fill sparse data with confident-sounding boilerplate or unexplained zeroes.
 
+CLI/Edge lesson decisions are attached to the context assembly as
+`edge_memory_selection`. They carry the source session and turn, operation
+(relevance, explicit dismissal, or cache reuse), candidate count, batch-local
+indices, selected flags and ranking order, selector model, measured selection duration, and
+provider probabilities when supplied (rounded to basis points). These facts
+are reported by the selected CLI/Edge, not independently verified by Server.
+Repeated assemblies reference the same turn decision; their durations must not
+be added together or placed on the Server clock. Missing or stale observations
+are omitted. Selection does not prove final prompt injection; the report
+explicitly says that injection is not measured.
+
+The concise view shows candidate and selected counts and the decision method.
+Details expose candidate decisions and available scores, never invented
+explanations. Model rejection of all candidates, no retrieved candidates,
+unavailable retrieval, selector failure with local fallback, and cache reuse
+remain distinct. Failed dismissal retains memories. Memory text and raw
+provider payloads do not enter this public Explain contract. There are at most
+two decision operations per bootstrap turn and 256 candidates per exported
+operation; these are observation bounds, not limits on selection behavior.
+
 The graph is a deterministic visual rendering of runtime facts; rendering it
 does not call an LLM or generate narrative claims. Any LLM explanation is a
 separate, explicitly requested product action and view. It must point back to
 the graph facts it used, label uncertainty, and stay visually distinct from
 the measured execution record.
+
+Asynchronous request admission is one measured stage, not an unavailable
+placeholder followed by another attempt. Its terminal timestamp is captured
+by the background owner before the main loop consumes the result. A separately
+measured wait may show how long the main loop actually blocked on that result;
+the full background duration must not be labeled added latency. Cancellation
+closes outstanding admission observations. Classification and any required
+Work plan retain distinct auxiliary inference identities and usage.
 
 Web and TUI preserve the execution tree and the
 information density of the README demonstration: context budget and source
@@ -108,6 +136,17 @@ different outcomes remain mixed. Token subtotals state how many observed
 requests supplied usage, retain known lanes, and leave unreported lanes unknown.
 Context assembly and request budget estimates remain separate from provider
 usage and identify their estimation scope.
+
+Primary prompt-cache read share is an input-only measurement. Its eligibility
+does not depend on output-token coverage or untimed stages. The canonical graph
+projects exact, complete input buckets from physical provider attempts only;
+stage totals and auxiliary snapshots never enter that denominator. Consumers
+also require verified identity and complete transport capture. Missing input
+lanes, conflicting facts, unfinished execution scopes, and arithmetic overflow
+cannot establish a full-run percentage. Zero input makes the ratio inapplicable.
+The current projection requires all three disjoint input buckets; it does not
+infer an absent cache-write bucket from the model name. Supporting an inclusive
+provider input total requires explicit validated evidence, not a renderer guess.
 
 The quality fixture includes at least: a long provider wait followed by a fast
 answer, a retried request with per-attempt token usage, parallel tools whose
@@ -222,6 +261,17 @@ parallel graph formats. The version field is part of this schema's evolution,
 not a request to preserve superseded event shapes. Trace event schemas remain
 owned and versioned by the observation plane.
 
+A terminal blocked or rejected `admission` event may include a typed
+`decision_detail` when the existing execution path has bounded evidence that
+materially explains the decision. Delegated-model catalog resolution may report
+the requirement's zero-based position and the count of exact eligible matches
+from the already-loaded authorized catalog snapshot. It must not expose the
+user's quote, provider response, or candidate catalog entries, and this detail
+does not grant execution authority. The detail itself adds no event kind or
+database operation. A pre-execution rejection emits the existing Admission
+start and finish facts because that path previously bypassed this observation
+boundary.
+
 A terminal `turn` fact carries the producer's known `coverage_gaps`. The server
 measures Edge approval waits. Server-internal approval waits are not yet
 separately instrumented and remain part of dispatch-to-result wall time.
@@ -307,9 +357,9 @@ surface may render them:
 
 | Topology | Live and replay facts | Human rendering | Next-turn artifact analysis |
 | --- | --- | --- | --- |
-| CLI/local runtime | Local typed stream and session journal | CLI/TUI may write a local Markdown companion and print its path | The local `introspect` reader can consume the opaque session handle |
+| CLI/local runtime | Local typed stream and session journal | CLI/TUI may write a local HTML companion by default (or explicit Markdown/text) and print its path | The local `introspect` reader can consume the opaque session handle |
 | Server + TUI/CLI | Server lifecycle is authoritative; the client consumes the same typed stream and durable replay | The client may render a local companion for the human, but must not treat its path as server authority | The model can recover only through a reader backed by the same server/session store; otherwise the required context reports the artifact as unavailable |
-| Server only | Server emits the versioned stream and durable run cursor | Web/SDK owns rendering or export; no server process writes a user's local path | The server-owned database handle is discovered on the next turn and read through server `introspect` |
+| Server only | Server emits the versioned stream and durable run cursor | Web/SDK owns rendering or export; no server process writes a user's local path | Server `introspect(explain={target:"previous"})` discovers and reads the first window on demand |
 | Server + Edge | Server and Edge facts retain producer, clock, parent, and gap metadata; reconnect uses the durable server cursor | The attached client renders one graph from merged facts; Edge never creates a second Explain semantics | Edge-local paths stay local; recovery uses the authorized host artifact backend and reports missing cross-host readers explicitly |
 
 Client-side rendering must therefore degrade to “shown locally, unavailable to
@@ -331,8 +381,9 @@ local readers support UTF-8 JSON windows with `offset` and a bounded
 `max_bytes` (64 KiB maximum), and return a continuation offset. They never
 expose a physical path. A failed write publishes an `unavailable` status for
 that run and turn when the store is reachable. Server discovery is bound first
-to the latest durable `run_started` record that explicitly requested Explain
-Analyze, then to that run's deterministic artifact identity; a missing or
+to the latest durable root `run_started` record that explicitly requested Explain
+Analyze, excluding the current root execution, then to that run's deterministic
+artifact identity; a missing or
 invalid artifact is reported as unavailable and never falls back to an older
 run. The local index uses the same fail-closed status model for the host it
 owns.
@@ -360,21 +411,71 @@ large files, provider captures, screenshots, exports, and future multimodal
 payloads on the same reference model without widening Explain Analyze into a
 raw trace or file browser.
 
-The server advertises the latest handle through the typed required-context lane
-on the next turn. The CLI/TUI may also print the path of a derived Markdown
-report for the human operator. That path is a presentation affordance; the
-model receives the server-owned opaque handle and reads the canonical artifact
-through the bounded reader. The physical path is never treated as model
-authority. A client-local companion is explicitly unavailable to a remote model
-when no shared artifact backend exists.
-The next turn receives only a short artifact handle through `introspect`. An
-agent that is explicitly asked to analyze the previous explain report reads
-that handle through the bounded artifact window API, then cites the recorded
-node and event identities in its answer. The entire event set is never added
-to the prompt automatically. Missing, partial, or unavailable
-artifacts are reported as such, and an Explain artifact never grants access to
-raw prompts, chain-of-thought, credentials, tool arguments, tool output, or
-trace payloads.
+Server chat preparation performs no Explain discovery, artifact fetch, or
+recovery. The canonical tool schema and catalog advertise the explicit selector:
+
+- `introspect(explain={target:"previous"}, offset=0, max_bytes=65536)` selects
+  the latest root strictly before the trusted current root's `(created_at, run_id)`
+  admission key for the authenticated user in the active session. Roots admitted
+  after current are not previous. A missing, foreign, or non-root current fails
+  closed with no selection. The store lookup without a current root selects the
+  latest root. Durable ordering is created time, then run ID, both descending;
+  later updates, run status, and whether Explain was requested do not affect selection.
+  Child runs and other users/sessions are excluded. The selected identity never
+  silently falls back to an older Explain capture.
+- `introspect(explain={target:"run",run_id:"…"}, offset=0, max_bytes=65536)`
+  selects that exact run after authenticated owner and active-session checks.
+  It never widens scope to another session. Both selectors share the same
+  exact-run read: when Explain was not enabled, they return a durable event
+  projection rather than an Explain artifact, without creating a new artifact.
+  This projection reads at most 256 events across opening and latest windows,
+  bounded by the observed durable cursor, without reading checkpoint payloads.
+  The event window has a 1 MiB transfer bound, shared equally across requested
+  event slots; oversized payloads are omitted before database transfer.
+  It reports total, observed, and omitted event counts; it is not complete replay.
+  Text and JSON retain whole events within `max_bytes`, including the text
+  envelope. Ordinary-run projections have no pagination cursor. Producer-bounded
+  results avoid secondary artifacts caused solely by generic truncation during
+  journal recording. Genuinely large results still use ordinary artifact storage;
+  the producer-bounded model presentation remains intact.
+- Explain artifact selection defaults to a bounded fact summary with run, turn,
+  execution-owner generation, capture status, uncertainty and omission counts,
+  and a concrete opaque detail handle. Missing usage is not zero usage. Whole
+  node and auxiliary-attempt rows retain their measurement basis; terminal and
+  coverage facts remain present even when all optional rows are omitted.
+  `depth="diagnostic"` or `depth="forensic"` selects the first raw byte window
+  instead. Detail pages use `introspect(artifact="…", offset=…, max_bytes=…)`;
+  start at offset zero when moving from the summary to raw detail.
+  the moving `previous` selector is never a pagination cursor.
+- `explain` and `artifact` are mutually exclusive; discovery requires offset
+  zero. `live_only` and `local_only` exclude server snapshot discovery.
+  Unsupported execution contexts, including the local CLI/Edge selector, return
+  an explicit error. Existing local handle readers retain their source policy
+  and active-session checks; neither boundary accepts arbitrary server paths.
+
+Readable discovery fetches the snapshot once and shares validation and the typed
+graph reducer with the canonical handle reader. Raw pages use UTF-8-safe byte
+windows. Child typed facts replay through their own durable run projection;
+compaction emits an unrecovered gap. These facts do not resolve the root's
+`ChildRunIntervals` coverage gap across independent clock domains.
+Byte-window completion is separate from capture completeness: partial facts,
+gaps, truncated coverage and unknown usage stay incomplete even after the final byte. Missing, corrupt,
+expired, mismatched or unavailable selected reports never fall back to older
+reports. Only physical absence may invoke exact completed-run recovery.
+
+The CLI/TUI may print a derived HTML, Markdown or text report path for the human
+operator. That path remains a presentation affordance, never model authority.
+A client-local companion is unavailable to a remote model without a shared
+authorized backend. Explain artifacts never grant access to raw prompts,
+chain-of-thought, credentials, tool arguments, tool output or trace payloads.
+
+Native stage observations use the already supplied run events. A snapshot
+retains at most 16 call identities, collapses identical replays, and marks
+conflicting observations unknown. Summary byte budgets explicitly report
+omitted retained observations. Stage input is cumulative within that stage;
+last-request input and model capacity are separate fields, not current context
+occupancy. Internal native tool counts and health are unknown. These observations
+are never added to physical model-attempt cache denominators.
 
 ## Correctness and failure behavior
 
@@ -383,14 +484,14 @@ trace payloads.
   server-session handle; a failure carries a bounded safe reason. The current
   stream receives this result before its terminal frames. If retaining the
   result also fails, `recorded=false` makes that limitation explicit. A local
-  Markdown path never substitutes for server publication success.
+  derived-report path never substitutes for server publication success.
 - Failed publication is a run observation, not an immutable empty snapshot.
   Missing reports can be recovered from the exact completed run's durable
-  facts on discovery or buffered-completion resume. Paused or cancelled runs
+  facts on explicit discovery or buffered-completion resume. Paused or cancelled runs
   cannot promote buffered successful facts into a completed report. Recovery
   preserves turn and generation identity and records its publication result;
   it does not rerun the model or overwrite a successful conflicting snapshot.
-- Artifact discovery is background capability metadata. The agent explains
+- Artifact discovery is an explicit observation request. The agent explains
   unavailability when asked about that report, rather than inserting unrelated
   storage warnings into ordinary answers. Clients surface failures when they
   occur, independently of what the model chooses to say.
@@ -399,6 +500,13 @@ trace payloads.
 - Durable append is ordered before event publication. Reconnect replays after
   the last durable index and hands off to live delivery without a missing
   interval or duplicate graph mutation.
+- Server live fanout coalesces pending facts for up to 250 ms from the first
+  queued fact, or until the existing 64-event / 256-KiB flush threshold is
+  reached. Interleaved transient frames share the bounded queue and preserve
+  delivery order without becoming durable rows or forcing their own commit.
+  Approval persistence, explicit drain, and channel close flush immediately;
+  a live-only frame with no pending fact remains immediate. The coalescing
+  interval is not a bound on database commit or client delivery latency.
 - Structural start/terminal facts are emitted before/after their corresponding
   slow work. In the local loopback fixture, measure from runtime creation of a
   structural event through its application by the client graph reducer: p95 is
@@ -444,3 +552,55 @@ trace payloads.
   durable append failure, slow/full consumers, reconnect at each structural
   boundary, and the replay-to-live handoff. No case may yield a complete graph
   with invented timing or missing execution nodes.
+
+### Auxiliary provider usage and settlement
+
+A terminal turn fact can carry two read-only, deliberately separate snapshots
+of auxiliary inference in the authenticated user's Session and turn.
+`auxiliary_usage` records physical provider attempts: attempt identity,
+provider, Offering, requested upstream model, purpose/operation, and reported
+token lanes. Invocation totals are not added to attempt totals.
+Repeated turn segments deduplicate attempt IDs. Missing usage remains unknown;
+partial provider usage is labeled partial. A failed or timed-out snapshot is
+marked unavailable and does not fail the user's turn. Collection has a one-second
+best-effort budget and runs only when Explain capture is enabled. The snapshot
+uses the existing durable-event batch row budget; overflow retains bounded rows
+with `truncated=true`. Counts then describe captured attempts and token sums are
+lower bounds, including fully reported lanes. An omitted `truncated` field means
+the capture did not overflow, preserving existing facts. The requested model comes from
+the immutable route and is not an assertion about the provider-returned model.
+The text/TUI/HTML projection keeps Offering and operation visible (including
+request classification and Work next-direction judgment). When only some
+attempts report a token lane, its sum is explicitly a lower bound; it is not
+presented as the total consumption of that group.
+
+Consumers validate fields strictly. Deploy the updated Rust/SDK readers before
+upgrading the server in a mixed-version deployment: older readers do not
+recognize populated `truncated` or `auxiliary_details` fields and reject that
+terminal fact. Non-overflow usage facts omit `truncated`, but a terminal fact
+with `auxiliary_details` still requires a reader that knows the new field. This
+is therefore a coordinated schema rollout, not a claim of mixed-version wire
+compatibility.
+
+`auxiliary_details` complements the physical ledger with bounded semantic
+settlement and local logical-call timing. Each call records its operation,
+stage, start offset, duration, and transport-level outcome as observed around
+the `SummaryLlmClient` boundary. It does not claim provider compute time or
+reconstruct timing from database timestamps. Calls may overlap, so consumers
+must not add their durations to each other or to the parent turn interval.
+The current runtime producer covers the built-in Work-admission classifier and
+planner (including clarification and bounded repair); an empty call list does
+not prove that no other auxiliary subsystem ran.
+Pre-dispatch paths have no call interval; cancellation or dropped futures are
+recorded as cancelled when the local boundary was entered. The terminal
+admission settlement separately records whether the typed result was accepted
+by the runtime; a provider response and an adopted execution decision are not
+the same fact. The semantic result is bounded and excludes provider response
+text, prompts, and credentials.
+
+TUI, text, HTML and Web show Jev auxiliary tokens separately from the main
+model's tokens and show the logical timing/settlement facts separately from
+those tokens. Both auxiliary snapshots are bounded; their truncation or
+unavailability is rendered explicitly. The snapshot is complete only as a
+query at terminal time; auxiliary calls performed after capture are not
+included.

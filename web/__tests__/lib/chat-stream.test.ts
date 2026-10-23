@@ -72,6 +72,144 @@ describe('streamChatMessage cancellation semantics', () => {
     globalThis.TextDecoder = TextDecoder as typeof globalThis.TextDecoder;
   });
 
+  it.each([
+    { name: 'empty', events: [] },
+    { name: 'text only', events: [{ type: 'text_done', full_text: 'Partial' }] },
+    { name: 'turn text', events: [{ type: 'turn_complete', assistant_text: 'Partial' }] },
+    { name: 'child completion', events: [{ type: 'run_finished', run_id: 'child', status: 'completed' }] },
+  ])('rejects $name EOF without a root receipt', async ({ events }) => {
+    const frames = [{ type: 'session_info', run_id: 'root' }, ...events]
+      .map(event => `data: ${JSON.stringify(event)}\n\n`);
+    frames.push('data: [DONE]\n\n');
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody(frames) });
+    const onDone = vi.fn(), onCancelled = vi.fn(), onPaused = vi.fn();
+    await expect(streamChatMessage('chat', defaultPayload, { onDone, onCancelled, onPaused }))
+      .rejects.toMatchObject({ code: 'stream_observation_interrupted' });
+    expect(onDone).not.toHaveBeenCalled();
+    expect(onCancelled).not.toHaveBeenCalled();
+    expect(onPaused).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { run_id: 'root' }, { run_id: 'root', status: 'unknown' }, { status: 'completed' },
+  ])('rejects a malformed terminal receipt (%j)', async receipt => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody([
+      'data: {"type":"session_info","run_id":"root"}\n\n',
+      `data: ${JSON.stringify({ type: 'run_finished', ...receipt })}\n\n`,
+    ]) });
+    const onDone = vi.fn();
+    await expect(streamChatMessage('chat', defaultPayload, { onDone }))
+      .rejects.toMatchObject({ code: 'contract_violation' });
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('keeps child lifecycle observable without changing root callbacks (coalesced=%s)', async coalesced => {
+    const events = [
+      { type: 'session_info', session_id: 'session', run_id: 'root' },
+      { type: 'run_started', run_id: 'child' },
+      { type: 'run_finished', run_id: 'child', status: 'cancelled', index: 7 },
+      { type: 'text_delta', content: 'Root answer' },
+      { type: 'run_finished', run_id: 'root', status: 'completed' },
+    ];
+    const frames = events.map(event => `data: ${JSON.stringify(event)}\n\n`);
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody(coalesced ? [frames.join('')] : frames) });
+    const onCancelled = vi.fn(), onDone = vi.fn(), onRunFinished = vi.fn(), onRunUpdated = vi.fn(), onWorkSurfaceEvent = vi.fn();
+    await expect(streamChatMessage('chat', defaultPayload,
+      { onCancelled, onDone, onRunFinished, onRunUpdated, onWorkSurfaceEvent })).resolves.toBe('Root answer');
+    expect(onCancelled).not.toHaveBeenCalled();
+    expect(onDone).toHaveBeenCalledWith('Root answer');
+    expect(onRunFinished).toHaveBeenCalledExactlyOnceWith({ runId: 'root', status: 'completed', error: null });
+    expect(onRunUpdated.mock.calls.every(([run]) => run.runId === 'root')).toBe(true);
+    expect(onWorkSurfaceEvent).toHaveBeenCalledWith(expect.objectContaining({ type: 'run_finished', run_id: 'child' }));
+  });
+
+  it('retains the canonical failure code through a synthesized terminal', async () => {
+    const frames = [
+      'data: {"type":"session_info","run_id":"root"}\n\n',
+      'data: {"type":"text_delta","content":"Partial answer"}\n\n',
+      'data: {"type":"run_error","run_id":"root","error":"Save failed","error_code":"canonical_persistence_failed"}\n\n',
+      'data: {"type":"run_finished","run_id":"root","status":"failed","error":"Save failed"}\n\n',
+      'data: [DONE]\n\n',
+    ];
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody(frames) });
+    const onText = vi.fn(), onDone = vi.fn();
+    await expect(streamChatMessage('chat', defaultPayload, { onText, onDone }))
+      .rejects.toMatchObject({ message: 'Save failed', code: 'canonical_persistence_failed' });
+    expect(onText).toHaveBeenLastCalledWith('Partial answer');
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { knownFailure: true, abort: false },
+    { knownFailure: true, abort: true },
+    { knownFailure: false, abort: false },
+  ])('keeps canonical failure precedence over a socket reset, but not user abort (%j)', async ({ knownFailure, abort }) => {
+    const controller = new AbortController();
+    let reads = 0;
+    const events = [
+      { type: 'session_info', run_id: 'root' },
+      { type: 'text_delta', content: 'Partial answer' },
+      ...(knownFailure ? [{ type: 'run_error', run_id: 'root', error: 'Save failed', error_code: 'canonical_persistence_failed' }] : []),
+    ];
+    const bytes = new TextEncoder().encode(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''));
+    const releaseLock = vi.fn();
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: { getReader: () => ({
+      async read() {
+        if (reads++ === 0) return { value: bytes, done: false };
+        if (abort) controller.abort();
+        throw new Error('socket reset');
+      },
+      releaseLock, cancel: vi.fn(),
+    }) } });
+    const onDone = vi.fn();
+    await expect(streamChatMessage('chat', defaultPayload, { signal: controller.signal, onDone })).rejects
+      .toMatchObject(abort ? { name: 'AbortError' } : knownFailure
+        ? { message: 'Save failed', code: 'canonical_persistence_failed' } : { code: 'stream_observation_interrupted' });
+    expect(onDone).not.toHaveBeenCalled();
+    expect(releaseLock).toHaveBeenCalledOnce();
+  });
+
+  it.each([['', false], ['   ', false], ['', true]])('never completes a failed terminal with a blank reason (%j, prior=%s)', async (reason, prior) => {
+    const events = [
+      { type: 'session_info', run_id: 'root' },
+      ...(prior ? [{ type: 'run_error', run_id: 'root', error: 'Save failed', error_code: 'canonical_persistence_failed' }] : []),
+      { type: 'run_finished', run_id: 'root', status: 'failed', error: reason },
+    ];
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true,
+      body: sseBody(events.map(event => `data: ${JSON.stringify(event)}\n\n`)) });
+    const onDone = vi.fn();
+    await expect(streamChatMessage('chat', defaultPayload, { onDone })).rejects
+      .toThrow(prior ? 'Save failed' : 'Astra run failed.');
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
+  it('surfaces hook configuration warnings without changing the answer or run status', async () => {
+    const onWarning = vi.fn();
+    const onRunFinished = vi.fn();
+    const onStreamGap = vi.fn();
+    const message = 'Hook configuration .astra/hooks.json at hooks[0].event: invalid event';
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody([
+      `data: ${JSON.stringify({ type: 'warning', code: 'hook_configuration', message, index: 7 })}\n\n`,
+      'data: {"type":"stream_gap","run_id":"run-1","repair":"refresh_run_snapshot"}\n\n',
+      'data: {"type":"text_delta","content":"answer"}\n\n',
+      'data: {"type":"run_finished","run_id":"run-1","status":"completed"}\n\n',
+    ]) });
+    await expect(streamChatMessage('chat', defaultPayload, { onWarning, onRunFinished, onStreamGap })).resolves.toBe('answer');
+    expect(onWarning).toHaveBeenCalledExactlyOnceWith(message);
+    expect(onRunFinished).toHaveBeenCalledWith(expect.objectContaining({ status: 'completed' }));
+    expect(onStreamGap).toHaveBeenCalledWith(expect.objectContaining({ nextEventIndex: 8 }));
+  });
+
+  it('does not replay hook warnings as new notifications', async () => {
+    const onWarning = vi.fn();
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody([
+      'data: {"type":"warning","code":"hook_configuration","message":"historical diagnostic","index":7}\n\n',
+      'data: [DONE]\n\n',
+    ]) });
+    await streamExistingChatRun('chat', 'run', { onWarning }, { replayOnly: true });
+    expect(onWarning).not.toHaveBeenCalled();
+  });
+
   it.each(["failed", "cancelled", "completed"])("repairs observations for a %s run without replaying its lifecycle", async (status) => {
     const onRunUpdated = vi.fn();
     const onText = vi.fn();
@@ -238,6 +376,76 @@ describe('streamChatMessage cancellation semantics', () => {
       ...event,
       dependency_node_ids: [],
     });
+  });
+
+  it('accepts the runtime terminal Explain payload with auxiliary details', async () => {
+    const onExplainAnalyzeEvent = vi.fn();
+    const event = {
+      type: 'explain_analyze',
+      schema_version: 1,
+      event_id: 'clock-1:terminal',
+      run_id: 'run-123',
+      turn_id: 'turn-1',
+      node_id: 'turn-1',
+      producer_id: 'worker-1',
+      clock_domain_id: 'clock-1',
+      kind: 'turn',
+      label: 'User turn',
+      transition: 'finished',
+      elapsed_ms: 100,
+      start_elapsed_ms: 0,
+      duration_ms: 100,
+      outcome: 'completed',
+      auxiliary_details: {
+        calls: [{
+          call_id: 'request_judgment:initial:0',
+          operation_id: 'request_judgment',
+          stage: 'initial',
+          start_elapsed_ms: 12,
+          duration_ms: 8,
+          outcome: 'succeeded',
+        }],
+        admission: {
+          status: 'accepted',
+          reason: { kind: 'accepted' },
+          classification: {
+            result: 'decided',
+            classification: {
+              work_required: true,
+              activation_deferred: false,
+              domain: null,
+              mutation: 'read_only',
+              scope: 'unknown',
+              parallel_subruns: false,
+              capabilities: [],
+            },
+          },
+          decision: {
+            result: 'decided',
+            classification: {
+              work_required: true,
+              activation_deferred: true,
+              domain: null,
+              mutation: 'read_only',
+              scope: 'unknown',
+              parallel_subruns: false,
+              capabilities: [],
+            },
+          },
+        },
+      },
+    };
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      body: sseBody([
+        `data: ${JSON.stringify(event)}\n\n`,
+        'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
+      ]),
+    });
+
+    await streamChatMessage('chat-123', defaultPayload, { onExplainAnalyzeEvent });
+
+    expect(onExplainAnalyzeEvent).toHaveBeenCalledWith(event);
   });
 
   it('treats a cancelled run as a clean stop instead of a failed stream', async () => {
@@ -491,6 +699,7 @@ describe('streamChatMessage cancellation semantics', () => {
   it('passes AbortSignal to fetch and releases the reader lock', async () => {
     const body = sseBody([
       'data: {"type":"run_started","run_id":"run-123"}\n\n',
+        'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
     ]);
     const signal = new AbortController().signal;
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
@@ -592,6 +801,7 @@ describe('streamChatMessage cancellation semantics', () => {
         'data: {"type":"tool_transport_started","call_id":"call-1","tool":"bash","transport":"server_local"}\n\n',
         'data: {"type":"tool_transport_completed","call_id":"call-1","tool":"bash","transport":"server_local","duration_ms":12}\n\n',
         'data: {"type":"tool_call_end","call_id":"call-1","tool":"bash","success":true,"result":"ok"}\n\n',
+        'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
       ]),
     });
 
@@ -601,7 +811,9 @@ describe('streamChatMessage cancellation semantics', () => {
       }),
     ).resolves.toBe('');
 
-    expect(onWorkSurfaceEvent).toHaveBeenCalledTimes(6);
+    expect(onWorkSurfaceEvent).toHaveBeenLastCalledWith(
+      expect.objectContaining({ type: 'run_finished', run_id: 'run-123', status: 'completed' }),
+    );
     expect(onWorkSurfaceEvent).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({
@@ -693,8 +905,10 @@ describe('streamChatMessage cancellation semantics', () => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body: sseBody([
+        'data: {"type":"session_info","run_id":"root"}\n\n',
         'data: {"type":"text_delta","content":"draft"}\n\n',
         'data: {"type":"turn_complete","assistant_text":"final answer"}\n\n',
+        'data: {"type":"run_finished","run_id":"root","status":"completed"}\n\n',
       ]),
     });
 
@@ -823,7 +1037,9 @@ describe('streamChatMessage cancellation semantics', () => {
   it('streams an existing run with an encoded GET URL', async () => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
-      body: sseBody(['data: {"type":"text_done","full_text":"resumed"}\n\n']),
+      body: sseBody(['data: {"type":"text_done","full_text":"resumed"}\n\n',
+        'data: {"type":"run_finished","run_id":"run/123","status":"completed"}\n\n',
+      ]),
     });
 
     await expect(
@@ -839,7 +1055,9 @@ describe('streamChatMessage cancellation semantics', () => {
   it('streams an existing run from the stored cursor into the bound assistant message', async () => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
-      body: sseBody(['data: {"type":"text_done","full_text":"resumed"}\n\n']),
+      body: sseBody(['data: {"type":"text_done","full_text":"resumed"}\n\n',
+        'data: {"type":"run_finished","run_id":"run/123","status":"completed"}\n\n',
+      ]),
     });
 
     await expect(
@@ -886,6 +1104,7 @@ describe('streamChatMessage cancellation semantics', () => {
       body: sseBody([
         'data: {"type":"run_input_queued","run_id":"run-123","index":"4"}\n\n',
         'data: {"type":"text_done","full_text":"continued"}\n\n',
+        'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
       ]),
     });
 
@@ -928,3 +1147,25 @@ async function waitUntil(assertion: () => void) {
     }
   }
 }
+
+describe("Web continuation initialization", () => {
+  const initial = { type: "chat_stream_init", assistant_message_id: "assistant", session_id: "session",
+    state: { assistantRawText: "Partial ", assistantText: "Partial", reasoningText: "",
+      runId: "root", nextEventIndex: 8, lastStatus: "streaming", runLifecycle: "running" } };
+  it.each(["wrong run", "wrong message", "bad raw", "repeated", "late", "wrong session"])("rejects %s initialization", async (kind) => {
+    const frame = structuredClone(initial);
+    if (kind === "wrong run") frame.state.runId = "other";
+    if (kind === "wrong message") frame.assistant_message_id = "other";
+    const frames: unknown[] = [kind === "bad raw" ? { ...frame, state: { ...frame.state, assistantRawText: null } } : frame];
+    if (kind === "repeated") frames.push(initial);
+    if (kind === "late") frames.unshift({ type: "session_info", session_id: "session", run_id: "root" });
+    if (kind === "wrong session") frames.push({ type: "session_info", session_id: "other", run_id: "root" });
+    const body = sseBody(frames.map(event => `data: ${JSON.stringify(event)}\n\n`));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, body }));
+    const onDone = vi.fn();
+    await expect(streamExistingChatRun("chat", "root", { onDone }, { nextEventIndex: 8, assistantMessageId: "assistant" }))
+      .rejects.toMatchObject({ code: "contract_violation" });
+    expect(onDone).not.toHaveBeenCalled();
+    expect(body.releaseLock).toHaveBeenCalled();
+  });
+});

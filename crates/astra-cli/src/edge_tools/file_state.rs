@@ -1,17 +1,16 @@
 //! File state tracking for staleness detection and content caching.
 //!
-//! Tracks mtime after each read/write/edit to prevent overwriting user edits
-//! and avoid disk I/O when unchanged file content is requested again.
+//! Tracks captured content identity after each read/write/edit to prevent
+//! overwriting unseen edits. Mtime is only a cache hint and ordering key.
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 
 use sha2::{Digest, Sha256};
 
-use super::{ToolExecutor, passive_cargo_check, passive_tsc_check};
+use super::ToolExecutor;
 
 /// Maximum number of entries in the file state cache. When exceeded, the
 /// entry with the oldest timestamp is evicted.
@@ -49,17 +48,12 @@ pub(crate) struct FileState {
     /// True if the last operation was a read (not a write/edit).
     /// Read-before-write validation only accepts a preceding read.
     pub(super) from_read: bool,
-    /// True if the last read was a partial view (outline, line range).
-    pub(super) is_partial: bool,
     /// Whether the current content identity is known in full.  This is
     /// monotonic across partial reads of the same bytes: a range read must not
     /// erase authority established by a complete read or content-bearing
     /// write.  A changed digest clears it, so a partial view of a new file
     /// cannot be used to authorize an overwrite.
     pub(super) full_content_known: bool,
-    /// How many times this file has been fully read.
-    /// Used for escalating warnings when the model loops on the same file.
-    pub(super) read_count: u32,
     /// Bounded union of source line intervals actually returned for the
     /// current content digest. Partial/truncated lines are never included.
     pub(super) delivered_line_ranges: Vec<DeliveredLineRange>,
@@ -74,18 +68,18 @@ pub(crate) struct FileState {
     pub(super) content_sha256: Option<[u8; 32]>,
 }
 
-fn file_content_sha256(path: &Path) -> Option<[u8; 32]> {
-    let mut file = fs::File::open(path).ok()?;
+fn file_content_sha256(path: &Path) -> io::Result<[u8; 32]> {
+    let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let read = file.read(&mut buffer).ok()?;
+        let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
     }
-    Some(hasher.finalize().into())
+    Ok(hasher.finalize().into())
 }
 
 fn content_sha256(content: &[u8]) -> [u8; 32] {
@@ -241,14 +235,13 @@ impl ToolExecutor {
         let content_sha256 = content
             .as_ref()
             .map(|content| content_sha256(content.as_bytes()))
-            .or_else(|| file_content_sha256(path));
+            .or_else(|| file_content_sha256(path).ok());
         let content_line_count = content.as_deref().map(|value| value.lines().count() as u64);
         let cached_content = content.filter(|c| c.len() <= MAX_CACHED_FILE_BYTES);
         let key = self.file_state_key(path);
         let mut overlapped = false;
         if let Ok(mut state) = self.file_state.lock() {
             let prev = state.get(&key);
-            let prev_count = prev.map(|fs| fs.read_count).unwrap_or(0);
             let same_content = content_sha256.is_some()
                 && prev.is_some_and(|previous| previous.content_sha256 == content_sha256);
             let mut delivered_line_ranges = if same_content {
@@ -276,11 +269,6 @@ impl ToolExecutor {
                         .any(|previous| previous.overlaps(delivered_range));
                 insert_delivered_line_range(&mut delivered_line_ranges, delivered_range);
             }
-            let new_count = if is_partial {
-                prev_count
-            } else {
-                prev_count + 1
-            };
             let full_content_known = if is_partial {
                 prev.is_some_and(|previous| {
                     previous.full_content_known
@@ -295,9 +283,7 @@ impl ToolExecutor {
                 FileState {
                     timestamp_ms: ts,
                     from_read: true,
-                    is_partial,
                     full_content_known,
-                    read_count: new_count,
                     delivered_line_ranges,
                     cached_content,
                     content_sha256,
@@ -309,12 +295,6 @@ impl ToolExecutor {
     }
 
     fn record_write_impl(&self, path: &Path, content: Option<&str>) {
-        if passive_cargo_check::should_schedule_passive_cargo(&self.project_root, path) {
-            self.passive_cargo_pending.store(true, Ordering::SeqCst);
-        }
-        if passive_tsc_check::should_schedule_passive_tsc(&self.project_root, path) {
-            self.passive_tsc_pending.store(true, Ordering::SeqCst);
-        }
         match content {
             Some(text) => {
                 self.passive_lsp
@@ -325,7 +305,7 @@ impl ToolExecutor {
         let ts = Self::file_mtime_ms(path);
         let content_sha256 = content
             .map(|content| content_sha256(content.as_bytes()))
-            .or_else(|| file_content_sha256(path));
+            .or_else(|| file_content_sha256(path).ok());
         let cached_content = content
             .filter(|c| c.len() <= MAX_CACHED_FILE_BYTES)
             .map(String::from);
@@ -336,9 +316,7 @@ impl ToolExecutor {
                 FileState {
                     timestamp_ms: ts,
                     from_read: false,
-                    is_partial: false,
                     full_content_known: content_sha256.is_some(),
-                    read_count: 0,
                     delivered_line_ranges: Vec::new(),
                     cached_content,
                     content_sha256,
@@ -360,38 +338,43 @@ impl ToolExecutor {
     }
 
     /// Check if a file has been modified since we last read/wrote it.
-    /// Returns Err(message) if stale, Ok(()) if fresh or unknown.
+    /// Returns Err(message) if stale, unread, or unverifiable. Only an actual
+    /// missing target may proceed without tracked content identity.
     ///
     /// The error message includes the concrete file path and the exact tool call
     /// the model should make next, so the LLM can act without extra reasoning.
     pub(super) fn check_staleness(&self, path: &Path) -> Result<(), String> {
-        let current_ts = Self::file_mtime_ms(path);
-        if current_ts == 0 {
-            return Ok(()); // file doesn't exist yet — ok for write_file
-        }
-        let current_sha256 = file_content_sha256(path);
-        let key = self.file_state_key(path);
         let rel = self.project_relative_display(path);
-        if let Ok(state) = self.file_state.lock() {
-            if let Some(fs) = state.get(&key) {
-                if current_ts != fs.timestamp_ms
-                    || fs.content_sha256.is_none()
-                    || current_sha256 != fs.content_sha256
-                {
-                    return Err(format!(
-                        "File has been modified since last read (by user or linter). \
-                         Read it again before editing.\n\
-                         → Action required: call read_file(\"{rel}\") first, then retry."
-                    ));
-                }
-            } else {
-                // Never read — require read first for existing files
+        match fs::metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
                 return Err(format!(
-                    "File exists but has not been read yet. \
-                     Read it first before writing/editing.\n\
+                    "Cannot inspect file '{rel}' before editing: {error}"
+                ));
+            }
+        }
+        let current_sha256 = file_content_sha256(path)
+            .map_err(|error| format!("Cannot read file '{rel}' before editing: {error}"))?;
+        let key = self.file_state_key(path);
+        let state = self
+            .file_state
+            .lock()
+            .map_err(|_| format!("Cannot validate file state for '{rel}' before editing"))?;
+        if let Some(fs) = state.get(&key) {
+            if fs.content_sha256 != Some(current_sha256) {
+                return Err(format!(
+                    "File has been modified since last read (by user or linter). \
+                     Read it again before editing.\n\
                      → Action required: call read_file(\"{rel}\") first, then retry."
                 ));
             }
+        } else {
+            return Err(format!(
+                "File exists but has not been read yet. \
+                 Read it first before writing/editing.\n\
+                 → Action required: call read_file(\"{rel}\") first, then retry."
+            ));
         }
         Ok(())
     }
@@ -418,39 +401,28 @@ impl ToolExecutor {
             .unwrap_or(false)
     }
 
-    /// How many times this file has been read in the current session.
-    pub(super) fn file_read_count(&self, path: &Path) -> u32 {
-        let key = self.file_state_key(path);
-        self.file_state
-            .lock()
-            .ok()
-            .and_then(|s| s.get(&key).map(|fs| fs.read_count))
-            .unwrap_or(0)
-    }
-
     /// Try to retrieve cached file content. Returns `Some(content)` if:
     /// - The file was previously read or written with content caching
     /// - The content was small enough to be cached
-    /// - The file mtime hasn't changed since caching
+    /// - Both file mtime and content digest still match
     ///
-    /// This avoids disk I/O for repeated reads of unchanged files while still
-    /// returning the requested content to every caller.
+    /// A cache miss does not hash the file. A possible hit still reads its bytes
+    /// to verify content identity, including same-mtime external edits.
     pub(super) fn get_cached_content(&self, path: &Path) -> Option<String> {
         let current_ts = Self::file_mtime_ms(path);
         if current_ts == 0 {
             return None;
         }
-        let current_sha256 = file_content_sha256(path)?;
         let key = self.file_state_key(path);
-        self.file_state.lock().ok().and_then(|s| {
-            s.get(&key).and_then(|fs| {
-                if fs.timestamp_ms == current_ts && Some(current_sha256) == fs.content_sha256 {
-                    fs.cached_content.clone()
-                } else {
-                    None
-                }
-            })
-        })
+        let (expected_sha256, content) = {
+            let state = self.file_state.lock().ok()?;
+            let entry = state.get(&key)?;
+            if entry.timestamp_ms != current_ts {
+                return None;
+            }
+            (entry.content_sha256?, entry.cached_content.clone()?)
+        };
+        (file_content_sha256(path).ok()? == expected_sha256).then_some(content)
     }
 
     /// Clear staleness and content-cache state after a workspace baseline reset.
@@ -536,6 +508,46 @@ mod tests {
     use crate::lock_recovery::LockRecovery;
 
     // ── Shared file-state across subtask turns ───────────────────────────
+
+    #[test]
+    fn staleness_distinguishes_missing_targets_from_io_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = crate::edge_tools::ToolExecutor::new(dir.path());
+        assert!(exe.check_staleness(&dir.path().join("missing")).is_ok());
+
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, "text").unwrap();
+        assert!(exe.check_staleness(&file.join("child")).is_err());
+        assert!(
+            exe.check_staleness(dir.path())
+                .unwrap_err()
+                .contains("Cannot read file")
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "text");
+    }
+
+    #[test]
+    fn staleness_rejects_poisoned_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, "text").unwrap();
+        let exe = crate::edge_tools::ToolExecutor::new(dir.path());
+        exe.record_read(&file, false);
+        let shared = exe.shared_file_state();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = shared.lock().unwrap();
+                panic!("simulate file-state owner failure");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(
+            exe.check_staleness(&file)
+                .unwrap_err()
+                .contains("Cannot validate file state")
+        );
+    }
 
     /// Simulate plan executor: two ToolExecutors sharing the same file_state.
     /// A file read in subtask 1 should allow editing in subtask 2.
@@ -746,7 +758,6 @@ mod tests {
         let state = exe.file_state.lock_recover();
         let fs = state.get(&key).unwrap();
         assert!(!fs.from_read);
-        assert_eq!(fs.read_count, 0);
     }
 
     #[test]

@@ -208,7 +208,6 @@ describe('queueDeferredRunInput', () => {
       runId: 'run-1',
       status: 'running',
       waitingFor: null,
-      nextEventIndex: 1,
       source: 'backend_poll',
       observedAt: expect.any(String),
     });
@@ -522,7 +521,7 @@ describe('queueDeferredRunInput', () => {
       activeRun: undefined,
     });
 
-    const result = await stopActiveRun('user-a', 'chat-stop');
+    const result = await stopActiveRun('user-a', 'chat-stop', { sessionId: 'chat-stop', runId: 'run-stop', assistantMessageId: null });
 
     expect(cancelRun).toHaveBeenCalledWith('run-stop');
     expect(result?.activeRun).toEqual({
@@ -562,7 +561,8 @@ describe('queueDeferredRunInput', () => {
       },
     });
 
-    const result = await stopActiveRun('user-a', 'chat-stop', {
+    const result = await stopActiveRun('user-a', 'chat-stop', { sessionId: 'chat-stop', runId: 'run-stop',
+      assistantMessageId: getStore('user-a').chats.find(chat => chat.id === 'chat-stop')?.activeRun?.assistantMessageId ?? null }, {
       skipSync: true,
       cancelTimeoutMs: 1,
     });
@@ -623,7 +623,8 @@ describe('queueDeferredRunInput', () => {
       },
     });
 
-    const result = await stopActiveRun('user-a', 'chat-stop', {
+    const result = await stopActiveRun('user-a', 'chat-stop', { sessionId: 'chat-stop', runId: 'run-stop',
+      assistantMessageId: getStore('user-a').chats.find(chat => chat.id === 'chat-stop')?.activeRun?.assistantMessageId ?? null }, {
       skipSync: true,
       cancelTimeoutMs: 1,
     });
@@ -687,7 +688,8 @@ describe('queueDeferredRunInput', () => {
       },
     });
 
-    await stopActiveRun('user-a', 'chat-stop', {
+    await stopActiveRun('user-a', 'chat-stop', { sessionId: 'chat-stop', runId: 'run-stop',
+      assistantMessageId: getStore('user-a').chats.find(chat => chat.id === 'chat-stop')?.activeRun?.assistantMessageId ?? null }, {
       skipSync: true,
       cancelTimeoutMs: 1,
     });
@@ -753,7 +755,8 @@ describe('queueDeferredRunInput', () => {
       },
     });
 
-    const result = await stopActiveRun('user-a', 'chat-stop', {
+    const result = await stopActiveRun('user-a', 'chat-stop', { sessionId: 'chat-stop', runId: 'run-stop',
+      assistantMessageId: getStore('user-a').chats.find(chat => chat.id === 'chat-stop')?.activeRun?.assistantMessageId ?? null }, {
       skipSync: true,
       cancelTimeoutMs: 1,
     });
@@ -844,7 +847,8 @@ describe('queueDeferredRunInput', () => {
       },
     });
 
-    await stopActiveRun('user-a', 'chat-stop', {
+    await stopActiveRun('user-a', 'chat-stop', { sessionId: 'chat-stop', runId: 'run-stop',
+      assistantMessageId: getStore('user-a').chats.find(chat => chat.id === 'chat-stop')?.activeRun?.assistantMessageId ?? null }, {
       skipSync: true,
       cancelTimeoutMs: 1,
     });
@@ -928,7 +932,8 @@ describe('queueDeferredRunInput', () => {
       },
     });
 
-    await stopActiveRun('user-a', 'chat-stop', {
+    await stopActiveRun('user-a', 'chat-stop', { sessionId: 'chat-stop', runId: 'run-stop',
+      assistantMessageId: getStore('user-a').chats.find(chat => chat.id === 'chat-stop')?.activeRun?.assistantMessageId ?? null }, {
       skipSync: true,
       cancelTimeoutMs: 1,
     });

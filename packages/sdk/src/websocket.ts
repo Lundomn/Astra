@@ -1,5 +1,6 @@
 import type { StreamEvent, StreamEventType, ConnectionState } from "./types";
 import { modelSelectionToWire } from "./wire";
+import { ASTRA_AGENT_INTERACTION_API_MAJOR } from "./paths";
 
 // ─── Event Emitter Types ────────────────────────────────────────────
 
@@ -15,13 +16,21 @@ export type AstraWSEventMap = {
 
 type Listener<T> = (data: T) => void;
 
+type PendingAttachment = {
+  runId: string;
+  lastIndex: number;
+  fromReconnect: boolean;
+  resolve: () => void;
+  reject: (error: Error) => void;
+};
+
 // ─── Options ────────────────────────────────────────────────────────
 
 export type AstraWebSocketOptions = {
   /** WebSocket URL (e.g. `ws://localhost:17001/chat/ws`). */
   url: string;
   /** JWT access token for authentication. */
-  token?: string;
+  token: string;
   /** WebSocket sub-protocols. */
   protocols?: string[];
 
@@ -39,6 +48,13 @@ export type ToolApproval = {
   callId: string;
   approved: boolean;
   reason?: string;
+};
+
+export type UserPromptAnswer = {
+  question: string;
+  answers: string[];
+  multi_select: boolean;
+  annotation?: { notes?: string; preview?: string };
 };
 
 // ─── AstraWebSocket ─────────────────────────────────────────────────
@@ -62,6 +78,7 @@ export type ToolApproval = {
  */
 export class AstraWebSocket {
   private ws: WebSocket | null = null;
+  private pendingConnection: { promise: Promise<void>; reject: (error: Error) => void } | null = null;
   private opts: Required<
     Pick<
       AstraWebSocketOptions,
@@ -70,7 +87,16 @@ export class AstraWebSocket {
   > &
     AstraWebSocketOptions;
   private reconnectAttempts = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
+  // Replay the last event inclusively: one durable event can project to
+  // multiple frames, and the socket can close between those frames.
+  private replayEventIndex = 0;
+  private seenReplayFrames = new Set<string>();
+  private deferredTerminalReplayIndex: number | null = null;
+  private seenDeferredFrames = new Set<string>();
+  private lastTerminalFrame: string | null = null;
+  private pendingAttachment: PendingAttachment | null = null;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private listeners = new Map<string, Set<Listener<any>>>();
 
@@ -120,8 +146,10 @@ export class AstraWebSocket {
   private emit<K extends keyof AstraWSEventMap>(
     type: K,
     data: AstraWSEventMap[K],
+    isCurrent?: () => boolean,
   ): void {
     this.listeners.get(type)?.forEach((fn) => {
+      if (isCurrent && !isCurrent()) return;
       try {
         fn(data);
       } catch {
@@ -133,61 +161,206 @@ export class AstraWebSocket {
   // ─── Connection ───────────────────────────────────────────────────
 
   /**
-   * Connect to the WebSocket server. Resolves when the connection is open
-   * (or rejects on immediate failure).
+   * Connect to the WebSocket server. Resolves after authentication and after
+   * any active run's reattach request is accepted at its durable cursor.
+   * Concurrent callers share one attempt; close() rejects an unfinished attempt.
    */
   connect(): Promise<void> {
-    this.closed = false;
-    this.setConnectionState("connecting");
-
-    return new Promise<void>((resolve, reject) => {
-      const url = new URL(this.opts.url);
-      if (this.opts.token) {
-        url.searchParams.set("token", this.opts.token);
-      }
-
-      this.ws = new WebSocket(url.toString(), this.opts.protocols);
-
-      this.ws.onopen = () => {
-        this.reconnectAttempts = 0;
-        this.setConnectionState("connected");
-        resolve();
+    if (!this.opts.token) {
+      return Promise.reject(new Error("WebSocket authentication token is required"));
+    }
+    if (this.pendingConnection) return this.pendingConnection.promise;
+    if (this.isConnected) return Promise.resolve();
+    let resolve!: () => void;
+    let reject!: (error: Error) => void;
+    const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolve = () => {
+        if (this.pendingConnection?.promise === promise) this.pendingConnection = null;
+        resolvePromise();
       };
-
-      this.ws.onmessage = (msg) => {
-        try {
-          const data = JSON.parse(msg.data as string) as StreamEvent;
-          this.processEvent(data);
-        } catch {
-          // Ignore malformed messages
-        }
-      };
-
-      this.ws.onclose = () => {
-        if (this.closed) {
-          this.setConnectionState("disconnected");
-          return;
-        }
-        this.setConnectionState("disconnected");
-        this.maybeReconnect();
-      };
-
-      this.ws.onerror = () => {
-        this.setConnectionState("error");
-        // Only reject on initial connect; reconnects don't have a promise
-        if (this.reconnectAttempts === 0) {
-          reject(new Error("WebSocket connection failed"));
-        }
+      reject = (error) => {
+        if (this.pendingConnection?.promise === promise) this.pendingConnection = null;
+        rejectPromise(error);
       };
     });
+    this.clearReconnectTimer();
+    const previous = this.ws;
+    this.ws = null;
+    previous?.close();
+    this.pendingConnection = { promise, reject };
+    this.closed = false;
+    try {
+      this.setConnectionState("connecting");
+      // A state listener may synchronously cancel this attempt.
+      if (!this.closed && this.pendingConnection?.promise === promise) {
+        this.connectSocket(resolve, reject);
+      }
+    } catch (error) {
+      reject(error instanceof Error ? error : new Error(String(error)));
+      this.setConnectionState("error");
+    }
+    return promise;
   }
 
-  /** Disconnect and stop reconnection. */
+  private connectSocket(resolve: () => void, reject: (error: Error) => void): void {
+    const socket = new WebSocket(this.opts.url, this.opts.protocols);
+    this.ws = socket;
+    let authenticated = false;
+
+    const fail = (error: Error) => {
+      if (this.ws !== socket) return;
+      this.rejectAttachment(error);
+      reject(error);
+      this.setConnectionState("error");
+      // Always dispose the captured transport, even if a callback replaced it.
+      socket.close();
+    };
+
+    socket.onopen = () => {
+      if (this.ws !== socket) return;
+      try {
+        socket.send(JSON.stringify({
+          type: "auth",
+          token: this.opts.token.startsWith("Bearer ")
+            ? this.opts.token
+            : `Bearer ${this.opts.token}`,
+          interaction_api_major: ASTRA_AGENT_INTERACTION_API_MAJOR,
+        }));
+      } catch (error) {
+        fail(error instanceof Error ? error : new Error(String(error)));
+      }
+    };
+
+    socket.onmessage = (msg) => {
+      if (this.ws !== socket) return;
+      let data: {
+        type: string;
+        interaction_api_major?: string;
+        message?: string;
+        retryable?: boolean;
+        run_id?: string;
+      };
+      try {
+        data = JSON.parse(msg.data as string);
+        if (!data || typeof data !== "object" || typeof data.type !== "string") return;
+      } catch {
+        return; // A malformed frame must not interrupt the stream.
+      }
+      if (!authenticated) {
+        if (data.type === "auth_error" || (data.type === "auth_ok"
+            && data.interaction_api_major !== ASTRA_AGENT_INTERACTION_API_MAJOR)) {
+          this.closed = true;
+          reject(new Error(data.type === "auth_error"
+            ? data.message ?? "WebSocket authentication failed"
+            : "WebSocket interaction contract mismatch"));
+          socket.close();
+          return;
+        }
+        if (data.type !== "auth_ok") return;
+        authenticated = true;
+        if (this.runId) {
+          this.pendingAttachment = {
+            runId: this.runId,
+            lastIndex: this.deferredTerminalReplayIndex ?? this.replayEventIndex,
+            fromReconnect: true,
+            resolve,
+            reject,
+          };
+          try {
+            socket.send(JSON.stringify({
+              type: "attach_run",
+              run_id: this.runId,
+              last_index: this.deferredTerminalReplayIndex ?? this.replayEventIndex,
+            }));
+          } catch (error) {
+            fail(error instanceof Error ? error : new Error(String(error)));
+          }
+          return;
+        }
+        this.reconnectAttempts = 0;
+        this.setConnectionState("connected", resolve);
+        return;
+      }
+      const pending = this.pendingAttachment;
+      if (pending && data.type === "session_info" && data.run_id === pending.runId) {
+        this.pendingAttachment = null;
+        const accepted = this.applyEvent(data as StreamEvent);
+        if (!pending.fromReconnect) {
+          this.replayEventIndex = pending.lastIndex;
+          this.seenReplayFrames.clear();
+          this.lastTerminalFrame = null;
+          pending.resolve();
+        } else {
+          this.reconnectAttempts = 0;
+          this.setConnectionState("connected", pending.resolve);
+        }
+        if (accepted) this.notifyEvent(data as StreamEvent);
+        return;
+      }
+      if (pending && data.type === "error") {
+        this.pendingAttachment = null;
+        const retryable = data.retryable === true;
+        if (retryable) {
+          this.runId = pending.runId;
+          this.replayEventIndex = pending.lastIndex;
+        } else if (this.runId === pending.runId) {
+          this.runId = null;
+          this.replayEventIndex = 0;
+          this.seenReplayFrames.clear();
+          this.deferredTerminalReplayIndex = null;
+          this.seenDeferredFrames.clear();
+        }
+        const accepted = this.applyEvent(data as StreamEvent);
+        pending.reject(new Error(data.message ?? "Run attachment failed"));
+        if (retryable) {
+          // An authenticated socket with a failed retryable attachment is not reusable.
+          this.setConnectionState("error");
+        } else if (pending.fromReconnect) {
+          this.reconnectAttempts = 0;
+          this.setConnectionState("connected");
+        }
+        if (accepted) this.notifyEvent(data as StreamEvent);
+        if (retryable) socket.close();
+        return;
+      }
+      this.processEvent(data as StreamEvent);
+    };
+
+    socket.onclose = () => {
+      if (this.ws !== socket) return;
+      this.ws = null;
+      this.rejectAttachment(new Error("WebSocket closed before run attachment"));
+      reject(new Error("WebSocket closed before authentication"));
+      this.setConnectionState("disconnected");
+      if (!this.ws && !this.pendingConnection && this.connectionState === "disconnected") {
+        this.maybeReconnect();
+      }
+    };
+
+    socket.onerror = () => fail(new Error("WebSocket connection failed"));
+  }
+
+  /** Disconnect locally, reject unfinished attempts, and stop reconnection. */
   close(): void {
     this.closed = true;
-    this.ws?.close();
+    this.clearReconnectTimer();
+    const socket = this.ws;
     this.ws = null;
+    const attachment = this.pendingAttachment;
+    this.pendingAttachment = null;
+    this.pendingConnection?.reject(new Error("WebSocket closed before connection completed"));
+    attachment?.reject(new Error("WebSocket closed before run attachment"));
+    socket?.close();
     this.setConnectionState("disconnected");
+  }
+
+  private rejectAttachment(error: Error): void {
+    const pending = this.pendingAttachment;
+    if (!pending) return;
+    this.pendingAttachment = null;
+    this.runId = pending.runId;
+    this.replayEventIndex = pending.lastIndex;
+    pending.reject(error);
   }
 
   // ─── Outgoing messages ────────────────────────────────────────────
@@ -233,6 +406,37 @@ export class AstraWebSocket {
     this.send({ type: "resume_run", ...(runId && { run_id: runId }) });
   }
 
+  /** Attach to an owned run; resolves when the server accepts lastIndex. */
+  attachRun(runId: string, lastIndex = 0): Promise<void> {
+    if (!runId) throw new Error("runId is required");
+    if (!Number.isSafeInteger(lastIndex) || lastIndex < 0 || lastIndex > 0xffffffff) {
+      throw new Error("lastIndex must be a nonnegative 32-bit integer");
+    }
+    if (!this.isConnected) throw new Error("WebSocket is not authenticated");
+    if (this.runId || this.pendingAttachment) {
+      throw new Error("a run is already attached");
+    }
+    return new Promise<void>((resolve, reject) => {
+      this.pendingAttachment = { runId, lastIndex, fromReconnect: false, resolve, reject };
+      try {
+        this.send({ type: "attach_run", run_id: runId, last_index: lastIndex });
+      } catch (error) {
+        this.pendingAttachment = null;
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+
+  /** Resolve an ask_user prompt on the attached run. */
+  respondToUserPrompt(requestId: string, answers: UserPromptAnswer[]): void {
+    this.send({ type: "user_prompt", request_id: requestId, answers: { answers } });
+  }
+
+  /** Cancel an ask_user prompt on the attached run. */
+  cancelUserPrompt(requestId: string): void {
+    this.send({ type: "user_prompt", request_id: requestId, cancelled: true });
+  }
+
   // ─── Getters ──────────────────────────────────────────────────────
 
   get readyState(): number {
@@ -240,55 +444,125 @@ export class AstraWebSocket {
   }
 
   get isConnected(): boolean {
-    return this.ws?.readyState === WebSocket.OPEN;
+    return this.connectionState === "connected" && this.ws?.readyState === WebSocket.OPEN;
   }
 
   // ─── Internals ────────────────────────────────────────────────────
 
   private send(payload: unknown): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(payload));
+    if (this.isConnected) {
+      this.ws?.send(JSON.stringify(payload));
     }
   }
 
-  private setConnectionState(state: ConnectionState): void {
+  private setConnectionState(state: ConnectionState, settle?: () => void): void {
     this.connectionState = state;
-    // Legacy callback
-    this.opts.onStateChange?.(state);
-    // Event emitter
-    this.emit("stateChange", state);
+    settle?.();
+    const socket = this.ws;
+    const pending = this.pendingConnection;
+    const isCurrent = () => this.ws === socket && this.pendingConnection === pending
+      && this.connectionState === state;
+    try {
+      this.opts.onStateChange?.(state);
+    } catch {
+      // Consumer errors cannot interrupt settlement or other current listeners.
+    }
+    this.emit("stateChange", state, isCurrent);
   }
 
   private processEvent(event: StreamEvent): void {
+    if (this.applyEvent(event)) this.notifyEvent(event);
+  }
+
+  private applyEvent(event: StreamEvent): boolean {
     // Track session/run state from events
     if (event.type === "session_info" && "session_id" in event) {
       this.sessionId = (event as { session_id: string }).session_id;
+      const runId = (event as { run_id?: string }).run_id;
+      if (runId) {
+        if (runId !== this.runId) {
+          this.replayEventIndex = 0;
+          this.seenReplayFrames.clear();
+          this.deferredTerminalReplayIndex = null;
+          this.seenDeferredFrames.clear();
+        }
+        this.runId = runId;
+      }
     }
     if (event.type === "run_started" && "run_id" in event) {
-      this.runId = (event as { run_id: string }).run_id;
+      const runId = (event as { run_id: string }).run_id;
+      if (runId !== this.runId) {
+        this.replayEventIndex = 0;
+        this.seenReplayFrames.clear();
+        this.deferredTerminalReplayIndex = null;
+        this.seenDeferredFrames.clear();
+      }
+      this.runId = runId;
+    }
+    const terminalFrame = event.type === "run_finished" ? JSON.stringify(event) : null;
+    if (terminalFrame && terminalFrame === this.lastTerminalFrame) return false;
+    const isBoundTerminal = event.type === "run_finished" && event.run_id === this.runId;
+    if (event.type === "artifact_publication" && event.run_id === this.runId
+        && typeof event.index === "number" && Number.isSafeInteger(event.index)
+        && this.deferredTerminalReplayIndex === null) {
+      this.deferredTerminalReplayIndex = this.replayEventIndex;
+      this.seenDeferredFrames = new Set(this.seenReplayFrames);
+    }
+    if (typeof event.index === "number" && Number.isSafeInteger(event.index)) {
+      // Explain publication is deliberately sent before the older durable
+      // terminal. Accept that terminal for the bound run without rewinding
+      // the inclusive replay cursor or admitting other stale frames.
+      if (event.index < this.replayEventIndex && !isBoundTerminal) return false;
+      if (event.index > this.replayEventIndex) {
+        this.replayEventIndex = event.index;
+        this.seenReplayFrames.clear();
+      }
+      const frame = JSON.stringify(event);
+      if (this.seenReplayFrames.has(frame) || this.seenDeferredFrames.has(frame)) return false;
+      this.seenReplayFrames.add(frame);
+      if (this.deferredTerminalReplayIndex !== null) this.seenDeferredFrames.add(frame);
     }
     if (event.type === "run_finished" || event.type === "run_cancelled") {
-      this.runId = null;
+      if (event.type === "run_cancelled" || isBoundTerminal) {
+        this.runId = null;
+        this.replayEventIndex = 0;
+        this.seenReplayFrames.clear();
+        this.deferredTerminalReplayIndex = null;
+        this.seenDeferredFrames.clear();
+      }
+      if (isBoundTerminal) this.lastTerminalFrame = terminalFrame;
     }
 
-    // Legacy callback
-    this.opts.onEvent?.(event);
-    // Emit to generic 'event' listeners
+    return true;
+  }
+
+  private notifyEvent(event: StreamEvent): void {
+    // Acceptance is already recorded: closing in a callback cannot revoke this frame.
+    try {
+      this.opts.onEvent?.(event);
+    } catch {
+      // Match emitter exception isolation for option callbacks.
+    }
     this.emit("event", event);
-    // Emit to type-specific listeners (e.g. 'text_delta')
     this.emit(event.type as keyof AstraWSEventMap, event);
   }
 
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+  }
+
   private maybeReconnect(): void {
-    if (!this.opts.reconnect || this.closed) return;
+    if (!this.opts.reconnect || this.closed || this.reconnectTimer !== null) return;
     if (this.reconnectAttempts >= this.opts.maxReconnectAttempts) return;
 
     this.reconnectAttempts++;
     const delay =
       this.opts.reconnectDelayMs * Math.pow(1.5, this.reconnectAttempts - 1);
 
-    setTimeout(() => {
-      if (!this.closed) {
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (!this.closed && this.connectionState === "disconnected") {
         this.connect().catch(() => {
           // Reconnect failures handled by onclose → maybeReconnect cycle
         });

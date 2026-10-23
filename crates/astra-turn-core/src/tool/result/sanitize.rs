@@ -29,7 +29,8 @@ fn str_replace_diff_block_re() -> &'static Regex {
 /// presentations are
 /// either replaced with an owner-scoped artifact by the runtime or kept behind
 /// a typed tool recovery API so omitted evidence remains recoverable.
-pub const MAX_TOOL_RESULT_CHARS: usize = 8_000;
+pub const MAX_TOOL_RESULT_CHARS: usize =
+    astra_core::runtime_limits::DEFAULT_TOOL_RESULT_INLINE_CHARS;
 /// Maximum `read_file`/`view` payload size that is delivered to the model.
 ///
 /// File read state must use this as an upper bound for "content seen by the
@@ -49,7 +50,7 @@ pub const INTROSPECT_MODEL_RESULT_CHARS: usize = 4_000;
 /// with `introspect` before it can follow the workflow it just loaded.
 pub const SKILL_MODEL_RESULT_CHARS: usize = crate::tool_result_storage::PERSIST_THRESHOLD_CHARS;
 const HIGH_CHURN_DIFF_RESULT_CHARS: usize = 8_000;
-const HIGH_CHURN_SHELL_RESULT_CHARS: usize = 8_000;
+const HIGH_CHURN_SHELL_RESULT_CHARS: usize = MAX_TOOL_RESULT_CHARS;
 
 /// Remove `_cli_*` keys from JSON tool results and diff sentinels from `str_replace` text.
 ///
@@ -147,8 +148,8 @@ fn truncate_tool_result(tool_name: &str, content: &str, max_chars: usize) -> Str
     // that contract and can split a marker before the final boundary.  Keep
     // marker-bearing results on the shared atomic head/tail path; ordinary
     // outputs retain the richer semantic compression below.
-    if astra_tools::credential_redaction::redaction_marker_status(content).1 {
-        return astra_tools::credential_redaction::truncate_redacted_head_tail_chars(
+    if astra_text_utils::credential_redaction::redaction_marker_status(content).1 {
+        return astra_text_utils::credential_redaction::truncate_redacted_head_tail_chars(
             content, max_chars,
         );
     }
@@ -172,8 +173,8 @@ fn truncate_tool_result(tool_name: &str, content: &str, max_chars: usize) -> Str
 }
 
 fn head_tail_truncate_fallback(tool_name: &str, content: &str, max_chars: usize) -> String {
-    if astra_tools::credential_redaction::redaction_marker_status(content).1 {
-        return astra_tools::credential_redaction::truncate_redacted_head_tail_chars(
+    if astra_text_utils::credential_redaction::redaction_marker_status(content).1 {
+        return astra_text_utils::credential_redaction::truncate_redacted_head_tail_chars(
             content, max_chars,
         );
     }
@@ -364,6 +365,18 @@ mod tests {
     }
 
     #[test]
+    fn bounded_bash_file_receipt_survives_model_projection() {
+        let receipt = format!(
+            "[bash full output: stdout=/workspace/astra-bash-outputs/one.stdout (48000 bytes, sha256={}); stderr=/workspace/astra-bash-outputs/one.stderr (0 bytes, sha256={}); complete=true]\n\n{}",
+            "a".repeat(64),
+            "b".repeat(64),
+            "preview\n".repeat(350),
+        );
+        assert!(receipt.len() <= astra_core::runtime_limits::DEFAULT_TOOL_RESULT_INLINE_CHARS / 2);
+        assert_eq!(tool_result_content_for_model("bash", &receipt), receipt);
+    }
+
+    #[test]
     fn large_read_file_output_is_folded_before_model_context() {
         let big = "fn example() {}\n".repeat(6_000);
         let out = tool_result_content_for_model("read_file", &big);
@@ -380,18 +393,91 @@ mod tests {
 
     #[test]
     fn introspection_projection_leaves_small_reports_and_artifact_windows_unchanged() {
+        // A focused report exercises passthrough without assuming that the
+        // evolving default session report fits the inline model budget.
+        let request = crate::introspect::IntrospectRequest {
+            facet: astra_core::ObservationFacet::Errors,
+            depth: astra_core::ObservationDepth::Hint,
+            ..Default::default()
+        };
         let report = crate::introspect::build_introspect_report(
             &crate::introspect::IntrospectSnapshot::default(),
-            &crate::introspect::IntrospectRequest::default(),
+            &request,
         );
         let raw = serde_json::to_string(&report).unwrap();
-        assert!(raw.chars().count() <= INTROSPECT_MODEL_RESULT_CHARS);
+        assert!(
+            raw.chars().count() <= INTROSPECT_MODEL_RESULT_CHARS,
+            "focused fixture must fit: {} chars",
+            raw.chars().count()
+        );
         assert_eq!(truncate_tool_result_for_model("introspect", &raw), raw);
 
         let artifact = json!({"artifact": "artifact://session/tool-result/test", "offset": 0, "content": "window", "has_more": false}).to_string();
         assert_eq!(
             truncate_tool_result_for_model("introspect", &artifact),
             artifact
+        );
+    }
+
+    #[test]
+    fn default_introspection_report_has_a_bounded_loss_aware_model_view() {
+        let report = crate::introspect::build_introspect_report(
+            &crate::introspect::IntrospectSnapshot::default(),
+            &crate::introspect::IntrospectRequest::default(),
+        );
+        let raw = serde_json::to_string(&report).unwrap();
+        let output = tool_result_content_for_model("introspect", &raw);
+        let projected: Value = serde_json::from_str(&output).unwrap();
+        assert!(output.chars().count() <= INTROSPECT_MODEL_RESULT_CHARS);
+        let expected_summary = if report.summary.chars().count() > 360 {
+            format!("{}…", report.summary.chars().take(360).collect::<String>())
+        } else {
+            report.summary.clone()
+        };
+        assert_eq!(projected["summary"], expected_summary);
+        assert_eq!(
+            projected["projection_budget"]["summary_shortened"],
+            report.summary.chars().count() > 360
+        );
+        if raw.chars().count() > INTROSPECT_MODEL_RESULT_CHARS {
+            assert_eq!(projected["schema"], "astra-introspect-model-projection-v1");
+            assert_eq!(projected["projection_budget"]["truncated"], true);
+            assert_eq!(
+                projected["snapshot_boundary"],
+                "before_current_introspect_execution"
+            );
+            assert_eq!(
+                projected["projection_budget"]["omitted"]["observations"],
+                report.observations.len() - projected["observations"].as_array().unwrap().len()
+            );
+            for observation in projected["observations"].as_array().unwrap() {
+                for reference in observation["evidence_refs"].as_array().unwrap() {
+                    assert!(
+                        projected["evidence"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|evidence| &evidence["ref_id"] == reference)
+                    );
+                }
+            }
+            assert!(
+                projected["recovery"]
+                    .as_str()
+                    .unwrap()
+                    .contains("new snapshot")
+            );
+        } else {
+            assert_eq!(output, raw);
+        }
+        assert_eq!(
+            serde_json::from_str::<Value>(&tool_result_content_for_model_unbounded(
+                "introspect",
+                &raw
+            ))
+            .unwrap(),
+            serde_json::from_str::<Value>(&raw).unwrap(),
+            "the full durable report must not be reduced to its inline projection"
         );
     }
 
@@ -425,7 +511,16 @@ mod tests {
         let projected: Value = serde_json::from_str(&output)
             .expect("bounded introspection must remain structured JSON");
         assert!(output.chars().count() <= INTROSPECT_MODEL_RESULT_CHARS);
-        assert_eq!(projected["summary"], report.summary);
+        let expected_summary = if report.summary.chars().count() > 360 {
+            format!("{}…", report.summary.chars().take(360).collect::<String>())
+        } else {
+            report.summary.clone()
+        };
+        assert_eq!(projected["summary"], expected_summary);
+        assert_eq!(
+            projected["projection_budget"]["summary_shortened"],
+            report.summary.chars().count() > 360
+        );
         assert_eq!(projected["projection_budget"]["truncated"], true);
         assert_eq!(
             serde_json::from_str::<Value>(&tool_result_content_for_model_unbounded(
@@ -460,9 +555,8 @@ mod tests {
 
         let out = tool_result_content_for_model("skill", &body);
         assert_eq!(
-            out,
-            body.trim_end(),
-            "skill instructions must not require pagination"
+            out, body,
+            "skill instructions must remain complete without whitespace normalization"
         );
     }
 
@@ -534,7 +628,7 @@ mod tests {
             "prefix AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n{}",
             "x".repeat(10_000)
         );
-        let (issued, _) = astra_tools::credential_redaction::redact_credentials_in_text(&raw);
+        let (issued, _) = astra_text_utils::credential_redaction::redact_credentials_in_text(&raw);
         let marker = issued
             .find("[REDACTED:")
             .and_then(|start| {

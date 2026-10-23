@@ -17,6 +17,16 @@ pub enum RunControlStatus {
     Paused,
 }
 
+/// One narrow control read. The event index is only a wake hint; the intent
+/// provider still owns pagination, apply acknowledgement and execution fences.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunControlObservation {
+    pub status: Option<RunControlStatus>,
+    pub last_event_idx: Option<i64>,
+    pub session_id: Option<String>,
+    pub run_generation: Option<u64>,
+}
+
 /// Authority presented when changing current-run guidance admission.
 ///
 /// Keeping local ownership and durable lease ownership as distinct variants
@@ -26,6 +36,12 @@ pub enum RunControlStatus {
 pub enum UserIntentAdmissionAuthority {
     ProcessLocal,
     DurableOwnerGeneration(u64),
+}
+
+#[derive(Clone, Copy)]
+pub struct UserIntentInvocationApplication<'a> {
+    pub identity: &'a astra_turn_types::ToolInvocationIdentity,
+    pub purpose: astra_services::runs::UserIntentApplyPurpose<'a>,
 }
 
 /// Exact decision at one externally metered provider boundary. Only
@@ -150,6 +166,10 @@ pub struct UserIntentPollIssue {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UserIntentApplyAck {
     Applied,
+    /// The provider conclusively declined this input; the run remains active.
+    Returned,
+    /// Input retains its pending custody until this execution is resumed.
+    Paused,
     /// The run terminated before application and durably returned delivery
     /// ownership to the submitting client.
     RunTerminalReturned,
@@ -159,6 +179,29 @@ pub enum UserIntentApplyAck {
 /// cancel/pause control without sticky sessions.
 #[async_trait]
 pub trait RunStatusProvider: Send + Sync {
+    /// Read requested and applied permission choices at a model-round boundary.
+    async fn permission_mode_snapshot(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _run_id: &str,
+    ) -> Result<Option<astra_turn_types::RunPermissionModeSnapshot>, String> {
+        Ok(None)
+    }
+
+    /// Acknowledge the captured choice under the exact durable execution owner.
+    async fn apply_permission_mode(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _run_id: &str,
+        _expected_owner_generation: u64,
+        _selection: &astra_turn_types::RunPermissionModeSelection,
+        _round_index: u32,
+    ) -> Result<bool, String> {
+        Err("permission-mode acknowledgement is unsupported".into())
+    }
+
     /// Returns `Some(Cancelled)`, `Some(Paused)`, or `None` if the run is
     /// still active (or doesn't exist). Transient lookup failures must be
     /// surfaced so callers do not confuse control-plane unavailability with a
@@ -168,6 +211,20 @@ pub trait RunStatusProvider: Send + Sync {
         user_id: &str,
         run_id: &str,
     ) -> Result<Option<RunControlStatus>, String>;
+
+    /// Observe control and the run's event watermark in the same read when a
+    /// durable provider supports it. Other providers retain status-only
+    /// behavior without inventing a watermark.
+    async fn control_observation(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<RunControlObservation, String> {
+        Ok(RunControlObservation {
+            status: self.control_status(user_id, run_id).await?,
+            ..RunControlObservation::default()
+        })
+    }
 
     /// Resolve the canonical origin for an observed cancellation. Providers
     /// without durable user-request evidence treat status/token cancellation
@@ -185,6 +242,12 @@ pub trait RunStatusProvider: Send + Sync {
 /// Polls durable user intents accepted while a run is executing.
 #[async_trait]
 pub trait UserIntentProvider: Send + Sync {
+    /// Optional process-local readiness signal. It carries no input payload
+    /// or authority; the ordinary poll/apply path remains the sole consumer.
+    fn input_wake(&self) -> Option<tokio::sync::watch::Receiver<i64>> {
+        None
+    }
+
     /// Cheap local wake hint. Durable providers may keep the default and use
     /// the bounded poll cadence; in-process providers override it so newly
     /// queued guidance/runtime facts reach the very next model boundary.
@@ -280,6 +343,7 @@ pub trait UserIntentProvider: Send + Sync {
         run_id: &str,
         event_indices: &[usize],
         authority: UserIntentAdmissionAuthority,
+        invocation_identity: Option<UserIntentInvocationApplication<'_>>,
     ) -> Result<UserIntentApplyAck, String>;
 }
 

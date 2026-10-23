@@ -3,6 +3,7 @@
 //!
 //! Maps to `docs/testing/saas-test-plan.md` §5.1–§5.3 (P/N/B coverage).
 
+use super::harness::{ProviderResponse, ProviderScript};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -15,19 +16,12 @@ use uuid::Uuid;
 use super::harness::{
     E2E_PASSWORD, MATRIX_E2E_EDGE_WORKSPACE_ROOT, bootstrap, build_e2e_access_token, get_json,
     grant_astra_admin_role, load_durable_interaction_event, maybe_tool_result_payload_from_sse,
-    model_selection, post_empty, post_json, put_json, revoke_astra_admin_role,
+    model_selection, parse_sse_events, post_empty, post_json, put_json, revoke_astra_admin_role,
     seed_pending_approval, seeded_model_selection,
 };
 use super::journey_saas_platform_matrix::{
     cleanup_resource_limits, cleanup_seeded_run, limits_payload, seed_capacity_holding_run,
 };
-
-fn parse_sse_events(raw: &str) -> Vec<Value> {
-    raw.lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter_map(|data| serde_json::from_str(data).ok())
-        .collect()
-}
 
 async fn seed_resource_usage_tokens(pool: &sqlx::MySqlPool, user_id: &str, tokens: i64) {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
@@ -471,6 +465,15 @@ pub async fn run_saas_edge_tool_result_success_path() {
     let auth = &b.auth_header;
     let tool_output = "saas edge tool result ok";
 
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(auth,vec![ProviderScript::new("run_saas_edge_tool_result_success_path",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="read saas probe file")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[{
+                        "id": "tc-saas-tool-ok",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"saas-probe.txt\"}"
+                        }
+                    }]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Done after tool result.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let payload = json!({
         "agent_id": "saas-edge-callback-agent",
         "session_id": ctx.session_id,
@@ -494,6 +497,7 @@ pub async fn run_saas_edge_tool_result_success_path() {
         },
         "model_selection": seeded_model_selection(ctx),
         "message": "read saas probe file",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "context": {
             "edge_profile": {
                 "cwd": MATRIX_E2E_EDGE_WORKSPACE_ROOT,
@@ -511,21 +515,7 @@ pub async fn run_saas_edge_tool_result_success_path() {
                         "required": ["path"]
                     }
                 }
-            }],
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [{
-                        "id": "tc-saas-tool-ok",
-                        "type": "function",
-                        "function": {
-                            "name": "read_file",
-                            "arguments": "{\"path\":\"saas-probe.txt\"}"
-                        }
-                    }]
-                },
-                { "full_text": "Done after tool result." }
-            ]
-        }
+            }]}
     });
 
     let req = Request::builder()
@@ -549,7 +539,7 @@ pub async fn run_saas_edge_tool_result_success_path() {
         if !posted_result
             && let Some(payload) = maybe_tool_result_payload_from_sse(
                 s.as_ref(),
-                "tc-saas-tool-ok",
+                &json!({"path":"saas-probe.txt"}),
                 &ctx.edge_agent_id,
                 "completed",
                 tool_output,

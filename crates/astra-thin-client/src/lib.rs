@@ -27,9 +27,15 @@ pub use astra_server_types::{
     WorkCreateCriterionV1, WorkCreateRequestV1, WorkExecutionPlacementV1, WorkExecutionStateV1,
     WorkExecutionSwitchOperationV1, WorkExecutionSwitchRequestV1,
     WorkExecutionSwitchRetryRequestV1, WorkExecutionSwitchStateV1, WorkExecutionTargetPageV1,
-    WorkExecutionTargetRequestV1, WorkExecutionTargetV1, WorkExecutionViewV1, WorkTurnRequestV1,
+    WorkExecutionTargetRequestV1, WorkExecutionTargetV1, WorkExecutionViewV1,
+    WorkRecoveryPointCaptureRequestV1, WorkRecoveryPointCursorV1, WorkRecoveryPointPageV1,
+    WorkRecoveryPointReasonV1, WorkRecoveryPointStatusV1, WorkRecoveryPointViewV1,
+    WorkTurnRequestV1,
 };
 pub use client::ThinClient;
+/// Allow the server's bounded dependency lookup to return its classified error
+/// instead of cancelling model discovery before that lookup finishes.
+pub const MODEL_CATALOG_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub use device_proof::{
     ASTRA_DEVICE_CHALLENGE_ID_HEADER, ASTRA_DEVICE_FINGERPRINT_HEADER, ASTRA_DEVICE_ID_HEADER,
     ASTRA_DEVICE_PROOF_HEADER, DeviceProofPurpose, canonical_device_proof_message,
@@ -42,18 +48,26 @@ pub use edge::{
 pub use error::ThinClientError;
 pub use protocol::{
     ApprovalDecision, ApprovalKind, ApprovalRespondRequest, ChatStreamRequest,
+    EDGE_CALLBACK_PAYLOAD_CONFLICT_CODE, EDGE_CAPABILITY_SCHEMA_UNSUPPORTED_CODE,
     EdgeHeartbeatReplayPolicy, EdgeHeartbeatRequest, EdgeHeartbeatResponse, EdgeRegisterRequest,
-    ModelSelection, ProviderInteractionRespondRequest, RunUserIntentRequest, RunUserIntentResponse,
-    SessionCreateRequest, SessionTranscriptItem, SessionTranscriptPage, SessionTranscriptPageRef,
+    ModelSelection, ProviderInteractionRespondRequest, RUN_INTERACTION_AUTHORITY_LOST_CODE,
+    RUN_INTERACTION_SUPERSEDED_CODE, RequestedModelPolicy, RunUserIntentRequest,
+    RunUserIntentResponse, SessionCreateRequest, SessionTranscriptItem, SessionTranscriptPage,
     SessionTranscriptReadScope, SessionTranscriptToolCall, SessionTranscriptToolResult,
-    SessionUpdateRequest, StreamEvent, ToolResultHashParts, ToolResultRequest,
-    ToolResultRequestParts, UserPromptRespondRequest, classify_stream_event,
+    SessionUpdateRequest, StreamEvent, ToolInteractionRequest, ToolResultHashParts,
+    ToolResultRequest, ToolResultRequestParts, UserPromptRespondRequest, classify_stream_event,
     tool_result_status_is_error,
 };
 /// SSE / buffered HTTP response from a Server-owned developer loop.
 pub use reqwest::Response as HttpResponse;
 pub use work::{
+    WorkCatalogAttentionV1, WorkCatalogCursorV1, WorkCatalogEntryV1, WorkCatalogPageV1,
     WorkItemDeliveryBlockerKindV2, WorkItemDeliveryStatusV2, WorkItemExecutionStatusV2,
     WorkItemVerificationStatusV2, WorkTaskGraphBasisV2, WorkTaskGraphCursorV2,
     WorkTaskGraphDependencyV2, WorkTaskGraphItemV2, WorkTaskGraphPageV2,
+};
+
+pub use protocol::{
+    RunPermissionModeApplied, RunPermissionModeRequest, RunPermissionModeSelection,
+    RunPermissionModeSnapshot,
 };

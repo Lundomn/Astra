@@ -1,7 +1,6 @@
 use astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity;
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 use astra_turn_core::turn_event_sink::IncrementalTurnState;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -45,6 +44,18 @@ impl ExecutionTimeBudgetClock {
     /// bound for new work, so a partial second must not be rounded up.
     pub(crate) fn remaining(&self) -> astra_services::runs::ExecutionTimeBudget {
         self.remaining_at(tokio::time::Instant::now())
+    }
+
+    /// Last instant at which a new Server admission may begin. Retries must
+    /// not keep the user waiting through the final-answer reserve.
+    pub(crate) fn admission_deadline(&self) -> tokio::time::Instant {
+        self.terminal_deadline
+            .checked_sub(
+                self.terminal_reserve
+                    .saturating_add(self.request_safety_margin)
+                    .saturating_add(Duration::from_secs(1)),
+            )
+            .unwrap_or_else(tokio::time::Instant::now)
     }
 
     fn remaining_at(&self, now: tokio::time::Instant) -> astra_services::runs::ExecutionTimeBudget {
@@ -134,20 +145,26 @@ pub enum StreamEvent {
     /// Provider-confirmed input occupancy for the just-completed request.
     /// The number includes the canonical fresh/cache-read/cache-write input
     /// buckets exactly once.
-    ContextWindowMeasured(u64),
+    ContextWindowMeasured(Option<u64>),
     /// Provider-normalized lanes for the same physical request as
     /// `ContextWindowMeasured`.
-    RequestTokenUsage(astra_turn_types::RequestTokenUsage),
+    RequestTokenUsage(Option<astra_turn_types::RequestTokenUsage>),
     /// Canonical, bounded runtime observation produced after one provider
     /// round. Consumers may display or persist it, but never treat this live
     /// projection as policy authority.
     RuntimeFeedback(Box<astra_turn_core::context_feedback::RuntimeFeedbackFrame>),
     /// LLM token chunk.
-    Token(String),
+    Token {
+        model_item_id: Option<String>,
+        text: String,
+    },
     /// Model thinking/reasoning started or stopped.
     Thinking(bool),
     /// Thinking/reasoning preview chunk.
-    ThinkingChunk(String),
+    ThinkingChunk {
+        model_item_id: Option<String>,
+        text: String,
+    },
     /// Tool execution started. `tool_use_id` is a server-minted UUIDv7
     /// correlation key that round-trips through the tool's matching
     /// `ToolCompleted` and survives into SSE JSON. `parent_tool_use_id`
@@ -171,9 +188,9 @@ pub enum StreamEvent {
         fanout_slot: Option<AgentFanoutSlotIdentity>,
         fanout_title: Option<String>,
     },
-    /// Tool execution completed. `tool_use_id` MUST match the paired
-    /// `ToolStarted`. `parent_tool_use_id` is propagated for the same
-    /// nested-event routing reason.
+    /// Tool execution completed. `tool_use_id` matches `ToolStarted` when
+    /// execution began; a server pre-dispatch rejection has no start.
+    /// `server_terminal` carries same-call evidence for that exception.
     ToolCompleted {
         name: String,
         description: String,
@@ -183,6 +200,7 @@ pub enum StreamEvent {
         output: Option<String>,
         tool_use_id: String,
         parent_tool_use_id: Option<String>,
+        server_terminal: Option<serde_json::Value>,
     },
     /// Server-issued projection of a durable canonical Work mutation. This is
     /// a dedicated protocol event rather than an inference from a tool card,
@@ -237,6 +255,8 @@ pub enum StreamEvent {
     RunInterrupted {
         user_message: String,
     },
+    /// Visible, non-terminal advisory; preserved independently of assistant text.
+    SystemWarning(String),
     /// Status line from headless tool execution (diff, diagnostic, etc.).
     StatusLine(String),
     /// A mid-turn input reached the runtime's next safe model boundary.
@@ -307,12 +327,6 @@ pub trait StreamEventSink: Send + Sync + std::fmt::Debug {
 }
 
 pub type SharedStreamEventSink = Arc<dyn StreamEventSink>;
-
-/// Mint a server-side `tool_use_id`. Prefix keeps it grep-distinguishable
-/// from session ids and approval request ids in logs/SSE payloads.
-pub fn new_tool_use_id() -> String {
-    format!("tu_{}", uuid::Uuid::now_v7().simple())
-}
 
 /// User's response to an approval prompt.
 ///
@@ -490,15 +504,19 @@ pub struct PlanReviewRequest {
 
 pub type PlanReviewRequestTx = mpsc::Sender<PlanReviewRequest>;
 
-/// Parameters for a single agentic chat turn — groups the many arguments
-/// to `stream_chat_sse` into a named struct to reduce cognitive load.
 use crate::cli::cli_config::cli_context::CliContext;
 
+/// Request-local reference to the canonical ordinary executor, published once.
+pub(crate) type CliExecutorObserver =
+    Arc<std::sync::OnceLock<Arc<crate::edge_tools::ToolExecutor>>>;
+
+/// Parameters for a single agentic chat turn — groups the many arguments
+/// to `stream_chat_sse` into a named struct to reduce cognitive load.
 pub(crate) struct ChatTurnParams<'a> {
     pub(crate) api: &'a astra_thin_client::ThinClient,
     pub(crate) token: &'a str,
-    /// Credential profile used for in-turn auth refresh when edge result posts hit 401.
-    pub(crate) auth_profile: Option<&'a str>,
+    /// Optional CLI owner snapshot used for in-turn auth refresh owner identity.
+    pub(crate) auth_owner: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     pub(crate) message: &'a str,
     /// Raw user intent captured before CLI prompt wrapping/runtime scaffolding.
     /// Runtime decision judges read this, not the prompt-facing `message`.
@@ -506,8 +524,6 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Runtime-owned per-turn control text that must reach the current model
     /// call while staying out of user content and prompt-facing history.
     pub(crate) input_runtime_required_texts: &'a [String],
-    /// Producer-owned built-in system skill identities for this turn.
-    pub(crate) input_active_system_skills: &'a [String],
     /// Dynamic text from external/session sources. Runtime-owned policy,
     /// guardrail, and telemetry signals use the typed injection lane instead.
     pub(crate) input_runtime_volatile_texts: &'a [String],
@@ -525,11 +541,15 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Prefer this over model-name heuristics when the resolved provider is known.
     pub(crate) provider: Option<&'a str>,
     pub(crate) explain: ExplainMode,
+    /// Configuration selected by the entrypoint and frozen for this execution.
+    pub(crate) runtime_config: Arc<astra_config::RuntimeConfig>,
     pub(crate) render_md: bool,
     pub(crate) history: &'a [(String, String)],
     pub(crate) perm_manager: &'a mut PermissionManager,
     pub(crate) verbose_mode: bool,
     pub(crate) render_policy: crate::cli::stream::stream_render::RenderPolicy,
+    /// Includes caller model intent and optional profile selection; resolved
+    /// `model`/`offering_id` alone must never establish an explicit override.
     pub(crate) cli_context: Option<&'a CliContext>,
 
     pub(crate) recent_tools: &'a [String],
@@ -541,12 +561,7 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Passed through to the ToolExecutor via `set_session_lessons` so
     /// every SelfModel snapshot surfaces prior-session advice.
     pub(crate) session_lessons: &'a [astra_services::LessonHint],
-    /// P8 seam: most recent auto-invoke diagnosis from the previous turn.
-    /// Injected into this turn's ToolExecutor via
-    /// `set_latest_skill_diagnosis` so the LLM sees "the system already
-    /// noticed X" in the self-awareness section. `None` → no diagnosis
-    /// pending; the ToolExecutor state is untouched.
-    pub(crate) latest_skill_diagnosis: Option<&'a astra_skills::auto_invoke::SkillDiagnosis>,
+    pub(crate) memory_selection_reports: &'a [astra_turn_types::MemorySelectionReport],
     /// Evaluator-derived feedback from the previous turn. This is injected
     /// alongside self-awareness on the next turn and cleared by the caller
     /// once a healthy turn completes.
@@ -559,21 +574,21 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) is_plan_subtask: bool,
     /// Sent on `/chat/stream` JSON so cloud can classify the turn like local `is_plan_subtask`.
     pub(crate) plan_subtask_id: Option<&'a str>,
-    /// Optional delegation engine for multi-agent coordination with verification gates.
-    pub(crate) delegation_engine:
-        Option<Arc<astra_runtime::server::delegation::engine::DelegationEngine>>,
     /// Optional cancellation token for interrupting SSE streaming mid-flight.
     pub(crate) cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     /// Original-deadline-backed wall-clock budget source. Each physical Server
     /// request snapshots it immediately before POST; it is never rendered into
     /// the static runtime system prompt or another cache-stable prompt prefix.
     pub(crate) execution_time_budget: Option<ExecutionTimeBudgetClock>,
-    /// Optional run-control provider for the active turn. CLI/TUI uses this
-    /// to feed in-process deferred user input into the runtime loop.
-    pub(crate) run_control: Option<Arc<dyn astra_runtime::turn::run_control::RunControlProvider>>,
+    /// Turn-scoped cancellation, pending runtime facts and remote guidance
+    /// dispositions. Durable admission remains Server-owned.
+    pub(crate) run_control: Option<Arc<crate::cli::turn::local_run_control::LocalRunControl>>,
     /// Incremental turn state for surviving interruptions.
     /// Written during streaming; snapped on force-exit to recover partial data.
     pub(crate) incremental_state: Option<Arc<IncrementalTurnState>>,
+    /// Observe the exact ordinary SSE executor through request settlement.
+    /// This carries a reference only, never a copied workspace or authority.
+    pub(crate) executor_observer: Option<CliExecutorObserver>,
     /// Request-scoped execution authority. Headless fresh-session calls bind
     /// this from the first accepted Server session identity before any edge
     /// tool can execute, then retain it through canonical local persistence.
@@ -615,18 +630,10 @@ pub(crate) struct ChatTurnParams<'a> {
     /// MCP client manager for external tool servers.
     pub(crate) mcp_manager:
         Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
-    /// Session-scoped skill quality tracker for learning loop.
-    pub(crate) skill_quality_tracker: &'a mut astra_skills::quality::SkillQualityTracker,
-    /// Session-scoped discover cache so surfaced skills survive across user turns.
-    pub(crate) discovered_skills: Option<&'a mut HashSet<String>>,
-    /// Shared messaging metrics for inter-agent communication observability.
-    pub(crate) messaging_metrics: Option<Arc<astra_messaging::MessagingMetrics>>,
-    /// Optional agent spawner for dynamic sub-agent creation via `agent(action='spawn', ...)`.
+    /// Session-local child recovery and observation projection; execution is Server-owned.
     pub(crate) agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     /// Optional logical root agent ID for this top-level turn when agent spawning is enabled.
     pub(crate) root_agent_id: Option<&'a str>,
-    /// Optional persistent top-level mailbox slot for cross-turn reply handling.
-    pub(crate) root_mailbox_slot: Option<&'a mut Option<astra_messaging::router::AgentMailbox>>,
     /// Optional observability hub for profiles, traces, and feedback signals.
     pub(crate) observability_hub: Option<Arc<astra_runtime::observability::ObservabilityHub>>,
     /// Optional observability session for per-session tracking.
@@ -666,8 +673,9 @@ pub(crate) struct ChatTurnParams<'a> {
     /// executor pulls a fresh handle from this slot per tool call;
     /// the TUI refills between calls.
     pub(crate) bash_detach_slot: Option<astra_tools::detach::DetachShellSlot>,
-    /// 1-based session turn currently in progress; used to tag journal entries
-    /// and rollback scopes.
+    /// 1-based local journal turn currently in progress. Every local tool
+    /// mutation, checkpoint, trace and rollback scope uses this clock. Server
+    /// admission and Server feedback own an independent turn sequence.
     pub(crate) turn_index: u32,
     /// Pre-loaded CSL messages (from CslManager.load() in chat_turn).
     /// Restored pipeline state from a checkpoint (enables warm-start on resume).
@@ -689,10 +697,7 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Shared harness snapshot sink for /inspect command.
     #[cfg(feature = "harness")]
     pub(crate) harness_sink: Option<std::sync::Arc<astra_harness::InMemorySnapshotSink>>,
-    /// Shared harness trace for /inspect trace command.
-    #[cfg(feature = "harness")]
-    pub(crate) harness_trace:
-        Option<std::sync::Arc<std::sync::RwLock<astra_harness::SessionTrace>>>,
+
     /// Optional benchmark profile for one-shot/headless runs.
     #[cfg(feature = "harness")]
     pub(crate) benchmark_profile: Option<astra_harness::HarnessProfile>,
@@ -706,25 +711,27 @@ pub(crate) struct ChatTurnParams<'a> {
 /// Used via [`ChatTurnParams::basic_cli`] to avoid repeating ~30 default fields
 /// at each retry site in `command_router.rs`.
 pub(crate) struct BasicCliChatContext<'a> {
+    /// Connected CLI MCP providers must survive the basic-turn adapter.
+    pub mcp_manager: Option<Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
     pub api: &'a astra_thin_client::ThinClient,
-    pub auth_profile: Option<&'a str>,
+    /// Frozen owner captured once per basic CLI invocation. All retries and
+    /// cancellation re-entries of the submitted turn share this single
+    /// immutable snapshot; never recapture a later login mid-turn.
+    pub auth_owner: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     pub message: &'a str,
     pub offering_id: Option<&'a str>,
     pub model: Option<&'a str>,
     pub provider: Option<&'a str>,
     pub explain: ExplainMode,
+    pub runtime_config: Arc<astra_config::RuntimeConfig>,
     pub render_md: bool,
     pub verbose_mode: bool,
     pub render_policy: crate::cli::stream::stream_render::RenderPolicy,
     pub cli_context: Option<&'a CliContext>,
 
     pub unified_skill_registry: &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
-    /// Optional agent spawner so `astra chat -m` (non-REPL one-shot)
-    /// can trigger `agent(action='spawn', ...)` just like the interactive
-    /// REPL does. When `None`, agent spawning returns "not available" —
-    /// the previous behavior before the fix. Callers that want the
-    /// fix set this via `initialize_multi_agent_runtime`-equivalent
-    /// bootstrap before constructing the context.
+    /// Optional local recovery projection for historical agent and fanout queries.
+    /// Server admission owns new child execution on every CLI surface.
     pub agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     /// Optional logical root agent id when `agent_spawner` is set.
     /// Passed through to `sse_loop::mod` for `AgentActionContext`
@@ -746,9 +753,7 @@ pub(crate) struct BasicCliChatContext<'a> {
     /// Shared harness snapshot sink for /inspect command (non-REPL one-shot paths).
     #[cfg(feature = "harness")]
     pub harness_sink: Option<std::sync::Arc<astra_harness::InMemorySnapshotSink>>,
-    /// Shared harness trace for /inspect trace command (non-REPL one-shot paths).
-    #[cfg(feature = "harness")]
-    pub harness_trace: Option<std::sync::Arc<std::sync::RwLock<astra_harness::SessionTrace>>>,
+
     /// Optional benchmark profile for one-shot/headless runs.
     #[cfg(feature = "harness")]
     pub benchmark_profile: Option<astra_harness::HarnessProfile>,
@@ -756,24 +761,21 @@ pub(crate) struct BasicCliChatContext<'a> {
 
 impl<'a> ChatTurnParams<'a> {
     /// Build a `ChatTurnParams` for a basic one-shot CLI chat invocation with
-    /// optional session-id and a freshly-borrowed `PermissionManager` /
-    /// `SkillQualityTracker` / token. All multi-agent / observability /
-    /// journal fields default to `None`.
+    /// optional session identity, credentials and permission manager.
+    /// Multi-agent, observability and journal fields default to `None`.
     pub(crate) fn basic_cli(
         ctx: &'a BasicCliChatContext<'a>,
         token: &'a str,
         session_id: Option<&'a str>,
         perm_manager: &'a mut PermissionManager,
-        skill_quality_tracker: &'a mut astra_skills::quality::SkillQualityTracker,
     ) -> ChatTurnParams<'a> {
         ChatTurnParams {
             api: ctx.api,
             token,
-            auth_profile: ctx.auth_profile,
+            auth_owner: ctx.auth_owner.clone(),
             message: ctx.message,
             user_intent: ctx.message,
             input_runtime_required_texts: &[],
-            input_active_system_skills: &[],
             input_runtime_volatile_texts: &[],
             input_work_unit_observations: &[],
             semantic_query_override: None,
@@ -782,6 +784,7 @@ impl<'a> ChatTurnParams<'a> {
             model: ctx.model,
             provider: ctx.provider,
             explain: ctx.explain,
+            runtime_config: ctx.runtime_config.clone(),
             render_md: ctx.render_md,
             history: &[],
             perm_manager,
@@ -794,16 +797,17 @@ impl<'a> ChatTurnParams<'a> {
             tool_health_entries: &[],
             resume_restricted_tools: &[],
             session_lessons: &[],
-            latest_skill_diagnosis: None,
+            memory_selection_reports: &[],
+
             latest_turn_quality_feedback: None,
             unified_skill_registry: ctx.unified_skill_registry,
             is_plan_subtask: false,
             plan_subtask_id: None,
-            delegation_engine: None,
             cancel_token: None,
             execution_time_budget: None,
             run_control: None,
             incremental_state: None,
+            executor_observer: None,
             request_session_execution_lease: None,
             plan_assemble_line_release: None,
             stream_event_tx: ctx.stream_event_tx.clone(),
@@ -813,13 +817,9 @@ impl<'a> ChatTurnParams<'a> {
             approval_request_tx: None,
             ask_user_request_tx: None,
             plan_review_request_tx: None,
-            mcp_manager: None,
-            skill_quality_tracker,
-            discovered_skills: None,
-            messaging_metrics: None,
+            mcp_manager: ctx.mcp_manager.clone(),
             agent_spawner: ctx.agent_spawner.clone(),
             root_agent_id: ctx.root_agent_id,
-            root_mailbox_slot: None,
             observability_hub: None,
             observability_session: None,
             file_journal: None,
@@ -841,8 +841,7 @@ impl<'a> ChatTurnParams<'a> {
             append_system_prompt: None,
             #[cfg(feature = "harness")]
             harness_sink: ctx.harness_sink.clone(),
-            #[cfg(feature = "harness")]
-            harness_trace: ctx.harness_trace.clone(),
+
             #[cfg(feature = "harness")]
             benchmark_profile: ctx.benchmark_profile,
         }

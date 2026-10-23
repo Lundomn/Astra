@@ -18,6 +18,332 @@ use std::time::Instant;
 use tokio::sync::oneshot;
 
 #[test]
+fn explicit_followup_is_a_composer_action_and_enter_stays_distinct() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    pane.set_task_status(TaskStatus::TurnRunning {
+        started_at: Instant::now(),
+    });
+    let text = "also update documentation\nwith examples";
+    pane.composer.set_text(text);
+    assert!(matches!(
+        pane.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        BottomPaneAction::QueueFollowUp(queued) if queued == text
+    ));
+    assert!(pane.composer.is_empty());
+    assert!(matches!(
+        pane.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        BottomPaneAction::Consumed
+    ));
+
+    pane.composer.set_text("use the existing helper");
+    assert!(matches!(
+        pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        BottomPaneAction::SubmitInput(text) if text == "use the existing helper"
+    ));
+}
+
+#[test]
+fn explicit_followup_accepts_additional_control_modifiers() {
+    for code in [KeyCode::Char('q'), KeyCode::Char('Q')] {
+        for modifiers in [
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SUPER,
+        ] {
+            let mut pane = BottomPane::new();
+            pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+            pane.composer.set_text("next task");
+            assert!(matches!(
+                pane.handle_key(KeyEvent::new(code, modifiers)),
+                BottomPaneAction::QueueFollowUp(text) if text == "next task"
+            ));
+            assert!(pane.composer.is_empty());
+        }
+    }
+
+    for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT, KeyModifiers::ALT] {
+        let mut pane = BottomPane::new();
+        pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+        pane.composer.set_text("draft");
+        assert!(!matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Char('q'), modifiers)),
+            BottomPaneAction::QueueFollowUp(_)
+        ));
+        assert!(!pane.composer.is_empty());
+    }
+}
+
+#[test]
+fn explicit_followup_uses_the_highlighted_slash_completion() {
+    for modifiers in [
+        KeyModifiers::CONTROL,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ] {
+        for select_second in [false, true] {
+            let mut pane = BottomPane::new();
+            pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+            pane.set_slash_items(vec![
+                crate::tui::slash_menu::SlashItem::simple("/work", "work hub"),
+                crate::tui::slash_menu::SlashItem::simple("/workspace", "workspace"),
+            ]);
+            pane.composer.set_text("/wor");
+            pane.sync_popups();
+            assert_eq!(pane.slash_menu_selected_name(), Some("/work"));
+            if select_second {
+                pane.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            }
+            let expected = if select_second { "/workspace" } else { "/work" };
+            assert_eq!(pane.slash_menu_selected_name(), Some(expected));
+            assert!(matches!(
+                pane.handle_key(KeyEvent::new(KeyCode::Char('q'), modifiers)),
+                BottomPaneAction::QueueFollowUp(text) if text == expected
+            ));
+            assert!(pane.composer.is_empty());
+            assert!(!pane.slash_menu_is_open());
+        }
+    }
+}
+
+#[test]
+fn explicit_followup_preserves_slash_arguments_and_unmatched_drafts() {
+    for text in ["/work resume existing", "/zzz_no_such_command"] {
+        let mut pane = BottomPane::new();
+        pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+        pane.set_slash_items(vec![crate::tui::slash_menu::SlashItem::simple(
+            "/work", "work hub",
+        )]);
+        pane.composer.set_text(text);
+        pane.sync_popups();
+        if text.starts_with("/zzz") {
+            assert!(pane.slash_menu_is_open());
+            assert_eq!(pane.slash_menu_len(), 0);
+        } else {
+            assert!(!pane.slash_menu_is_open());
+        }
+        assert!(matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            BottomPaneAction::QueueFollowUp(actual) if actual == text
+        ));
+        assert!(pane.composer.is_empty());
+        assert!(!pane.slash_menu_is_open());
+    }
+}
+
+#[test]
+fn explicit_followup_slash_completion_preserves_paste_custody() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    pane.set_slash_items(vec![crate::tui::slash_menu::SlashItem::simple(
+        "/work", "work hub",
+    )]);
+    pane.composer.set_text("/wor");
+    pane.sync_popups();
+    assert_eq!(pane.slash_menu_selected_name(), Some("/work"));
+
+    let suffix = "k resume existing";
+    pane.composer.force_pending_paste_burst_for_test(
+        suffix,
+        Instant::now() + std::time::Duration::from_secs(1),
+    );
+    let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+    assert!(matches!(pane.handle_key(key), BottomPaneAction::Consumed));
+    assert_eq!(pane.composer.text(), "/wor");
+    assert!(pane.slash_menu_is_open());
+
+    pane.composer
+        .force_pending_paste_burst_for_test(suffix, Instant::now());
+    assert!(matches!(
+        pane.handle_key(key),
+        BottomPaneAction::QueueFollowUp(text) if text == "/work resume existing"
+    ));
+    assert!(pane.composer.is_empty());
+    assert!(!pane.slash_menu_is_open());
+}
+
+#[test]
+fn explicit_followup_preserves_whitespace_and_expands_pasted_blobs() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+    pane.composer.set_text("  \n\t");
+    assert!(matches!(pane.handle_key(key), BottomPaneAction::Consumed));
+    assert_eq!(pane.composer.text(), "  \n\t");
+
+    pane.composer.set_text("");
+    let pasted = "long pasted line\n".repeat(100);
+    pane.handle_paste(&pasted);
+    assert!(matches!(
+        pane.handle_key(key), BottomPaneAction::QueueFollowUp(text) if text == pasted
+    ));
+}
+
+#[test]
+fn explicit_followup_keeps_shift_and_alt_enter_as_newlines() {
+    for modifiers in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+        let mut pane = BottomPane::new();
+        pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+        pane.composer.set_text("first line");
+        assert!(matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Enter, modifiers)),
+            BottomPaneAction::Consumed
+        ));
+        assert_eq!(pane.composer.text(), "first line\n");
+    }
+}
+
+#[test]
+fn explicit_followup_does_not_submit_a_draft_beneath_a_modal() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    pane.composer.set_text("draft underneath the picker");
+    pane.push_view(Box::new(
+        crate::tui::slash_dispatch::build_permission_mode_picker(
+            crate::cli::permission_manager::PermissionMode::Prompt,
+        ),
+    ));
+    assert!(matches!(
+        pane.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        BottomPaneAction::Consumed
+    ));
+    assert_eq!(pane.composer.text(), "draft underneath the picker");
+    assert!(pane.has_active_view());
+    assert_eq!(pane.queued_next_turn_submission_count(), 0);
+}
+
+#[test]
+fn explicit_followup_does_not_resolve_a_pending_approval() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    let (tx, mut rx) = oneshot::channel::<ApprovalResponse>();
+    pane.enqueue_approval(
+        "bash".into(),
+        "Need approval".into(),
+        None,
+        "testing".into(),
+        serde_json::Value::Null,
+        tx,
+    );
+    pane.composer.set_text("afterwards summarize");
+    assert!(matches!(
+        pane.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        BottomPaneAction::QueueFollowUp(text) if text == "afterwards summarize"
+    ));
+    assert!(pane.has_pending_approvals());
+    assert!(matches!(
+        rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn explicit_followup_does_not_escape_an_ask_user_view() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    pane.composer.set_text("draft behind the question");
+    let prompt = serde_json::from_value(serde_json::json!({
+        "context": null,
+        "questions": [{
+            "header": "Scope",
+            "question": "Which scope?",
+            "options": [{"label": "Core", "description": null, "preview": null}],
+            "multi_select": false,
+            "allow_freeform": false
+        }]
+    }))
+    .unwrap();
+    let (tx, mut rx) = oneshot::channel();
+    pane.enqueue_ask_user(prompt, tx);
+    assert!(matches!(
+        pane.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        BottomPaneAction::Consumed
+    ));
+    assert!(pane.has_active_view());
+    assert_eq!(pane.composer.text(), "draft behind the question");
+    assert!(matches!(
+        rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert_eq!(pane.queued_next_turn_submission_count(), 0);
+}
+
+#[test]
+fn binding_retained_root_preserves_child_and_navigator_focus() {
+    for durable in [false, true] {
+        for child_visible in [false, true] {
+            let mut pane = BottomPane::new();
+            if durable {
+                pane.ensure_durable_root_transcript("session".into(), 80, 24);
+            } else {
+                pane.push_view(Box::new(TranscriptView::from_snapshot(
+                    TranscriptSnapshot::new(vec![]),
+                    24,
+                    80,
+                )));
+            }
+            if child_visible {
+                pane.push_view(Box::new(AgentTranscriptView::live_unbound(
+                    "child".into(),
+                    "Child".into(),
+                    "child-run".into(),
+                    None,
+                    "agents",
+                    80,
+                    24,
+                )));
+            } else {
+                pane.push_view(Box::new(InFlightAgentsView::new(Vec::<AgentRow>::new())));
+            }
+            let focused = pane.active_conversation_tab_id();
+            let view_count = pane.view_stack.len();
+            assert_eq!(
+                pane.promote_open_root_transcript_to_durable("session".into(), 80, 24),
+                !durable,
+            );
+            assert_eq!(pane.active_conversation_tab_id(), focused);
+            assert_eq!(pane.view_stack.len(), view_count);
+            assert!(!pane.promote_open_root_transcript_to_durable("session".into(), 80, 24));
+            assert_eq!(pane.active_conversation_tab_id(), focused);
+            assert!(!pane.ensure_durable_root_transcript("session".into(), 80, 24));
+            assert_eq!(
+                pane.active_conversation_tab_id(),
+                Some(super::view::ConversationTabId::Root)
+            );
+        }
+    }
+}
+
+#[test]
+fn retained_root_page_completion_dispatches_one_pending_reload_without_a_keypress() {
+    use super::root_transcript_view::{RootTranscriptSource, RootTranscriptUpdate};
+
+    let mut pane = BottomPane::new();
+    pane.ensure_durable_root_transcript("session".into(), 80, 24);
+    pane.push_view(Box::new(InFlightAgentsView::new(Vec::<AgentRow>::new())));
+    let focused = pane.active_conversation_tab_id();
+    assert!(pane.refresh_root_transcript_committed("session"));
+    assert!(pane.take_projection_action().is_none());
+    assert!(pane.refresh_root_transcript(RootTranscriptUpdate::Loaded {
+        session_id: "session".into(),
+        page: astra_thin_client::SessionTranscriptPage {
+            session_id: "session".into(),
+            items: vec![],
+            next_before_seq: None,
+            has_more: false,
+        },
+        replace: true,
+        source: RootTranscriptSource::DurableServer,
+    }));
+    assert!(matches!(
+        pane.take_projection_action(),
+        Some(BottomPaneViewAction::LoadRootTranscript { session_id, before_seq: None, .. })
+            if session_id == "session"
+    ));
+    assert!(pane.take_projection_action().is_none());
+    assert_eq!(pane.active_conversation_tab_id(), focused);
+}
+
+#[test]
 fn cancelling_task_status_ignores_late_activity_until_terminal_settlement() {
     let mut pane = BottomPane::new();
     let started_at = Instant::now();
@@ -34,16 +360,16 @@ fn cancelling_task_status_ignores_late_activity_until_terminal_settlement() {
 }
 
 #[test]
-fn backtab_opens_permission_picker_when_composer_is_active() {
+fn backtab_cycles_permission_mode_when_composer_is_active() {
     let mut pane = BottomPane::new();
 
     let action = pane.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
 
-    assert!(matches!(action, BottomPaneAction::OpenPermissionModePicker));
+    assert!(matches!(action, BottomPaneAction::CyclePermissionMode));
 }
 
 #[test]
-fn backtab_keeps_approval_navigation_when_approval_is_pending() {
+fn backtab_cycles_permission_mode_while_approval_is_pending() {
     let mut pane = BottomPane::new();
     let (tx, _rx) = oneshot::channel::<ApprovalResponse>();
     pane.enqueue_approval(
@@ -57,13 +383,11 @@ fn backtab_keeps_approval_navigation_when_approval_is_pending() {
 
     let action = pane.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
 
-    assert!(matches!(action, BottomPaneAction::Consumed));
+    assert!(matches!(action, BottomPaneAction::CyclePermissionMode));
 }
 
 #[test]
-fn backtab_opens_picker_when_idle_no_view_no_approval() {
-    // The shortcut is available while composing or idle, but it opens an
-    // explicit picker rather than changing a capability/consent policy.
+fn backtab_cycles_permission_mode_when_idle_no_view_no_approval() {
     let mut pane = BottomPane::new();
     // Composer is empty; no view; no approval.
     assert!(pane.composer.is_empty());
@@ -71,23 +395,39 @@ fn backtab_opens_picker_when_idle_no_view_no_approval() {
 
     let action = pane.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
 
-    assert!(matches!(action, BottomPaneAction::OpenPermissionModePicker));
+    assert!(matches!(action, BottomPaneAction::CyclePermissionMode));
 }
 
 #[test]
-fn backtab_opens_picker_when_composer_has_text() {
+fn backtab_cycles_permission_mode_when_composer_has_text() {
     let mut pane = BottomPane::new();
     pane.composer.set_text("hello world");
 
     let action = pane.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
 
-    assert!(matches!(action, BottomPaneAction::OpenPermissionModePicker));
+    assert!(matches!(action, BottomPaneAction::CyclePermissionMode));
+}
+
+#[test]
+fn backtab_stays_with_an_active_permission_picker() {
+    let mut pane = BottomPane::new();
+    pane.push_view(Box::new(
+        crate::tui::slash_dispatch::build_permission_mode_picker(
+            crate::cli::permission_manager::PermissionMode::Prompt,
+        ),
+    ));
+
+    let action = pane.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+
+    assert!(matches!(action, BottomPaneAction::Consumed));
+    assert!(pane.has_active_view());
 }
 
 #[test]
 fn terminal_agent_workbench_remains_until_explicit_close() {
     let mut pane = BottomPane::new();
     pane.push_view(Box::new(InFlightAgentsView::new(vec![AgentRow {
+        kind: crate::tui::agent_run_projection::AgentRunKind::Agent,
         agent_id: "reviewer@done".into(),
         name: "reviewer".into(),
         spawn_tool_call_id: None,
@@ -121,6 +461,7 @@ fn terminal_agent_workbench_remains_until_explicit_close() {
 fn typed_inspect_action_keeps_run_navigator_as_transcript_parent() {
     let mut pane = BottomPane::new();
     pane.push_view(Box::new(InFlightAgentsView::new(vec![AgentRow {
+        kind: crate::tui::agent_run_projection::AgentRunKind::Agent,
         agent_id: "reviewer@active".into(),
         name: "reviewer".into(),
         spawn_tool_call_id: None,
@@ -236,6 +577,7 @@ fn expanded_transcript_routes_down_to_its_last_detail_row() {
 fn returning_to_run_tree_preserves_agent_conversation_tab() {
     let mut pane = BottomPane::new();
     pane.push_view(Box::new(InFlightAgentsView::new(vec![AgentRow {
+        kind: crate::tui::agent_run_projection::AgentRunKind::Agent,
         agent_id: "reviewer@active".into(),
         name: "reviewer".into(),
         spawn_tool_call_id: None,
@@ -360,6 +702,7 @@ fn conversation_tabs_cycle_in_stable_workspace_order() {
 #[test]
 fn hidden_run_tree_receives_updates_while_an_agent_transcript_is_focused() {
     let row = AgentRow {
+        kind: crate::tui::agent_run_projection::AgentRunKind::Agent,
         agent_id: "reviewer@active".into(),
         name: "reviewer".into(),
         spawn_tool_call_id: None,
@@ -405,7 +748,15 @@ fn hidden_run_tree_receives_updates_while_an_agent_transcript_is_focused() {
     let mut buffer = Buffer::empty(area);
     pane.render(area, &mut buffer);
     let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
+    assert!(rendered.contains("No active agent runs"), "{rendered}");
+    assert!(rendered.contains("H history"), "{rendered}");
+
+    pane.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+    let mut buffer = Buffer::empty(area);
+    pane.render(area, &mut buffer);
+    let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
     assert!(rendered.contains("done"), "{rendered}");
+    assert!(rendered.contains("reviewer"), "{rendered}");
 }
 
 #[test]
@@ -426,6 +777,7 @@ fn transcript_location_refresh_emits_one_typed_durable_load_action() {
     );
 
     let row = AgentRow {
+        kind: crate::tui::agent_run_projection::AgentRunKind::Agent,
         agent_id: "reviewer@active".into(),
         name: "reviewer".into(),
         spawn_tool_call_id: None,
@@ -481,7 +833,10 @@ fn hidden_agent_conversation_keeps_receiving_typed_live_events() {
     assert!(pane.refresh_agent_live_event(&AgentLiveEvent {
         agent_id: "agent-reviewer".into(),
         run_id: "run-reviewer".into(),
-        kind: AgentLiveEventKind::OutputDelta("completed finding".into()),
+        kind: AgentLiveEventKind::OutputDelta {
+            model_item_id: Some("test-model-item".into()),
+            text: "completed finding".into()
+        },
     }));
     assert!(pane.close_active_view());
 
@@ -499,6 +854,7 @@ fn hidden_agent_conversation_keeps_receiving_typed_live_events() {
 fn typed_cancel_action_keeps_owning_view_open() {
     let mut pane = BottomPane::new();
     pane.push_view(Box::new(InFlightAgentsView::new(vec![AgentRow {
+        kind: crate::tui::agent_run_projection::AgentRunKind::Agent,
         agent_id: "reviewer@active".into(),
         name: "reviewer".into(),
         spawn_tool_call_id: None,

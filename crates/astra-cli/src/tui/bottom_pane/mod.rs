@@ -16,7 +16,6 @@ pub(crate) mod plan_review_view;
 pub(crate) mod root_transcript_view;
 pub(crate) mod session_picker_view;
 pub(crate) mod skill_popup;
-pub(crate) mod task_detail_view;
 pub(crate) mod textarea;
 pub(crate) mod timeline_view;
 pub(crate) mod transcript_view;
@@ -41,6 +40,8 @@ mod plan_review_integration_tests;
 mod queue_preview_tests;
 #[cfg(test)]
 mod slash_integration_tests;
+#[cfg(test)]
+mod update_notice_tests;
 
 use chat_composer::{ChatComposer, ComposerAction};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -70,9 +71,32 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+enum ModelCatalogState {
+    Ready(Vec<astra_services::ModelListItemResponse>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NextTurnSubmission {
+    Interactive(String),
+    Conversation {
+        target: crate::tui::event_loop::SessionContinuationTarget,
+        content: String,
+    },
+}
+
+impl NextTurnSubmission {
+    pub(crate) fn text(&self) -> &str {
+        match self {
+            Self::Interactive(text) => text,
+            Self::Conversation { content, .. } => content,
+        }
+    }
+}
+
 pub(crate) struct BottomPane {
     pub composer: ChatComposer,
     pub footer: Footer,
+    pub update_notice: Option<String>,
     view_stack: Vec<Box<dyn BottomPaneView>>,
     /// Stable browser-like order for retained conversation workspaces.
     ///
@@ -97,12 +121,13 @@ pub(crate) struct BottomPane {
     /// User messages accepted after visible output ended but before the
     /// current turn has committed its canonical boundary. These are next-turn
     /// submissions, not guidance for the previous run.
-    queued_next_turn_submissions: std::collections::VecDeque<String>,
+    queued_next_turn_submissions: std::collections::VecDeque<NextTurnSubmission>,
     applied_user_intent_ids: std::collections::HashSet<String>,
     /// Typed actions emitted while a retained projection refreshes. These are
     /// not user-input events: for example, a live agent transcript upgrades
     /// itself once a later receipt supplies its durable history location.
     projection_actions: std::collections::VecDeque<BottomPaneViewAction>,
+    model_catalog: Option<ModelCatalogState>,
     /// True when the user pressed Esc/Ctrl+C to interrupt the current
     /// run and terminal settlement is pending. The queue panel reflects
     /// this intermediate state so the user isn't stuck wondering why
@@ -174,32 +199,45 @@ enum PendingUserIntentCustody {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PendingUserIntentTarget {
     ActiveRun,
-    AgentRun { run_id: String, agent_name: String },
+    AgentRun {
+        target: crate::tui::event_loop::AgentGuideTarget,
+    },
 }
 
 fn pending_user_intent_title(intent: &PendingUserIntent, task_status: &TaskStatus) -> String {
-    if matches!(intent.target, PendingUserIntentTarget::ActiveRun)
-        && intent.custody == PendingUserIntentCustody::Unconfirmed
-    {
-        return "Guidance delivery uncertain · stable identity retained".to_string();
+    if intent.custody == PendingUserIntentCustody::Unconfirmed {
+        return match &intent.target {
+            PendingUserIntentTarget::ActiveRun => {
+                "Guidance delivery uncertain · stable identity retained".to_string()
+            }
+            PendingUserIntentTarget::AgentRun { target } => {
+                let agent_name = target.agent_name();
+                let phase = if intent.status == astra_turn_types::UserIntentStatus::AcceptedRemote {
+                    "application"
+                } else {
+                    "delivery"
+                };
+                format!("Guidance {phase} unknown for {agent_name} · stable identity retained")
+            }
+        };
     }
     match (&intent.target, intent.status) {
         (
-            PendingUserIntentTarget::AgentRun { agent_name, .. },
+            PendingUserIntentTarget::AgentRun { target },
             astra_turn_types::UserIntentStatus::AcceptedLocal,
-        ) => format!("Sending guidance to {agent_name}"),
+        ) => format!("Sending guidance to {}", target.agent_name()),
         (
-            PendingUserIntentTarget::AgentRun { agent_name, .. },
+            PendingUserIntentTarget::AgentRun { target },
             astra_turn_types::UserIntentStatus::AcceptedRemote,
-        ) => format!("Guidance accepted by {agent_name} · awaiting application"),
+        ) => format!("Guidance accepted by {} · awaiting application", target.agent_name()),
         (
-            PendingUserIntentTarget::AgentRun { agent_name, .. },
+            PendingUserIntentTarget::AgentRun { target },
             astra_turn_types::UserIntentStatus::Applied,
-        ) => format!("Guidance applied by {agent_name}"),
+        ) => format!("Guidance applied by {}", target.agent_name()),
         (
-            PendingUserIntentTarget::AgentRun { agent_name, .. },
+            PendingUserIntentTarget::AgentRun { target },
             astra_turn_types::UserIntentStatus::Returned,
-        ) => format!("Guidance returned by {agent_name}"),
+        ) => format!("Guidance returned by {}", target.agent_name()),
         (PendingUserIntentTarget::ActiveRun, astra_turn_types::UserIntentStatus::AcceptedLocal) => {
             "Sending guidance · awaiting server acceptance".to_string()
         }
@@ -245,6 +283,7 @@ impl BottomPane {
         Self {
             composer: ChatComposer::new(),
             footer: Footer::new(),
+            update_notice: None,
             view_stack: Vec::new(),
             conversation_tab_order: Vec::new(),
             task_status: TaskStatus::Idle,
@@ -260,6 +299,7 @@ impl BottomPane {
             queued_next_turn_submissions: std::collections::VecDeque::new(),
             applied_user_intent_ids: std::collections::HashSet::new(),
             projection_actions: std::collections::VecDeque::new(),
+            model_catalog: None,
             interrupt_pending: false,
             staged_permission_mode: None,
         }
@@ -381,8 +421,7 @@ impl BottomPane {
     pub fn accept_agent_guide(
         &mut self,
         intent_id: String,
-        run_id: String,
-        agent_name: String,
+        target: crate::tui::event_loop::AgentGuideTarget,
         text: String,
     ) -> bool {
         self.accept_user_intent_for_target(
@@ -390,7 +429,7 @@ impl BottomPane {
             astra_turn_types::UserIntentDelivery::GuideCurrentRun,
             astra_turn_types::UserIntentStatus::AcceptedLocal,
             text,
-            PendingUserIntentTarget::AgentRun { run_id, agent_name },
+            PendingUserIntentTarget::AgentRun { target },
         )
         .is_ok()
     }
@@ -453,13 +492,21 @@ impl BottomPane {
         true
     }
 
-    /// Record an ownership ambiguity after the request crossed the transport
-    /// boundary. It is neither safe to claim remote acceptance nor safe to
-    /// replay the content as a new turn.
+    /// Stop detached observation without changing the run's delivery custody.
+    pub(crate) fn retire_detached_agent_observations(&self, session_id: Option<&str>, epoch: u64) {
+        for intent in &self.pending_user_intents {
+            if let PendingUserIntentTarget::AgentRun { target } = &intent.target
+                && !target.is_attached(session_id, epoch)
+            {
+                target.retire_observation();
+            }
+        }
+    }
+
+    /// Record transport ambiguity without reclaiming or resending the input.
     pub fn mark_user_intent_unconfirmed(&mut self, intent_id: &str) -> bool {
         let Some(intent) = self.pending_user_intents.iter_mut().find(|intent| {
             intent.intent_id == intent_id
-                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
                 && matches!(
                     intent.custody,
                     PendingUserIntentCustody::Client | PendingUserIntentCustody::Run
@@ -502,10 +549,22 @@ impl BottomPane {
         self.pending_user_intents.remove(index)
     }
 
-    pub fn remove_agent_guide(&mut self, intent_id: &str) -> Option<PendingUserIntent> {
+    /// Claim one member intent in its original attachment. Mailbox receipts
+    /// additionally have to identify the exact run that observed the message.
+    pub fn remove_agent_guide(
+        &mut self,
+        intent_id: &str,
+        session_id: Option<&str>,
+        attachment_epoch: u64,
+        receiver_run_id: Option<&str>,
+    ) -> Option<PendingUserIntent> {
         let index = self.pending_user_intents.iter().position(|intent| {
             intent.intent_id == intent_id
-                && matches!(intent.target, PendingUserIntentTarget::AgentRun { .. })
+                && matches!(&intent.target,
+                    PendingUserIntentTarget::AgentRun { target }
+                        if target.is_attached(session_id, attachment_epoch)
+                            && receiver_run_id.is_none_or(|receiver| receiver == target.run_id())
+                )
         })?;
         self.pending_user_intents.remove(index)
     }
@@ -536,6 +595,12 @@ impl BottomPane {
             .iter()
             .position(|pending| pending.intent_id == intent_id)
         {
+            if matches!(
+                self.pending_user_intents[index].target,
+                PendingUserIntentTarget::AgentRun { .. }
+            ) {
+                return None;
+            }
             self.pending_user_intents
                 .remove(index)
                 .map(|pending| pending.target)
@@ -649,27 +714,68 @@ impl BottomPane {
         locally_owned
     }
 
-    /// Accept a message for the next turn once the current answer is visible.
-    /// The event loop transfers this FIFO lane to its ordinary submit path as
-    /// soon as the current canonical turn boundary is committed.
+    /// Accept a message for the next safe conversational turn. The event loop
+    /// transfers this FIFO lane to its ordinary submit path once the current
+    /// run or Session lifecycle action has reached a safe boundary.
     pub fn queue_next_turn_submission(&mut self, text: String) -> bool {
         if text.trim().is_empty() {
             return false;
         }
-        self.queued_next_turn_submissions.push_back(text);
+        self.queued_next_turn_submissions
+            .push_back(NextTurnSubmission::Interactive(text));
         true
     }
 
-    pub fn take_queued_next_turn_submissions(&mut self) -> std::collections::VecDeque<String> {
+    pub(crate) fn queue_session_continuation(
+        &mut self,
+        target: crate::tui::event_loop::SessionContinuationTarget,
+        content: String,
+    ) -> bool {
+        if content.trim().is_empty() {
+            return false;
+        }
+        self.queued_next_turn_submissions
+            .push_back(NextTurnSubmission::Conversation { target, content });
+        true
+    }
+
+    pub(crate) fn queued_next_turn_submission_count(&self) -> usize {
+        self.queued_next_turn_submissions.len()
+    }
+
+    /// Insert at the position this text had when the user submitted it.
+    /// Entries queued later stay behind it. An index past the end appends.
+    pub(crate) fn insert_next_turn_submission(&mut self, index: usize, text: String) -> bool {
+        if text.trim().is_empty() {
+            return false;
+        }
+        let index = index.min(self.queued_next_turn_submissions.len());
+        self.queued_next_turn_submissions
+            .insert(index, NextTurnSubmission::Interactive(text));
+        true
+    }
+
+    pub(crate) fn take_queued_next_turn_submissions(
+        &mut self,
+    ) -> std::collections::VecDeque<NextTurnSubmission> {
         std::mem::take(&mut self.queued_next_turn_submissions)
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_user_intent_count(&self) -> usize {
+        self.pending_user_intents.len()
+    }
+
+    #[cfg(test)]
     fn has_pending_user_intents(&self) -> bool {
         !self.pending_user_intents.is_empty()
     }
 
     fn has_pending_composer_queue(&self) -> bool {
-        self.has_pending_user_intents() || !self.queued_next_turn_submissions.is_empty()
+        self.pending_user_intents
+            .iter()
+            .any(|intent| matches!(intent.target, PendingUserIntentTarget::ActiveRun))
+            || !self.queued_next_turn_submissions.is_empty()
     }
 
     pub fn set_task_status(&mut self, status: TaskStatus) {
@@ -713,11 +819,38 @@ impl BottomPane {
         self.view_stack.push(view);
     }
 
+    /// A delayed control receipt must not steal focus from another form.
+    pub(crate) fn push_workbench_input(&mut self, view: Box<dyn BottomPaneView>) {
+        if self.has_active_view() && !self.agent_monitor_is_open() {
+            self.view_stack.insert(0, view);
+        } else {
+            self.push_view(view);
+        }
+    }
+
+    pub(crate) fn current_model_catalog(&self) -> &[astra_services::ModelListItemResponse] {
+        match &self.model_catalog {
+            Some(ModelCatalogState::Ready(rows)) => rows,
+            _ => &[],
+        }
+    }
+
+    pub(crate) fn clear_model_catalog(&mut self) {
+        self.model_catalog = None;
+    }
+
+    pub(crate) fn cache_model_catalog(&mut self, rows: Vec<astra_services::ModelListItemResponse>) {
+        self.model_catalog = Some(ModelCatalogState::Ready(rows));
+    }
+
     pub fn enqueue_ask_user(
         &mut self,
         prompt: crate::cli::chat_stream::AskUserPrompt,
         response_tx: oneshot::Sender<crate::cli::chat_stream::AskUserResponse>,
     ) {
+        if response_tx.is_closed() {
+            return;
+        }
         self.view_stack
             .push(Box::new(AskUserView::new(prompt, response_tx)));
     }
@@ -736,19 +869,6 @@ impl BottomPane {
                 plan_markdown,
                 response_tx,
             )));
-    }
-
-    pub fn refresh_task_detail(
-        &mut self,
-        id: &str,
-        cell: &crate::tui::history_cell::task::TaskCell,
-    ) -> bool {
-        self.active_view_mut()
-            .is_some_and(|view| view.refresh_task_cell(id, cell))
-    }
-
-    pub fn active_live_task_id(&self) -> Option<&str> {
-        self.view_stack.last().and_then(|view| view.live_task_id())
     }
 
     pub fn refresh_background_task_rows(
@@ -810,6 +930,11 @@ impl BottomPane {
         let mut refreshed = false;
         for view in self.view_stack.iter_mut().rev() {
             refreshed |= view.refresh_agent_transcript(update.clone());
+            if let Some(request) = view.take_action_request()
+                && request.disposition == ViewActionDisposition::KeepOpen
+            {
+                self.projection_actions.push_back(request.action);
+            }
         }
         refreshed
     }
@@ -821,6 +946,11 @@ impl BottomPane {
         let mut refreshed = false;
         for view in self.view_stack.iter_mut().rev() {
             refreshed |= view.refresh_root_transcript(update.clone());
+            if let Some(request) = view.take_action_request()
+                && request.disposition == ViewActionDisposition::KeepOpen
+            {
+                self.projection_actions.push_back(request.action);
+            }
         }
         refreshed
     }
@@ -830,11 +960,17 @@ impl BottomPane {
     /// evidence and never merges it into durable history by presentation text.
     pub(crate) fn refresh_root_transcript_live(
         &mut self,
+        binding: Option<(&str, &str)>,
         item: Option<transcript_view::TranscriptItem>,
     ) -> bool {
         let mut refreshed = false;
         for view in self.view_stack.iter_mut().rev() {
-            refreshed |= view.refresh_root_transcript_live(item.clone());
+            refreshed |= view.refresh_root_transcript_live(binding, item.clone());
+            if let Some(request) = view.take_action_request()
+                && request.disposition == ViewActionDisposition::KeepOpen
+            {
+                self.projection_actions.push_back(request.action);
+            }
         }
         refreshed
     }
@@ -873,6 +1009,11 @@ impl BottomPane {
         let mut refreshed = false;
         for view in self.view_stack.iter_mut().rev() {
             refreshed |= view.refresh_agent_live_event(event);
+            if let Some(request) = view.take_action_request()
+                && request.disposition == ViewActionDisposition::KeepOpen
+            {
+                self.projection_actions.push_back(request.action);
+            }
         }
         refreshed
     }
@@ -943,6 +1084,15 @@ impl BottomPane {
         self.view_stack
             .iter()
             .any(|view| view.is_root_transcript_view())
+    }
+
+    pub(crate) fn has_agent_transcript_tab(&self) -> bool {
+        self.view_stack.iter().any(|view| {
+            matches!(
+                view.conversation_tab_id(),
+                Some(view::ConversationTabId::Run { .. })
+            )
+        })
     }
 
     /// Conversation tabs are navigable surfaces, not focus-stealing modals.
@@ -1127,8 +1277,20 @@ impl BottomPane {
         width: u16,
         terminal_height: u16,
     ) -> bool {
-        self.has_root_transcript_tab()
-            && self.ensure_durable_root_transcript(session_id, width, terminal_height)
+        let Some(index) = self.view_stack.iter().rposition(|view| {
+            view.conversation_tab_id().as_ref() == Some(&ConversationTabId::Root)
+        }) else {
+            return false;
+        };
+        if self.view_stack[index].durable_root_transcript_session() == Some(session_id.as_str()) {
+            return false;
+        }
+        self.view_stack[index] = Box::new(root_transcript_view::RootTranscriptView::loading(
+            session_id,
+            width,
+            terminal_height,
+        ));
+        true
     }
 
     pub(crate) fn activate_agent_transcript(&mut self, agent_id: &str, run_id: &str) -> bool {
@@ -1229,10 +1391,12 @@ impl BottomPane {
             return;
         }
 
-        // Slash menu: open whenever the first line starts with '/'. Empty
-        // matches still keep the menu open so users see a "no matches"
-        // message rather than silent closure.
-        if self.view_stack.is_empty() && is_open_for(&text) && !self.slash_items.is_empty() {
+        // Completion owns command names, never their arguments. Otherwise
+        // selecting a menu item would discard the user's remaining input.
+        if self.view_stack.is_empty()
+            && is_open_for(&text, &self.slash_items)
+            && !self.slash_items.is_empty()
+        {
             self.close_mention();
             self.skill_popup = None;
             match self.slash_menu.as_mut() {
@@ -1284,17 +1448,35 @@ impl BottomPane {
         self.skill_popup = None;
     }
 
-    pub(crate) fn stage_permission_mode_for_next_turn(
+    pub(crate) fn stage_permission_mode_for_next_round(
         &mut self,
         mode: crate::cli::permission_manager::PermissionMode,
     ) {
         self.staged_permission_mode = Some(mode);
+        self.footer.set_pending_permission_mode(mode);
+    }
+
+    /// Clear a pending selection after acknowledgement or response settlement.
+    pub(crate) fn clear_staged_permission_mode(&mut self) {
+        self.staged_permission_mode = None;
+        self.footer.clear_pending_permission_mode();
+    }
+
+    /// Peek at the requested policy without consuming it.
+    /// Repeated runtime shortcuts use this value as their cycle cursor while
+    /// the currently executing round keeps its captured policy.
+    pub(crate) fn staged_permission_mode(
+        &self,
+    ) -> Option<crate::cli::permission_manager::PermissionMode> {
+        self.staged_permission_mode
     }
 
     pub(crate) fn take_staged_permission_mode(
         &mut self,
     ) -> Option<crate::cli::permission_manager::PermissionMode> {
-        self.staged_permission_mode.take()
+        let mode = self.staged_permission_mode.take();
+        self.footer.clear_pending_permission_mode();
+        mode
     }
 
     fn close_mention(&mut self) {
@@ -1370,7 +1552,7 @@ impl BottomPane {
             // without args (Value::Null). We can't safely
             // re-evaluate those, so leave them in the queue and let
             // the original gate resolve them explicitly.
-            if entry.args.is_null() {
+            if entry.args.is_null() || entry.runtime_dependencies.is_some() {
                 return None;
             }
             let envelope = evaluate_permission(&entry.tool, &entry.args, &ctx);
@@ -1428,9 +1610,6 @@ impl BottomPane {
     }
 
     /// Move focus within the pending-approval queue.
-    pub fn move_approval_focus_up(&mut self) {
-        self.approval_queue.move_focus_up();
-    }
     pub fn move_approval_focus_down(&mut self) {
         self.approval_queue.move_focus_down();
     }
@@ -1534,6 +1713,7 @@ impl BottomPane {
         if let Some(hint) = view.selection_hint {
             cell = cell.with_selection_hint(hint);
         }
+        cell.invocation_scoped = view.invocation_scoped;
         cell = cell.with_scope_context(
             view.workspace_untrusted,
             view.is_compound_command,
@@ -1580,7 +1760,12 @@ impl BottomPane {
         // One quiet row above the composer is reserved for the context rail.
         // Keeping it stable avoids shifting the input when the first usage
         // measurement arrives; before that it simply acts as breathing room.
-        content_h + approval_h + queue_h + popup_h + 2
+        content_h
+            + approval_h
+            + queue_h
+            + popup_h
+            + 2
+            + self.update_notice_lines(width).len() as u16
     }
 
     /// Top-level key routing. Dispatches to named phase handlers so
@@ -1595,6 +1780,22 @@ impl BottomPane {
     pub fn handle_key(&mut self, key: KeyEvent) -> BottomPaneAction {
         if let Some(a) = self.handle_ctrl_keys(key) {
             return a;
+        }
+        // A slash is an explicit command-palette gesture. Let it reclaim
+        // focus from a completed picker (for example `/work`'s catalog) so a
+        // user can immediately type `/model` or any other command without
+        // first guessing which close key the overlay expects. The picker is
+        // already a read-only action; closing it does not mutate Work.
+        if matches!(key.code, KeyCode::Char('/'))
+            && key.modifiers.is_empty()
+            && self
+                .active_view()
+                .is_some_and(|view| view.slash_reclaims_focus())
+        {
+            self.pop_active_view();
+            self.composer.set_text("/");
+            self.sync_popups();
+            return BottomPaneAction::Consumed;
         }
         if let Some(a) = self.handle_active_view_key(key) {
             return a;
@@ -1623,7 +1824,7 @@ impl BottomPane {
             return a;
         }
         if key.code == KeyCode::BackTab {
-            return BottomPaneAction::OpenPermissionModePicker;
+            return BottomPaneAction::CyclePermissionMode;
         }
         self.route_to_composer(key)
     }
@@ -1766,10 +1967,6 @@ impl BottomPane {
                 self.move_approval_focus_down();
                 Some(BottomPaneAction::Consumed)
             }
-            KeyCode::BackTab if self.slash_menu.is_none() && self.mention_menu.is_none() => {
-                self.move_approval_focus_up();
-                Some(BottomPaneAction::Consumed)
-            }
             _ => None,
         }
     }
@@ -1819,7 +2016,7 @@ impl BottomPane {
         None
     }
 
-    /// Slash menu navigation. Enter with no matches falls through to
+    /// Slash menu navigation. Submit keys with no matches fall through to
     /// the composer so the raw draft gets submitted as-is (avoids a
     /// silent no-op).
     fn handle_slash_menu_key(&mut self, key: KeyEvent) -> Option<BottomPaneAction> {
@@ -1863,6 +2060,11 @@ impl BottomPane {
                 Some(BottomPaneAction::Consumed)
             }
             KeyCode::Char(digit) if key.modifiers.is_empty() && digit.is_ascii_digit() => {
+                let mut prospective = self.composer.text();
+                prospective.insert(self.composer.cursor_byte(), digit);
+                if !is_open_for(&prospective, &self.slash_items) {
+                    return None;
+                }
                 if let Some(index) = digit.to_digit(10) {
                     if index > 0 {
                         if self
@@ -1884,7 +2086,17 @@ impl BottomPane {
                 }
                 Some(BottomPaneAction::Consumed)
             }
-            KeyCode::Enter => {
+            _ if key.code == KeyCode::Enter || ChatComposer::is_explicit_followup_key(key) => {
+                let explicit_followup = ChatComposer::is_explicit_followup_key(key);
+                if explicit_followup {
+                    // Apply the same paste guard as ordinary composer queueing.
+                    // A due burst can change the completion or add arguments;
+                    // refresh the menu before choosing a command from it.
+                    if self.composer.handle_key(key) != ComposerAction::QueueFollowUp {
+                        return Some(BottomPaneAction::Consumed);
+                    }
+                    self.sync_popups();
+                }
                 if let Some(picked) = self
                     .slash_menu
                     .as_ref()
@@ -1893,7 +2105,11 @@ impl BottomPane {
                 {
                     self.composer.clear_draft();
                     self.slash_menu = None;
-                    return Some(BottomPaneAction::SubmitInput(picked));
+                    return Some(if explicit_followup {
+                        BottomPaneAction::QueueFollowUp(picked)
+                    } else {
+                        BottomPaneAction::SubmitInput(picked)
+                    });
                 }
                 None
             }
@@ -1949,12 +2165,17 @@ impl BottomPane {
     }
 
     fn route_to_composer(&mut self, key: KeyEvent) -> BottomPaneAction {
-        let action = match self.composer.handle_key(key) {
-            ComposerAction::Submit => {
+        let composer_action = self.composer.handle_key(key);
+        let action = match composer_action {
+            ComposerAction::Submit | ComposerAction::QueueFollowUp => {
                 let text = self.composer.clear_and_submit();
                 self.slash_menu = None;
                 self.close_mention();
-                BottomPaneAction::SubmitInput(text)
+                if composer_action == ComposerAction::QueueFollowUp {
+                    BottomPaneAction::QueueFollowUp(text)
+                } else {
+                    BottomPaneAction::SubmitInput(text)
+                }
             }
             ComposerAction::OpenExternalEditor => {
                 if self.task_status.is_active() {
@@ -1973,7 +2194,8 @@ impl BottomPane {
     }
 
     pub fn pre_draw_tick(&mut self, now: std::time::Instant) -> bool {
-        let mut changed = false;
+        let mut changed = self.approval_queue.prune_closed() > 0;
+        self.footer.pending_approvals = self.approval_queue.len();
         if let Some(view) = self.active_view_mut() {
             view.pre_draw_tick(now);
         }
@@ -2050,6 +2272,16 @@ impl BottomPane {
             return;
         }
 
+        // Keep installation notices below the composer/status strip, outside
+        // conversation history. Modal views retain their existing layout.
+        let notice_lines = self.update_notice_lines(area.width);
+        let notice_h = (notice_lines.len() as u16).min(area.height.saturating_sub(3));
+        let content_area = Rect::new(area.x, area.y, area.width, area.height - notice_h);
+        ratatui::widgets::Paragraph::new(notice_lines).render(
+            Rect::new(area.x, content_area.bottom(), area.width, notice_h),
+            buf,
+        );
+        let area = content_area;
         let popup_h = self.popup_height();
         let content_h = self.composer.desired_height(area.width);
         let intent_queue_h = self.user_intent_height();
@@ -2103,6 +2335,19 @@ impl BottomPane {
         }
     }
 
+    fn update_notice_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let Some(notice) = &self.update_notice else {
+            return Vec::new();
+        };
+        super::wrapping::word_wrap_lines(
+            [Line::styled(
+                notice.clone(),
+                Style::default().fg(super::theme::current().warn),
+            )],
+            width.max(1) as usize,
+        )
+    }
+
     fn render_focused_approval(&self, area: Rect, buf: &mut Buffer) {
         if area.height == 0 {
             return;
@@ -2111,9 +2356,9 @@ impl BottomPane {
             return;
         };
         use crate::tui::history_cell::HistoryCell;
-        use crate::tui::render::line_utils::{FullRowParagraph, sanitize_lines_for_terminal};
+        use crate::tui::render::line_utils::{FullRowParagraph, sanitize_lines_for_buffer};
         use ratatui::widgets::{Widget, Wrap};
-        let lines = sanitize_lines_for_terminal(cell.display_lines(area.width));
+        let lines = sanitize_lines_for_buffer(cell.display_lines(area.width));
         FullRowParagraph::new(lines)
             .wrap(Wrap { trim: false })
             .render(area, buf);
@@ -2194,11 +2439,15 @@ impl BottomPane {
             .enumerate()
         {
             // Truncate by the actual column budget, not a hard-coded 100.
-            let status = match pending.status {
-                astra_turn_types::UserIntentStatus::AcceptedLocal => "sending",
-                astra_turn_types::UserIntentStatus::AcceptedRemote => "accepted by run",
-                astra_turn_types::UserIntentStatus::Applied => "applied",
-                astra_turn_types::UserIntentStatus::Returned => "returned",
+            let status = if pending.custody == PendingUserIntentCustody::Unconfirmed {
+                "unknown"
+            } else {
+                match pending.status {
+                    astra_turn_types::UserIntentStatus::AcceptedLocal => "sending",
+                    astra_turn_types::UserIntentStatus::AcceptedRemote => "accepted by run",
+                    astra_turn_types::UserIntentStatus::Applied => "applied",
+                    astra_turn_types::UserIntentStatus::Returned => "returned",
+                }
             };
             let prefix = format!("{}  {status} · ", idx + 1);
             let budget = area.width.saturating_sub(prefix.width() as u16) as usize;
@@ -2241,7 +2490,7 @@ impl BottomPane {
         Widget::render(
             Line::from(Span::styled(
                 truncate_display(
-                    "Next message queued · starts after this reply is committed",
+                    "Message queued · starts when the current action is ready",
                     area.width as usize,
                 ),
                 title_style,
@@ -2266,7 +2515,7 @@ impl BottomPane {
         {
             let prefix = format!("{}  queued · ", idx + 1);
             let budget = area.width.saturating_sub(prefix.width() as u16) as usize;
-            let line = format!("{prefix}{}", deferred_followup_preview(text, budget));
+            let line = format!("{prefix}{}", deferred_followup_preview(text.text(), budget));
             let style = if idx == 0 { head_style } else { tail_style };
             Widget::render(
                 Line::from(Span::styled(
@@ -2294,6 +2543,10 @@ impl BottomPane {
         if let Some(view) = self.active_view() {
             return view.cursor_pos(area);
         }
+
+        let notice_h =
+            (self.update_notice_lines(area.width).len() as u16).min(area.height.saturating_sub(3));
+        let area = Rect::new(area.x, area.y, area.width, area.height - notice_h);
 
         let approval_h = self.focused_approval_height(area.width);
         let intent_queue_h = self.user_intent_height();
@@ -2408,15 +2661,19 @@ pub(crate) enum ApprovalActivation {
 #[derive(Debug)]
 pub(crate) enum BottomPaneAction {
     SubmitInput(String),
+    /// A composer-only delivery choice. The active loop retains conversational
+    /// input in its existing local FIFO; idle input and local controls use the
+    /// ordinary dispatcher. This does not transfer custody to the Server.
+    QueueFollowUp(String),
     OpenExternalEditor(String),
     /// The shortcut was pressed while a turn owns the event loop. Opening the
     /// editor here would stop polling that turn, so the dispatcher must show a
     /// non-blocking explanation instead.
     ExternalEditorUnavailable,
-    /// Request the explicit permission-mode picker. Permission modes encode
-    /// distinct capability/consent policies, so keyboard navigation must
-    /// never silently advance through them as if they were one dial.
-    OpenPermissionModePicker,
+    /// Cycle the everyday permission policies. The event loop applies the
+    /// action immediately while idle, or stages it for the next safe turn
+    /// boundary while a turn is running.
+    CyclePermissionMode,
     ViewCompleted {
         result: Option<view::ViewResult>,
         reopen: Option<String>,

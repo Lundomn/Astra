@@ -175,9 +175,6 @@ pub(crate) struct CanonicalHeadObservabilityResponse {
 #[derive(Serialize, Debug, PartialEq, Eq)]
 pub(crate) struct SessionProjectionObservabilityResponse {
     pub observability_available: bool,
-    pub transcript_page_count: u32,
-    pub transcript_page_high_watermark: i64,
-    pub transcript_page_lag_items: i64,
     pub active_run_projection_lag_events: i64,
     pub prompt_request_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -253,22 +250,13 @@ fn transcript_read_scope(
 pub(crate) struct TranscriptResponse {
     pub session_id: String,
     pub items: Vec<TranscriptItemResponse>,
-    pub page_refs: Vec<TranscriptPageRefResponse>,
     pub next_before_seq: Option<i64>,
     pub has_more: bool,
 }
 
 #[derive(Serialize)]
-pub(crate) struct TranscriptPageRefResponse {
-    pub page_seq: i64,
-    pub start_item_seq: i64,
-    pub end_item_seq: i64,
-    pub item_count: i64,
-    pub page_hash: String,
-}
-
-#[derive(Serialize)]
 pub(crate) struct TranscriptItemResponse {
+    pub model_item_id: Option<String>,
     pub session_id: String,
     pub item_seq: i64,
     pub run_id: Option<String>,
@@ -488,7 +476,7 @@ pub(crate) async fn create_session_handler(
         };
         return Ok((status, Json(SessionResponse::from(result.session))));
     }
-    let session = super::session_quota::create_session_with_resource_quota(
+    let (session, _) = super::session::session_quota::create_session_with_resource_quota(
         &state,
         principal.user.user_id,
         data,
@@ -619,27 +607,6 @@ pub(crate) async fn get_session_state_handler(
         ));
     }
 
-    persist_session_state_revision(
-        pool,
-        SessionStateRevisionWrite {
-            session_id: &session.session_id,
-            user_id: &session.user_id,
-            monotonic_id: monotonic_id as i64,
-            revision_hash: &revision_hash,
-            device_fingerprint: &device_fingerprint,
-            transcript_high_watermark,
-            run_event_high_watermark,
-            state_projection_hash: &state_projection_hash,
-        },
-    )
-    .await
-    .map_err(|error| {
-        internal_error(format!(
-            "persist session state revision failed for session {}: {error}",
-            session.session_id
-        ))
-    })?;
-
     let cold_start = query.known_state_revision == 0 || query.client_cache_empty;
     let transcript_replay_required = cold_start && transcript_high_watermark > 0;
     let run_event_replay_required = cold_start && run_event_high_watermark > 0;
@@ -660,7 +627,6 @@ pub(crate) async fn get_session_state_handler(
         pool,
         &session.user_id,
         &session.session_id,
-        transcript_high_watermark,
         active_run.as_ref(),
     )
     .await?;
@@ -804,27 +770,6 @@ pub(crate) async fn get_session_transcript_handler(
         })?;
     let transcript_item_count = items.len();
     let transcript_first_seq = items.first().map(|item| item.item_seq);
-    let transcript_last_seq = items.last().map(|item| item.item_seq);
-    let page_refs = if matches!(scope, TranscriptReadScope::RootConversation) {
-        // Physical page hashes cover the whole session stream. Returning one
-        // for a filtered root projection would incorrectly claim that it
-        // hashes only the rows in this response.
-        Vec::new()
-    } else {
-        load_transcript_page_refs(
-            pool,
-            &user_id,
-            &session_id,
-            transcript_first_seq,
-            transcript_last_seq,
-        )
-        .await
-        .map_err(|error| {
-            internal_error(format!(
-                "load transcript page refs failed for session {session_id}: {error}"
-            ))
-        })?
-    };
     let next_before_seq = transcript_first_seq;
     let has_more = if transcript_item_count == limit as usize {
         match (scope, next_before_seq) {
@@ -883,7 +828,6 @@ pub(crate) async fn get_session_transcript_handler(
     Ok(Json(TranscriptResponse {
         session_id,
         items,
-        page_refs,
         next_before_seq,
         has_more,
     }))
@@ -898,6 +842,7 @@ fn decode_transcript_item(row: &impl RowExt) -> Result<TranscriptItemResponse, S
         .map_err(|error| format!("decode transcript payload: {error}"))?
         .unwrap_or_default();
     Ok(TranscriptItemResponse {
+        model_item_id: payload.model_item_id,
         session_id: session_row_string(row, "session_id")?,
         item_seq: session_row_i64(row, "item_seq")?,
         run_id,
@@ -1015,51 +960,6 @@ async fn hydrate_transcript_artifacts(
     Ok(())
 }
 
-async fn load_transcript_page_refs(
-    pool: &SharedPool,
-    user_id: &str,
-    session_id: &str,
-    start_item_seq: Option<i64>,
-    end_item_seq: Option<i64>,
-) -> Result<Vec<TranscriptPageRefResponse>, String> {
-    let (Some(start_item_seq), Some(end_item_seq)) = (start_item_seq, end_item_seq) else {
-        return Ok(Vec::new());
-    };
-    let rows = sqlx::query(
-        "SELECT tp.page_seq, tp.start_item_seq, tp.end_item_seq, tp.item_count, tp.page_hash
-         FROM transcript_pages tp
-         WHERE tp.user_id = ? AND tp.session_id = ? AND tp.end_item_seq >= ? AND tp.start_item_seq <= ?
-         ORDER BY tp.page_seq ASC",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .bind(start_item_seq)
-    .bind(end_item_seq)
-    .fetch_all(pool.get())
-    .await
-    .map_err(|error| error.to_string())?;
-    rows.into_iter()
-        .map(|row| decode_transcript_page_ref(&row))
-        .collect()
-}
-
-fn decode_transcript_page_ref(row: &impl RowExt) -> Result<TranscriptPageRefResponse, String> {
-    Ok(TranscriptPageRefResponse {
-        page_seq: session_row_i64(row, "page_seq")?,
-        start_item_seq: session_row_i64(row, "start_item_seq")?,
-        end_item_seq: session_row_i64(row, "end_item_seq")?,
-        item_count: session_row_i64(row, "item_count")?,
-        page_hash: session_row_string(row, "page_hash")?,
-    })
-}
-
-fn decode_transcript_page_stats(row: &impl RowExt) -> Result<(u32, i64), String> {
-    Ok((
-        session_row_u32(row, "page_count")?,
-        session_row_non_negative_i64(row, "page_high_watermark")?,
-    ))
-}
-
 fn decode_state_category_summary(
     row: &impl RowExt,
 ) -> Result<StateCategorySummaryResponse, String> {
@@ -1124,21 +1024,8 @@ async fn load_session_projection_observability(
     pool: &SharedPool,
     user_id: &str,
     session_id: &str,
-    transcript_high_watermark: i64,
     active_run: Option<&ActiveRunProjection>,
 ) -> Result<SessionProjectionObservabilityResponse, (StatusCode, Json<ErrorResponse>)> {
-    let transcript_page_row = sqlx::query(
-        "SELECT COUNT(*) AS page_count, COALESCE(MAX(tp.end_item_seq), 0) AS page_high_watermark
-         FROM transcript_pages tp
-         WHERE tp.user_id = ? AND tp.session_id = ?",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .fetch_one(pool.get())
-    .await
-    .map_err(internal_error)?;
-    let (transcript_page_count, transcript_page_high_watermark) =
-        decode_transcript_page_stats(&transcript_page_row).map_err(internal_error)?;
     let active_run_projection_lag_events = if let Some(active_run) = active_run {
         let row = sqlx::query(
             "SELECT projection_event_idx
@@ -1258,10 +1145,6 @@ async fn load_session_projection_observability(
         .map(|record| record.event.compaction);
     Ok(SessionProjectionObservabilityResponse {
         observability_available: true,
-        transcript_page_count,
-        transcript_page_high_watermark,
-        transcript_page_lag_items: (transcript_high_watermark - transcript_page_high_watermark)
-            .max(0),
         active_run_projection_lag_events,
         prompt_request_count,
         latest_prompt_request,
@@ -1951,84 +1834,83 @@ pub(crate) async fn close_session_handler(
         )
         .await?;
     astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
-    schedule_session_end_governance(&state, owner_id, session_id);
+    // The close transaction durably enqueued memory work; the managed recovery
+    // task owns dispatch and shutdown rather than an untracked detached task.
     Ok(Json(SessionResponse::from(session)))
 }
 
-/// Run destructive session-end memory governance only after the authenticated
-/// session lifecycle has crossed its explicit `closed` boundary.
-///
-/// Normal `/chat` terminal turns intentionally do not call this: a durable
-/// session may receive many follow-up turns and its working memory is part of
-/// that continuity contract. The task is detached from the close response so
-/// Memoria latency cannot make the UI wait, while the existing per-owner,
-/// per-session debouncer prevents duplicate close requests from writing two
-/// episodes or purging twice.
-fn schedule_session_end_governance(state: &AppState, owner_id: String, session_id: String) {
-    let Some(resolver) = state.auth_service.memoria_credentials() else {
-        tracing::debug!(
-            owner_id = %owner_id,
-            session_id = %session_id,
-            "session-end governance skipped because credential storage is unavailable"
-        );
-        return;
-    };
-    let mut memoria_client =
-        crate::turn::cloud::memoria_compact::UserScopedMemoriaPort::new(resolver, owner_id.clone());
+pub(crate) async fn session_memory_status_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .session_service
+        .get_session(session_id.clone(), user.user_id.clone())
+        .await?;
+    let pool = state.shared_pool.clone().ok_or_else(|| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "durable memory storage is unavailable",
+        )
+    })?;
+    astra_services::session_memory_lifecycle::SessionMemoryLifecycleStore::new(pool)
+        .status(&user.user_id, &session_id)
+        .await
+        .map(Json)
+        .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error))
+}
+
+/// Queue maintenance while preserving the CLI's resumable Session.
+pub(crate) async fn finalize_session_memory_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .session_service
+        .get_session(session_id.clone(), user.user_id.clone())
+        .await?;
+    let resolver = state.auth_service.memoria_credentials().ok_or_else(|| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "memory authority is unavailable",
+        )
+    })?;
+    let mut port = crate::turn::cloud::memoria_compact::UserScopedMemoriaPort::new(
+        resolver,
+        user.user_id.clone(),
+    );
     if state.memoria_self_hosted_fallback_enabled
-        && let Some(master_key) = state.memoria_master_key.clone()
+        && let Some(key) = state.memoria_master_key.clone()
     {
-        memoria_client =
-            memoria_client.with_self_hosted_fallback(state.memoria_base_url.clone(), master_key);
+        port = port.with_self_hosted_fallback(state.memoria_base_url.clone(), key);
     }
-
-    tokio::spawn(async move {
-        let debouncer = crate::turn::session_end_debounce::global();
-        let Some(governance_permit) = debouncer.try_begin(&owner_id, &session_id) else {
-            tracing::debug!(
-                owner_id = %owner_id,
-                session_id = %session_id,
-                "session-end governance skipped by debounce"
-            );
-            return;
-        };
-
-        let session_facts = astra_turn_types::session_facts::SessionFacts::default();
-        let governance = crate::turn::cloud::session_end_governance::run_session_end_governance(
-            &session_facts,
-            &session_id,
-            &memoria_client,
-        );
-        let result = tokio::time::timeout(std::time::Duration::from_secs(60), governance).await;
-        match result {
-            Ok(Ok(report)) => {
-                tracing::info!(
-                    owner_id = %owner_id,
-                    session_id = %session_id,
-                    purged = report.working_purged,
-                    episode_chars = report.episode_chars,
-                    scenes_stored = report.scenes_stored,
-                    "session-end governance complete"
-                );
-                governance_permit.complete();
-            }
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    owner_id = %owner_id,
-                    session_id = %session_id,
-                    error = %error,
-                    "session-end governance failed"
-                );
-            }
-            Err(_) => {
-                tracing::warn!(
-                    owner_id = %owner_id,
-                    session_id = %session_id,
-                    "session-end governance timed out"
-                );
-            }
-        }
-    });
+    if !astra_memoria::MemoriaPort::admits_operation(&port, true)
+        .await
+        .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error))?
+    {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "memory write access is not enabled",
+        ));
+    }
+    let pool = state.shared_pool.clone().ok_or_else(|| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "durable memory storage is unavailable",
+        )
+    })?;
+    astra_services::session_memory_lifecycle::SessionMemoryLifecycleStore::new(pool)
+        .request_finalization(&user.user_id, &session_id)
+        .await
+        .map_err(|error| error_response(StatusCode::CONFLICT, error))?;
+    // Recovery polls this durable handoff independently of the CLI process.
+    Ok(Json(
+        serde_json::json!({"accepted":true, "session_id":session_id, "status":"queued"}),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -2210,11 +2092,13 @@ pub(crate) async fn resume_session_handler(
         .await
         .map_err(internal_error)?;
     let key = server_session_key(&user_id, &session.session_id);
-    let canonical_head = match state.session_context_coordinator.as_ref() {
-        Some(coordinator) => coordinator
-            .load_head(&key)
-            .await
-            .map_err(session_context_http_error)?,
+    let canonical_snapshot = match state.session_context_coordinator.as_ref() {
+        Some(coordinator) => Some(
+            coordinator
+                .load_admission_snapshot(&key)
+                .await
+                .map_err(session_context_http_error)?,
+        ),
         None => None,
     };
     let mut restored = legacy.unwrap_or_else(|| astra_services::session_restore::RestoredSession {
@@ -2223,7 +2107,9 @@ pub(crate) async fn resume_session_handler(
         restored_from_cloud: true,
         ..Default::default()
     });
-    if let Some(head) = canonical_head {
+    if let Some(snapshot) = canonical_snapshot
+        && let Some(head) = snapshot.head
+    {
         let coordinator = state
             .session_context_coordinator
             .as_ref()
@@ -2243,7 +2129,15 @@ pub(crate) async fn resume_session_handler(
                 materialized_conversation_root_hash: Some(materialized_root),
                 degraded_reasons: Vec::new(),
                 repair_actions: Vec::new(),
-                projections: Default::default(),
+                projections: astra_turn_types::ResumeProjectionSetV1 {
+                    provider: Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
+                        head.cursor.clone(),
+                        astra_turn_types::ResumeProviderProjectionV1 {
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
             }],
         )
         .map_err(internal_error)?;
@@ -3025,6 +2919,7 @@ fn session_context_http_error(
             error_response(StatusCode::NOT_FOUND, error.to_string())
         }
         astra_services::SessionContextCoordinatorError::Fenced
+        | astra_services::SessionContextCoordinatorError::SessionLifecycleFenced
         | astra_services::SessionContextCoordinatorError::Expired => {
             error_response(StatusCode::CONFLICT, error.to_string())
         }
@@ -3107,33 +3002,68 @@ pub(crate) async fn cancel_session_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     headers: HeaderMap,
-) -> Result<Json<SessionResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<(StatusCode, Json<CancelSessionResponse>), (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let user_id = user.user_id.clone();
     let session_id_for_cancel = session_id.clone();
-    let _ = state
+    let session = state
         .session_service
         .get_session(session_id.clone(), user_id.clone())
         .await?;
-    state
+    let cancellation = state
         .execution
         .run_lifecycle_service
         .cancel_session_runs(session_id_for_cancel, user_id.clone())
         .await?;
-    let session = state
-        .session_service
-        .update_session(
-            session_id,
-            user_id,
-            SessionUpdateRequestData {
-                title: None,
-                metadata: None,
-                metadata_patch: None,
-                status: Some(STATUS_CANCELLED.to_string()),
-            },
-        )
-        .await?;
-    Ok(Json(SessionResponse::from(session)))
+    let session = if cancellation.execution_settled {
+        state
+            .session_service
+            .update_session(
+                session_id,
+                user_id,
+                SessionUpdateRequestData {
+                    title: None,
+                    metadata: None,
+                    metadata_patch: None,
+                    status: Some(STATUS_CANCELLED.to_string()),
+                },
+            )
+            .await?
+    } else {
+        session
+    };
+    Ok(session_cancellation_response(
+        SessionResponse::from(session),
+        cancellation,
+    ))
+}
+
+fn session_cancellation_response(
+    mut session: SessionResponse,
+    cancellation: astra_services::runs::CancelSessionRecord,
+) -> (StatusCode, Json<CancelSessionResponse>) {
+    let status = if cancellation.execution_settled {
+        session.status = STATUS_CANCELLED.to_string();
+        StatusCode::OK
+    } else {
+        // This response describes the operation, not a premature durable
+        // terminal. Retrying the endpoint continues canonical convergence.
+        session.status = "cancellation_requested".to_string();
+        StatusCode::ACCEPTED
+    };
+    (
+        status,
+        Json(CancelSessionResponse {
+            session,
+            execution_settled: cancellation.execution_settled,
+            execution_blocker: cancellation.execution_blocker,
+            runs: cancellation
+                .runs
+                .into_iter()
+                .map(CancelRunResponse::from)
+                .collect(),
+        }),
+    )
 }
 
 pub(crate) async fn session_activity_handler(
@@ -3343,84 +3273,6 @@ struct DeviceLeaseRow {
     device_id: String,
     device_fingerprint: String,
     status: String,
-}
-
-struct SessionStateRevisionWrite<'a> {
-    session_id: &'a str,
-    user_id: &'a str,
-    monotonic_id: i64,
-    revision_hash: &'a str,
-    device_fingerprint: &'a str,
-    transcript_high_watermark: i64,
-    run_event_high_watermark: i64,
-    state_projection_hash: &'a str,
-}
-
-async fn persist_session_state_revision(
-    pool: &SharedPool,
-    revision: SessionStateRevisionWrite<'_>,
-) -> Result<(), sqlx::Error> {
-    if update_session_state_revision(pool, &revision).await? {
-        return Ok(());
-    }
-
-    let insert_result = sqlx::query(
-        "INSERT INTO session_state_revisions
-         (session_id, user_id, monotonic_id, revision_hash, device_fingerprint,
-          transcript_high_watermark, run_event_high_watermark, state_projection_hash, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
-    )
-    .bind(revision.session_id)
-    .bind(revision.user_id)
-    .bind(revision.monotonic_id)
-    .bind(revision.revision_hash)
-    .bind(revision.device_fingerprint)
-    .bind(revision.transcript_high_watermark)
-    .bind(revision.run_event_high_watermark)
-    .bind(revision.state_projection_hash)
-    .execute(pool.get())
-    .await;
-
-    match insert_result {
-        Ok(_) => Ok(()),
-        Err(error) if is_duplicate_key_error(&error) => {
-            match update_session_state_revision(pool, &revision).await? {
-                true => Ok(()),
-                false => Err(sqlx::Error::RowNotFound),
-            }
-        }
-        Err(error) => Err(error),
-    }
-}
-
-async fn update_session_state_revision(
-    pool: &SharedPool,
-    revision: &SessionStateRevisionWrite<'_>,
-) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE session_state_revisions
-         SET user_id = ?,
-             monotonic_id = ?,
-             revision_hash = ?,
-             device_fingerprint = ?,
-             transcript_high_watermark = ?,
-             run_event_high_watermark = ?,
-             state_projection_hash = ?,
-             updated_at = NOW(6)
-         WHERE session_id = ? AND user_id = ?",
-    )
-    .bind(revision.user_id)
-    .bind(revision.monotonic_id)
-    .bind(revision.revision_hash)
-    .bind(revision.device_fingerprint)
-    .bind(revision.transcript_high_watermark)
-    .bind(revision.run_event_high_watermark)
-    .bind(revision.state_projection_hash)
-    .bind(revision.session_id)
-    .bind(revision.user_id)
-    .execute(pool.get())
-    .await?;
-    Ok(result.rows_affected() > 0)
 }
 
 fn validate_device_protocol_value<'a>(
@@ -3920,14 +3772,16 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use astra_core::{ErrorResponse, error_response};
+    use astra_core::{ErrorResponse, SharedPool, error_response};
     use astra_services::auth::SessionActivityRecord;
+    use astra_services::observation_capture::DurableCaptureOutcome;
     use astra_services::{
         AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
         AuthTokenRecord, AuthUserRecord, SessionCreateRequestData, SessionListFilter,
         SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
         StoredSessionArtifact,
     };
+    use astra_services::{ContextManifestWrite, DatabaseContextManifestStore};
     use async_trait::async_trait;
     use axum::{
         Json,
@@ -3938,6 +3792,57 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::{AppState, HealthChecker, ServiceInfo};
+
+    #[test]
+    fn session_cancel_wire_requires_explicit_convergence_even_with_no_active_runs() {
+        for settled in [false, true] {
+            let session = SessionResponse {
+                session_id: "session-1".into(),
+                user_id: "user-1".into(),
+                agent_id: None,
+                title: None,
+                metadata: Default::default(),
+                status: "active".into(),
+                event_count: 0,
+                created_at: "2026-09-19T00:00:00".into(),
+                updated_at: None,
+                ended_at: None,
+            };
+            let (status, Json(body)) = session_cancellation_response(
+                session,
+                astra_services::runs::CancelSessionRecord {
+                    runs: vec![],
+                    execution_settled: settled,
+                    execution_blocker: (!settled).then_some(astra_services::session_context_coordinator::SessionExecutionBlocker::UnresolvedTool),
+                },
+            );
+            let wire = serde_json::to_value(body).unwrap();
+            assert_eq!(
+                status,
+                if settled {
+                    StatusCode::OK
+                } else {
+                    StatusCode::ACCEPTED
+                }
+            );
+            assert_eq!(wire["session_id"], "session-1");
+            assert_eq!(
+                wire["status"],
+                if settled {
+                    "cancelled"
+                } else {
+                    "cancellation_requested"
+                }
+            );
+            assert_eq!(wire["execution_settled"], settled);
+            assert_eq!(wire["runs"], json!([]));
+            if settled {
+                assert!(wire.get("execution_blocker").is_none());
+            } else {
+                assert_eq!(wire["execution_blocker"], "unresolved_tool");
+            }
+        }
+    }
 
     #[test]
     fn handoff_storage_failure_is_not_reported_as_invalid_user_input() {
@@ -3956,6 +3861,7 @@ mod tests {
 
     fn transcript_item(run_id: &str, item_seq: i64, content: &str) -> TranscriptItemResponse {
         TranscriptItemResponse {
+            model_item_id: None,
             session_id: "session-1".to_string(),
             item_seq,
             run_id: Some(run_id.to_string()),
@@ -4064,7 +3970,6 @@ mod tests {
                 "event_type" => "auto_expire",
                 "reason" => "stale",
                 "ended_at_server" => "2026-06-26T13:00:00",
-                "page_hash" => "hash-1",
                 "run_id" => "run-1",
                 "branch_id" => "main",
                 "isolation_domain" => "owner-session-v1",
@@ -4081,7 +3986,7 @@ mod tests {
                 "canonical_root_hash" => Some("a".repeat(64)),
                 "source_event_id" => None,
                 "payload_json" => Some(
-                    r#"{"reasoning":"thinking","reasoning_status":"complete","tool_calls":[{"tool_use_id":"call-1","name":"read_file","arguments":"{\"path\":\"src/lib.rs\"}"}]}"#
+                    r#"{"model_item_id":"accepted-A","reasoning":"thinking","reasoning_status":"complete","tool_calls":[{"tool_use_id":"call-1","name":"read_file","arguments":"{\"path\":\"src/lib.rs\"}"}]}"#
                         .to_string(),
                 ),
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
@@ -4100,12 +4005,6 @@ mod tests {
             match column {
                 "item_seq" => Ok(7),
                 "last_monotonic_id" => Ok(42),
-                "page_seq" => Ok(2),
-                "start_item_seq" => Ok(5),
-                "end_item_seq" => Ok(9),
-                "item_count" => Ok(5),
-                "page_count" => Ok(3),
-                "page_high_watermark" => Ok(9),
                 "projection_event_idx" => Ok(8),
                 "total" => Ok(4),
                 "total_estimated_tokens" => Ok(123),
@@ -4305,6 +4204,117 @@ mod tests {
             HeaderValue::from_static("Bearer session-test-token"),
         );
         headers
+    }
+
+    fn manifest_fixture_id(prefix: &str) -> String {
+        format!("{prefix}-{}", Uuid::new_v4().simple())
+    }
+
+    async fn insert_manifest_session(pool: &SharedPool, user_id: &str, session_id: &str) {
+        sqlx::query(
+            "INSERT INTO agent_sessions
+             (session_id, user_id, agent_id, title, status, metadata, created_at, updated_at)
+             VALUES (?, ?, 'perf-agent', 'perf session', 'active', '{}', NOW(6), NOW(6))",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .execute(pool.get())
+        .await
+        .expect("insert manifest reader session");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ASTRA_TEST_DB_IT=1; live MatrixOne"]
+    async fn latest_manifest_reader_prefers_run_and_preserves_owner_scope() {
+        const MANIFESTS: usize = 3;
+
+        let pool = crate::turn::services::setup_live_pool_for_test().await;
+        let user_id = manifest_fixture_id("reader-user");
+        let session_id = manifest_fixture_id("reader-session");
+        let preferred_run_id = manifest_fixture_id("reader-preferred-run");
+        let latest_run_id = manifest_fixture_id("reader-latest-run");
+        let manifest_prefix = manifest_fixture_id("reader-manifest");
+        insert_manifest_session(&pool, &user_id, &session_id).await;
+
+        let store = DatabaseContextManifestStore::new(pool.clone());
+        for index in 0..MANIFESTS {
+            let outcome = store
+                .save_manifest(
+                    ContextManifestWrite {
+                        manifest_id: format!("{manifest_prefix}-{index:04}"),
+                        user_id: user_id.clone(),
+                        session_id: session_id.clone(),
+                        run_id: Some(if index + 1 == MANIFESTS {
+                            latest_run_id.clone()
+                        } else {
+                            preferred_run_id.clone()
+                        }),
+                        turn_id: format!("turn-{index}"),
+                        model_provider: "mock".to_string(),
+                        model_name: "perf-read-llm".to_string(),
+                        context_window_tokens: 8_000,
+                        max_output_tokens: 700,
+                        total_estimated_tokens: 1_200,
+                        policy_version: "context_manifest_v1".to_string(),
+                        tokenizer_id: Some("estimated_v1".to_string()),
+                        budget_template_id: Some("budget_v1_8k".to_string()),
+                        turn_intent: Some("normal".to_string()),
+                        reason: "normal_turn".to_string(),
+                        manifest_json: json!({}),
+                    },
+                    vec![],
+                )
+                .await
+                .expect("seed manifest");
+            assert_eq!(
+                outcome,
+                DurableCaptureOutcome::Inserted,
+                "seed must be a fresh capture"
+            );
+        }
+
+        let preferred =
+            load_latest_context_manifest(&pool, &user_id, &session_id, Some(&preferred_run_id))
+                .await
+                .expect("read preferred manifest")
+                .expect("preferred run has a manifest");
+        assert_eq!(
+            preferred.manifest_id,
+            format!("{manifest_prefix}-{:04}", MANIFESTS - 2)
+        );
+
+        let fallback = load_latest_context_manifest(&pool, &user_id, &session_id, None)
+            .await
+            .expect("read latest manifest")
+            .expect("session has a manifest");
+        assert_eq!(
+            fallback.manifest_id,
+            format!("{manifest_prefix}-{:04}", MANIFESTS - 1)
+        );
+
+        let missing_preferred = load_latest_context_manifest(
+            &pool,
+            &user_id,
+            &session_id,
+            Some("perf-read-missing-run"),
+        )
+        .await
+        .expect("read missing run fallback")
+        .expect("missing run falls back to session latest");
+        assert_eq!(
+            missing_preferred.manifest_id,
+            format!("{manifest_prefix}-{:04}", MANIFESTS - 1)
+        );
+
+        let wrong_owner = load_latest_context_manifest(
+            &pool,
+            "perf-read-not-owner",
+            &session_id,
+            Some(&preferred_run_id),
+        )
+        .await
+        .expect("read foreign owner");
+        assert!(wrong_owner.is_none(), "must not read another owner");
     }
 
     #[tokio::test]
@@ -4673,6 +4683,7 @@ mod tests {
         assert_eq!(item.run_id.as_deref(), Some("run-1"));
         assert_eq!(item.role, "assistant");
         assert_eq!(item.content, "answer");
+        assert_eq!(item.model_item_id.as_deref(), Some("accepted-A"));
         assert_eq!(item.reasoning.as_deref(), Some("thinking"));
         assert_eq!(item.reasoning_status.as_deref(), Some("complete"));
         assert_eq!(item.tool_calls.len(), 1);
@@ -4691,66 +4702,6 @@ mod tests {
             assert!(
                 err.contains(&format!("decode column `{column}`")),
                 "error should identify missing transcript column {column}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn transcript_page_ref_decode_fails_loudly_on_required_columns() {
-        let page = decode_transcript_page_ref(&FakeSessionRow::complete())
-            .expect("complete page ref decodes");
-        assert_eq!(page.page_seq, 2);
-        assert_eq!(page.start_item_seq, 5);
-        assert_eq!(page.end_item_seq, 9);
-        assert_eq!(page.item_count, 5);
-        assert_eq!(page.page_hash, "hash-1");
-
-        for column in [
-            "page_seq",
-            "start_item_seq",
-            "end_item_seq",
-            "item_count",
-            "page_hash",
-        ] {
-            let err = match decode_transcript_page_ref(&FakeSessionRow::fail_on(column)) {
-                Ok(_) => panic!("missing transcript page column must fail: {column}"),
-                Err(err) => err,
-            };
-            assert!(
-                err.contains(&format!("decode column `{column}`")),
-                "error should identify missing page column {column}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn transcript_page_stats_decode_fails_loudly_on_required_columns() {
-        let (page_count, high_watermark) =
-            decode_transcript_page_stats(&FakeSessionRow::complete()).expect("stats decode");
-        assert_eq!(page_count, 3);
-        assert_eq!(high_watermark, 9);
-
-        for column in ["page_count", "page_high_watermark"] {
-            let err = match decode_transcript_page_stats(&FakeSessionRow::fail_on(column)) {
-                Ok(_) => panic!("missing transcript stats column must fail: {column}"),
-                Err(err) => err,
-            };
-            assert!(
-                err.contains(&format!("decode column `{column}`")),
-                "error should identify stats column {column}: {err}"
-            );
-        }
-
-        for (column, value) in [
-            ("page_count", -1),
-            ("page_count", i64::from(u32::MAX) + 1),
-            ("page_high_watermark", -1),
-        ] {
-            let err = decode_transcript_page_stats(&FakeSessionRow::with_i64(column, value))
-                .expect_err("invalid transcript stats value must fail");
-            assert!(
-                err.contains(column),
-                "error should identify invalid stats column {column}: {err}"
             );
         }
     }

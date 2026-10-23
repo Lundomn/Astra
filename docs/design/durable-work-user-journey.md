@@ -2,7 +2,7 @@
 
 > Status: target design contract; current support and verification limits are
 > described in the final section.
-> Last updated: 2026-09-15.
+> Last updated: 2026-10-18.
 
 This document owns the user-visible journey for finding, observing, continuing,
 and changing the execution provider for one durable Work across TUI, Web, and
@@ -57,9 +57,10 @@ Server Run-owner recovery require separate contracts and release gates.
 ### 1. Start or promote once
 
 Web and TUI create Work through the same Server Work service. Web may create a
-new Work. TUI may promote its current idle durable Session, preserving that
-Session instead of creating a hidden second conversation. If TUI has no durable
-Session yet, it explains the one prerequisite and offers the next action.
+new Work. TUI promotes its current idle durable Session when one exists. If a
+fresh TUI has no Session yet, `/work start <goal>` creates and binds the
+Session as part of the same explicit action; the user never needs to send a
+throwaway message or issue `/resume`.
 
 On success, both surfaces show the same `work_id` and selected `branch_id`.
 TUI should expose a direct Web link when the profile has a configured Web origin;
@@ -88,6 +89,17 @@ such as refreshing or explicitly taking control. Concurrent readers remain
 usable. Duplicate admission requests reuse an idempotency identity; unresolved
 external effects are reconciled through the invocation ledger before any retry
 that could repeat them.
+
+On TUI, `/work` first opens the owner-scoped catalog and then presents two
+explicit actions for the selected item: **Observe Work** keeps the current
+Session read-only, while **Continue this Work** prepares an editable
+`/work continue <work-id> <message>` command. The continuation uses a TUI-scoped
+attachment and the canonical Work turn endpoint; it never resumes the hidden
+Work Session in the current chat tab. The TUI receives lifecycle progress for
+accepted runs, tools, approvals, prompts, and waiting states. A stream that
+ends before a terminal fact keeps the partial response and request identity and
+offers `/work retry <request-id>` after the user checks the Work status. A
+terminal response remains visible even if controller cleanup needs attention.
 
 ### 4. Continue on another Edge
 
@@ -167,7 +179,76 @@ The user-visible states are:
 | Controller/attachment | `attachment_id + controller basis` | Work branch control and Session handoff authorize a client to submit; a read attachment grants no control |
 | Edge process | `registry_id + connection generation` | Edge registry owns connection liveness and advertised capabilities; `executor_id` is a selectable label |
 | Provider binding | `Session/workspace + binding generation` | Canonical selection authorizes provider use at Run admission and invocation dispatch |
-| Workspace materialization | persisted `materialization_id` plus authenticated canonical checkout root (bounded physical claim) and repo identity/ref/tree hash | The local Edge state identity survives reconnects and Edge-label changes, while independently materialized devices can use the same path without sharing a claim; a matching hash proves committed tree identity, not environment or external effects |
+| Workspace materialization | persisted `materialization_id` plus authenticated canonical checkout root and repo identity/ref/tree hash | The local Edge state identity survives reconnects and Edge-label changes; independent Sessions may bind it, while the executor's workspace coordination lease serializes physical operations. A matching hash proves committed tree identity, not environment or external effects |
+
+The shared CLI/Edge runtime-env owner persists the canonical checkout identity
+under the default device-state directory, keyed by the canonical checkout path.
+Isolated cache roots mirror that identity and reject conflicting values; they
+cannot create a second identity owner. When a filesystem UUID is available,
+Unix mount device/inode metadata only seed a first registration: a changed mount
+number does not invalidate the published identity. New registrations keep the
+pre-UUID device/path/device-number/inode seed so an older client can read an
+unchanged checkout. The UUID belongs only in the independent witness, not the ID
+seed. Previously published IDs, including UUID-seeded IDs from an earlier
+implementation, remain byte-for-byte unchanged; this does not make those IDs
+readable by older clients. An older client still cannot handle mount-number
+drift because it does not consult the witness. A bounded `.checkout` sidecar records a
+device/path/filesystem-UUID/inode fingerprint without the volatile mount number.
+The filesystem UUID comes from macOS `ATTR_VOL_UUID` or Linux
+`FS_IOC_GETFSUUID`, read through the same open directory as its inode. A changed
+volume is rejected even when its root happens to have the same inode number.
+`st_dev`, mount IDs and `statfs.f_fsid` are not substitutes for this UUID:
+they can depend on mount allocation. Filesystem clones retaining the same UUID
+and inode are outside this discriminator's guarantees.
+
+An unavailable Linux UUID API (`ENOTTY`, `EOPNOTSUPP`, or `ENOSYS`) preserves the
+original strict device-and-inode validation if no UUID witness exists. A valid
+legacy `.id` on an unchanged checkout is retained byte-for-byte; fresh registration
+also works. No inode-only witness is written, and changed devices/inodes remain
+rejected when continuity cannot be established. If a UUID witness already exists,
+an unavailable API does not remove or downgrade it: startup fails explicitly.
+Permission/I/O failures and malformed, missing or zero UUID data are not treated
+as an unavailable API. Once the API becomes available, a witness can be published
+without rotating an existing legacy ID.
+Without UUID evidence, reused device/inode values cannot distinguish filesystem
+replacement; this path preserves the pre-existing checks, not UUID-level guarantees.
+On Unix, a later inode change
+also rejects directory replacement at the same path instead of reusing the old ID;
+it requires explicit identity recovery/re-registration. Legacy `.id` files have
+no inode witness: their first upgraded start binds the current directory, so a
+replacement before that migration cannot be detected. Non-Unix binding checks
+cover device identity and canonical path only, as before.
+Existing canonical default-state identity values are retained. A path-alias file
+is a mirror of an existing canonical owner and must match that owner's ID. If
+there is no canonical owner, alias migration must match the original strict
+device/path/device-number/inode seed before publishing any canonical owner or
+witness. An unchanged legacy alias retains its exact bytes; an alias whose target
+or unprovable mount binding changed fails closed instead of relabelling the old
+target's identity. Restore the original checkout or explicitly back up/remove
+only that unverified alias before registering the current target again. No
+extra alias mapping or state format is introduced. Identity
+files remain bounded regular files with atomic no-replace publication; malformed
+or symlinked state is rejected. A conflicting legacy identity present only in an
+isolated cache is not adopted when the default-state owner is absent; the cache
+is left unchanged and requires explicit recovery. This does not change
+authenticated provider binding, repository attestation, or executor-local
+workspace coordination.
+
+For an **intentional checkout replacement**, stop all Astra/astra-edge processes
+using that checkout. Back up and remove only its canonical
+`edge-materializations/<canonical-path-hash>.id` **and the matching `.checkout`**
+under the default device-state root, together with that checkout's older path
+alias and isolated-cache `.id` mirrors. Removing `.id` alone does not reset the
+checkout guard. Register the replacement checkout again; do not treat this as
+permission to resume the previous checkout's Session/provider binding. Deleting
+the owner and witness is an explicit loss of continuity
+evidence, not proof of a new identity: recycled device/inode values can reproduce
+the legacy seed. Do not use such a reset to authorize an old Session binding. Keep
+`device.id`, login credentials and unrelated checkout state. For a conflicting
+isolated cache/alias only, back up/remove only that conflicting mirror, retaining
+the canonical `.id` and `.checkout`. No automatic deletion or identity repair is
+performed. Failure to verify an already published UUID witness requires restoring
+UUID API support, not deleting that witness to bypass its protection.
 
 Client URLs and normal user-facing controls identify Work and branch. Session
 and Run ids remain available in diagnostics and repair surfaces, not as the
@@ -183,8 +264,10 @@ per projection and recover retention gaps with a bounded snapshot. They must
 not scan all events or rebuild the entire Work view for every task update. The
 owner-scoped Server activity read discovers Runs started by other surfaces; a
 local Web composer flag is not evidence that a Run is active. Each visible Work
-detail page polls one exact branch about every 1.2 seconds so a quiet page can
-discover a Run started elsewhere. The latest `/now` page refreshes its first
+detail page polls one exact branch about every 1.2 seconds and its Work event
+head about every 2 seconds while active (10 seconds while idle), so a quiet page
+can discover a Run started elsewhere and a Work started from TUI or another
+Edge can trigger a bounded server snapshot refresh. The latest `/now` page refreshes its first
 20-entry keyset page about every 10 seconds; older pages do not poll. Task graph
 refresh remains bounded to its first page while a Run can change it. Hidden tabs
 pause refresh. Reconnect resumes with bounded backoff and jitter, ignores
@@ -219,10 +302,27 @@ Each authenticated read and mutation is scoped by the resolved principal and
 workspace authority. A foreign owner receives the same not-found behavior as a
 missing Work. Runs in different Sessions must not share cursors, attachments,
 leases, idempotency keys, or provider bindings. Independent Sessions may
-progress concurrently. If they share a physical checkout, its workspace
-mutation boundary must still serialize conflicting mutations or require
-separate worktrees; independent Session leases alone do not make a shared
-workspace safe.
+progress concurrently. If they share a physical checkout, the executor's
+workspace observation and mutation lease serializes physical operations.
+Read-only observations may run independently when the executor supports them,
+while conflicting writes are serialized or return the executor's typed
+base/conflict result. A physical directory is therefore not a Session-level
+mutex.
+
+A saved Session does not permanently own its checkout. Ordinary CLI startup
+creates a fresh conversation in the selected directory; continuing a saved
+conversation requires explicit resume. A new Session can bind the same
+authenticated Edge materialization without changing the other Session's
+binding, history, files, or Git state. Dirty files alone are not a reason to
+resume an old conversation or reject a new one; verified Edge-to-Edge transfer
+remains a separate operation.
+
+Session execution debt remains Session-scoped: a live Run, unresolved tool,
+writer/reservation, settlement fence, or provider switch can block that
+Session's own cancellation or binding change, but it cannot block an
+independent Session in the same directory. The canonical binding generation
+fences delayed work for its own Session. The executor-owned workspace lease is
+the only physical-operation serialization boundary.
 
 ## Unhappy paths
 
@@ -243,7 +343,8 @@ workspace safe.
 | Target validation fails after binding commit | Keep the prior Edge fenced for this binding, preserve evidence, and show `Needs attention` |
 | Disconnect or cancel races with transfer | Before binding commit, an abandoned preflight leaves the current provider unchanged; after commit, keep the new binding and admit no execution until resumed |
 | Transfer races with a new Run | Serialize at canonical admission or binding compare-and-swap; exactly one transition wins |
-| Different Sessions share a checkout | Serialize conflicting workspace mutations or require isolated worktrees |
+| Different Sessions share a checkout | Admit independent Sessions; serialize physical workspace operations with the executor-owned lease and return a retryable result when it is unavailable |
+| Old Session is idle in the selected checkout | Admit a fresh conversation after the Session-local execution-debt check; preserve old history and binding; do not require resume or a new worktree |
 | DB or event service degraded | Show last confirmed revision and staleness; retry with bounded backoff |
 | Duplicate or reordered updates | Reconcile by durable cursor/revision; never regress status or synthesize twice |
 
@@ -272,10 +373,21 @@ workspace safe.
 
 ## Current implementation audit
 
+- Work criteria and task graphs change only through owner-scoped proposal
+  acceptance with the recorded payload hash and revision basis. Direct criteria
+  and graph writer APIs and the unexposed Goal editing prototype are retired.
+  The genesis Goal and its revision remain part of proposal, branch and delivery
+  fencing; this does not introduce a new Goal editing surface.
+
 - TUI `/work start` promotes its current durable Session through the Server Work
-  binding API. It rejects a missing Session, reuses the Session on exact retry,
-  and prints the Work id, `Ctrl+T` task-board hint, and the Web `/now` entry
-  point. There is no configured Web deep link yet.
+  binding API, creating and binding a Session when the TUI is pristine. It
+  reuses the Session on exact retry, and prints the Work id, the next action,
+  and the Web `/now` entry point. There is no configured Web deep link yet. TUI `/work` opens an
+  owner-scoped catalog with explicit Observe/Continue actions; Continue routes
+  a Work-scoped turn through a TUI attachment, shows accepted-run lifecycle
+  progress without feeding Work Session events into the current chat, and
+  preserves partial/unknown results with an exact retry request id. There is
+  no automatic Session resume.
 - TUI `/work execution` reads the current Work binding, authoritative provider
   generation, and a bounded target directory without blocking the render loop.
   It is a read-only diagnostic surface; provider switching and retry are
@@ -291,10 +403,26 @@ workspace safe.
   active task graphs refresh their first bounded page every 2 seconds even for
   TUI-originated Runs. Both
   loops pause in hidden tabs, add jitter, back off after errors, and avoid
-  overlapping requests. Load targets remain unmeasured.
+  overlapping requests. The Web page uses one stable read-attachment identity
+  per browser instance and Work/branch, and renews it on projection refresh, so
+  live updates do not consume a new attachment slot or inherit another
+  browser's controller. An expired attachment is replaced by a fresh
+  read-only generation without waiting for the janitor. Switching Work or
+  branch remounts the composer and closes only that browser stream; the durable
+  Server Run keeps its own lifecycle. Load targets remain unmeasured.
 - Web chat history imports Server sessions tagged `source=web_v1`; a TUI Session
   is not automatically inserted into the Web chat list. The Work page is the
   current cross-surface entry point.
+- A task assignment is not evidence that its tools executed. Tool invocation
+  decisions freeze the producer Run and exact Work/branch/item revision/attempt
+  before dispatch, and the canonical journal retains that attribution even when
+  completion persistence fails. Harness replacement checks count actual executed
+  invocations, including failed outcomes, rather than treating a claim as a side
+  effect. Missing, conflicting, or stale attribution cannot certify that a
+  cancelled task remained unexecuted; replay uses the original frozen decision.
+  Pipeline-intercepted skill executions freeze the same attribution before
+  execution. Already-loaded skill receipts are suppressed, not executed; a
+  subsequent admission rejection remains rejected.
 - Work now has a durable execution-selection record keyed by isolation domain,
   owner, Session, and branch. Authorized admission pins the canonical Server
   sandbox or records an authenticated Edge placement. A read never creates or
@@ -310,15 +438,62 @@ workspace safe.
   scoped to the affected Session; dispatch does not lock the selection row, so
   the binding fence adds no serialization to parallel tool fan-out. Live
   MatrixOne coverage exists for owner/Session isolation, stale generations,
-  switching-state admission, and busy-switch rejection, but this environment
-  cannot execute those database tests. Dispatch verifies an existing physical
-  workspace claim with a non-locking read; claim insertion and repair stay on
-  binding admission, so parallel tool fan-out does not add a write/lock to the
-  hot path. A physical identity is derived from the persisted materialization
-  identity and authenticated canonical checkout root; hostname, executor
+  switching-state admission, busy-switch rejection, and same-directory
+  multi-Session admission, but this environment cannot execute those database
+  tests. Dispatch rechecks only the Session binding generation in the same
+  transaction as Run action admission and the invocation claim; it does not
+  issue a physical-workspace claim query or write. A physical identity is still
+  derived from the persisted materialization identity and authenticated
+  canonical checkout root for executor-local coordination; hostname, executor
   labels, and connection registry ids are never used as a checkout fallback.
   The identity file lives in Edge local state rather than the repository, so
   attestation does not manufacture a dirty workspace.
+- Recovery-point foundations now have one shared typed manifest for Work,
+  branch, Session cursor/context head, Run frontier, execution binding,
+  Workspace snapshot, Artifact references, and environment requirements. The
+  Workspace manifest validates the capture declaration shape, matching
+  fingerprints, canonical paths, content aggregates, file/blob digests,
+  symlink boundaries, and MatrixOne Git4Data source references. The Work
+  repository captures owner-scoped, idempotent boundaries in one transaction
+  after verifying Work/branch revisions, immutable graph basis, Session context
+  head, quiescent invocation state and execution binding. `captured` is logical
+  progress for observation; it does not promise file or unfinished Run restoration.
+  Sealed workspace publication reads only manifest/descriptor metadata at the
+  HTTP boundary, then verifies the full package and current Session/Work basis
+  and attaches its Artifact retention reference in the canonical transaction.
+  The HTTP read does not authorize content integrity; corruption after seal or
+  a changed basis rejects publication without leaving a recovery point. This
+  avoids loading the full package twice for one publication while retaining
+  the transaction's integrity boundary; the point remains `captured`. An exact
+  retry replays the original committed publication receipt; it does not certify
+  the current bytes again. The verified artifact GET remains the current-content
+  integrity boundary, including for corruption after a successful publication.
+  The retired two-commit preparing/mark-captured write API is removed. The logical capture
+  path is `POST /v1/works/{work}/branches/{branch}/recovery-points`; TUI exposes
+  it as `/work save` (with `/work checkpoint` as an alias), and Web lists the
+  resulting boundaries under **Saved progress**. The action is intentionally
+  explicit and non-restoring: it records the current conversation/Work point,
+  reports the missing workspace and effect coverage, and never silently
+  changes Session or execution authority. This is still not cross-Edge
+  migration or Server Run-owner recovery.
+- The shared Artifact catalog now has an owner-scoped, content-addressed byte
+  backend with resumable chunk puts, one artifact-level upload lease, temporary
+  reachability edges, and an atomic seal verifier. Work workspace capture reads
+  a canonical basis (including the opaque bound `logical_workspace_id`) before
+  local files are collected, echoes its five expectation fields at
+  upload admission, and rejects a changed Session/Work head instead of
+  relabelling an old filesystem snapshot. A verified Work artifact read returns
+  the typed manifest and deterministic blob layout, so a second Web/TUI/Edge
+  client can discover, download, and hash the package through the HTTP/SDK
+  boundary, without the uploader's in-memory state. Local capture and installation
+  are not wired into CLI, Web, or Rust Thin Client product flows; their unused Rust
+  implementations are retired. The shared package verifier remains responsible
+  for content integrity and symlink boundaries, hashing each unique blob once. Session
+  hard-delete refuses while a
+  preparing/captured/ready Work recovery point still depends on the Session
+  provenance; the canonical Work branch-deletion operation releases those
+  points before deleting the Session, so neither ordinary Session deletion nor
+  cleanup can silently discard a saved boundary.
 - Work branch-control operations and Session handoff already implement
   authorized client-controller transfer with fencing and effect sealing. The
   Web force-takeover copy currently says `Moving this Work here`, which can be

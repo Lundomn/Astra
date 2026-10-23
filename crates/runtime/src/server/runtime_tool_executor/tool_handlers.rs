@@ -4,7 +4,6 @@ use astra_services::{OwnerScope, SessionArtifactStore};
 use astra_turn_core::tool::schema::tool_schema_name;
 use async_trait::async_trait;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use astra_tools::ToolExecutor;
@@ -15,7 +14,7 @@ use astra_tools::tool_engine::{
 
 use super::{RuntimeToolExecutor, memory_producer_id};
 use crate::server::tool_agent_info::{AgentInfoIdentity, render_agent_info};
-use crate::server::tool_agent_runtime::{execute_agent_fanout_tool, execute_agent_tool};
+use crate::server::tool_agent_runtime::execute_agent_fanout_tool;
 use crate::server::tool_database_snapshots::{execute_mo_query, rollback_database_snapshots};
 use crate::server::tool_execution_result::tool_result_from_output;
 use crate::server::tool_file_runtime::{
@@ -56,11 +55,6 @@ pub(super) fn runtime_tool_engine() -> ToolEngine<RuntimeToolExecutor> {
     register_handler_or_log!(engine, "notify", NotifyToolHandler);
     register_handler_or_log!(
         engine,
-        "submit_task_resolution",
-        SubmitTaskResolutionToolHandler
-    );
-    register_handler_or_log!(
-        engine,
         "web_search",
         DefaultExecutorToolHandler { name: "web_search" }
     );
@@ -92,12 +86,12 @@ pub(super) fn runtime_tool_engine() -> ToolEngine<RuntimeToolExecutor> {
         "propose_work_criteria",
         ProposeWorkCriteriaToolHandler
     );
-    register_handler_or_log!(engine, "agent", AgentToolHandler);
     register_handler_or_log!(engine, "agent_fanout", AgentFanoutToolHandler);
     register_handler_or_log!(engine, "ask_user", AskUserToolHandler);
     register_handler_or_log!(engine, "enter_plan_mode", EnterPlanModeToolHandler);
     register_handler_or_log!(engine, "exit_plan_mode", ExitPlanModeToolHandler);
     register_handler_or_log!(engine, "introspect", IntrospectToolHandler);
+    register_handler_or_log!(engine, "model_catalog", ModelCatalogToolHandler);
     register_handler_or_log!(engine, "reflect", ReflectToolHandler);
     register_handler_or_log!(engine, "compress_context", CompressContextToolHandler);
     register_handler_or_log!(
@@ -234,80 +228,6 @@ impl ToolHandler<RuntimeToolExecutor> for SettleWorkItemToolHandler {
 #[derive(Debug, Clone, Copy, Default)]
 struct GetAgentInfoToolHandler;
 
-struct SubmitTaskResolutionToolHandler;
-
-#[async_trait]
-impl ToolHandler<RuntimeToolExecutor> for SubmitTaskResolutionToolHandler {
-    async fn execute(
-        &self,
-        context: &RuntimeToolExecutor,
-        args: &Value,
-        cancel: Option<&CancellationToken>,
-    ) -> astra_tools::ToolResult {
-        self.execute_invocation(context, args, ToolInvocationMetadata::default(), cancel)
-            .await
-    }
-
-    async fn execute_invocation(
-        &self,
-        _context: &RuntimeToolExecutor,
-        args: &Value,
-        invocation: ToolInvocationMetadata<'_>,
-        cancel: Option<&CancellationToken>,
-    ) -> astra_tools::ToolResult {
-        let reject = |reason: &str| astra_tools::ToolResult {
-            output: serde_json::json!({"status": "rejected", "reason": reason}).to_string(),
-            is_error: true,
-            exit_semantics: None,
-            metadata: Some(serde_json::Map::from_iter([
-                ("disposition".into(), serde_json::json!("rejected")),
-                ("execution_started".into(), serde_json::json!(false)),
-            ])),
-        };
-        if cancel.is_some_and(CancellationToken::is_cancelled) {
-            return astra_tools::cancelled_tool_result("submit_task_resolution", false);
-        }
-        let (Some(authority), Some(call_id), Some(chain_id)) = (
-            invocation.task_resolution_authority,
-            invocation.tool_call_id,
-            invocation.turn_chain_id,
-        ) else {
-            return reject("No active reconciliation authority for this invocation");
-        };
-        if authority.for_call(call_id).is_none() {
-            return reject("Reconciliation authority does not match this invocation");
-        }
-        let boundary_id = authority.boundary_id();
-        let Ok(proposal) = serde_json::from_value::<
-            astra_turn_types::task_resolution::TaskResolutionProposal,
-        >(args.clone()) else {
-            return reject("Invalid structured task assessment");
-        };
-        let assessment = astra_turn_types::task_resolution::TaskResolutionAssessment {
-            scope: chain_id.to_owned(),
-            boundary_id: boundary_id.to_owned(),
-            verification_target: proposal.verification_target,
-            failed_call_ids: proposal.failed_call_ids,
-            evidence_call_ids: proposal.evidence_call_ids,
-            conclusion: proposal.conclusion,
-            rationale: proposal.rationale,
-            remaining_gaps: proposal.remaining_gaps,
-        };
-        if let Err(error) = astra_turn_core::evaluation::task_resolution::validate_assessment_header(
-            &assessment,
-            chain_id,
-            boundary_id,
-        ) {
-            return reject(&error.to_string());
-        }
-        // Echo the typed proposal, not an acceptance or success receipt. The
-        // shared loop validates durable evidence before retaining an assessment.
-        astra_tools::ToolResult::text(
-            serde_json::to_string(&assessment).expect("typed assessment serializes"),
-        )
-    }
-}
-
 #[async_trait]
 impl ToolHandler<RuntimeToolExecutor> for GetAgentInfoToolHandler {
     async fn execute(
@@ -345,9 +265,9 @@ impl ToolHandler<RuntimeToolExecutor> for ToolSearchToolHandler {
         _cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
         let pool = context.current_tool_search_pool_schemas();
-        let output = astra_tools::tool_search::tool_search(&pool, args);
+        let result = astra_tools::tool_search::tool_search_result(&pool, args);
         if let Some(query) = args.get("query").and_then(Value::as_str) {
-            let selected = serde_json::from_str::<Value>(&output).ok();
+            let selected = serde_json::from_str::<Value>(&result.output).ok();
             let selected_digests = selected
                 .as_ref()
                 .and_then(|value| value.get("matches"))
@@ -372,83 +292,12 @@ impl ToolHandler<RuntimeToolExecutor> for ToolSearchToolHandler {
                 "deferred discovery contract selected"
             );
         }
-        tool_result_from_output(output)
+        result
     }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct MemoryToolHandler;
-
-/// Build executor-owned evidence for a successful mutation in the external
-/// Memoria service.  Filesystem fingerprinting cannot observe a database
-/// mutation, so this typed handler records a narrow action-specific receipt
-/// instead.  The receipt is only projected after the structured backend
-/// response proves a positive effect; assistant text, tool names, and exit
-/// status are never used as evidence.
-fn memory_external_mutation_receipt(
-    action: astra_tools::memory_tool_contract::MemoryAction,
-    args: &Value,
-    output: &str,
-) -> Option<serde_json::Map<String, Value>> {
-    let response = serde_json::from_str::<Value>(output).ok()?;
-    let successful_effect = match action {
-        astra_tools::memory_tool_contract::MemoryAction::Remember => response
-            .get("memory_id")
-            .and_then(Value::as_str)
-            .is_some_and(|id| !id.trim().is_empty()),
-        astra_tools::memory_tool_contract::MemoryAction::Forget => response
-            .get("purged")
-            .or_else(|| response.get("deleted_count"))
-            .and_then(Value::as_u64)
-            .is_some_and(|count| count > 0),
-        astra_tools::memory_tool_contract::MemoryAction::Update
-        | astra_tools::memory_tool_contract::MemoryAction::Feedback => {
-            let status = response.get("status").and_then(Value::as_str);
-            status.is_some_and(|status| {
-                matches!(
-                    status.trim().to_ascii_lowercase().as_str(),
-                    "completed" | "complete" | "ok" | "success" | "successful"
-                )
-            }) || response
-                .get("memory_id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| !id.trim().is_empty())
-        }
-        _ => false,
-    };
-    if !successful_effect {
-        return None;
-    }
-
-    let operation_digest = format!(
-        "{:x}",
-        Sha256::digest(astra_core::canonical_json_string(args))
-    );
-    let scope = astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE;
-    Some(serde_json::Map::from_iter([
-        (
-            astra_tools::workspace_observation::EXTERNAL_EFFECT_OBSERVED_FIELD.to_string(),
-            Value::Bool(true),
-        ),
-        (
-            astra_tools::workspace_observation::EXTERNAL_EFFECT_SCOPE_FIELD.to_string(),
-            Value::String(scope.to_string()),
-        ),
-        (
-            astra_tools::workspace_observation::EXTERNAL_EFFECT_RECEIPT_FIELD.to_string(),
-            serde_json::json!({
-                "schema": "external_effect_receipt.v1",
-                "source": "typed_external_tool",
-                "scope": scope,
-                "changed": true,
-                "ownership": astra_tools::workspace_observation::TYPED_EXTERNAL_TOOL_OWNERSHIP,
-                "tool": "memory",
-                "action": action.as_str(),
-                "operation_digest": operation_digest,
-            }),
-        ),
-    ]))
-}
 
 impl MemoryToolHandler {
     async fn execute_for_producer(
@@ -515,20 +364,11 @@ impl MemoryToolHandler {
             .memoria_client
             .call(action.as_str(), &isolated_args)
             .await;
-        let mut result = if astra_tools::memoria::memoria_output_is_error(&output) {
+        if astra_tools::memoria::memoria_output_is_error(&output) {
             astra_tools::ToolResult::error(output)
         } else {
             astra_tools::ToolResult::text(output)
-        };
-        if !result.is_error
-            && let Some(receipt) = memory_external_mutation_receipt(action, args, &result.output)
-        {
-            result
-                .metadata
-                .get_or_insert_with(Default::default)
-                .extend(receipt);
         }
-        result
     }
 }
 
@@ -668,47 +508,6 @@ impl ToolHandler<RuntimeToolExecutor> for ProposeWorkCriteriaToolHandler {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct AgentToolHandler;
-
-#[async_trait]
-impl ToolHandler<RuntimeToolExecutor> for AgentToolHandler {
-    async fn execute(
-        &self,
-        context: &RuntimeToolExecutor,
-        args: &Value,
-        cancel_token: Option<&CancellationToken>,
-    ) -> astra_tools::ToolResult {
-        self.execute_invocation(
-            context,
-            args,
-            ToolInvocationMetadata::default(),
-            cancel_token,
-        )
-        .await
-    }
-
-    async fn execute_invocation(
-        &self,
-        context: &RuntimeToolExecutor,
-        args: &Value,
-        invocation: ToolInvocationMetadata<'_>,
-        cancel_token: Option<&CancellationToken>,
-    ) -> astra_tools::ToolResult {
-        // P2-C: Cooperative cancellation check at heavy handler entry
-        if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::cancelled_tool_result("agent", false);
-        }
-        execute_agent_tool(
-            &context.default_executor,
-            context.agent_tool_context.as_ref(),
-            args,
-            invocation.tool_call_id,
-        )
-        .await
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
 struct AgentFanoutToolHandler;
 
 #[async_trait]
@@ -740,9 +539,10 @@ impl ToolHandler<RuntimeToolExecutor> for AgentFanoutToolHandler {
             return astra_tools::cancelled_tool_result("agent_fanout", false);
         }
         execute_agent_fanout_tool(
-            context.agent_tool_context.as_ref(),
+            context.agent_tool_context_snapshot().as_ref(),
             args,
             invocation.tool_call_id,
+            invocation.delegation_model_admission,
         )
         .await
     }
@@ -797,6 +597,18 @@ impl ToolHandler<RuntimeToolExecutor> for EnterPlanModeToolHandler {
     }
 }
 
+fn plan_review_request_id(session_id: &str, invocation_id: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    match invocation_id {
+        Some(id) => {
+            let identity =
+                serde_json::to_vec(&(session_id, id)).expect("string tuple serialization");
+            format!("plan-review:{:x}", Sha256::digest(identity))
+        }
+        None => format!("plan-review:{}", uuid::Uuid::new_v4()),
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct ExitPlanModeToolHandler;
 
@@ -837,22 +649,31 @@ impl ToolHandler<RuntimeToolExecutor> for ExitPlanModeToolHandler {
                 context.plan_resume_hint_handle.as_ref(),
                 context.plan_authoring_active_handle.as_ref(),
                 context.approval_gate.as_deref(),
-                &invocation
-                    .tool_call_id
-                    .map(|tool_call_id| {
-                        format!("plan-review:{}:{tool_call_id}", context.session_id)
-                    })
-                    .unwrap_or_else(|| {
-                        format!(
-                            "plan-review:{}:{}",
-                            context.session_id,
-                            uuid::Uuid::new_v4()
-                        )
-                    }),
+                &plan_review_request_id(&context.session_id, invocation.tool_call_id),
                 args,
             )
             .await,
         )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ModelCatalogToolHandler;
+
+#[async_trait]
+impl ToolHandler<RuntimeToolExecutor> for ModelCatalogToolHandler {
+    async fn execute(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        crate::server::tool_model_catalog::handle_model_catalog(
+            args,
+            &context.user_id,
+            context.model_catalog_reader.as_ref(),
+        )
+        .await
     }
 }
 
@@ -867,7 +688,53 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
         args: &Value,
         _cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        if args.get("explain").is_some() {
+            let Some((engine, root)) = context.explain_root.as_ref() else {
+                return astra_tools::ToolResult::error(
+                    "Explain discovery requires a server root execution context".to_string(),
+                );
+            };
+            return match crate::server::explain_analyze_artifact::resolve_selector(
+                context.context_manifest_pool.as_ref(),
+                context.session_artifact_store.as_deref(),
+                engine,
+                &context.user_id,
+                &context.session_id,
+                root,
+                args,
+            )
+            .await
+            {
+                Ok(output) => {
+                    tool_result_from_output(output).with_source_bounded_model_projection()
+                }
+                Err(error) => astra_tools::ToolResult::error(format!("Error: {error}"))
+                    .with_source_bounded_model_projection(),
+            };
+        }
         if args.get("artifact").is_some() {
+            if args
+                .get("artifact")
+                .and_then(Value::as_str)
+                .is_some_and(|handle| {
+                    handle.starts_with(astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX)
+                })
+            {
+                return match crate::server::context_history_artifact::resolve_request(
+                    context.session_artifact_store.as_deref(),
+                    &context.user_id,
+                    &context.session_id,
+                    args,
+                )
+                .await
+                {
+                    Ok(output) => {
+                        tool_result_from_output(output).with_source_bounded_model_projection()
+                    }
+                    Err(error) => astra_tools::ToolResult::error(format!("Error: {error}"))
+                        .with_source_bounded_model_projection(),
+                };
+            }
             // Explain Analyze snapshots are owned by the server run/session
             // store.  Resolve this typed handle before the legacy local
             // tool-result reader; a client-local Explain path/handle must
@@ -933,6 +800,70 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
             &context.introspect_snapshot,
             context.journal_turn_index.load(Ordering::Acquire),
         );
+        let request = astra_turn_core::introspect::IntrospectRequest::from_args(args);
+        // Refresh only this request's projection; never retain stale ledger
+        // facts in the shared round snapshot or add them to primary usage.
+        snapshot.judgment_usage = None;
+        snapshot.semantic_judgments = None;
+        if astra_services::semantic_judgment_observation::semantic_judgment_facet_enabled(
+            request.facet,
+        ) {
+            use astra_turn_core::introspect::{JudgmentUsageCoverage, JudgmentUsageSnapshot};
+            let include_semantic_execution = matches!(
+                request.depth,
+                astra_core::ObservationDepth::Diagnostic | astra_core::ObservationDepth::Forensic
+            );
+            let (usage_capture, mut semantics) = tokio::join!(
+                async {
+                    if matches!(
+                        request.source_policy,
+                        astra_core::SourcePolicy::LiveOnly | astra_core::SourcePolicy::LocalOnly
+                    ) {
+                        Err(JudgmentUsageCoverage::SourceExcluded)
+                    } else {
+                        load_introspect_judgment_usage_capture(
+                            context.context_manifest_pool.as_ref(),
+                            &context.user_id,
+                            &context.session_id,
+                            include_semantic_execution,
+                        )
+                        .await
+                    }
+                },
+                astra_services::semantic_judgment_observation::load_semantic_judgment_view(
+                    context.context_manifest_pool.as_ref(),
+                    &context.user_id,
+                    &context.session_id,
+                    request.source_policy,
+                    request.depth,
+                ),
+            );
+            let usage = match &usage_capture {
+                Ok(capture) => JudgmentUsageSnapshot::from_ledger(capture.facts.clone()),
+                Err(coverage) => JudgmentUsageSnapshot::unavailable(*coverage),
+            };
+            if include_semantic_execution {
+                match usage_capture.as_ref() {
+                    Ok(capture) => {
+                        if semantics.counts.is_some() {
+                            astra_services::semantic_judgment_observation::apply_semantic_execution_capture(
+                                &mut semantics,
+                                capture,
+                                &context.session_id,
+                            );
+                        }
+                    }
+                    Err(coverage) => {
+                        astra_services::semantic_judgment_observation::mark_execution_lookup_unavailable(
+                            &mut semantics,
+                            semantic_execution_coverage_for_usage(*coverage),
+                        );
+                    }
+                }
+            }
+            snapshot.judgment_usage = Some(usage);
+            snapshot.semantic_judgments = Some(semantics);
+        }
         let run_id = args
             .get("_run_id")
             .or_else(|| args.get("run_id"))
@@ -990,6 +921,58 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
         }
         tool_result_from_output(render_introspect_snapshot(args, &snapshot))
             .with_native_recovery_model_projection()
+    }
+}
+
+async fn load_introspect_judgment_usage_capture(
+    pool: Option<&astra_core::SharedPool>,
+    user_id: &str,
+    session_id: &str,
+    include_execution: bool,
+) -> Result<
+    astra_services::inference_execution::SessionAuxiliaryUsageCapture,
+    astra_turn_core::introspect::JudgmentUsageCoverage,
+> {
+    let Some(pool) = pool else {
+        return Err(astra_turn_core::introspect::JudgmentUsageCoverage::NoPool);
+    };
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        astra_services::inference_execution::load_session_auxiliary_capture(
+            pool,
+            user_id,
+            session_id,
+            128,
+            include_execution,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(capture)) => Ok(capture),
+        Ok(Err(_)) => Err(astra_turn_core::introspect::JudgmentUsageCoverage::QueryFailed),
+        Err(_) => Err(astra_turn_core::introspect::JudgmentUsageCoverage::Timeout),
+    }
+}
+
+fn semantic_execution_coverage_for_usage(
+    coverage: astra_turn_core::introspect::JudgmentUsageCoverage,
+) -> astra_services::semantic_judgment_observation::SemanticJudgmentExecutionCoverage {
+    use astra_services::semantic_judgment_observation::SemanticJudgmentExecutionCoverage;
+    use astra_turn_core::introspect::JudgmentUsageCoverage;
+    match coverage {
+        JudgmentUsageCoverage::NoPool => SemanticJudgmentExecutionCoverage::NoPool,
+        JudgmentUsageCoverage::Timeout => SemanticJudgmentExecutionCoverage::Timeout,
+        JudgmentUsageCoverage::QueryFailed => SemanticJudgmentExecutionCoverage::QueryFailed,
+        JudgmentUsageCoverage::SourceExcluded => SemanticJudgmentExecutionCoverage::SourceExcluded,
+        JudgmentUsageCoverage::LedgerUnavailable
+        | JudgmentUsageCoverage::LocalCaptureUnavailable => {
+            SemanticJudgmentExecutionCoverage::SourceUnavailable
+        }
+        JudgmentUsageCoverage::Available
+        | JudgmentUsageCoverage::CaptureTruncated
+        | JudgmentUsageCoverage::NotObserved => {
+            SemanticJudgmentExecutionCoverage::SourceUnavailable
+        }
     }
 }
 
@@ -1163,20 +1146,15 @@ impl ToolHandler<RuntimeToolExecutor> for DefaultExecutorToolHandler {
             .map(|(run_id, turn_chain_id)| {
                 format!("{}:{run_id}:{turn_chain_id}", context.session_id)
             });
-        let Some(authority) = authority else {
-            return context
-                .default_executor
-                .execute_with_cancel(self.name, args, cancel_token)
-                .await;
-        };
         context
             .default_executor
             .execute_with_workspace_convergence_authority(
                 self.name,
                 args,
                 &context.convergence_tracker,
-                &authority,
+                authority.as_deref(),
                 cancel_token,
+                invocation.admission_deadline,
             )
             .await
     }
@@ -1241,9 +1219,9 @@ impl ToolHandler<RuntimeToolExecutor> for StrReplaceToolHandler {
         if cancel_token.is_some_and(CancellationToken::is_cancelled) {
             return astra_tools::cancelled_tool_result("str_replace", false);
         }
-        let args = match astra_tools::fs_ops::normalize_str_replace_args(args) {
+        let args = match astra_tools::fs_ops::normalize_str_replace_invocation_args(args) {
             Ok(args) => args,
-            Err(error) => return tool_result_from_output(error),
+            Err(error) => return error,
         };
         let turn_index = context.journal_turn_index.load(Ordering::Relaxed);
         if args
@@ -1449,6 +1427,7 @@ impl ToolHandler<RuntimeToolExecutor> for MoQueryToolHandler {
             context.database_snapshot_journal.as_ref(),
             args,
             context.journal_turn_index.load(Ordering::Relaxed),
+            cancel_token,
         )
     }
 }
@@ -1538,17 +1517,145 @@ impl DynamicToolHandler<RuntimeToolExecutor> for McpToolHandler {
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
             return astra_tools::cancelled_tool_result(name, false);
         }
-        context.execute_mcp_tool(name, args, None, None).await
+        let mut request = context.tool_execution_request(name, args);
+        // This adapter has no trusted invocation identity. Preserve its
+        // fail-closed Agent Binding behavior instead of promoting an identity
+        // carried in provider-authored arguments.
+        request.tool_call_id.clear();
+        context.execute_mcp_tool(&request, None, cancel_token).await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plan_review_ids_are_bounded_and_invocation_scoped() {
+        let session = "long-session:".repeat(128);
+        for id in ["a".repeat(64), "native:".repeat(1024)] {
+            let review = super::plan_review_request_id(&session, Some(&id));
+            assert_eq!(review.len(), 76);
+            assert_eq!(super::plan_review_request_id(&session, Some(&id)), review);
+            assert_ne!(
+                super::plan_review_request_id("another-session", Some(&id)),
+                review
+            );
+            assert_ne!(
+                super::plan_review_request_id(&session, Some(&(id + ":next"))),
+                review
+            );
+        }
+        assert_ne!(
+            super::plan_review_request_id("a:b", Some("c")),
+            super::plan_review_request_id("a", Some("b:c"))
+        );
+        let first = super::plan_review_request_id(&session, None);
+        let second = super::plan_review_request_id(&session, None);
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 48);
+        assert!(uuid::Uuid::parse_str(first.strip_prefix("plan-review:").unwrap()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn dynamic_mcp_adapter_does_not_promote_argument_call_identity() {
+        use astra_tools::tool_engine::DynamicToolHandler;
+        let root = tempfile::tempdir().unwrap();
+        let mut executor = super::RuntimeToolExecutor::new(
+            root.path().to_path_buf(),
+            "user".into(),
+            "session".into(),
+            None,
+            None,
+        );
+        executor.set_agent_binding_mcp(std::sync::Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "tools",
+                &["mcp__tools__query"],
+            ),
+        ));
+        let result = super::McpToolHandler
+            .execute(
+                "mcp__tools__query",
+                &executor,
+                &serde_json::json!({"_tool_call_id": "untrusted"}),
+                None,
+            )
+            .await;
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result
+                .output
+                .contains("missing its trusted tool call identity"),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_adapter_retains_cutoff_without_convergence_identity() {
+        use astra_tools::tool_engine::{ToolHandler, ToolInvocationMetadata};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("answer.txt"), "read only before expiry").unwrap();
+        let executor = super::RuntimeToolExecutor::new(
+            root.path().to_path_buf(),
+            "user".into(),
+            "session".into(),
+            None,
+            None,
+        );
+        let handler = super::DefaultExecutorToolHandler { name: "read_file" };
+        for (has_identity, expired) in [(false, true), (true, true), (false, false)] {
+            let now = tokio::time::Instant::now().into_std();
+            let result = handler
+                .execute_invocation(
+                    &executor,
+                    &serde_json::json!({"path": "answer.txt"}),
+                    ToolInvocationMetadata {
+                        admission_deadline: Some(if expired {
+                            now
+                        } else {
+                            now + std::time::Duration::from_secs(10)
+                        }),
+                        run_id: has_identity.then_some("run"),
+                        turn_chain_id: has_identity.then_some("turn"),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await;
+            if expired {
+                assert_eq!(
+                    result.metadata.as_ref().unwrap()["execution_started"],
+                    false
+                );
+                assert!(!result.output.contains("read only before expiry"));
+            } else {
+                assert!(!result.is_error, "{result:?}");
+                assert!(result.output.contains("read only before expiry"));
+            }
+        }
+    }
+
     use super::*;
 
     #[tokio::test]
-    async fn task_resolution_submission_requires_exact_local_authority() {
-        use astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority;
+    async fn introspect_judgment_usage_capture_errors_keep_typed_coverage() {
+        use astra_turn_core::introspect::JudgmentUsageCoverage;
+        assert_eq!(
+            load_introspect_judgment_usage_capture(None, "owner", "session", false).await,
+            Err(JudgmentUsageCoverage::NoPool)
+        );
+        assert_eq!(
+            semantic_execution_coverage_for_usage(JudgmentUsageCoverage::Timeout),
+            astra_services::semantic_judgment_observation::SemanticJudgmentExecutionCoverage::Timeout
+        );
+        assert_eq!(
+            semantic_execution_coverage_for_usage(JudgmentUsageCoverage::QueryFailed),
+            astra_services::semantic_judgment_observation::SemanticJudgmentExecutionCoverage::QueryFailed
+        );
+    }
+
+    #[tokio::test]
+    async fn introspect_judgment_usage_no_pool_keeps_tool_successful_and_source_exclusion_explicit()
+    {
         let dir = tempfile::tempdir().unwrap();
         let executor = RuntimeToolExecutor::new(
             dir.path().to_path_buf(),
@@ -1557,63 +1664,47 @@ mod tests {
             None,
             None,
         );
-        let args = serde_json::json!({
-            "verification_target": "artifact",
-            "failed_call_ids": ["failed"], "evidence_call_ids": [],
-            "conclusion": "unknown", "rationale": "No later verification", "remaining_gaps": ["verify artifact"]
-        });
-        let handler = SubmitTaskResolutionToolHandler;
-        let denied = handler.execute(&executor, &args, None).await;
-        assert!(denied.is_error);
-        assert_eq!(denied.metadata.unwrap()["execution_started"], false);
-        let authority =
-            TaskResolutionSubmissionAuthority::for_admitted_call("boundary", "call").unwrap();
-        let metadata = ToolInvocationMetadata {
-            tool_call_id: Some("call"),
-            turn_chain_id: Some("chain"),
-            task_resolution_authority: Some(&authority),
-            ..Default::default()
-        };
-        let accepted = handler
-            .execute_invocation(&executor, &args, metadata, None)
-            .await;
-        assert!(!accepted.is_error);
-        let mut expected = args.clone();
-        expected["scope"] = serde_json::json!("chain");
-        expected["boundary_id"] = serde_json::json!("boundary");
-        assert_eq!(
-            serde_json::from_str::<Value>(&accepted.output).unwrap(),
-            expected
-        );
-        // A successful submission preserves unknown; it is not a success receipt.
-        for (field, value) in [("scope", "other-chain"), ("boundary_id", "stale")] {
-            let mut invalid = args.clone();
-            invalid[field] = serde_json::json!(value);
+        for (policy, expected) in [
+            ("auto", "no_pool"),
+            ("live_only", "source_excluded"),
+            ("local_only", "source_excluded"),
+        ] {
+            let result = IntrospectToolHandler
+                .execute(
+                    &executor,
+                    &serde_json::json!({
+                        "format":"json", "source_policy":policy,
+                    }),
+                    None,
+                )
+                .await;
+            assert!(!result.is_error);
+            let report: Value = serde_json::from_str(&result.output).unwrap();
+            assert_eq!(report["judgment_usage"]["coverage"], expected);
+            assert!(report["judgment_usage"]["observed_attempts"].is_null());
+            assert_eq!(report["semantic_judgments"]["coverage"], expected);
+            assert!(report["semantic_judgments"]["counts"].is_null());
+            assert!(report["semantic_judgments"].get("model_adoption").is_none());
             assert!(
-                handler
-                    .execute_invocation(&executor, &invalid, metadata, None)
-                    .await
-                    .is_error
+                report.get("tool_result_judgments").is_none(),
+                "retired selector evidence must not be projected"
             );
+
+            let trace = IntrospectToolHandler
+                .execute(
+                    &executor,
+                    &serde_json::json!({
+                        "format":"json", "facet":"trace", "source_policy":policy,
+                    }),
+                    None,
+                )
+                .await;
+            assert!(!trace.is_error);
+            let trace_report: Value = serde_json::from_str(&trace.output).unwrap();
+            assert_eq!(trace_report["judgment_usage"]["coverage"], expected);
+            assert_eq!(trace_report["semantic_judgments"]["coverage"], expected);
+            assert!(trace_report.get("tool_result_judgments").is_none());
         }
-        let sibling = ToolInvocationMetadata {
-            tool_call_id: Some("sibling"),
-            ..metadata
-        };
-        assert!(
-            handler
-                .execute_invocation(&executor, &args, sibling, None)
-                .await
-                .is_error
-        );
-        let cancelled = CancellationToken::new();
-        cancelled.cancel();
-        assert!(
-            handler
-                .execute_invocation(&executor, &args, metadata, Some(&cancelled))
-                .await
-                .is_error
-        );
     }
 
     #[test]
@@ -1647,57 +1738,5 @@ mod tests {
                 "server-specific wrapper `{wrapped}` must still have a runtime handler"
             );
         }
-    }
-
-    #[test]
-    fn memory_receipt_requires_positive_structured_effect() {
-        let remember_args = serde_json::json!({
-            "action": "remember",
-            "content": "opaque test content",
-            "memory_type": "working",
-        });
-        let fields = memory_external_mutation_receipt(
-            astra_tools::memory_tool_contract::MemoryAction::Remember,
-            &remember_args,
-            r#"{"memory_id":"m-1","is_active":true}"#,
-        )
-        .expect("remember identity is an executor-owned positive receipt");
-        let receipt = fields
-            .get(astra_tools::workspace_observation::EXTERNAL_EFFECT_RECEIPT_FIELD)
-            .expect("external receipt")
-            .clone();
-        assert!(
-            astra_tools::workspace_observation::is_authoritative_external_effect_receipt(&receipt)
-        );
-        assert_eq!(receipt["action"], "remember");
-        assert_eq!(receipt["tool"], "memory");
-        assert!(receipt["operation_digest"].as_str().is_some_and(|digest| {
-            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-        }));
-
-        assert!(
-            memory_external_mutation_receipt(
-                astra_tools::memory_tool_contract::MemoryAction::Remember,
-                &remember_args,
-                "memory stored, m-1",
-            )
-            .is_none()
-        );
-        assert!(
-            memory_external_mutation_receipt(
-                astra_tools::memory_tool_contract::MemoryAction::Forget,
-                &serde_json::json!({"action":"forget", "memory_id":"m-1"}),
-                r#"{"purged":0}"#,
-            )
-            .is_none()
-        );
-        assert!(
-            memory_external_mutation_receipt(
-                astra_tools::memory_tool_contract::MemoryAction::Update,
-                &serde_json::json!({"action":"update", "memory_id":"m-1"}),
-                r#"{"status":"failed"}"#,
-            )
-            .is_none()
-        );
     }
 }

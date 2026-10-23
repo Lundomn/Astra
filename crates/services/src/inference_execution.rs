@@ -7,9 +7,10 @@ use sqlx::{Acquire, Row};
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
 
 use crate::model_request_context::{
-    MODEL_REQUEST_CONTEXT_SCHEMA, ModelRequestContextEvent, ModelRequestContextScope,
-    ModelRequestContextSeed, ModelRequestEventStage, ModelRequestIdentity, ModelRequestTopology,
-    ModelRequestUsage, ModelRequestWireComposition, compact_model_request_context_scope,
+    MODEL_REQUEST_CONTEXT_SCHEMA, MODEL_REQUEST_TERMINAL_SCHEMA, ModelRequestContextEvent,
+    ModelRequestContextSeed, ModelRequestEventStage, ModelRequestIdentity, ModelRequestRoute,
+    ModelRequestTerminalFact, ModelRequestTopology, ModelRequestUsage, ModelRequestWireComposition,
+    clear_model_request_measured_usage, compact_model_request_context_scope,
 };
 use crate::models::{ModelAccessKind, ModelExecutionPlacement, validate_model_offering_id};
 use crate::service_error::{ServiceError, ServiceErrorKind, ServiceResult};
@@ -22,7 +23,7 @@ pub struct InferenceInvocationInput {
     pub scope: InferenceInvocationScope,
     /// Exact durable execution capability for a run-scoped invocation.
     ///
-    /// Session/harness work has its own owner boundary and must leave this
+    /// Session work has its own owner boundary and must leave this
     /// empty. A run-scoped provider admission is executable only while all of
     /// these immutable facts still match in the same transaction that inserts
     /// the invocation row.
@@ -56,12 +57,16 @@ pub struct InferenceInvocationPlan {
     owner_token: String,
     owner_generation: u64,
     input: InferenceInvocationInput,
+    // Serialized once from validated admission material. Pricing is evidence,
+    // not part of invocation identity: a catalog update cannot authorize replay.
+    price_snapshot_json: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct InferenceProviderAttemptPlan {
     attempt_id: String,
     invocation_id: String,
+    route_id: String,
     user_id: String,
     attempt_index: u32,
     provider: String,
@@ -108,6 +113,32 @@ pub struct InferenceProviderWireIdentity {
 }
 
 impl InferenceInvocationPlan {
+    /// Offline verification observes the exact admitted run authority without
+    /// exposing opaque admission or owner tokens.
+    #[cfg(feature = "e2e-hooks")]
+    pub fn e2e_admission_coordinates(
+        &self,
+    ) -> (
+        astra_turn_types::InferenceInvocationScope,
+        Option<InferenceRunAdmissionAuthority>,
+    ) {
+        (self.input.scope.clone(), self.input.run_authority.clone())
+    }
+
+    pub fn with_price_snapshot(
+        mut self,
+        snapshot: Option<&crate::models::InferencePriceSnapshot>,
+    ) -> ServiceResult<Self> {
+        self.price_snapshot_json =
+            snapshot
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| {
+                    ServiceError::invalid(format!("serialize inference price: {error}"))
+                })?;
+        Ok(self)
+    }
+
     #[must_use]
     pub fn route_id(&self) -> &str {
         &self.route_id
@@ -267,7 +298,7 @@ impl InferenceProviderWireIdentity {
         let protocol = protocol.into();
         if !matches!(
             protocol.as_str(),
-            "openai_compatible" | "anthropic_messages" | "bedrock_converse"
+            "openai_compatible" | "anthropic_messages" | "bedrock_converse" | "typesafe_systemone"
         ) {
             return Err(ServiceError::invalid(
                 "provider_protocol must be one of the typed transport protocols",
@@ -406,19 +437,14 @@ pub enum InferenceProviderDeliveryState {
 /// the database acknowledgement.
 ///
 /// Resolution is performed while holding the same durable scope locks as the
-/// original admission transaction, so `Absent` cannot race a late commit.
+/// original admission transaction, so confirmed absence cannot race a late
+/// commit. Scope authority is returned separately from this settlement fact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InferenceInvocationAdmissionResolution {
-    /// The old admission is absent or closed; apply guidance before new work.
-    GuidancePending,
     Settled,
     ExactTerminal,
     ConflictingIdentity,
     ScopeUnavailable,
-    /// The exact ambiguous identity was conclusively closed, but the caller's
-    /// run generation/owner/lease/control capability is no longer live. The
-    /// caller must not create a replacement logical attempt.
-    AuthorityLost,
 }
 
 /// Authoritative result of projecting one exact durable settlement decision.
@@ -508,9 +534,6 @@ pub fn plan_inference_invocation(
     if let Some(run_id) = input.scope.run_id() {
         validate_identity(run_id, "run_id", 64)?;
     }
-    if let Some(harness_run_id) = input.scope.harness_run_id() {
-        validate_identity(harness_run_id, "harness_run_id", 128)?;
-    }
     validate_identity(input.scope.operation_id(), "operation_id", 64)?;
     match (&input.scope, &input.run_authority) {
         (InferenceInvocationScope::Run { .. }, Some(authority)) => {
@@ -535,7 +558,7 @@ pub fn plan_inference_invocation(
         }
         (_, Some(_)) => {
             return Err(ServiceError::invalid(
-                "run execution authority cannot cross a session or harness scope",
+                "run execution authority cannot cross a session scope",
             ));
         }
         (_, None) => {}
@@ -557,7 +580,6 @@ pub fn plan_inference_invocation(
         input.scope.kind(),
         input.scope.session_id().unwrap_or(""),
         input.scope.run_id().unwrap_or(""),
-        input.scope.harness_run_id().unwrap_or(""),
         turn.as_deref().unwrap_or(""),
         round.as_deref().unwrap_or(""),
         input.scope.operation_id(),
@@ -579,14 +601,13 @@ pub fn plan_inference_invocation(
         owner_token: new_admission_token(),
         owner_generation: 1,
         input,
+        price_snapshot_json: None,
     })
 }
 
-/// Return the first unused two-attempt allocation after durable history for
-/// one exact logical operation. `N` is the requested identity and `N + 1` is
-/// reserved for the single foreground ambiguity recovery. This is a cursor
-/// read, not provider authority: concurrent callers are still serialized by
-/// the unique invocation identity at admission and losers must re-read.
+/// First unused two-attempt allocation for one exact logical operation.
+/// Concurrent callers remain fenced by unique invocation identity at admission;
+/// a losing caller must re-read this cursor.
 pub async fn next_inference_logical_attempt_pair_base(
     pool: &SharedPool,
     input: &InferenceInvocationInput,
@@ -601,7 +622,6 @@ pub async fn next_inference_logical_attempt_pair_base(
            AND scope_kind = ?
            AND session_id <=> ?
            AND run_id <=> ?
-           AND harness_run_id <=> ?
            AND turn_index <=> ?
            AND round_index <=> ?
            AND operation_id = ?
@@ -611,7 +631,6 @@ pub async fn next_inference_logical_attempt_pair_base(
     .bind(input.scope.kind())
     .bind(input.scope.session_id())
     .bind(input.scope.run_id())
-    .bind(input.scope.harness_run_id())
     .bind(input.scope.turn().map(i64::from))
     .bind(input.scope.round().map(i64::from))
     .bind(input.scope.operation_id())
@@ -682,6 +701,7 @@ pub fn plan_inference_provider_attempt_with_context(
             ],
         ),
         invocation_id: invocation.invocation_id.clone(),
+        route_id: invocation.route_id.clone(),
         user_id: invocation.input.user_id.clone(),
         attempt_index,
         provider: invocation.input.provider.clone(),
@@ -734,60 +754,24 @@ fn model_request_metric_shard(attempt_id: &str) -> i16 {
     i16::from(Sha256::digest(attempt_id.as_bytes())[0] % 64)
 }
 
-fn model_request_event(
+fn model_request_accepted_event(
     attempt: &InferenceProviderAttemptPlan,
-    stage: ModelRequestEventStage,
-    terminal: Option<&InferenceInvocationTerminal>,
 ) -> ServiceResult<(String, String, ModelRequestContextEvent)> {
-    if matches!(
-        (stage, terminal),
-        (ModelRequestEventStage::Accepted, Some(_)) | (ModelRequestEventStage::Terminal, None)
-    ) {
-        return Err(ServiceError::internal(
-            "model request accepted events cannot carry terminals and terminal events require one",
-        ));
-    }
-    let mut budget = attempt.request_context.budget.clone();
-    let usage = terminal.map(|terminal| {
-        let measured = terminal.usage.input.total_input_tokens();
-        budget.measured_input_tokens = Some(measured);
-        budget.usage_source = Some("provider_terminal".to_string());
-        if let Some(estimated) = budget.estimated_input_tokens {
-            let error = i128::from(measured) - i128::from(estimated);
-            budget.estimate_error_tokens =
-                Some(i64::try_from(error).unwrap_or(if error.is_negative() {
-                    i64::MIN
-                } else {
-                    i64::MAX
-                }));
-            budget.estimate_error_ratio =
-                (estimated > 0).then_some(error as f64 / estimated as f64);
-        }
-        ModelRequestUsage {
-            input: terminal.usage.input,
-            output_tokens: terminal.usage.output_tokens,
-        }
-    });
-    let mut cache = attempt.request_context.cache.clone();
-    if let Some(usage) = usage.as_ref() {
-        let total_input_tokens = usage.total_input_tokens();
-        cache.cache_read_share = (total_input_tokens > 0)
-            .then_some(usage.input.cache_read_tokens as f64 / total_input_tokens as f64);
-    }
     let input = &attempt.invocation_input;
-    let event = ModelRequestContextEvent {
+    let mut event = ModelRequestContextEvent {
         schema: MODEL_REQUEST_CONTEXT_SCHEMA.to_string(),
-        stage,
+        stage: ModelRequestEventStage::Accepted,
         identity: ModelRequestIdentity {
             request_id: attempt.request_id().to_string(),
-            provider_response_id: terminal
-                .and_then(|terminal| terminal.provider_response_id.clone()),
+            provider_response_id: None,
             owner_scope: input.user_id.clone(),
             session_id: input.scope.session_id().map(str::to_string),
             run_id: input.scope.run_id().map(str::to_string),
-            harness_run_id: input.scope.harness_run_id().map(str::to_string),
             turn: input.scope.turn(),
-            round: input.scope.round(),
+            round: attempt
+                .request_context
+                .execution_round
+                .or(input.scope.round()),
             logical_attempt: input.scope.logical_attempt(),
             physical_attempt: attempt.attempt_index,
             actor_id: attempt.request_context.actor_id.clone(),
@@ -805,21 +789,32 @@ fn model_request_event(
             model: input.resolved_model_name.clone(),
             offering_id: input.offering_id.clone(),
             inference_purpose: input.purpose.as_str().to_string(),
+            operation_id: input.scope.operation_id().to_string(),
             provider_protocol: attempt.wire.protocol.clone(),
             provider_wire_hash: attempt.wire.provider_wire_hash.clone(),
             provider_wire_bytes: attempt.wire.provider_wire_bytes,
         },
+        route: ModelRequestRoute {
+            route_id: attempt.route_id.clone(),
+            invocation_id: attempt.invocation_id.clone(),
+            upstream_model: input.upstream_model_name.clone(),
+            execution_placement: input.execution_placement,
+            access_kind: input.access_kind,
+        },
         lineage: attempt.request_context.lineage.clone(),
-        budget,
-        usage,
+        budget: attempt.request_context.budget.clone(),
+        usage: None,
         composition: attempt.request_context.composition.clone(),
         wire_composition: attempt.wire.composition.clone(),
-        cache,
+        cache: attempt.request_context.cache.clone(),
         compaction: attempt.request_context.compaction.clone(),
-        terminal_status: terminal.map(|terminal| terminal.status.as_str().to_string()),
-        usage_status: terminal.map(|terminal| terminal.usage_status.as_str().to_string()),
-        error_kind: terminal.and_then(|terminal| terminal.error_kind.clone()),
+        terminal_status: None,
+        usage_status: None,
+        error_kind: None,
     };
+    // Surface diagnostics are not provider measurements. Clear any stale
+    // derived values even on the accepted record, before a response exists.
+    clear_model_request_measured_usage(&mut event);
     let event_json = serde_json::to_string(&event).map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Internal,
@@ -827,8 +822,31 @@ fn model_request_event(
             error,
         )
     })?;
-    let event_id = hash_identity("mrctx", &[attempt.attempt_id.as_str(), stage.as_str()]);
+    let event_id = hash_identity(
+        "mrctx",
+        &[
+            attempt.attempt_id.as_str(),
+            ModelRequestEventStage::Accepted.as_str(),
+        ],
+    );
     Ok((event_id, event_json, event))
+}
+
+fn model_request_terminal_fact(terminal: &InferenceInvocationTerminal) -> ModelRequestTerminalFact {
+    ModelRequestTerminalFact {
+        schema: MODEL_REQUEST_TERMINAL_SCHEMA.into(),
+        terminal_status: terminal.status.as_str().into(),
+        provider_response_id: terminal.provider_response_id.clone(),
+        usage_status: terminal.usage_status.as_str().into(),
+        usage: (terminal.usage_status != InferenceUsageStatus::Unavailable).then_some(
+            ModelRequestUsage {
+                input: terminal.usage.input,
+                output_tokens: terminal.usage.output_tokens,
+            },
+        ),
+        error_kind: terminal.error_kind.clone(),
+        usage_source: "provider_terminal".into(),
+    }
 }
 
 async fn insert_model_request_context_event(
@@ -885,8 +903,35 @@ async fn insert_model_request_context_event_with_expiry(
     terminal: Option<&InferenceInvocationTerminal>,
     context_expired_at: Option<chrono::NaiveDateTime>,
 ) -> ServiceResult<()> {
-    let (event_id, event_json, event) = model_request_event(attempt, stage, terminal)?;
-    let usage = event.usage.as_ref();
+    let fact = match (stage, terminal) {
+        (ModelRequestEventStage::Accepted, None) => None,
+        (ModelRequestEventStage::Terminal, Some(terminal)) => {
+            Some(model_request_terminal_fact(terminal))
+        }
+        _ => {
+            return Err(ServiceError::internal(
+                "model request event stage disagrees with terminal facts",
+            ));
+        }
+    };
+    let (event_id, event_json) = if let Some(fact) = fact.as_ref() {
+        fact.validate()?;
+        (
+            hash_identity("mrctx", &[attempt.attempt_id.as_str(), stage.as_str()]),
+            serde_json::to_string(fact).map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Internal,
+                    "serialize model request terminal fact",
+                    error,
+                )
+            })?,
+        )
+    } else {
+        let (id, json, _) = model_request_accepted_event(attempt)?;
+        (id, json)
+    };
+    let usage = fact.as_ref().and_then(|fact| fact.usage.as_ref());
+    let terminal_status = fact.as_ref().map(|fact| fact.terminal_status.as_str());
     let model_family = attempt
         .request_context
         .model_family
@@ -895,20 +940,17 @@ async fn insert_model_request_context_event_with_expiry(
     if context_expired_at.is_none() {
         let session_id = attempt.invocation_input.scope.session_id();
         let run_id = attempt.invocation_input.scope.run_id();
-        let harness_run_id = attempt.invocation_input.scope.harness_run_id();
-        let terminal_status = event.terminal_status.as_deref();
         let usage_present = usage.is_some();
         let insert_sql = matrixone_statement_with_null_shape(
             "INSERT INTO model_request_context_events
-         (event_id, user_id, attempt_id, invocation_id, session_id, run_id, harness_run_id,
+         (event_id, user_id, attempt_id, invocation_id, session_id, run_id,
           event_stage, terminal_status, topology, provider, model_family, purpose,
           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
           event_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
             [
                 session_id.is_some(),
                 run_id.is_some(),
-                harness_run_id.is_some(),
                 terminal_status.is_some(),
                 usage_present,
                 usage_present,
@@ -916,20 +958,19 @@ async fn insert_model_request_context_event_with_expiry(
                 usage_present,
             ],
         );
-        sqlx::query(&insert_sql)
+        sqlx::query(insert_sql)
             .bind(event_id)
             .bind(&attempt.user_id)
             .bind(&attempt.attempt_id)
             .bind(&attempt.invocation_id)
             .bind(session_id)
             .bind(run_id)
-            .bind(harness_run_id)
             .bind(stage.as_str())
             .bind(terminal_status)
-            .bind(event.identity.topology.as_str())
-            .bind(&event.identity.provider)
+            .bind(attempt.request_context.topology.as_str())
+            .bind(&attempt.invocation_input.provider)
             .bind(model_family)
-            .bind(&event.identity.inference_purpose)
+            .bind(attempt.invocation_input.purpose.as_str())
             .bind(checked_optional_i64(
                 usage.map(ModelRequestUsage::total_input_tokens),
                 "model request input_tokens",
@@ -956,23 +997,21 @@ async fn insert_model_request_context_event_with_expiry(
                     error,
                 )
             })?;
-        let scope = match &attempt.invocation_input.scope {
+        let session_id = match &attempt.invocation_input.scope {
             InferenceInvocationScope::Run { session_id, .. }
-            | InferenceInvocationScope::Session { session_id, .. } => {
-                ModelRequestContextScope::Session(session_id)
-            }
-            InferenceInvocationScope::HarnessRun { harness_run_id, .. } => {
-                ModelRequestContextScope::HarnessRun(harness_run_id)
-            }
+            | InferenceInvocationScope::Session { session_id, .. } => session_id,
         };
         // A normal request appends an accepted/terminal pair. Compact once at
         // the terminal boundary; orphaned accepted rows remain covered by the
         // existing expiry sweeper.
         if stage == ModelRequestEventStage::Terminal {
-            compact_model_request_context_scope(connection, &attempt.user_id, scope).await?;
+            compact_model_request_context_scope(connection, &attempt.user_id, session_id).await?;
         }
     }
-    if let (Some(status), Some(usage)) = (event.terminal_status.as_deref(), usage) {
+    // Count every terminal request, including failures with unavailable
+    // usage. Token sums contain observed usage only; coverage remains in the
+    // per-request usage_status and must be checked before estimating cost.
+    if let Some(status) = terminal_status {
         sqlx::query(
             "INSERT INTO model_request_metric_shards
              (metric_shard, topology, provider, model_family, purpose, terminal_status,
@@ -989,25 +1028,25 @@ async fn insert_model_request_context_event_with_expiry(
               updated_at = NOW(6)",
         )
         .bind(model_request_metric_shard(&attempt.attempt_id))
-        .bind(event.identity.topology.as_str())
-        .bind(&event.identity.provider)
+        .bind(attempt.request_context.topology.as_str())
+        .bind(&attempt.invocation_input.provider)
         .bind(model_family)
-        .bind(&event.identity.inference_purpose)
+        .bind(attempt.invocation_input.purpose.as_str())
         .bind(status)
         .bind(checked_i64(
-            usage.total_input_tokens(),
+            usage.map_or(0, ModelRequestUsage::total_input_tokens),
             "model request metric input_tokens",
         )?)
         .bind(checked_i64(
-            usage.output_tokens,
+            usage.map_or(0, |usage| usage.output_tokens),
             "model request metric output_tokens",
         )?)
         .bind(checked_i64(
-            usage.input.cache_read_tokens,
+            usage.map_or(0, |usage| usage.input.cache_read_tokens),
             "model request metric cache_read_tokens",
         )?)
         .bind(checked_i64(
-            usage.input.cache_creation_tokens,
+            usage.map_or(0, |usage| usage.input.cache_creation_tokens),
             "model request metric cache_creation_tokens",
         )?)
         .execute(&mut *connection)
@@ -1031,6 +1070,28 @@ async fn insert_recovered_model_request_terminal(
     terminal: &DurableInferenceTerminal,
 ) -> Result<(), sqlx::Error> {
     let mut tx = connection.begin().await?;
+    // A competing reconciler can settle after the caller observed admission.
+    // Lock and recheck that authority before touching disposable diagnostics.
+    let owner = sqlx::query(
+        "SELECT status, terminal_fingerprint FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ? FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(invocation_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| sqlx::Error::Protocol("request recovery has no invocation owner".into()))?;
+    if owner.try_get::<String, _>("status")? != "admitted" {
+        if owner.try_get::<Option<String>, _>("terminal_fingerprint")?
+            != terminal.terminal_fingerprint
+        {
+            return Err(sqlx::Error::Protocol(
+                "request recovery conflicts with settled invocation".into(),
+            ));
+        }
+        tx.commit().await?;
+        return Ok(());
+    }
     insert_recovered_model_request_terminal_tx(
         &mut tx,
         user_id,
@@ -1050,7 +1111,7 @@ async fn insert_recovered_model_request_terminal_tx(
     terminal: &DurableInferenceTerminal,
 ) -> Result<(), sqlx::Error> {
     let accepted = sqlx::query(
-        "SELECT event_json, model_family
+        "SELECT event_json, model_family, session_id, run_id
          FROM model_request_context_events
          WHERE user_id = ? AND invocation_id = ? AND attempt_id = ?
            AND event_stage = 'accepted'",
@@ -1067,10 +1128,20 @@ async fn insert_recovered_model_request_terminal_tx(
     };
     let accepted_json = accepted.try_get::<String, _>("event_json")?;
     let model_family = accepted.try_get::<String, _>("model_family")?;
-    let mut event = serde_json::from_str::<ModelRequestContextEvent>(&accepted_json)
+    let event = serde_json::from_str::<ModelRequestContextEvent>(&accepted_json)
         .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-    event.stage = ModelRequestEventStage::Terminal;
-    event.identity.provider_response_id = terminal.provider_response_id.clone();
+    event
+        .validate_accepted()
+        .and_then(|()| {
+            event.validate_stored_identity(
+                user_id,
+                accepted.get::<Option<String>, _>("session_id").as_deref(),
+                accepted.get::<Option<String>, _>("run_id").as_deref(),
+                attempt_id,
+                invocation_id,
+            )
+        })
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     let fresh_input_tokens = u64::try_from(terminal.input_tokens)
         .map_err(|_| sqlx::Error::Protocol("negative recovered fresh input tokens".to_string()))?;
     let cache_read_tokens = u64::try_from(terminal.cache_read_tokens)
@@ -1088,60 +1159,52 @@ async fn insert_recovered_model_request_terminal_tx(
         ),
         output_tokens,
     };
-    let measured = usage.total_input_tokens();
-    event.budget.measured_input_tokens = Some(measured);
-    event.budget.usage_source = Some("provider_terminal_recovery".to_string());
-    if let Some(estimated) = event.budget.estimated_input_tokens {
-        let error = i128::from(measured) - i128::from(estimated);
-        event.budget.estimate_error_tokens =
-            Some(i64::try_from(error).unwrap_or(if error.is_negative() {
-                i64::MIN
-            } else {
-                i64::MAX
-            }));
-        event.budget.estimate_error_ratio =
-            (estimated > 0).then_some(error as f64 / estimated as f64);
-    }
-    event.cache.cache_read_share =
-        (measured > 0).then_some(usage.input.cache_read_tokens as f64 / measured as f64);
-    event.usage = Some(usage.clone());
-    event.terminal_status = Some(terminal.status.clone());
-    event.usage_status = Some(terminal.usage_status.clone());
-    event.error_kind = terminal.error_kind.clone();
+    let fact = ModelRequestTerminalFact {
+        schema: MODEL_REQUEST_TERMINAL_SCHEMA.into(),
+        terminal_status: terminal.status.clone(),
+        provider_response_id: terminal.provider_response_id.clone(),
+        usage_status: terminal.usage_status.clone(),
+        usage: (terminal.usage_status != "unavailable").then_some(usage),
+        error_kind: terminal.error_kind.clone(),
+        usage_source: "provider_terminal_recovery".into(),
+    };
+    fact.validate()
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     let event_json =
-        serde_json::to_string(&event).map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        serde_json::to_string(&fact).map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     let event_id = hash_identity(
         "mrctx",
         &[attempt_id, ModelRequestEventStage::Terminal.as_str()],
     );
-    let total_input_tokens = terminal
-        .input_tokens
-        .checked_add(terminal.cache_read_tokens)
-        .and_then(|total| total.checked_add(terminal.cache_creation_tokens))
-        .ok_or_else(|| sqlx::Error::Protocol("recovered input token total overflow".to_string()))?;
+    let observed_usage = fact.usage.as_ref();
+    let total_input_tokens = checked_optional_i64(
+        observed_usage.map(ModelRequestUsage::total_input_tokens),
+        "recovered model request input tokens",
+    )
+    .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+    let output_tokens = observed_usage.map(|_| terminal.output_tokens);
+    let cache_read_tokens = observed_usage.map(|_| terminal.cache_read_tokens);
+    let cache_creation_tokens = observed_usage.map(|_| terminal.cache_creation_tokens);
     let existing_terminal = sqlx::query(
         "SELECT event_json FROM model_request_context_events
-         WHERE event_id = ? FOR UPDATE",
+         WHERE user_id = ? AND event_id = ? FOR UPDATE",
     )
+    .bind(user_id)
     .bind(&event_id)
     .fetch_optional(&mut *connection)
     .await?;
     if let Some(existing_terminal) = existing_terminal {
         let existing_json = existing_terminal.try_get::<String, _>("event_json")?;
-        let existing_event = serde_json::from_str::<ModelRequestContextEvent>(&existing_json)
+        let existing_event = serde_json::from_str::<ModelRequestTerminalFact>(&existing_json)
             .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-        let exact_usage = existing_event.usage.as_ref().is_some_and(|existing| {
-            existing.input.fresh_input_tokens == fresh_input_tokens
-                && existing.input.cache_read_tokens == cache_read_tokens
-                && existing.input.cache_creation_tokens == cache_creation_tokens
-                && existing.output_tokens == output_tokens
-        });
-        let exact_terminal = existing_event.stage == ModelRequestEventStage::Terminal
-            && existing_event.terminal_status.as_deref() == Some(terminal.status.as_str())
-            && existing_event.usage_status.as_deref() == Some(terminal.usage_status.as_str())
-            && existing_event.identity.provider_response_id == terminal.provider_response_id
+        existing_event
+            .validate()
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        let exact_terminal = existing_event.terminal_status == terminal.status
+            && existing_event.usage_status == terminal.usage_status
+            && existing_event.provider_response_id == terminal.provider_response_id
             && existing_event.error_kind == terminal.error_kind
-            && exact_usage;
+            && existing_event.usage == fact.usage;
         return if exact_terminal {
             Ok(())
         } else {
@@ -1150,33 +1213,41 @@ async fn insert_recovered_model_request_terminal_tx(
             )))
         };
     }
-    sqlx::query(
+    let insert_sql = matrixone_statement_with_null_shape(
         "INSERT INTO model_request_context_events
-         (event_id, user_id, attempt_id, invocation_id, session_id, run_id, harness_run_id,
+         (event_id, user_id, attempt_id, invocation_id, session_id, run_id,
           event_stage, terminal_status, topology, provider, model_family, purpose,
           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
           event_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'terminal', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-    )
-    .bind(event_id)
-    .bind(user_id)
-    .bind(attempt_id)
-    .bind(invocation_id)
-    .bind(event.identity.session_id.as_deref())
-    .bind(event.identity.run_id.as_deref())
-    .bind(event.identity.harness_run_id.as_deref())
-    .bind(&terminal.status)
-    .bind(event.identity.topology.as_str())
-    .bind(&event.identity.provider)
-    .bind(&model_family)
-    .bind(&event.identity.inference_purpose)
-    .bind(total_input_tokens)
-    .bind(terminal.output_tokens)
-    .bind(terminal.cache_read_tokens)
-    .bind(terminal.cache_creation_tokens)
-    .bind(event_json)
-    .execute(&mut *connection)
-    .await?;
+         VALUES (?, ?, ?, ?, ?, ?, 'terminal', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+        [
+            event.identity.session_id.is_some(),
+            event.identity.run_id.is_some(),
+            observed_usage.is_some(),
+            observed_usage.is_some(),
+            observed_usage.is_some(),
+            observed_usage.is_some(),
+        ],
+    );
+    sqlx::query(insert_sql)
+        .bind(event_id)
+        .bind(user_id)
+        .bind(attempt_id)
+        .bind(invocation_id)
+        .bind(event.identity.session_id.as_deref())
+        .bind(event.identity.run_id.as_deref())
+        .bind(&terminal.status)
+        .bind(event.identity.topology.as_str())
+        .bind(&event.identity.provider)
+        .bind(&model_family)
+        .bind(&event.identity.inference_purpose)
+        .bind(total_input_tokens)
+        .bind(output_tokens)
+        .bind(cache_read_tokens)
+        .bind(cache_creation_tokens)
+        .bind(event_json)
+        .execute(&mut *connection)
+        .await?;
     sqlx::query(
         "INSERT INTO model_request_metric_shards
          (metric_shard, topology, provider, model_family, purpose, terminal_status,
@@ -1197,39 +1268,49 @@ async fn insert_recovered_model_request_terminal_tx(
     .bind(model_family)
     .bind(&event.identity.inference_purpose)
     .bind(&terminal.status)
-    .bind(total_input_tokens)
-    .bind(terminal.output_tokens)
-    .bind(terminal.cache_read_tokens)
-    .bind(terminal.cache_creation_tokens)
+    .bind(total_input_tokens.unwrap_or(0))
+    .bind(output_tokens.unwrap_or(0))
+    .bind(cache_read_tokens.unwrap_or(0))
+    .bind(cache_creation_tokens.unwrap_or(0))
     .execute(&mut *connection)
     .await?;
     Ok(())
 }
 
-async fn rollback_inference_tx(tx: sqlx::Transaction<'_, sqlx::MySql>, operation: &'static str) {
-    if let Err(error) = tx.rollback().await {
-        tracing::warn!(
-            target: "astra_services::inference_execution",
-            operation,
-            %error,
-            "inference transaction rollback failed"
-        );
+async fn rollback_inference_tx(
+    tx: sqlx::Transaction<'_, sqlx::MySql>,
+    operation: &'static str,
+) -> bool {
+    match tx.rollback().await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                target: "astra_services::inference_execution",
+                operation,
+                %error,
+                "inference transaction rollback failed"
+            );
+            false
+        }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InvocationScopeAuthority {
     Live,
-    GuidancePending,
-    Unavailable,
+    Rejected(InferenceScopeRejection),
 }
 
 /// Typed admission fence. New guidance invalidates a request snapshot, not
-/// the execution owner; callers must reconcile it before trying new work.
+/// the execution owner; a retained pause suspends that same owner. Callers must
+/// reconcile these control causes before trying new work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InferenceScopeRejection {
     GuidancePending,
+    /// The exact run owner retains a live lease and a waiting obligation.
+    /// Provider delivery remains forbidden until the existing pause clears.
+    Paused,
     Unavailable,
 }
 
@@ -1237,12 +1318,43 @@ impl std::fmt::Display for InferenceScopeRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::GuidancePending => "new user guidance requires a fresh execution snapshot",
+            Self::Paused => "inference execution is paused with retained owner authority",
             Self::Unavailable => "inference execution scope is no longer available",
         })
     }
 }
 
 impl std::error::Error for InferenceScopeRejection {}
+
+fn classify_run_invocation_scope_authority(
+    expected: &InferenceRunAdmissionAuthority,
+    stored_generation: i64,
+    owner_pod_id: Option<&str>,
+    lease_active: bool,
+    cancellation_requested: bool,
+    status: &str,
+    has_waiting_obligation: bool,
+) -> ServiceResult<InvocationScopeAuthority> {
+    let expected_generation = i64::try_from(expected.expected_owner_generation).map_err(|_| {
+        ServiceError::invalid("expected_owner_generation exceeds the durable BIGINT range")
+    })?;
+    if stored_generation != expected_generation
+        || owner_pod_id != Some(expected.expected_owner_pod_id.as_str())
+        || !lease_active
+        || cancellation_requested
+    {
+        return Ok(InvocationScopeAuthority::Rejected(
+            InferenceScopeRejection::Unavailable,
+        ));
+    }
+    Ok(match status {
+        "running" => InvocationScopeAuthority::Live,
+        "paused" if has_waiting_obligation => {
+            InvocationScopeAuthority::Rejected(InferenceScopeRejection::Paused)
+        }
+        _ => InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+    })
+}
 
 async fn lock_invocation_scope_authority(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
@@ -1251,7 +1363,7 @@ async fn lock_invocation_scope_authority(
     // This is an ownership/lifecycle observation inside the admission
     // transaction. MatrixOne's supported row-lock primitive here is
     // `FOR UPDATE`; the shared storage primitive establishes the global
-    // session -> tombstone -> execution-slot -> exact-run order before this
+    // session -> lifecycle-fence -> execution-slot -> exact-run order before this
     // function observes run events. Keep those locks only through the durable
     // invocation insert. Sibling fanout admissions may briefly queue on this
     // scope lock, but provider I/O never occurs inside the transaction, so the
@@ -1266,30 +1378,26 @@ async fn lock_invocation_scope_authority(
                     "run-scoped inference requires exact durable execution authority",
                 )
             })?;
-            let run_exists = match crate::storage::admit_session_scoped_run_write(
-                tx,
-                session_id,
-                &input.user_id,
-                run_id,
-                false,
-            )
-            .await
-            {
-                Ok(run_exists) => run_exists,
-                Err(sqlx::Error::RowNotFound) => false,
-                Err(error) => {
-                    return Err(ServiceError::with_source(
-                        ServiceErrorKind::Persistence,
-                        "lock canonical inference session/run scope",
-                        error,
-                    ));
-                }
-            };
-            if !run_exists {
-                InvocationScopeAuthority::Unavailable
+            let scope_admitted =
+                match crate::storage::admit_session_execution_write(tx, session_id, &input.user_id)
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(sqlx::Error::RowNotFound) => false,
+                    Err(error) => {
+                        return Err(ServiceError::with_source(
+                            ServiceErrorKind::Persistence,
+                            "lock canonical inference session/run scope",
+                            error,
+                        ));
+                    }
+                };
+            if !scope_admitted {
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable)
             } else {
                 let row = sqlx::query(
                     "SELECT status, run_generation, owner_pod_id, last_event_idx,
+                            CAST(waiting_for IS NOT NULL AS SIGNED) AS has_waiting_obligation,
                             CAST(cancellation_requested_at IS NOT NULL AS SIGNED)
                                 AS cancellation_requested,
                             CAST(CASE WHEN owner_lease_expires_at >= NOW(6) THEN 1 ELSE 0 END AS SIGNED)
@@ -1311,7 +1419,9 @@ async fn lock_invocation_scope_authority(
                     )
                 })?;
                 let Some(row) = row else {
-                    return Ok(InvocationScopeAuthority::Unavailable);
+                    return Ok(InvocationScopeAuthority::Rejected(
+                        InferenceScopeRejection::Unavailable,
+                    ));
                 };
                 let status: String = row.try_get("status").map_err(|error| {
                     ServiceError::with_source(
@@ -1357,28 +1467,42 @@ async fn lock_invocation_scope_authority(
                             error,
                         )
                     })?;
-                let expected_generation = i64::try_from(expected.expected_owner_generation)
-                    .map_err(|_| {
-                        ServiceError::invalid(
-                            "expected_owner_generation exceeds the durable BIGINT range",
+                let has_waiting_obligation: i64 =
+                    row.try_get("has_waiting_obligation").map_err(|error| {
+                        ServiceError::with_source(
+                            ServiceErrorKind::Persistence,
+                            "decode inference run waiting obligation",
+                            error,
                         )
                     })?;
-                if expected.expected_control_epoch > last_event_idx {
+                let authority = classify_run_invocation_scope_authority(
+                    expected,
+                    stored_generation,
+                    owner_pod_id.as_deref(),
+                    lease_active == 1,
+                    cancellation_requested != 0,
+                    &status,
+                    has_waiting_obligation == 1,
+                )?;
+                if authority
+                    != InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable)
+                    && expected.expected_control_epoch > last_event_idx
+                {
                     return Err(ServiceError::invalid(format!(
                         "inference control epoch {} is ahead of durable run event index {}",
                         expected.expected_control_epoch, last_event_idx
                     )));
                 }
-                if status != "running"
-                    || stored_generation != expected_generation
-                    || owner_pod_id.as_deref() != Some(expected.expected_owner_pod_id.as_str())
-                    || lease_active != 1
-                    || cancellation_requested != 0
-                {
-                    InvocationScopeAuthority::Unavailable
+                if authority != InvocationScopeAuthority::Live {
+                    authority
+                } else if expected.expected_control_epoch == last_event_idx {
+                    // This transaction holds the run-row lock. Event append
+                    // advances this frontier and inserts its rows atomically,
+                    // so an exact frontier has no later guidance to probe.
+                    InvocationScopeAuthority::Live
                 } else {
                     // The run row is held before its event range, preserving
-                    // canonical session -> tombstone/slot -> run -> run-events
+                    // canonical session -> lifecycle-fence/slot -> run -> run-events
                     // lock order. Any
                     // later guidance is an execution fence. User cancellation
                     // is represented by the run row marker locked above;
@@ -1403,7 +1527,7 @@ async fn lock_invocation_scope_authority(
                         )
                     })?;
                     if control_fence.is_some() {
-                        InvocationScopeAuthority::GuidancePending
+                        InvocationScopeAuthority::Rejected(InferenceScopeRejection::GuidancePending)
                     } else {
                         InvocationScopeAuthority::Live
                     }
@@ -1415,7 +1539,9 @@ async fn lock_invocation_scope_authority(
                 .await
             {
                 Ok(()) => InvocationScopeAuthority::Live,
-                Err(sqlx::Error::RowNotFound) => InvocationScopeAuthority::Unavailable,
+                Err(sqlx::Error::RowNotFound) => {
+                    InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable)
+                }
                 Err(error) => {
                     return Err(ServiceError::with_source(
                         ServiceErrorKind::Persistence,
@@ -1423,27 +1549,6 @@ async fn lock_invocation_scope_authority(
                         error,
                     ));
                 }
-            }
-        }
-        InferenceInvocationScope::HarnessRun { harness_run_id, .. } => {
-            let status = sqlx::query_scalar::<_, String>(
-                "SELECT status FROM harness_runs
-                 WHERE user_id = ? AND harness_run_id = ? LIMIT 1 FOR UPDATE",
-            )
-            .bind(&input.user_id)
-            .bind(harness_run_id)
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(|error| {
-                ServiceError::with_source(
-                    ServiceErrorKind::Persistence,
-                    "verify inference harness scope",
-                    error,
-                )
-            })?;
-            match status.as_deref() {
-                Some("running") => InvocationScopeAuthority::Live,
-                Some(_) | None => InvocationScopeAuthority::Unavailable,
             }
         }
     };
@@ -1455,13 +1560,14 @@ fn unavailable_scope_error(
     authority: InvocationScopeAuthority,
 ) -> ServiceError {
     let reason = match authority {
-        InvocationScopeAuthority::GuidancePending => InferenceScopeRejection::GuidancePending,
-        InvocationScopeAuthority::Unavailable => InferenceScopeRejection::Unavailable,
+        InvocationScopeAuthority::Rejected(reason) => reason,
         InvocationScopeAuthority::Live => unreachable!("live authority is not a rejection"),
     };
     ServiceError::with_source(
         match reason {
-            InferenceScopeRejection::GuidancePending => ServiceErrorKind::Conflict,
+            InferenceScopeRejection::GuidancePending | InferenceScopeRejection::Paused => {
+                ServiceErrorKind::Conflict
+            }
             InferenceScopeRejection::Unavailable => ServiceErrorKind::NotFound,
         },
         format!(
@@ -1620,7 +1726,7 @@ pub async fn admit_inference_invocation(
         connection.release();
         return Err(existing_invocation_error(plan, &persisted));
     }
-    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
+    let mut tx = connection.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin inference admission",
@@ -1637,8 +1743,11 @@ pub async fn admit_inference_invocation(
     .await;
 
     if let Err(error) = write_result {
-        rollback_inference_tx(tx, "admit_inference_invocation").await;
-        drop(connection);
+        if rollback_inference_tx(tx, "admit_inference_invocation").await {
+            connection.release();
+        } else {
+            drop(connection);
+        }
         match load_invocation_admission_fact_cancellation_safe(db, plan).await {
             Ok(Some(persisted)) => return Err(existing_invocation_error(plan, &persisted)),
             Ok(None) => return Err(error),
@@ -1698,8 +1807,8 @@ async fn insert_inference_invocation_admission(
             "INSERT INTO inference_routes
                  (route_id, user_id, session_id, scope_kind, run_id,
                   offering_id, resolved_model_name, upstream_model_name, provider,
-                  execution_placement, access_kind, purpose, created_at)
-                 VALUES (?, ?, ?, 'run', ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+                  execution_placement, access_kind, purpose, price_snapshot_json, created_at)
+                 VALUES (?, ?, ?, 'run', ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         )
         .bind(&plan.route_id)
         .bind(&plan.input.user_id)
@@ -1709,22 +1818,12 @@ async fn insert_inference_invocation_admission(
             "INSERT INTO inference_routes
                  (route_id, user_id, session_id, scope_kind,
                   offering_id, resolved_model_name, upstream_model_name, provider,
-                  execution_placement, access_kind, purpose, created_at)
-                 VALUES (?, ?, ?, 'session', ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+                  execution_placement, access_kind, purpose, price_snapshot_json, created_at)
+                 VALUES (?, ?, ?, 'session', ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         )
         .bind(&plan.route_id)
         .bind(&plan.input.user_id)
         .bind(session_id),
-        InferenceInvocationScope::HarnessRun { harness_run_id, .. } => sqlx::query(
-            "INSERT INTO inference_routes
-                 (route_id, user_id, scope_kind, harness_run_id,
-                  offering_id, resolved_model_name, upstream_model_name, provider,
-                  execution_placement, access_kind, purpose, created_at)
-                 VALUES (?, ?, 'harness_run', ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-        )
-        .bind(&plan.route_id)
-        .bind(&plan.input.user_id)
-        .bind(harness_run_id),
     };
     route_query
         .bind(&plan.input.offering_id)
@@ -1734,6 +1833,7 @@ async fn insert_inference_invocation_admission(
         .bind(plan.input.execution_placement.as_str())
         .bind(plan.input.access_kind.as_str())
         .bind(plan.input.purpose.as_str())
+        .bind(&plan.price_snapshot_json)
         .execute(&mut *connection)
         .await
         .map_err(|error| {
@@ -1776,20 +1876,6 @@ async fn insert_inference_invocation_admission(
         .bind(&plan.route_id)
         .bind(&plan.input.user_id)
         .bind(session_id),
-        InferenceInvocationScope::HarnessRun { harness_run_id, .. } => sqlx::query(
-            "INSERT INTO inference_invocations
-                 (invocation_id, route_id, user_id, scope_kind, harness_run_id,
-                  admission_token, owner_token, owner_generation, owner_lease_expires_at,
-                  operation_id, logical_attempt, purpose, status, terminal_fingerprint,
-                  usage_status, provider_delivery_state, created_at, terminal_at)
-                 VALUES (?, ?, ?, 'harness_run', ?, ?, ?, ?,
-                         DATE_ADD(NOW(6), INTERVAL 60 SECOND), ?, ?, ?,
-                         'admitted', NULL, 'unavailable', 'unknown', NOW(6), NULL)",
-        )
-        .bind(&plan.invocation_id)
-        .bind(&plan.route_id)
-        .bind(&plan.input.user_id)
-        .bind(harness_run_id),
     };
     let invocation_query = invocation_query
         .bind(&plan.admission_token)
@@ -1802,7 +1888,6 @@ async fn insert_inference_invocation_admission(
         | InferenceInvocationScope::Session { turn, round, .. } => invocation_query
             .bind(i64::from(*turn))
             .bind(i64::from(*round)),
-        InferenceInvocationScope::HarnessRun { .. } => invocation_query,
     };
     invocation_query
         .bind(plan.input.scope.operation_id())
@@ -1828,11 +1913,18 @@ async fn insert_inference_invocation_admission(
 /// admission token decide the outcome. Scope validation uses the same short
 /// `FOR UPDATE` lock as the original transaction, so deletion cannot race the
 /// recovery insert.
+///
+/// Return the confirmed recovery fact separately from its scope fence.
+/// A paused owner may resume an absent plan, but never an identity already
+/// transferred to settlement. No result is returned before commit/debt proof.
 pub async fn settle_uncertain_inference_admission(
     pool: &SharedPool,
     plan: &InferenceInvocationPlan,
     terminal: &InferenceInvocationTerminal,
-) -> ServiceResult<InferenceInvocationAdmissionResolution> {
+) -> ServiceResult<(
+    InferenceInvocationAdmissionResolution,
+    Option<InferenceScopeRejection>,
+)> {
     if terminal.status != InferenceTerminalStatus::Cancelled
         || terminal.usage != InferenceUsage::default()
         || terminal.usage_status != InferenceUsageStatus::Unavailable
@@ -1854,7 +1946,7 @@ pub async fn settle_uncertain_inference_admission(
                 error,
             )
         })?;
-    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
+    let mut tx = connection.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin inference admission recovery",
@@ -1864,8 +1956,9 @@ pub async fn settle_uncertain_inference_admission(
     let scope_authority = match lock_invocation_scope_authority(&mut tx, &plan.input).await {
         Ok(authority) => authority,
         Err(error) => {
-            rollback_inference_tx(tx, "settle_uncertain_inference_admission").await;
-            drop(connection);
+            if rollback_inference_tx(tx, "settle_uncertain_inference_admission").await {
+                connection.release();
+            }
             return Err(error);
         }
     };
@@ -1887,7 +1980,7 @@ pub async fn settle_uncertain_inference_admission(
             error,
         )
     })?;
-    let mut resolution = match row {
+    let resolution = match row {
         None => {
             if scope_authority == InvocationScopeAuthority::Live {
                 insert_inference_invocation_admission(&mut tx, plan).await?;
@@ -1982,29 +2075,16 @@ pub async fn settle_uncertain_inference_admission(
         )
         .await?;
     }
-    if scope_authority == InvocationScopeAuthority::GuidancePending
-        && matches!(
-            resolution,
-            InferenceInvocationAdmissionResolution::Settled
-                | InferenceInvocationAdmissionResolution::ExactTerminal
-                | InferenceInvocationAdmissionResolution::ScopeUnavailable
-        )
-    {
-        resolution = InferenceInvocationAdmissionResolution::GuidancePending;
-    }
-    if scope_authority == InvocationScopeAuthority::Unavailable
-        && matches!(
-            resolution,
-            InferenceInvocationAdmissionResolution::Settled
-                | InferenceInvocationAdmissionResolution::ExactTerminal
-        )
-    {
-        resolution = InferenceInvocationAdmissionResolution::AuthorityLost;
-    }
     let error = match tx.commit().await {
         Ok(()) => {
             connection.release();
-            return Ok(resolution);
+            return Ok((
+                resolution,
+                match scope_authority {
+                    InvocationScopeAuthority::Live => None,
+                    InvocationScopeAuthority::Rejected(reason) => Some(reason),
+                },
+            ));
         }
         Err(error) => {
             drop(connection);
@@ -2041,7 +2121,13 @@ pub async fn settle_uncertain_inference_admission(
     .await;
     reconciliation.release();
     match match_result {
-        Ok(true) => Ok(resolution),
+        Ok(true) => Ok((
+            resolution,
+            match scope_authority {
+                InvocationScopeAuthority::Live => None,
+                InvocationScopeAuthority::Rejected(reason) => Some(reason),
+            },
+        )),
         Ok(false) => Err(commit_error),
         Err(read_error) => {
             tracing::warn!(
@@ -2211,7 +2297,7 @@ fn validate_ambiguous_provider_attempt_admission(
     )))
 }
 
-fn ambiguous_canonical_admission_proof_sql(parent_present: bool) -> String {
+fn ambiguous_canonical_admission_proof_sql(parent_present: bool) -> sqlx::SqlStr {
     matrixone_statement_with_null_shape(
         "SELECT wal.payload_json AS canonical_payload
          FROM inference_canonical_transition_heads AS head
@@ -2312,7 +2398,7 @@ where
     // character width (matrixorigin/matrixone#28103).
     let proof_sql =
         ambiguous_canonical_admission_proof_sql(attempt.canonical_parent_transition_id.is_some());
-    let proof = sqlx::query(&proof_sql)
+    let proof = sqlx::query(proof_sql)
         .bind(&attempt.user_id)
         .bind(session_id)
         .bind(i64::from(turn))
@@ -2809,7 +2895,7 @@ async fn insert_inference_canonical_transition_wal(
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         [attempt.canonical_parent_transition_id.is_some()],
     );
-    let inserted = sqlx::query(&insert_sql)
+    let inserted = sqlx::query(insert_sql)
         .bind(&attempt.user_id)
         .bind(entry.session_id)
         .bind(i64::from(entry.turn))
@@ -2857,12 +2943,12 @@ async fn insert_inference_provider_attempt_admission(
 ) -> ServiceResult<()> {
     let insert_sql = matrixone_statement_with_null_shape(
         "INSERT INTO inference_provider_attempts
-         (attempt_id, invocation_id, user_id, session_id, run_id, harness_run_id, attempt_index,
+         (attempt_id, invocation_id, user_id, session_id, run_id, attempt_index,
           provider, admission_token, provider_protocol, provider_wire_hash, provider_wire_bytes,
           canonical_transition_id, canonical_parent_transition_id,
           canonical_transition_hash,
           status, usage_status, started_at, terminal_at)
-         SELECT ?, invocation_id, user_id, session_id, run_id, harness_run_id,
+         SELECT ?, invocation_id, user_id, session_id, run_id,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', 'unavailable', NOW(6), NULL
          FROM inference_invocations
          WHERE user_id = ? AND invocation_id = ? AND status = 'admitted'
@@ -2878,7 +2964,7 @@ async fn insert_inference_provider_attempt_admission(
             attempt.canonical_transition_hash.is_some(),
         ],
     );
-    let result = sqlx::query(&insert_sql)
+    let result = sqlx::query(insert_sql)
         .bind(&attempt.attempt_id)
         .bind(i64::from(attempt.attempt_index))
         .bind(&attempt.provider)
@@ -2994,7 +3080,7 @@ pub async fn admit_inference_invocation_with_first_provider_attempt(
                 error,
             )
         })?;
-    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
+    let mut tx = connection.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin combined inference admission",
@@ -3011,8 +3097,12 @@ pub async fn admit_inference_invocation_with_first_provider_attempt(
     }
     .await;
     if let Err(error) = write_result {
-        rollback_inference_tx(tx, "admit_inference_invocation_with_first_provider_attempt").await;
-        drop(connection);
+        if rollback_inference_tx(tx, "admit_inference_invocation_with_first_provider_attempt").await
+        {
+            connection.release();
+        } else {
+            drop(connection);
+        }
         let mut reconciliation = match CancellationSafePoolConnection::acquire(db).await {
             Ok(connection) => connection,
             Err(read_error) => {
@@ -3418,7 +3508,16 @@ pub async fn renew_inference_invocation_owner(
     // heartbeat already in flight can therefore observe zero updated rows even
     // though no owner transfer occurred. Re-read the row under a write lock so
     // terminal completion is distinguished from lease expiry or a newer owner.
-    let mut tx = pool.get().begin().await.map_err(|error| {
+    let mut connection = CancellationSafePoolConnection::acquire(pool.get())
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "acquire inference owner renewal resolution connection",
+                error,
+            )
+        })?;
+    let mut tx = connection.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin inference owner renewal resolution",
@@ -3472,10 +3571,13 @@ pub async fn renew_inference_invocation_owner(
                     error,
                 )
             })?;
+            connection.release();
             Ok(outcome)
         }
         Err(error) => {
-            rollback_inference_tx(tx, "resolve inference owner renewal").await;
+            if rollback_inference_tx(tx, "resolve inference owner renewal").await {
+                connection.release();
+            }
             Err(error)
         }
     }
@@ -3507,7 +3609,7 @@ pub async fn begin_inference_provider_attempt(
             attempt.attempt_id, persisted.status
         )));
     }
-    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
+    let mut tx = connection.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin inference provider attempt admission",
@@ -3516,7 +3618,9 @@ pub async fn begin_inference_provider_attempt(
     })?;
     let authority = lock_invocation_scope_authority(&mut tx, &attempt.invocation_input).await?;
     if authority != InvocationScopeAuthority::Live {
-        rollback_inference_tx(tx, "begin_inference_provider_attempt_scope_authority").await;
+        if rollback_inference_tx(tx, "begin_inference_provider_attempt_scope_authority").await {
+            connection.release();
+        }
         return Err(unavailable_scope_error(
             &attempt.invocation_input,
             authority,
@@ -3575,7 +3679,9 @@ pub async fn begin_inference_provider_attempt(
     })?
     .is_some();
     if settlement_pending {
-        rollback_inference_tx(tx, "begin_provider_attempt_settlement_pending").await;
+        if rollback_inference_tx(tx, "begin_provider_attempt_settlement_pending").await {
+            connection.release();
+        }
         return Err(ServiceError::conflict(format!(
             "inference invocation {} has a durable settlement decision; provider delivery must not be repeated",
             attempt.invocation_id
@@ -3599,7 +3705,9 @@ pub async fn begin_inference_provider_attempt(
     })?
     .is_some();
     if provider_attempt_open {
-        rollback_inference_tx(tx, "begin_provider_attempt_already_open").await;
+        if rollback_inference_tx(tx, "begin_provider_attempt_already_open").await {
+            connection.release();
+        }
         return Err(ServiceError::conflict(format!(
             "inference invocation {} already has an open provider attempt; concurrent provider delivery is forbidden",
             attempt.invocation_id
@@ -3607,12 +3715,12 @@ pub async fn begin_inference_provider_attempt(
     }
     let insert_sql = matrixone_statement_with_null_shape(
         "INSERT INTO inference_provider_attempts
-         (attempt_id, invocation_id, user_id, session_id, run_id, harness_run_id, attempt_index,
+         (attempt_id, invocation_id, user_id, session_id, run_id, attempt_index,
           provider, admission_token, provider_protocol, provider_wire_hash, provider_wire_bytes,
           canonical_transition_id, canonical_parent_transition_id,
           canonical_transition_hash,
           status, usage_status, started_at, terminal_at)
-         SELECT ?, invocation_id, user_id, session_id, run_id, harness_run_id,
+         SELECT ?, invocation_id, user_id, session_id, run_id,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', 'unavailable', NOW(6), NULL
          FROM inference_invocations
          WHERE user_id = ? AND invocation_id = ? AND status = 'admitted'
@@ -3637,7 +3745,7 @@ pub async fn begin_inference_provider_attempt(
             attempt.canonical_transition_hash.is_some(),
         ],
     );
-    let result = sqlx::query(&insert_sql)
+    let result = sqlx::query(insert_sql)
         .bind(&attempt.attempt_id)
         .bind(i64::from(attempt.attempt_index))
         .bind(&attempt.provider)
@@ -3660,18 +3768,26 @@ pub async fn begin_inference_provider_attempt(
         Ok(result) if result.rows_affected() == 1 => {
             if let Err(error) = advance_inference_canonical_transition_head(&mut tx, attempt).await
             {
-                rollback_inference_tx(tx, "advance inference canonical transition head").await;
+                if rollback_inference_tx(tx, "advance inference canonical transition head").await {
+                    connection.release();
+                }
                 return Err(error);
             }
-            if let Err(error) = insert_model_request_context_event(
+            // The successful insert above owns this new row in the same
+            // transaction. Its expiry is NULL; locking and reading it again
+            // cannot add protection against a concurrent expiry operation.
+            if let Err(error) = insert_model_request_context_event_with_expiry(
                 &mut tx,
                 attempt,
                 ModelRequestEventStage::Accepted,
                 None,
+                None,
             )
             .await
             {
-                rollback_inference_tx(tx, "record accepted model request context").await;
+                if rollback_inference_tx(tx, "record accepted model request context").await {
+                    connection.release();
+                }
                 return Err(error);
             }
             let error = match tx.commit().await {
@@ -3714,8 +3830,11 @@ pub async fn begin_inference_provider_attempt(
             attempt.invocation_id, attempt.attempt_id
         ))),
         Err(error) => {
-            rollback_inference_tx(tx, "begin_inference_provider_attempt").await;
-            drop(connection);
+            if rollback_inference_tx(tx, "begin_inference_provider_attempt").await {
+                connection.release();
+            } else {
+                drop(connection);
+            }
             if let Some(persisted) =
                 load_provider_attempt_fact_cancellation_safe(db, attempt).await?
             {
@@ -3780,7 +3899,16 @@ pub async fn load_inference_canonical_transitions_for_session(
     // Once fenced, recheck admission inside this transaction: a provider
     // attempt that won the intervening race is then observed as a blocker,
     // while later attempts wait until this bounded snapshot is complete.
-    let mut recovery_tx = pool.get().begin().await.map_err(|error| {
+    let mut recovery_connection = CancellationSafePoolConnection::acquire(pool.get())
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "acquire canonical transition WAL recovery connection",
+                error,
+            )
+        })?;
+    let mut recovery_tx = recovery_connection.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin canonical transition WAL recovery snapshot",
@@ -3941,6 +4069,7 @@ pub async fn load_inference_canonical_transitions_for_session(
                 error,
             )
         })?;
+        recovery_connection.release();
         return Ok(Vec::new());
     };
     let head_transition_id: String = head.try_get("head_transition_id").map_err(|error| {
@@ -4356,6 +4485,7 @@ pub async fn load_inference_canonical_transitions_for_session(
             error,
         )
     })?;
+    recovery_connection.release();
     Ok(vec![receipt])
 }
 
@@ -4370,7 +4500,54 @@ pub async fn retire_inference_canonical_transitions_through_turn(
 ) -> ServiceResult<u64> {
     validate_identity(user_id, "user_id", 128)?;
     validate_identity(session_id, "session_id", 64)?;
-    let mut tx = pool.get().begin().await.map_err(|error| {
+    let mut connection = CancellationSafePoolConnection::acquire(pool.get())
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "acquire inference canonical transition retirement connection",
+                error,
+            )
+        })?;
+    // Most session boundaries have nothing left to retire. An empty,
+    // writable snapshot needs no child-write transaction; nonempty or
+    // unavailable snapshots still use the canonical locked boundary below.
+    let pending: Option<i64> = sqlx::query_scalar(
+        "SELECT CASE WHEN
+            EXISTS (SELECT 1 FROM inference_canonical_transition_wal
+                    WHERE user_id = ? AND session_id = ? AND turn_index <= ?)
+            OR EXISTS (SELECT 1 FROM inference_canonical_transition_heads
+                       WHERE user_id = ? AND session_id = ? AND turn_index <= ?)
+            THEN 1 ELSE 0 END
+         FROM agent_sessions session_root
+         JOIN agent_session_lifecycle_fences fence
+           ON fence.user_id = session_root.user_id AND fence.session_id = session_root.session_id
+         WHERE session_root.user_id = ? AND session_root.session_id = ?
+           AND session_root.status <> 'deleting'
+           AND fence.delete_requested_at IS NULL AND fence.database_deleted_at IS NULL",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(i64::from(through_turn))
+    .bind(user_id)
+    .bind(session_id)
+    .bind(i64::from(through_turn))
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_optional(connection.connection_mut())
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "check absorbed inference canonical transition retirement work",
+            error,
+        )
+    })?;
+    if pending == Some(0) {
+        connection.release();
+        return Ok(0);
+    }
+    let mut tx = connection.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin inference canonical transition retirement",
@@ -4436,6 +4613,7 @@ pub async fn retire_inference_canonical_transitions_through_turn(
             error,
         )
     })?;
+    connection.release();
     Ok(retired)
 }
 
@@ -4703,7 +4881,7 @@ pub async fn finish_successful_inference_provider_attempt_and_invocation(
                 error,
             )
         })?;
-    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
+    let mut tx = connection.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin combined successful inference settlement",
@@ -4788,8 +4966,11 @@ pub async fn finish_successful_inference_provider_attempt_and_invocation(
     })?;
 
     if attempt_update.rows_affected() != 1 {
-        rollback_inference_tx(tx, "classify combined successful inference settlement").await;
-        drop(connection);
+        if rollback_inference_tx(tx, "classify combined successful inference settlement").await {
+            connection.release();
+        } else {
+            drop(connection);
+        }
         return if combined_successful_settlement_is_durable_cancellation_safe(
             db,
             plan,
@@ -4852,7 +5033,9 @@ pub async fn finish_successful_inference_provider_attempt_and_invocation(
         )
     })?;
     if invocation_update.rows_affected() != 1 {
-        rollback_inference_tx(tx, "finish combined successful inference settlement").await;
+        if rollback_inference_tx(tx, "finish combined successful inference settlement").await {
+            connection.release();
+        }
         return Err(ServiceError::conflict(format!(
             "inference invocation {} is unavailable for combined successful settlement",
             plan.invocation_id
@@ -4951,7 +5134,7 @@ pub async fn finish_inference_provider_attempt(
         // A successful physical response is final. Persist its recovery debt in
         // the same transaction, so a crash cannot leave a successful response
         // invisible to the logical lifecycle without an explicit recovery fact.
-        let mut tx = connection.connection_mut().begin().await.map_err(|error| {
+        let mut tx = connection.begin().await.map_err(|error| {
             ServiceError::with_source(
                 ServiceErrorKind::Persistence,
                 "begin successful inference provider terminal",
@@ -4975,8 +5158,11 @@ pub async fn finish_inference_provider_attempt(
                     "finish inference provider attempt",
                     error,
                 );
-                rollback_inference_tx(tx, "finish successful inference provider attempt").await;
-                drop(connection);
+                if rollback_inference_tx(tx, "finish successful inference provider attempt").await {
+                    connection.release();
+                } else {
+                    drop(connection);
+                }
                 return recover_provider_terminal_after_unknown_write(
                     db,
                     attempt,
@@ -5000,7 +5186,9 @@ pub async fn finish_inference_provider_attempt(
             )
             .await
         {
-            rollback_inference_tx(tx, "record successful inference settlement debt").await;
+            if rollback_inference_tx(tx, "record successful inference settlement debt").await {
+                connection.release();
+            }
             return Err(error);
         }
         if result.rows_affected() == 1
@@ -5012,7 +5200,9 @@ pub async fn finish_inference_provider_attempt(
             )
             .await
         {
-            rollback_inference_tx(tx, "record successful model request context").await;
+            if rollback_inference_tx(tx, "record successful model request context").await {
+                connection.release();
+            }
             return Err(error);
         }
         if let Err(error) = tx.commit().await {
@@ -5035,7 +5225,7 @@ pub async fn finish_inference_provider_attempt(
         }
         result
     } else {
-        let mut tx = connection.connection_mut().begin().await.map_err(|error| {
+        let mut tx = connection.begin().await.map_err(|error| {
             ServiceError::with_source(
                 ServiceErrorKind::Persistence,
                 "begin inference provider terminal",
@@ -5062,7 +5252,9 @@ pub async fn finish_inference_provider_attempt(
                     )
                     .await
                 {
-                    rollback_inference_tx(tx, "record terminal model request context").await;
+                    if rollback_inference_tx(tx, "record terminal model request context").await {
+                        connection.release();
+                    }
                     return Err(error);
                 }
                 if let Err(error) = tx.commit().await {
@@ -5091,8 +5283,11 @@ pub async fn finish_inference_provider_attempt(
                     "finish inference provider attempt",
                     error,
                 );
-                rollback_inference_tx(tx, "finish inference provider attempt").await;
-                drop(connection);
+                if rollback_inference_tx(tx, "finish inference provider attempt").await {
+                    connection.release();
+                } else {
+                    drop(connection);
+                }
                 return recover_provider_terminal_after_unknown_write(
                     db,
                     attempt,
@@ -5320,13 +5515,13 @@ async fn write_inference_settlement_debt(
     })?;
     sqlx::query(
         "INSERT IGNORE INTO inference_invocation_settlement_debts
-         (user_id, invocation_id, session_id, harness_run_id,
+         (user_id, invocation_id, session_id,
           terminal_status, terminal_fingerprint, usage_status,
           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
           provider_response_id, error_kind, error_message, provider_attempt_id,
           provider_delivery_state)
          SELECT invocation.user_id, invocation.invocation_id,
-                invocation.session_id, invocation.harness_run_id,
+                invocation.session_id,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          FROM inference_invocations AS invocation
          WHERE invocation.user_id = ? AND invocation.invocation_id = ?",
@@ -5636,7 +5831,7 @@ async fn record_inference_settlement_debt(
                 error,
             )
         })?;
-    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
+    let mut tx = connection.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin inference settlement debt",
@@ -6767,7 +6962,8 @@ async fn recover_expired_inference_invocation(
     user_id: &str,
     invocation_id: &str,
 ) -> Result<u64, sqlx::Error> {
-    let mut tx = db.begin().await?;
+    let mut connection = CancellationSafePoolConnection::acquire(db).await?;
+    let mut tx = connection.begin().await?;
     let Some(invocation) = sqlx::query(
         "SELECT status, owner_token, owner_generation,
                 IF(owner_lease_expires_at <= NOW(6), 1, 0) AS lease_expired
@@ -6781,12 +6977,14 @@ async fn recover_expired_inference_invocation(
     .await?
     else {
         tx.rollback().await?;
+        connection.release();
         return Ok(0);
     };
     let status = invocation.try_get::<String, _>("status")?;
     let lease_expired = invocation.try_get::<i64, _>("lease_expired")? == 1;
     if status != "admitted" || !lease_expired {
         tx.rollback().await?;
+        connection.release();
         return Ok(0);
     }
     let old_owner_token = invocation.try_get::<String, _>("owner_token")?;
@@ -6807,6 +7005,7 @@ async fn recover_expired_inference_invocation(
     .is_some();
     if settlement_exists {
         tx.rollback().await?;
+        connection.release();
         return Ok(0);
     }
 
@@ -6968,9 +7167,11 @@ async fn recover_expired_inference_invocation(
     .await?;
     if updated.rows_affected() != 1 {
         tx.rollback().await?;
+        connection.release();
         return Ok(0);
     }
     tx.commit().await?;
+    connection.release();
     Ok(1)
 }
 
@@ -7260,7 +7461,7 @@ pub async fn finish_inference_invocation(
                 error,
             )
         })?;
-    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
+    let mut tx = connection.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin inference terminal commit",
@@ -7344,8 +7545,11 @@ pub async fn finish_inference_invocation(
     .await;
 
     if let Err(error) = write_result {
-        rollback_inference_tx(tx, "finish_inference_invocation").await;
-        drop(connection);
+        if rollback_inference_tx(tx, "finish_inference_invocation").await {
+            connection.release();
+        } else {
+            drop(connection);
+        }
         if let Some(existing) = existing_terminal_fingerprint_cancellation_safe(db, plan).await? {
             return if existing == fingerprint {
                 Ok(())
@@ -7395,10 +7599,294 @@ pub async fn finish_inference_invocation(
     Ok(())
 }
 
+pub(crate) fn projected_auxiliary_usage(
+    protocol: &str,
+    status: &str,
+    counts: [i64; 4],
+) -> ServiceResult<Option<astra_turn_types::ExplainAnalyzeTokenUsageV1>> {
+    use astra_turn_types::{ExplainAnalyzeTokenUsageV1, ExplainAnalyzeUsageBasisV1};
+    let basis = match status {
+        "unavailable" => return Ok(None),
+        "provider_exact" => ExplainAnalyzeUsageBasisV1::ProviderExact,
+        "provider_partial" => ExplainAnalyzeUsageBasisV1::ProviderPartial,
+        _ => return Err(ServiceError::internal("invalid inference usage status")),
+    };
+    if counts.iter().any(|value| *value < 0) {
+        return Err(ServiceError::internal("negative inference usage"));
+    }
+    let count = |value| -> ServiceResult<Option<u64>> {
+        let value =
+            u64::try_from(value).map_err(|_| ServiceError::internal("negative inference usage"))?;
+        Ok(if status == "provider_partial" && value == 0 {
+            None
+        } else {
+            Some(value)
+        })
+    };
+    Ok(Some(ExplainAnalyzeTokenUsageV1 {
+        basis,
+        fresh_input_tokens: count(counts[0])?,
+        output_tokens: count(counts[1])?,
+        cache_read_tokens: if protocol == "typesafe_systemone" {
+            None
+        } else {
+            count(counts[2])?
+        },
+        cache_creation_tokens: if protocol == "typesafe_systemone" {
+            None
+        } else {
+            count(counts[3])?
+        },
+    }))
+}
+
+/// Request-local physical execution identity captured alongside the existing
+/// auxiliary usage read. This is intentionally not persisted or exposed as a
+/// second ledger; consumers use it to correlate already-read attempts with
+/// bounded semantic observations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuxiliaryExecutionAttemptFact {
+    pub invocation_id: String,
+    pub invocation_session_id: Option<String>,
+    pub invocation_run_id: Option<String>,
+    pub invocation_turn: Option<i64>,
+    pub invocation_round: Option<i64>,
+    pub route_session_id: Option<String>,
+    pub route_run_id: Option<String>,
+    pub route_provider: Option<String>,
+    pub attempt_id: String,
+    pub attempt_index: i64,
+    pub attempt_session_id: Option<String>,
+    pub attempt_run_id: Option<String>,
+    pub attempt_provider: String,
+    pub attempt_protocol: String,
+    pub attempt_status: String,
+    pub resolved_model_name: String,
+    pub upstream_model_name: String,
+}
+
+/// One bounded, request-local read of the session auxiliary-attempt ledger.
+/// `facts` is the existing usage projection; `execution` is optional detail
+/// selected only by callers that explicitly request a diagnostic depth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionAuxiliaryUsageCapture {
+    pub facts: astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1,
+    pub execution: Vec<AuxiliaryExecutionAttemptFact>,
+}
+
+/// Read-only auxiliary usage from physical attempts, scoped to one authenticated
+/// owner/session/turn. Invocation totals are never added to attempt totals.
+pub async fn load_explain_auxiliary_usage(
+    pool: &SharedPool,
+    user_id: &str,
+    session_id: &str,
+    turn: u32,
+    max_attempts: usize,
+) -> ServiceResult<astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1> {
+    validate_identity(user_id, "user_id", 128)?;
+    validate_identity(session_id, "session_id", 64)?;
+    let rows = sqlx::query("SELECT a.attempt_id, a.provider, a.provider_protocol, r.offering_id, r.upstream_model_name, i.purpose, i.operation_id, a.usage_status, a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_creation_tokens FROM inference_invocations i JOIN inference_provider_attempts a ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id JOIN inference_routes r ON r.user_id = i.user_id AND r.route_id = i.route_id WHERE i.user_id = ? AND i.session_id = ? AND i.turn_index = ? AND i.purpose NOT IN ('primary_agent', 'sub_agent') ORDER BY a.attempt_id LIMIT ?")
+        .bind(user_id).bind(session_id).bind(i64::from(turn))
+        .bind(i64::try_from(max_attempts.saturating_add(1)).map_err(|_| ServiceError::internal("invalid Explain capture budget"))?).fetch_all(pool.get()).await
+        .map_err(|e| ServiceError::internal(format!("load auxiliary Explain usage: {e}")))?;
+    project_auxiliary_usage_rows(rows, max_attempts)
+}
+
+/// Session-scoped view over the same physical attempt facts used by Explain.
+/// Reflection reads this only on demand and never combines invocation totals
+/// with provider-attempt totals.
+pub async fn load_session_auxiliary_usage(
+    pool: &SharedPool,
+    user_id: &str,
+    session_id: &str,
+    max_attempts: usize,
+) -> ServiceResult<astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1> {
+    Ok(
+        load_session_auxiliary_capture(pool, user_id, session_id, max_attempts, false)
+            .await?
+            .facts,
+    )
+}
+
+/// The canonical bounded session read used by reflection and introspection.
+/// Detailed execution identity is selected in the same query only when the
+/// caller asks for Diagnostic/Forensic output; it never causes a second ledger
+/// query or connection checkout.
+pub async fn load_session_auxiliary_capture(
+    pool: &SharedPool,
+    user_id: &str,
+    session_id: &str,
+    max_attempts: usize,
+    include_execution: bool,
+) -> ServiceResult<SessionAuxiliaryUsageCapture> {
+    validate_identity(user_id, "user_id", 128)?;
+    validate_identity(session_id, "session_id", 64)?;
+    let select = if include_execution {
+        "SELECT i.invocation_id, i.session_id AS invocation_session_id, i.run_id AS invocation_run_id, i.turn_index AS invocation_turn, i.round_index AS invocation_round, r.session_id AS route_session_id, r.run_id AS route_run_id, r.provider AS route_provider, a.attempt_id, a.attempt_index, a.session_id AS attempt_session_id, a.run_id AS attempt_run_id, a.provider, a.provider_protocol, a.status AS attempt_status, r.resolved_model_name, r.upstream_model_name, a.usage_status, a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_creation_tokens, r.offering_id, i.purpose, i.operation_id"
+    } else {
+        "SELECT a.attempt_id, a.provider, a.provider_protocol, r.offering_id, r.upstream_model_name, i.purpose, i.operation_id, a.usage_status, a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_creation_tokens"
+    };
+    // Delegation/model-selector judgments use request-specific operation IDs;
+    // classify their usage by the admitted introspection purpose instead of
+    // attempting to enumerate hashed operation identities.
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "{select} FROM inference_invocations i JOIN inference_provider_attempts a ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id JOIN inference_routes r ON r.user_id = i.user_id AND r.route_id = i.route_id WHERE i.user_id = ? AND i.session_id = ? AND (i.operation_id IN ('request_judgment', 'skill_auto_route', 'work_plan', 'memory_relevance', 'memory_feedback', 'verification_judge', 'completion_proxy:turn_intent', 'completion_proxy:tool_result_rerank') OR i.purpose IN ('introspection', 'memory_retrieval_rerank', 'tool_result_rerank', 'verification_judge')) ORDER BY a.attempt_id LIMIT ?"
+    )))
+        .bind(user_id)
+        .bind(session_id)
+        .bind(i64::try_from(max_attempts.saturating_add(1)).map_err(|_| ServiceError::internal("invalid reflection capture budget"))?)
+        .fetch_all(pool.get())
+        .await
+        .map_err(|e| ServiceError::internal(format!("load session auxiliary usage: {e}")))?;
+    let (facts, execution) =
+        project_auxiliary_usage_rows_with_execution(rows, max_attempts, include_execution)?;
+    Ok(SessionAuxiliaryUsageCapture { facts, execution })
+}
+
+fn project_auxiliary_usage_rows(
+    rows: Vec<sqlx::mysql::MySqlRow>,
+    max_attempts: usize,
+) -> ServiceResult<astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1> {
+    Ok(project_auxiliary_usage_rows_with_execution(rows, max_attempts, false)?.0)
+}
+
+fn project_auxiliary_usage_rows_with_execution(
+    rows: Vec<sqlx::mysql::MySqlRow>,
+    max_attempts: usize,
+    include_execution: bool,
+) -> ServiceResult<(
+    astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1,
+    Vec<AuxiliaryExecutionAttemptFact>,
+)> {
+    use astra_turn_types::{ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageV1};
+    let truncated = rows.len() > max_attempts;
+    let mut attempts = Vec::with_capacity(rows.len().min(max_attempts));
+    let mut execution = Vec::with_capacity(rows.len().min(max_attempts));
+    for row in rows.into_iter().take(max_attempts) {
+        let status: String = row
+            .try_get("usage_status")
+            .map_err(|e| ServiceError::internal(e.to_string()))?;
+        let protocol: String = row
+            .try_get("provider_protocol")
+            .map_err(|e| ServiceError::internal(e.to_string()))?;
+        let mut counts = [0; 4];
+        for (count, column) in counts.iter_mut().zip([
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_creation_tokens",
+        ]) {
+            *count = row
+                .try_get(column)
+                .map_err(|e| ServiceError::internal(e.to_string()))?;
+        }
+        let usage = projected_auxiliary_usage(&protocol, &status, counts)?;
+        let text = |column: &str| {
+            row.try_get::<String, _>(column)
+                .map_err(|e| ServiceError::internal(e.to_string()))
+        };
+        if include_execution {
+            execution.push(AuxiliaryExecutionAttemptFact {
+                invocation_id: text("invocation_id")?,
+                invocation_session_id: row
+                    .try_get("invocation_session_id")
+                    .map_err(|e| ServiceError::internal(e.to_string()))?,
+                invocation_run_id: row
+                    .try_get("invocation_run_id")
+                    .map_err(|e| ServiceError::internal(e.to_string()))?,
+                invocation_turn: row
+                    .try_get("invocation_turn")
+                    .map_err(|e| ServiceError::internal(e.to_string()))?,
+                invocation_round: row
+                    .try_get("invocation_round")
+                    .map_err(|e| ServiceError::internal(e.to_string()))?,
+                route_session_id: row
+                    .try_get("route_session_id")
+                    .map_err(|e| ServiceError::internal(e.to_string()))?,
+                route_run_id: row
+                    .try_get("route_run_id")
+                    .map_err(|e| ServiceError::internal(e.to_string()))?,
+                route_provider: Some(text("route_provider")?),
+                attempt_id: text("attempt_id")?,
+                attempt_index: row
+                    .try_get("attempt_index")
+                    .map_err(|e| ServiceError::internal(e.to_string()))?,
+                attempt_session_id: row
+                    .try_get("attempt_session_id")
+                    .map_err(|e| ServiceError::internal(e.to_string()))?,
+                attempt_run_id: row
+                    .try_get("attempt_run_id")
+                    .map_err(|e| ServiceError::internal(e.to_string()))?,
+                attempt_provider: text("provider")?,
+                attempt_protocol: text("provider_protocol")?,
+                attempt_status: text("attempt_status")?,
+                resolved_model_name: text("resolved_model_name")?,
+                upstream_model_name: text("upstream_model_name")?,
+            });
+        }
+        attempts.push(ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: text("attempt_id")?,
+            provider: text("provider")?,
+            offering_id: text("offering_id")?,
+            model_name: text("upstream_model_name")?,
+            purpose: text("purpose")?,
+            operation_id: text("operation_id")?,
+            usage: usage.filter(astra_turn_types::ExplainAnalyzeTokenUsageV1::is_valid),
+            usage_status: match status.as_str() {
+                "provider_exact" => {
+                    astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact
+                }
+                "provider_partial" => {
+                    astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderPartial
+                }
+                _ => astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::Unavailable,
+            },
+        });
+    }
+    let result = ExplainAnalyzeAuxiliaryUsageV1 {
+        available: true,
+        truncated,
+        attempts,
+    };
+    if !result.is_valid() {
+        return Err(ServiceError::internal(
+            "invalid auxiliary inference usage fact",
+        ));
+    }
+    Ok((result, execution))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_request_context::{
+        apply_model_request_terminal_usage, projected_cache_read_share,
+    };
     use serde_json::json;
+
+    fn model_request_event(
+        attempt: &InferenceProviderAttemptPlan,
+        stage: ModelRequestEventStage,
+        terminal: Option<&InferenceInvocationTerminal>,
+    ) -> ServiceResult<(String, String, ModelRequestContextEvent)> {
+        let accepted = model_request_accepted_event(attempt)?;
+        match (stage, terminal) {
+            (ModelRequestEventStage::Accepted, None) => Ok(accepted),
+            (ModelRequestEventStage::Terminal, Some(terminal)) => {
+                let fact = model_request_terminal_fact(terminal);
+                let event = fact.hydrate(accepted.2)?;
+                let json = serde_json::to_string(&fact).unwrap();
+                Ok((
+                    hash_identity("mrctx", &[attempt.attempt_id.as_str(), stage.as_str()]),
+                    json,
+                    event,
+                ))
+            }
+            _ => Err(ServiceError::internal(
+                "test fixture stage disagrees with terminal",
+            )),
+        }
+    }
 
     fn input() -> InferenceInvocationInput {
         InferenceInvocationInput {
@@ -7426,6 +7914,488 @@ mod tests {
         }
     }
 
+    fn assert_scope_rejection(error: &ServiceError, expected: InferenceScopeRejection) {
+        assert_eq!(
+            error.kind,
+            match expected {
+                InferenceScopeRejection::GuidancePending | InferenceScopeRejection::Paused => {
+                    ServiceErrorKind::Conflict
+                }
+                InferenceScopeRejection::Unavailable => ServiceErrorKind::NotFound,
+            }
+        );
+        assert_eq!(
+            error
+                .source
+                .as_deref()
+                .and_then(|source| source.downcast_ref::<InferenceScopeRejection>()),
+            Some(&expected)
+        );
+    }
+
+    #[test]
+    fn retained_pause_requires_exact_live_uncancelled_owner_and_waiting_obligation() {
+        let input = input();
+        let expected = input.run_authority.as_ref().unwrap();
+        let owner = Some(expected.expected_owner_pod_id.as_str());
+        for (status, generation, stored_owner, lease_live, cancelled, waiting, authority) in [
+            (
+                "running",
+                0,
+                owner,
+                true,
+                false,
+                false,
+                InvocationScopeAuthority::Live,
+            ),
+            (
+                "running",
+                0,
+                owner,
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Live,
+            ),
+            (
+                "paused",
+                0,
+                owner,
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Paused),
+            ),
+            (
+                "paused",
+                0,
+                owner,
+                true,
+                false,
+                false,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "paused",
+                1,
+                owner,
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "paused",
+                0,
+                Some("other-owner"),
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "paused",
+                0,
+                None,
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "paused",
+                0,
+                owner,
+                false,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "paused",
+                0,
+                owner,
+                true,
+                true,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "running",
+                0,
+                owner,
+                false,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "running",
+                0,
+                owner,
+                true,
+                true,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "waiting",
+                0,
+                owner,
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "cancelled",
+                0,
+                owner,
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "completed",
+                0,
+                owner,
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+        ] {
+            assert_eq!(
+                classify_run_invocation_scope_authority(
+                    expected,
+                    generation,
+                    stored_owner,
+                    lease_live,
+                    cancelled,
+                    status,
+                    waiting,
+                )
+                .unwrap(),
+                authority,
+                "status={status}, generation={generation}, owner={stored_owner:?}, lease={lease_live}, cancelled={cancelled}, waiting={waiting}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ASTRA_TEST_DB_IT=1 and a current-schema MatrixOne database"]
+    async fn retained_pause_fences_real_logical_and_final_provider_admission() {
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let mut settings = astra_core::MatrixOneSettings::from_env();
+        settings.db_pool_max_connections = 2;
+        settings.db_pool_min_connections = 0;
+        let catalog =
+            std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+        crate::storage::ensure_core_schema(&settings, &catalog)
+            .await
+            .unwrap();
+        let pool = SharedPool::new(&settings).await.unwrap();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let user_id = format!("retained-pause-{suffix}");
+        let session_id = format!("retained-pause-session-{suffix}");
+        let run_id = format!("retained-pause-run-{suffix}");
+        sqlx::query(
+            "INSERT INTO agent_sessions
+             (session_id, user_id, status, event_count, project_retention_policy,
+              created_at, updated_at, last_active_at)
+             VALUES (?, ?, 'active', 0, 'session', NOW(6), NOW(6), NOW(6))",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_runs
+             (run_id, user_id, session_id, root_run_id, ancestor_path, depth, retry_scope,
+              status, execution_mode, owner_pod_id, owner_lease_expires_at,
+              run_generation, last_event_idx, total_prompt_tokens,
+              total_completion_tokens, total_tool_calls, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 0, 'node', 'running', 'web_agent',
+                     'test-inference-owner', TIMESTAMPADD(MINUTE, 5, NOW(6)),
+                     0, 0, 0, 0, 0, NOW(6), NOW(6))",
+        )
+        .bind(&run_id)
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&run_id)
+        .bind(&run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        let plan = |operation_id: &str| {
+            let mut input = input();
+            input.user_id = user_id.clone();
+            input.scope = InferenceInvocationScope::Run {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                turn: 0,
+                round: 0,
+                operation_id: operation_id.into(),
+                logical_attempt: 0,
+            };
+            plan_inference_invocation(input).unwrap()
+        };
+        let attempt = |plan: &InferenceInvocationPlan| {
+            plan_inference_provider_attempt(
+                plan,
+                0,
+                InferenceProviderWireIdentity::new("openai_compatible", "a".repeat(64), 2).unwrap(),
+            )
+        };
+        let final_plan = plan("paused_final");
+        admit_inference_invocation(&pool, &final_plan)
+            .await
+            .unwrap();
+        let settlement_plan = plan("paused_settlement");
+        admit_inference_invocation(&pool, &settlement_plan)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_runs SET status = 'paused', waiting_for = 'user_resume' WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id).bind(&run_id).execute(pool.get()).await.unwrap();
+        let logical_plan = plan("paused_logical");
+        let combined_plan = plan("paused_combined");
+        for error in [
+            admit_inference_invocation(&pool, &logical_plan)
+                .await
+                .unwrap_err(),
+            admit_inference_invocation_with_first_provider_attempt(
+                &pool,
+                &combined_plan,
+                &attempt(&combined_plan),
+            )
+            .await
+            .unwrap_err(),
+            begin_inference_provider_attempt(&pool, &attempt(&final_plan))
+                .await
+                .unwrap_err(),
+        ] {
+            assert_scope_rejection(&error, InferenceScopeRejection::Paused);
+        }
+        let terminal = InferenceInvocationTerminal {
+            status: InferenceTerminalStatus::Cancelled,
+            usage: InferenceUsage::default(),
+            usage_status: InferenceUsageStatus::Unavailable,
+            provider_response_id: None,
+            error_kind: Some("cancelled".into()),
+            error_message: None,
+        };
+        for (plan, resolution) in [
+            (
+                &logical_plan,
+                InferenceInvocationAdmissionResolution::ScopeUnavailable,
+            ),
+            (
+                &settlement_plan,
+                InferenceInvocationAdmissionResolution::Settled,
+            ),
+        ] {
+            assert_eq!(
+                settle_uncertain_inference_admission(&pool, plan, &terminal)
+                    .await
+                    .unwrap(),
+                (resolution, Some(InferenceScopeRejection::Paused)),
+            );
+        }
+        assert_eq!(
+            settle_uncertain_inference_admission(&pool, &plan("paused_settlement"), &terminal)
+                .await
+                .unwrap(),
+            (
+                InferenceInvocationAdmissionResolution::ConflictingIdentity,
+                Some(InferenceScopeRejection::Paused)
+            ),
+        );
+        for (table, expected) in [
+            ("inference_routes", 2_i64),
+            ("inference_invocations", 2),
+            ("inference_provider_attempts", 0),
+            ("inference_invocation_settlement_debts", 1),
+        ] {
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} WHERE user_id = ?"
+            )))
+            .bind(&user_id)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+            assert_eq!(
+                count, expected,
+                "paused recovery has an unexpected row count in {table}"
+            );
+        }
+        let waiting_for: Option<String> = sqlx::query_scalar(
+            "SELECT waiting_for FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(waiting_for.as_deref(), Some("user_resume"));
+        sqlx::query("UPDATE agent_runs SET waiting_for = NULL WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id)
+            .bind(&run_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        assert_scope_rejection(
+            &admit_inference_invocation(&pool, &logical_plan)
+                .await
+                .unwrap_err(),
+            InferenceScopeRejection::Unavailable,
+        );
+        sqlx::query("UPDATE agent_runs SET waiting_for = 'user_resume', owner_lease_expires_at = TIMESTAMPADD(SECOND, -1, NOW(6)) WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id).bind(&run_id).execute(pool.get()).await.unwrap();
+        assert_scope_rejection(
+            &admit_inference_invocation(&pool, &logical_plan)
+                .await
+                .unwrap_err(),
+            InferenceScopeRejection::Unavailable,
+        );
+        // Resume the same owner and the already-admitted invocation. A pause
+        // must not force logical re-admission or replace its physical identity.
+        sqlx::query("UPDATE agent_runs SET status = 'running', waiting_for = NULL, owner_lease_expires_at = TIMESTAMPADD(MINUTE, 5, NOW(6)) WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id).bind(&run_id).execute(pool.get()).await.unwrap();
+        assert_eq!(
+            begin_inference_provider_attempt(&pool, &attempt(&settlement_plan))
+                .await
+                .unwrap_err()
+                .kind,
+            ServiceErrorKind::Conflict,
+            "resume must not revive an invocation already handed to settlement",
+        );
+        begin_inference_provider_attempt(&pool, &attempt(&final_plan))
+            .await
+            .unwrap();
+        let resumed_attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM inference_provider_attempts WHERE user_id = ?",
+        )
+        .bind(&user_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(resumed_attempts, 1);
+        for table in [
+            "inference_invocation_settlement_debts",
+            "inference_provider_attempts",
+            "inference_invocations",
+            "inference_routes",
+            "agent_runs",
+            "agent_sessions",
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE user_id = ?"
+            )))
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ASTRA_TEST_DB_IT=1 and a current-schema MatrixOne database"]
+    async fn inference_price_snapshot_survives_persisted_replay_and_recovery() {
+        let _ = dotenvy::dotenv();
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let mut settings = astra_core::MatrixOneSettings::from_env();
+        settings.db_pool_max_connections = 2;
+        settings.db_pool_min_connections = 0;
+        let catalog =
+            std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+        crate::storage::ensure_core_schema(&settings, &catalog)
+            .await
+            .unwrap();
+        let pool = SharedPool::new(&settings).await.unwrap();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let user_id = format!("price-snapshot-{suffix}");
+        let session_id = format!("price-snapshot-{suffix}");
+        sqlx::query("INSERT INTO agent_sessions (session_id, user_id, status, event_count, project_retention_policy, created_at, updated_at, last_active_at) VALUES (?, ?, 'active', 0, 'session', NOW(6), NOW(6), NOW(6))")
+            .bind(&session_id).bind(&user_id).execute(pool.get()).await.unwrap();
+        let mut input = input();
+        input.user_id = user_id.clone();
+        input.run_authority = None;
+        input.scope = InferenceInvocationScope::Session {
+            session_id: session_id.clone(),
+            turn: 0,
+            round: 0,
+            operation_id: "price_snapshot".into(),
+            logical_attempt: 0,
+        };
+        let snapshot = |rate| {
+            crate::models::InferencePriceSnapshot::from_stored(
+                &json!({
+                    "calculation_version": 1,
+                    "currency": "USD", "unit": "per_token", "source": "configured",
+                    "prompt": rate, "completion": rate,
+                    "configuration_updated_at": "2026-09-27",
+                })
+                .to_string(),
+            )
+            .unwrap()
+        };
+        let original = plan_inference_invocation(input.clone())
+            .unwrap()
+            .with_price_snapshot(Some(&snapshot(0.000001)))
+            .unwrap();
+        admit_inference_invocation(&pool, &original).await.unwrap();
+        let replay = plan_inference_invocation(input)
+            .unwrap()
+            .with_price_snapshot(Some(&snapshot(0.000002)))
+            .unwrap();
+        assert_eq!(original.route_id(), replay.route_id());
+        assert_eq!(original.invocation_id(), replay.invocation_id());
+        assert_ne!(original.price_snapshot_json, replay.price_snapshot_json);
+        assert!(admit_inference_invocation(&pool, &replay).await.is_err());
+        let recovery = original
+            .clone()
+            .with_price_snapshot(Some(&snapshot(0.000002)))
+            .unwrap();
+        let terminal = InferenceInvocationTerminal {
+            status: InferenceTerminalStatus::Cancelled,
+            usage: InferenceUsage::default(),
+            usage_status: InferenceUsageStatus::Unavailable,
+            provider_response_id: None,
+            error_kind: Some("cancelled".into()),
+            error_message: None,
+        };
+        assert_eq!(
+            settle_uncertain_inference_admission(&pool, &recovery, &terminal)
+                .await
+                .unwrap(),
+            (InferenceInvocationAdmissionResolution::Settled, None),
+        );
+        let retained: String = sqlx::query_scalar(
+            "SELECT CAST(price_snapshot_json AS CHAR) FROM inference_routes WHERE user_id = ? AND route_id = ?",
+        )
+        .bind(&user_id).bind(original.route_id()).fetch_one(pool.get()).await.unwrap();
+        assert_eq!(
+            crate::models::InferencePriceSnapshot::from_stored(&retained),
+            Some(snapshot(0.000001))
+        );
+        for table in [
+            "inference_invocation_settlement_debts",
+            "inference_invocations",
+            "inference_routes",
+            "agent_sessions",
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE user_id = ?"
+            )))
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        }
+    }
+
     #[test]
     fn invocation_identity_changes_with_inference_purpose() {
         let primary = plan_inference_invocation(input()).expect("primary plan");
@@ -7438,6 +8408,122 @@ mod tests {
                 .expect("changed plan")
                 .invocation_id
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ASTRA_TEST_DB_IT=1 and a current-schema MatrixOne database"]
+    async fn delayed_recovery_rechecks_settled_authority_after_diagnostic_pruning() {
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let settings = astra_core::MatrixOneSettings::from_env();
+        crate::storage::ensure_core_schema(&settings, "mysql")
+            .await
+            .unwrap();
+        let pool = SharedPool::new(&settings).await.unwrap();
+        let user = uuid::Uuid::new_v4().to_string();
+        let session = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO agent_sessions (session_id,user_id,status,event_count,project_retention_policy,created_at,updated_at,last_active_at) VALUES (?,?,'active',0,'session',NOW(6),NOW(6),NOW(6))")
+            .bind(&session).bind(&user).execute(pool.get()).await.unwrap();
+        let mut request = input();
+        request.user_id = user.clone();
+        request.provider = format!("delayed-{user}");
+        request.run_authority = None;
+        request.scope = InferenceInvocationScope::Session {
+            session_id: session.clone(),
+            turn: 1,
+            round: 0,
+            operation_id: "delayed-recovery".into(),
+            logical_attempt: 0,
+        };
+        let plan = plan_inference_invocation(request.clone()).unwrap();
+        let attempt = plan_inference_provider_attempt(
+            &plan,
+            0,
+            InferenceProviderWireIdentity::new("openai_compatible", "a".repeat(64), 2).unwrap(),
+        );
+        let terminal = InferenceInvocationTerminal::succeeded(InferenceUsage::default(), None);
+        let durable = DurableInferenceTerminal::from_terminal(
+            &terminal,
+            terminal_fingerprint(&terminal).unwrap(),
+        )
+        .unwrap();
+        admit_inference_invocation_with_first_provider_attempt(&pool, &plan, &attempt)
+            .await
+            .unwrap();
+        // The first reconciler has observed admission. Another completes the
+        // invocation and GC prunes before the first enters its cold transaction.
+        finish_successful_inference_provider_attempt_and_invocation(
+            &pool, &plan, &attempt, &terminal,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE model_request_context_events SET created_at=DATE_SUB(NOW(6),INTERVAL 31 DAY) WHERE user_id=?")
+            .bind(&user).execute(pool.get()).await.unwrap();
+        let page = crate::model_request_context::expire_model_request_context_events(
+            &pool,
+            1000,
+            &mut Default::default(),
+        )
+        .await
+        .unwrap();
+        assert!(page.deleted >= 2);
+        let mut connection = pool.get().acquire().await.unwrap();
+        insert_recovered_model_request_terminal(
+            &mut connection,
+            &user,
+            plan.invocation_id(),
+            attempt.attempt_id(),
+            &durable,
+        )
+        .await
+        .unwrap();
+        let mut conflict = durable.clone();
+        conflict.terminal_fingerprint = Some("b".repeat(64));
+        assert!(
+            insert_recovered_model_request_terminal(
+                &mut connection,
+                &user,
+                plan.invocation_id(),
+                attempt.attempt_id(),
+                &conflict
+            )
+            .await
+            .is_err()
+        );
+        drop(connection);
+        assert!(
+            crate::list_model_request_context_events(&pool, &user, &session, 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let requests: i64 = sqlx::query_scalar("SELECT CAST(SUM(requests) AS SIGNED) FROM model_request_metric_shards WHERE provider=?")
+            .bind(&request.provider).fetch_one(pool.get()).await.unwrap();
+        assert_eq!(
+            requests, 1,
+            "a delayed reconciler cannot recreate accounting"
+        );
+        for table in [
+            "model_request_context_events",
+            "inference_provider_attempts",
+            "inference_invocation_settlement_debts",
+            "inference_invocations",
+            "inference_routes",
+            "agent_sessions",
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE user_id=?"
+            )))
+            .bind(&user)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        }
+        sqlx::query("DELETE FROM model_request_metric_shards WHERE provider=?")
+            .bind(&request.provider)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        pool.close().await;
     }
 
     #[test]
@@ -7521,19 +8607,8 @@ mod tests {
         };
         session_input.run_authority = None;
         let session = plan_inference_invocation(session_input).expect("session plan");
-        let mut harness_input = input();
-        harness_input.scope = InferenceInvocationScope::HarnessRun {
-            harness_run_id: "harness-run-1".to_string(),
-            operation_id: "skillify_extract".to_string(),
-            logical_attempt: 0,
-        };
-        harness_input.run_authority = None;
-        harness_input.purpose = InferencePurpose::SkillSynthesis;
-        let harness = plan_inference_invocation(harness_input).expect("harness plan");
 
         assert_ne!(run.invocation_id(), session.invocation_id());
-        assert_ne!(run.invocation_id(), harness.invocation_id());
-        assert_ne!(session.invocation_id(), harness.invocation_id());
     }
 
     #[test]
@@ -7749,8 +8824,8 @@ mod tests {
     fn ambiguous_canonical_proof_separates_root_and_child_statement_identities() {
         let root = ambiguous_canonical_admission_proof_sql(false);
         let child = ambiguous_canonical_admission_proof_sql(true);
-        assert!(root.ends_with("/* astra-null-shape:0 */"));
-        assert!(child.ends_with("/* astra-null-shape:1 */"));
+        assert!(root.as_str().ends_with("/* astra-null-shape:0 */"));
+        assert!(child.as_str().ends_with("/* astra-null-shape:1 */"));
         assert_ne!(root, child);
     }
 
@@ -7874,6 +8949,8 @@ mod tests {
     #[test]
     fn provider_wire_identity_rejects_ambiguous_or_fabricated_values() {
         let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(InferenceProviderWireIdentity::new("typesafe_systemone", hash, 1).is_ok());
+        assert!(InferenceProviderWireIdentity::new("unknown_protocol", hash, 1).is_err());
         assert!(InferenceProviderWireIdentity::new("", hash, 1).is_err());
         assert!(InferenceProviderWireIdentity::new("openai compatible", hash, 1).is_err());
         assert!(
@@ -7944,11 +9021,104 @@ mod tests {
     }
 
     #[test]
+    fn projected_usage_does_not_invent_system_one_cache_counters() {
+        let jev = projected_auxiliary_usage("typesafe_systemone", "provider_exact", [100, 4, 0, 0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(jev.fresh_input_tokens, Some(100));
+        assert_eq!(jev.output_tokens, Some(4));
+        assert_eq!(jev.cache_read_tokens, None);
+        assert_eq!(jev.cache_creation_tokens, None);
+        let zero = projected_auxiliary_usage("typesafe_systemone", "provider_exact", [0, 0, 0, 0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(zero.fresh_input_tokens, Some(0));
+        assert_eq!(zero.output_tokens, Some(0));
+        let llm = projected_auxiliary_usage("openai_compatible", "provider_exact", [40, 8, 60, 0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(llm.cache_read_tokens, Some(60));
+        assert_eq!(llm.cache_creation_tokens, Some(0));
+        assert!(
+            projected_auxiliary_usage("openai_compatible", "unavailable", [0; 4])
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            projected_auxiliary_usage("openai_compatible", "provider_exact", [-1, 0, 0, 0])
+                .is_err()
+        );
+        let usage = ModelRequestUsage {
+            input: astra_turn_types::NormalizedPromptCacheUsage::new(40, 60, 0),
+            output_tokens: 8,
+        };
+        assert_eq!(
+            projected_cache_read_share("typesafe_systemone", "provider_exact", &usage),
+            None
+        );
+        assert_eq!(
+            projected_cache_read_share("openai_compatible", "provider_exact", &usage),
+            Some(0.6)
+        );
+        assert_eq!(
+            projected_cache_read_share("openai_compatible", "provider_partial", &usage),
+            None
+        );
+    }
+
+    #[test]
+    fn system_one_trace_keeps_operation_and_unknown_cache_share() {
+        let mut input = input();
+        input.provider = "typesafe".into();
+        input.purpose = InferencePurpose::Introspection;
+        input.scope = InferenceInvocationScope::Session {
+            session_id: "session-1".into(),
+            turn: 3,
+            round: 0,
+            operation_id: "request_judgment".into(),
+            logical_attempt: 0,
+        };
+        input.run_authority = None;
+        let invocation = plan_inference_invocation(input).unwrap();
+        let wire = InferenceProviderWireIdentity::new(
+            "typesafe_systemone",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            100,
+        )
+        .unwrap();
+        let attempt = plan_inference_provider_attempt_with_context(
+            &invocation,
+            0,
+            wire,
+            ModelRequestContextSeed::server_default(),
+        );
+        let terminal = InferenceInvocationTerminal::succeeded(
+            InferenceUsage {
+                input: astra_turn_types::NormalizedPromptCacheUsage::new(100, 0, 0),
+                output_tokens: 4,
+            },
+            None,
+        );
+        let (_, _, event) =
+            model_request_event(&attempt, ModelRequestEventStage::Terminal, Some(&terminal))
+                .unwrap();
+        assert_eq!(event.identity.operation_id, "request_judgment");
+        assert_eq!(event.identity.provider_protocol, "typesafe_systemone");
+        assert_eq!(event.cache.cache_read_share, None);
+        assert_eq!(event.usage.as_ref().unwrap().input.fresh_input_tokens, 100);
+        assert_eq!(
+            serde_json::to_value(&event).unwrap()["identity"]["operation_id"],
+            "request_judgment"
+        );
+    }
+
+    #[test]
     fn model_request_event_uses_exact_causal_facts_and_partitions_usage() {
         let invocation = plan_inference_invocation(input()).expect("invocation");
         let mut seed = ModelRequestContextSeed::server_default();
         seed.topology = ModelRequestTopology::CliServer;
         seed.interaction_owner = "cli".to_string();
+        seed.execution_round = Some(7);
         seed.budget.estimated_input_tokens = Some(900);
         seed.cache.current_identity = Some("sha256:stable-prefix".to_string());
         let wire = InferenceProviderWireIdentity::new(
@@ -7983,9 +9153,21 @@ mod tests {
                 .expect("terminal event");
 
         assert_ne!(accepted_id, terminal_id);
+        let route = &accepted.route;
+        assert_eq!(route.route_id, invocation.route_id());
+        assert_eq!(route.invocation_id, invocation.invocation_id());
+        assert_eq!(route.upstream_model, "provider-model-1");
+        assert_eq!(accepted.identity.model, "model-1");
+        assert_eq!(accepted.identity.round, Some(7));
+        assert_eq!(route.access_kind, ModelAccessKind::SelfHosted);
+        assert_eq!(route.execution_placement, ModelExecutionPlacement::Server);
+        assert_eq!(accepted.route, terminal_event.route);
         assert!(accepted.usage.is_none());
         assert!(accepted.usage_status.is_none());
         assert_eq!(terminal_event.identity.physical_attempt, 2);
+        assert_eq!(terminal_event.identity.round, Some(7));
+        assert_eq!(accepted.identity.operation_id, "agent_turn");
+        assert_eq!(terminal_event.identity.operation_id, "agent_turn");
         assert_eq!(
             terminal_event.identity.provider_wire_hash,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -8005,7 +9187,28 @@ mod tests {
         );
         assert_eq!(terminal_event.wire_composition.system_bytes, 100);
         assert!(!accepted_json.contains("provider-response"));
-        assert!(terminal_json.contains(MODEL_REQUEST_CONTEXT_SCHEMA));
+        assert!(!accepted_json.contains(&invocation.admission_token));
+        assert!(!accepted_json.contains(&invocation.owner_token));
+        assert!(!accepted_json.contains(&attempt.admission_token));
+        let fact: ModelRequestTerminalFact = serde_json::from_str(&terminal_json).unwrap();
+        assert_eq!(fact.hydrate(accepted.clone()).unwrap(), terminal_event);
+        assert!(terminal_json.len() < accepted_json.len() / 2);
+        assert!(
+            serde_json::from_str::<ModelRequestTerminalFact>(
+                &serde_json::to_string(&terminal_event).unwrap()
+            )
+            .is_err()
+        );
+        let mut corrupted = accepted.clone();
+        corrupted.usage_status = Some("provider_exact".into());
+        assert!(fact.hydrate(corrupted).is_err());
+        let mut invalid = fact.clone();
+        invalid.usage_status = "unavailable".into();
+        assert!(invalid.validate().is_err());
+        invalid.usage = None;
+        assert!(invalid.validate().is_ok());
+        invalid.schema = "unsupported".into();
+        assert!(invalid.validate().is_err());
 
         for status in [
             InferenceTerminalStatus::Succeeded,
@@ -8027,5 +9230,169 @@ mod tests {
                 Some(1_000)
             );
         }
+    }
+
+    #[test]
+    fn model_request_event_route_links_retries_without_merging_invocations() {
+        let invocation = plan_inference_invocation(input()).expect("invocation");
+        let wire = InferenceProviderWireIdentity::new(
+            "openai_compatible",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            100,
+        )
+        .expect("wire");
+        let first = plan_inference_provider_attempt(&invocation, 0, wire.clone());
+        let retry = plan_inference_provider_attempt(&invocation, 1, wire.clone());
+        let (_, _, first_event) =
+            model_request_event(&first, ModelRequestEventStage::Accepted, None).unwrap();
+        let (_, _, retry_event) =
+            model_request_event(&retry, ModelRequestEventStage::Accepted, None).unwrap();
+        assert_ne!(
+            first_event.identity.request_id,
+            retry_event.identity.request_id
+        );
+        assert_eq!(first_event.route, retry_event.route);
+
+        let mut next_input = input();
+        next_input.scope = InferenceInvocationScope::Run {
+            session_id: "session-1".into(),
+            run_id: "run-1".into(),
+            turn: 3,
+            round: 2,
+            operation_id: "agent_turn".into(),
+            logical_attempt: 1,
+        };
+        let next = plan_inference_invocation(next_input).unwrap();
+        let next_attempt = plan_inference_provider_attempt(&next, 0, wire.clone());
+        let (_, _, next_event) =
+            model_request_event(&next_attempt, ModelRequestEventStage::Accepted, None).unwrap();
+        assert_ne!(first_event.route, next_event.route);
+
+        let mut other_owner = input();
+        other_owner.user_id = "user-2".into();
+        let other = plan_inference_invocation(other_owner).unwrap();
+        let other_attempt = plan_inference_provider_attempt(&other, 0, wire);
+        let (_, _, other_event) =
+            model_request_event(&other_attempt, ModelRequestEventStage::Accepted, None).unwrap();
+        assert_ne!(first_event.route, other_event.route);
+    }
+
+    #[test]
+    fn model_request_event_requires_admitted_route() {
+        let invocation = plan_inference_invocation(input()).unwrap();
+        let attempt = plan_inference_provider_attempt(
+            &invocation,
+            0,
+            InferenceProviderWireIdentity::new(
+                "openai_compatible",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                100,
+            )
+            .unwrap(),
+        );
+        let (_, encoded, _) =
+            model_request_event(&attempt, ModelRequestEventStage::Accepted, None).unwrap();
+        let mut invalid: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        invalid.as_object_mut().unwrap().remove("route");
+        assert!(serde_json::from_value::<ModelRequestContextEvent>(invalid.clone()).is_err());
+        invalid["route"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<ModelRequestContextEvent>(invalid).is_err());
+    }
+
+    #[test]
+    fn model_request_event_usage_distinguishes_unknown_partial_and_measured_zero() {
+        let invocation = plan_inference_invocation(input()).unwrap();
+        let mut seed = ModelRequestContextSeed::server_default();
+        seed.budget.estimated_input_tokens = Some(100);
+        // Caller diagnostics must not fabricate provider measurements.
+        seed.budget.measured_input_tokens = Some(999);
+        seed.budget.estimate_error_tokens = Some(899);
+        seed.budget.estimate_error_ratio = Some(8.99);
+        seed.cache.cache_read_share = Some(0.9);
+        let attempt = plan_inference_provider_attempt_with_context(
+            &invocation,
+            0,
+            InferenceProviderWireIdentity::new(
+                "openai_compatible",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                100,
+            )
+            .unwrap(),
+            seed,
+        );
+        let (_, _, accepted) =
+            model_request_event(&attempt, ModelRequestEventStage::Accepted, None).unwrap();
+        assert!(accepted.budget.measured_input_tokens.is_none());
+        assert!(accepted.cache.cache_read_share.is_none());
+
+        for status in [
+            InferenceUsageStatus::Unavailable,
+            InferenceUsageStatus::ProviderPartial,
+            InferenceUsageStatus::ProviderExact,
+        ] {
+            let terminal = InferenceInvocationTerminal {
+                status: InferenceTerminalStatus::Failed,
+                usage: InferenceUsage::default(),
+                usage_status: status,
+                provider_response_id: None,
+                error_kind: Some("transport".into()),
+                error_message: None,
+            };
+            let (_, _, event) =
+                model_request_event(&attempt, ModelRequestEventStage::Terminal, Some(&terminal))
+                    .unwrap();
+            assert_eq!(event.usage_status.as_deref(), Some(status.as_str()));
+            assert_eq!(
+                event.usage.is_none(),
+                status == InferenceUsageStatus::Unavailable
+            );
+            assert_eq!(
+                event.budget.measured_input_tokens,
+                (status == InferenceUsageStatus::ProviderExact).then_some(0),
+            );
+            assert_eq!(
+                event.budget.estimate_error_tokens,
+                (status == InferenceUsageStatus::ProviderExact).then_some(-100),
+            );
+            assert!(event.cache.cache_read_share.is_none());
+            assert_eq!(event.route, accepted.route);
+
+            // Recovery uses the same projection from the persisted accepted
+            // record; it must preserve route attribution and usage coverage.
+            let mut recovered = accepted.clone();
+            apply_model_request_terminal_usage(
+                &mut recovered,
+                (status != InferenceUsageStatus::Unavailable).then_some(ModelRequestUsage {
+                    input: terminal.usage.input,
+                    output_tokens: terminal.usage.output_tokens,
+                }),
+                status.as_str(),
+                "provider_terminal_recovery",
+            )
+            .unwrap();
+            assert_eq!(recovered.usage, event.usage);
+            assert_eq!(
+                recovered.budget.measured_input_tokens,
+                event.budget.measured_input_tokens
+            );
+            assert_eq!(recovered.route, event.route);
+        }
+        let partial = InferenceInvocationTerminal {
+            status: InferenceTerminalStatus::Cancelled,
+            usage: InferenceUsage {
+                input: astra_turn_types::NormalizedPromptCacheUsage::new(25, 50, 0),
+                output_tokens: 10,
+            },
+            usage_status: InferenceUsageStatus::ProviderPartial,
+            provider_response_id: None,
+            error_kind: None,
+            error_message: None,
+        };
+        let (_, _, event) =
+            model_request_event(&attempt, ModelRequestEventStage::Terminal, Some(&partial))
+                .unwrap();
+        assert_eq!(event.usage.as_ref().unwrap().total_input_tokens(), 75);
+        assert!(event.budget.estimate_error_ratio.is_none());
+        assert!(event.cache.cache_read_share.is_none());
     }
 }

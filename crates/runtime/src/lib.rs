@@ -50,22 +50,16 @@ pub use self_model::introspection;
 // ── Internal modules: runtime storage helpers ────────────────────────────────
 
 pub(crate) use data_layer::storage::{
-    ensure_core_schema, insert_core_turn_event, insert_tool_turn_event, insert_turn_decision_audit,
-    insert_turn_skill_selection, resolve_active_skill_versions, update_snapshot_llm_ids,
-    update_turn_skill_selection_version,
+    ensure_core_schema, insert_turn_skill_selection, resolve_active_skill_versions,
 };
 
 // ── Public modules: runtime core ─────────────────────────────────────────────
 
 mod app_state;
-pub mod auto_invoke_handler;
 pub mod bash_intent;
 pub mod capabilities;
 pub(crate) mod capability_endpoint_pool;
-pub mod capability_registry;
 pub(crate) mod capacity_model;
-pub mod deployment;
-pub mod evaluation;
 pub mod learning;
 pub(crate) mod llm_provider_admission;
 pub mod matrix_cloud_runtime;
@@ -73,12 +67,14 @@ pub mod memory_hooks;
 pub mod observability;
 pub use astra_plan as plan;
 pub mod prompts;
-pub mod provider;
 pub mod server;
 pub mod session_memory;
-pub mod storage;
 pub mod tool_registry;
 pub mod turn;
+
+#[cfg(test)]
+#[path = "../../services/tests/common/isolated_database.rs"]
+pub(crate) mod isolated_database;
 
 #[doc(hidden)]
 pub mod context_observability_bench {
@@ -128,11 +124,10 @@ pub fn apply_safety_config_from_runtime_config(cfg: &astra_config::RuntimeConfig
 
 pub use astra_services::{
     admin::{
-        AdminAuditFilter, AdminAuditReader, AdminAuditRecord, AdminAuthorizer,
-        AdminFeedbackStatsFilter, AdminFeedbackStatsReader, AdminFeedbackStatsRecord,
-        AdminInitRecord, AdminInitializer, AdminTokenCreateRequestData, AdminTokenFilter,
-        AdminTokenReader, AdminTokenRecord, AdminTokenWriter, AdminUserRoleManager,
-        AdminUserRoleRecord, AdminUserRoleRequestData, AuthenticatedUser,
+        AdminAuditFilter, AdminAuditReader, AdminAuditRecord, AdminAuthorizer, AdminInitRecord,
+        AdminInitializer, AdminTokenCreateRequestData, AdminTokenFilter, AdminTokenReader,
+        AdminTokenRecord, AdminTokenWriter, AdminUserRoleManager, AdminUserRoleRecord,
+        AdminUserRoleRequestData, AuthenticatedUser,
     },
     agents::{
         AgentCreateRequestData, AgentListItem, AgentListRecord, AgentRecord, AgentService,
@@ -141,15 +136,13 @@ pub use astra_services::{
     auth::{
         AuthLoginRequestData, AuthPrincipal, AuthPrincipalOrigin, AuthRefreshRequestData,
         AuthRegisterRequestData, AuthService, AuthTokenRecord, AuthUserRecord,
-        DatabaseAdminAuditReader, DatabaseAdminAuthorizer, DatabaseAdminFeedbackStatsReader,
-        DatabaseAdminInitializer, DatabaseAdminTokenReader, DatabaseAdminTokenWriter,
-        DatabaseAdminUserRoleManager, DatabaseAuthService, DatabaseSessionService,
-        FernetTokenEncryptor, ReauthenticationProofRecord, ReauthenticationPurpose,
-        ReauthenticationRequestData, SessionActivityRecord, SessionCreateRequestData,
-        SessionListFilter, SessionListRecord, SessionRecord, SessionService,
-        SessionUpdateRequestData,
+        DatabaseAdminAuditReader, DatabaseAdminAuthorizer, DatabaseAdminInitializer,
+        DatabaseAdminTokenReader, DatabaseAdminTokenWriter, DatabaseAdminUserRoleManager,
+        DatabaseAuthService, DatabaseSessionService, FernetTokenEncryptor,
+        ReauthenticationProofRecord, ReauthenticationPurpose, ReauthenticationRequestData,
+        SessionActivityRecord, SessionCreateRequestData, SessionListFilter, SessionListRecord,
+        SessionRecord, SessionService, SessionUpdateRequestData,
     },
-    branches::{BranchService, DatabaseBranchService, UnconfiguredBranchService},
     context::{
         ContextService, DatabaseContextService, SnapshotCreateRequestData, SnapshotListFilter,
         SnapshotListItem, SnapshotListRecord, SnapshotRecord, UnconfiguredContextService,
@@ -164,17 +157,6 @@ pub use astra_services::{
     events::{
         DatabaseEventService, EventCreateRequestData, EventListFilter, EventListRecord,
         EventRecord, EventService, UnconfiguredEventService,
-    },
-    harness::{
-        DatabaseHarnessService, HarnessCitationRecord, HarnessDecisionRequest, HarnessItemRecord,
-        HarnessNodeCatalogRecord, HarnessRunRecord, HarnessService, HarnessSkillDraftRecord,
-        HarnessSkillRuleRecord, HarnessTemplateRecord, SkillifyAgentCitation, SkillifyAgentDraft,
-        SkillifyAgentExecutor, SkillifyAgentOutput, SkillifyAgentRequest, SkillifyAgentRule,
-        SkillifyDraftRecord, SkillifyDraftRequest, SkillifyPublishRecord, SkillifyPublishRequest,
-        SkillifyRunRequest, SkillifySourceFile, SkillifySourcePacket, UnconfiguredHarnessService,
-    },
-    jobs::{
-        InMemoryJobService, JobRecord, JobService, JobSubmitRequestData, UnconfiguredJobService,
     },
     marketplace::{DatabaseMarketplaceService, MarketplaceService, UnconfiguredMarketplaceService},
     marketplace_stats::{
@@ -194,7 +176,6 @@ pub use astra_services::{
         UnconfiguredEdgeRegistryService,
     },
     reflect::{DatabaseReflectService, ReflectReport, ReflectService, UnconfiguredReflectService},
-    replay::{DatabaseReplayService, ReplayService, UnconfiguredReplayService},
     runs::{
         CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, RunLifecycleService,
         RunListRecord, RunStatusRecord,
@@ -210,11 +191,6 @@ pub use astra_services::{
         DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,
     },
     skills::{DatabaseSkillService, SkillRecord, SkillService, UnconfiguredSkillService},
-    triggers::{DatabaseTriggerService, TriggerRecord, TriggerService, UnconfiguredTriggerService},
-    workflows::{
-        UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem, WorkflowRunRecord,
-        WorkflowService,
-    },
 };
 
 pub(crate) use astra_services::runs::UnconfiguredRunLifecycleService;
@@ -226,9 +202,8 @@ pub use app_state::{
     MemoriaHealth, NoopMemoriaForwarder, ReqwestMemoriaForwarder, ServiceInfo,
 };
 
-// ── Re-exports: evaluation & introspection ───────────────────────────────────
+// ── Re-exports: introspection ────────────────────────────────────────────────
 
-pub use evaluation::{DatabaseEvaluationService, EvaluationService, UnconfiguredEvaluationService};
 pub use introspection::{
     DatabaseIntrospectionService, IntrospectionService, UnconfiguredIntrospectionService,
 };
@@ -236,35 +211,25 @@ pub use introspection::{
 // ── Re-exports: server ───────────────────────────────────────────────────────
 
 pub use server::build_test_router;
-pub use server::delegation::engine::{
-    CheckpointGate, DefaultQualityGate, DelegationEngine, DelegationTracker, GateVerdict,
-    QualityThresholds, VerificationGate,
-};
+pub use server::delegation::engine::{DelegationEngine, DelegationTracker};
 pub use server::run::engine::RunEngine;
 pub use server::run::lifecycle::AgenticRunLifecycleService;
 pub use server::{build_app, build_server_state, serve};
 
 // ── Re-exports: orchestration ────────────────────────────────────────────────
 
-pub use orchestration::{AgentHistoryRecord, AgentRegistry};
+pub use orchestration::AgentHistoryRecord;
 
 // ── Re-exports: turn engine ──────────────────────────────────────────────────
 
-pub(crate) use astra_turn_core::contracts::TurnReflectionLessonRequest;
-
 pub use astra_turn_core::contracts::{
-    TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnCoreEventRecord, TurnCoreEventWriter,
-    TurnCorePersistOutcome, TurnCorePersistPlan, TurnDecisionAuditRecord, TurnHookDbPersistPlan,
-    TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker, TurnReflectionLessonRecord,
-    TurnReflectionLessonWriter, TurnReflectionMark, TurnReflectionStateStore,
-    TurnSessionActivityWriter, TurnSkillSelectionRecord, TurnToolEventPersistPlan,
-    TurnToolEventRecord, TurnToolEventWriter,
+    TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnHookDbPersistPlan, TurnHookDbWriter,
+    TurnObserverRequest, TurnObserverWorker, TurnSkillSelectionRecord,
 };
 
 pub use turn::services::{
-    DatabaseTraceEventWriter, DatabaseTurnAuxiliaryEventWriter, DatabaseTurnCoreEventWriter,
-    DatabaseTurnHookDbWriter, DatabaseTurnObserverWorker, DatabaseTurnReflectionLessonWriter,
-    DatabaseTurnSessionActivityWriter, DatabaseTurnToolEventWriter,
+    DatabaseTraceEventWriter, DatabaseTurnAuxiliaryEventWriter, DatabaseTurnHookDbWriter,
+    DatabaseTurnObserverWorker,
 };
 
 pub use astra_turn_core::{
@@ -273,8 +238,6 @@ pub use astra_turn_core::{
         explicit_approval_reason, tool_action_profile, tool_action_profile_value,
         tool_requires_explicit_approval,
     },
-    activity::SessionActivityUpdatePlan,
-    cache::SessionCache,
     cloud_attachments::{
         AttachmentBuilder, PlanAttachment, PostCompactAttachments, SkillAttachment,
     },
@@ -292,14 +255,11 @@ pub use astra_turn_core::{
         RecoveredEventRow, append_recovered_events, find_tool_call_safe_split,
         merge_tool_results_into_history,
     },
-    hook_plans::{SnapshotLinkPlan, build_snapshot_link_plan},
     observer::{build_observer_messages, should_run_observer},
     response_guard::{is_prompt_leaked, is_repetition_loop},
-    routing::build_skipped_routing_metadata,
     stall::{
-        DIVERGENCE_CORRECTION, DivergenceStatus, SERVER_STALL_WINDOW, canonical_tool_args,
-        detect_divergence, detect_server_stall, record_server_tool_signatures,
-        server_tool_call_signature,
+        DivergenceStatus, SERVER_STALL_WINDOW, canonical_tool_args, detect_divergence,
+        detect_server_stall, record_server_tool_signatures, server_tool_call_signature,
     },
     state::{new_session_entry, resolve_turn_identifiers},
     stream_events::{
@@ -315,16 +275,10 @@ pub use astra_turn_core::{
     },
 };
 pub use turn::cloud::{
-    analytics::{
-        CompactionEvent, CompactionEventType, MICRO_COMPACT_STUB, MessageRange,
-        PartialCompactRequest, PartialCompactResult, TurnCountCompactConfig, TurnCountTrigger,
-        apply_micro_compact, compact_partial, evaluate_turn_count_trigger,
-    },
-    compaction::{CompactBoundary, CompactCircuitBreaker, CompactResult, CompactTrigger},
+    compaction::{CompactBoundary, CompactResult, CompactTrigger},
     memoria_compact::{
         HttpMemoriaPort, MemoriaCompactConfig, MemoriaCompactParams, MemoriaMemory, MemoriaPort,
-        claude_code_session_memory_path, compact_with_memoria, memoria_compact_retrieve_query,
-        sanitize_path_for_claude_projects,
+        compact_with_memoria, memoria_compact_retrieve_query,
     },
 };
 

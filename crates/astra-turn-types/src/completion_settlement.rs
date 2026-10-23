@@ -24,37 +24,12 @@ pub struct CompletionSettlementState {
     /// Number of same-turn recovery calls made after the provider returned a
     /// successful response with neither tool calls nor user-visible text.
     pub textless_response_retries: u32,
-    /// Number of bounded terminal rewrites after a tool failure remained
-    /// unresolved across multiple policy observations.  The retry is
-    /// synthesis-only: it calibrates claims against retained evidence rather
-    /// than reopening exploration or hiding the failed outcome.
-    pub outcome_reconciliation_retries: u32,
-    /// A single provider-schema correction may replace a task-resolution
-    /// submission rejected by the runtime argument preflight. This is
-    /// independent of the one accepted assessment attempt and is initialized
-    /// only when a fresh reconciliation window is opened. Missing legacy
-    /// checkpoints default to zero so they never gain repair authority.
-    #[serde(default)]
-    pub outcome_reconciliation_schema_corrections_remaining: u8,
-    /// Evidence-linked model interpretation accepted for the active boundary.
-    /// This does not replace execution facts or deterministic verifier receipts.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    pub outcome_reconciliation_assessment: Option<crate::task_resolution::TaskResolutionAssessment>,
     /// Number of bounded same-turn retries after a task whose typed profile
     /// requires a workspace change attempted to finish without recording one.
     /// This is deliberately separate from the read-only escalation advisory:
     /// the latter guides exploration while this field protects the terminal
     /// completion boundary.
     pub workspace_mutation_retries: u32,
-    /// Number of bounded retries after an external or mixed mutation contract
-    /// attempted to finish without an executor-owned external delta receipt.
-    pub external_effect_retries: u32,
-    /// Structured external observation scope carried across the bounded
-    /// recovery boundary.  A model may split observation and mutation across
-    /// two calls; the executor-owned scope is the only authority allowed to
-    /// bridge those calls, never command text or assistant prose.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    pub external_effect_recovery_paths: Option<Vec<String>>,
     /// Number of bounded same-turn retries after the final successful
     /// workspace mutation had no later successful observation.  A mutation is
     /// progress, but it is not evidence that the resulting workspace is
@@ -137,7 +112,11 @@ pub struct CompletionSettlementState {
     #[serde(deserialize_with = "deserialize_required_option")]
     pub latest_provider_text: Option<String>,
     #[serde(deserialize_with = "deserialize_required_option")]
+    pub latest_provider_text_model_item_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub deferred_candidate_text: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub deferred_candidate_model_item_id: Option<String>,
     /// Source of the active wrap-up boundary, if any.
     #[serde(deserialize_with = "deserialize_required_option")]
     pub wrapup_origin: Option<BudgetWrapupOrigin>,
@@ -152,6 +131,7 @@ pub struct ForegroundFanoutPagination {
     pub group_id: String,
     pub target_count: u64,
     pub pending_slots: BTreeMap<u64, u64>,
+    pub had_recoverable_issues: bool,
 }
 
 /// A narrow action that can finish an already-established obligation at the
@@ -159,14 +139,8 @@ pub struct ForegroundFanoutPagination {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum CompletionAction {
-    /// Submit an evidence-linked model assessment at this exact boundary.
-    /// Matching admission does not establish acceptance or verification success.
-    #[serde(rename = "outcome_reconciliation")]
-    OutcomeReconciliation { boundary_id: String },
     #[serde(rename = "required_workspace_mutation")]
     RequiredWorkspaceMutation,
-    #[serde(rename = "required_external_effect")]
-    RequiredExternalEffect,
     /// Spend one terminal boundary on a task-facing tool action when the
     /// structured workspace intent is unknown or merely permits mutation.
     /// Ordinary admission and safety policy still own executable authority;
@@ -217,6 +191,7 @@ pub struct CompletionActionWindow {
 #[serde(deny_unknown_fields)]
 pub enum BudgetWrapupOrigin {
     RoundSlice,
+    ExecutionDeadline,
     TokenRail,
 }
 
@@ -240,12 +215,7 @@ mod tests {
             canonical_work_establishment_retries: 1,
             output_cap_continuations: 1,
             textless_response_retries: 1,
-            outcome_reconciliation_retries: 2,
-            outcome_reconciliation_schema_corrections_remaining: 11,
-            outcome_reconciliation_assessment: None,
             workspace_mutation_retries: 3,
-            external_effect_retries: 4,
-            external_effect_recovery_paths: Some(vec!["artifact".into()]),
             post_mutation_observation_retries: 5,
             post_mutation_observation_failed_action_retries: 6,
             post_mutation_repair_retries: 7,
@@ -260,7 +230,9 @@ mod tests {
             }),
             preserve_final_synthesis_wire_surface: true,
             latest_provider_text: Some("latest".into()),
+            latest_provider_text_model_item_id: Some("latest-item".into()),
             deferred_candidate_text: Some("candidate".into()),
+            deferred_candidate_model_item_id: Some("candidate-item".into()),
             completion_action_window: Some(CompletionActionWindow {
                 action: CompletionAction::ExplicitVerification {
                     missing_labels: vec!["validator".into()],
@@ -274,6 +246,7 @@ mod tests {
                 group_id: "group".into(),
                 target_count: 2,
                 pending_slots: BTreeMap::from([(0, 40), (1, 80)]),
+                had_recoverable_issues: false,
             }),
             text_only: true,
             work_settlement_only: true,
@@ -284,21 +257,7 @@ mod tests {
             serde_json::from_value::<CompletionSettlementState>(wire.clone()).unwrap(),
             state
         );
-        let mut legacy_wire = wire.clone();
-        legacy_wire
-            .as_object_mut()
-            .unwrap()
-            .remove("outcome_reconciliation_schema_corrections_remaining");
-        let restored_legacy =
-            serde_json::from_value::<CompletionSettlementState>(legacy_wire).unwrap();
-        assert_eq!(
-            restored_legacy.outcome_reconciliation_schema_corrections_remaining, 0,
-            "legacy checkpoints gain no schema-correction authority"
-        );
         for field in wire.as_object().unwrap().keys() {
-            if field == "outcome_reconciliation_schema_corrections_remaining" {
-                continue;
-            }
             let mut incomplete = wire.clone();
             incomplete.as_object_mut().unwrap().remove(field);
             assert!(

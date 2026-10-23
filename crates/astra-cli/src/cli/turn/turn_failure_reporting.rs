@@ -9,6 +9,15 @@ use crate::cli::session::session_startup;
 use crate::cli::session::session_state::SessionState;
 use astra_services::session_journal;
 
+pub(crate) fn turn_failure_diagnostic(failure: &crate::TurnFailure) -> String {
+    match failure.partial.error_code.as_deref() {
+        Some(code) if failure.partial.server_admission_not_dispatched => {
+            format!("[{code}] {}", failure.error)
+        }
+        _ => failure.error.clone(),
+    }
+}
+
 pub(crate) async fn reconcile_and_report_turn_failure(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
@@ -53,43 +62,70 @@ pub(crate) async fn reconcile_and_report_turn_failure(
 /// Render a server admission rejection without pretending that a model turn
 /// or durable Run existed. The HTTP request reached the server, but admission
 /// stopped it before any model or tool work ran. Keep the newly-created Session
-/// attached and make recovery explicit; never silently restore another Session.
+/// attached, return the draft to the composer, and make recovery explicit;
+/// never silently restore another Session.
 pub(crate) fn report_admission_rejection(
     state: &mut SessionState,
+    line: &str,
     failure: &crate::TurnFailure,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
 ) {
+    let draft_restored =
+        !line.trim().is_empty() && ui.restore_input(line, state.session_id.as_deref());
     let metadata = failure.partial.error_metadata.as_ref();
-    if failure.partial.error_code.as_deref() == Some("execution_workspace_claimed") {
-        let owner = metadata
-            .and_then(|value| value.get("owner_session_id"))
+    if matches!(
+        failure.partial.error_code.as_deref(),
+        Some("session_writer_conflict" | "session_execution_slot_occupied")
+    ) {
+        let session_id = metadata
+            .and_then(|value| value.get("session_id"))
             .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.trim().is_empty());
-        // Keep the newly-created Session attached. It is a real, empty
-        // Session whose execution has not been admitted; clearing only the
-        // local identity would leave the remote row and long-lived producers
-        // out of sync. The owner is retained as an explicit recovery target
-        // for `/session` and `/resume`, never auto-restored.
-        if state.turn == 0
-            && state.history.is_empty()
-            && let Some(owner) = owner
-        {
-            state.pending_recovery = Some(owner.to_string());
+            .filter(|value| !value.trim().is_empty())
+            .or(state.session_id.as_deref());
+        let cursor_only = metadata
+            .and_then(|value| value.get("recovery_action"))
+            .and_then(serde_json::Value::as_str)
+            == Some("retry_session");
+        let mut message = if cursor_only {
+            String::from("The session cursor changed before this turn was admitted\n")
+        } else {
+            String::from("Another run still owns this session\n")
+        };
+        if draft_restored {
+            message.push_str("  Your message was not sent; the draft is back in the composer.\n");
+        } else if cursor_only {
+            message.push_str("  Your message was not sent; retry it.\n");
+        } else {
+            message.push_str(
+                "  Your message was not sent; retry it after the active run releases this session.\n",
+            );
         }
-        let mut message = String::from("Workspace unavailable\n");
-        if let Some(owner) = owner {
-            message.push_str(&format!("  Session {owner} owns this checkout.\n"));
-            message.push_str(&format!("  Resume it explicitly with: /resume {owner}\n"));
+        if cursor_only {
+            message.push_str("  No run is holding this session, so do not cancel it.\n");
+        } else {
+            message.push_str("  ");
+            message.push_str(
+                &crate::cli::stream::streaming_types::session_stop_then_resume(session_id),
+            );
+            message.push('\n');
         }
-        message.push_str(
-            "  Request was not admitted; no model or tool ran.\n  Use another worktree, or retry this new Session after the checkout is available.",
-        );
+        message.push_str("  No model or tool ran.");
         ui.show_error(&message);
         return;
     }
-    ui.show_error(
-        "Session execution is busy\n  Request was not admitted; no model or tool ran.\n  Retry this new Session after the current operation finishes, then send the same input again.",
-    );
+    let mut message = admission_rejection_message(draft_restored);
+    message.push_str("  No model or tool ran.");
+    ui.show_error(&message);
+}
+
+fn admission_rejection_message(draft_restored: bool) -> String {
+    let mut message = String::from("Session execution is busy\n");
+    if draft_restored {
+        message.push_str("  Your message was not sent; the draft is back in the composer.\n");
+    } else {
+        message.push_str("  Your message was not sent; retry it after the conflict clears.\n");
+    }
+    message
 }
 
 async fn reconcile_failure_accounting(
@@ -106,9 +142,12 @@ async fn reconcile_failure_accounting(
         return;
     };
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    // Do not call fresh_access_token here. Its refresh writes auth.json and
+    // outlives this 5s deadline only when settlement is detached; starting it
+    // from a best-effort read is unnecessary and used to cancel mid-rotation.
     let Some(token) = await_failure_reconciliation_before_deadline(
         deadline,
-        crate::cli::session::session_runtime::fresh_access_token(api, profile),
+        crate::cli::session::session_runtime::access_token_without_refresh(profile),
     )
     .await
     .flatten() else {
@@ -129,8 +168,11 @@ async fn reconcile_failure_accounting(
             return;
         }
         let request_timeout = remaining.min(std::time::Duration::from_secs(1));
-        if let Ok(Ok(run)) =
-            tokio::time::timeout(request_timeout, api.get_run(Some(&token), &run_id)).await
+        if let Ok(Ok(run)) = tokio::time::timeout(
+            request_timeout,
+            api.get_run_with_presented_bearer(&token, &run_id),
+        )
+        .await
             && run
                 .get("accounting")
                 .is_some_and(|accounting| apply_durable_run_accounting(partial, accounting))
@@ -257,7 +299,10 @@ pub(crate) fn report_turn_failure(
         &failure.partial,
     );
     {
-        let error_kind = astra_core::ClassifiedError::from(failure.error.clone()).kind;
+        let error_kind = failure
+            .partial
+            .failure_kind
+            .unwrap_or_else(|| astra_core::ClassifiedError::from(failure.error.clone()).kind);
         err_event.metadata = Some(serde_json::json!({
             "error_kind": error_kind.as_str(),
             "retryable": error_kind.is_retryable(),
@@ -285,6 +330,19 @@ pub(crate) fn report_turn_failure(
         }),
     );
     err_event = err_event.with_run_id(failure.partial.run_id.as_deref());
+    // This producer owns the root turn; missing admission identity remains
+    // unknown rather than being inferred from a user message or turn number.
+    err_event.producer_scope = failure
+        .partial
+        .run_id
+        .as_ref()
+        .filter(|run_id| !run_id.trim().is_empty())
+        .map(|run_id| session_journal::JournalProducerScope {
+            run_id: run_id.clone(),
+            parent_run_id: None,
+            agent_id: Some("root".into()),
+            local_turn: None,
+        });
 
     // The live continuation and restart hydration must be byte-for-byte the
     // same projection of the same durable TurnError fact. Partial assistant
@@ -339,8 +397,9 @@ pub(crate) fn report_turn_failure(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_durable_run_accounting, await_failure_reconciliation_before_deadline,
-        reconcile_and_report_turn_failure, report_admission_rejection, report_turn_failure,
+        admission_rejection_message, apply_durable_run_accounting,
+        await_failure_reconciliation_before_deadline, reconcile_and_report_turn_failure,
+        reconcile_failure_accounting, report_admission_rejection, report_turn_failure,
     };
     use crate::cli::session::session_state::SessionState;
     use crate::tests::heavy_checkpoint_with_runtime_state;
@@ -381,6 +440,19 @@ mod tests {
             original_tool_name: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn line_surface_does_not_claim_a_composer_restore() {
+        let mut line_ui = crate::cli::ui_adapter::LineUiAdapter;
+        assert!(!crate::cli::ui_adapter::ReplUiAdapter::restore_input(
+            &mut line_ui,
+            "draft",
+            Some("session-current"),
+        ));
+        let message = admission_rejection_message(false);
+        assert!(message.contains("retry it after the conflict clears"));
+        assert!(!message.contains("back in the composer"));
     }
 
     #[tokio::test]
@@ -486,6 +558,83 @@ mod tests {
         assert_eq!(outcomes.rejected, 1);
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failure_accounting_uses_presented_native_token_without_refresh() {
+        use astra_credentials::native::{Environment, NativeSession, NativeStore, unix_now};
+        use std::os::unix::fs::PermissionsExt;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let origin = server.uri();
+        let issuer = format!("{origin}/realms/moi");
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = NativeStore::with_directory(directory.path().to_path_buf());
+        let saved = store.clone();
+        let session = NativeSession {
+            environment: Environment {
+                issuer: issuer.clone(),
+                astra_url: origin.clone(),
+                moi_url: origin.clone(),
+                authorization_endpoint: format!("{origin}/api/v1/uc/oauth2/authorize"),
+                token_endpoint: format!("{issuer}/protocol/openid-connect/token"),
+                revocation_endpoint: format!("{issuer}/protocol/openid-connect/revoke"),
+                jwks_uri: format!("{issuer}/protocol/openid-connect/certs"),
+            },
+            generation: "replaced-on-publish".into(),
+            subject: "subject-a".into(),
+            session_id: "sid-a".into(),
+            astra_user_id: "astra-a".into(),
+            moi_principal_id: "moi-a".into(),
+            catalog_user_id: "catalog-a".into(),
+            access_token: "presented-access-token".into(),
+            refresh_token: "refresh-must-not-be-sent".into(),
+            expires_at: unix_now().unwrap() + 30,
+            workspace_id: None,
+            role_id: None,
+            refresh_pending: false,
+        };
+        let (published, _) = store.publish(session).unwrap();
+        let binding = crate::cli::native_auth::binding_for_test(store, published);
+        let _active = crate::cli::native_auth::install_active_for_test(binding.clone());
+        Mock::given(method("POST"))
+            .and(path("/realms/moi/protocol/openid-connect/token"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/run-accounting"))
+            .and(header("authorization", "Bearer presented-access-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accounting": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 4,
+                    "cache_read_tokens": 2,
+                    "cache_creation_tokens": 1
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&origin, None)
+            .unwrap()
+            .with_bearer_provider(binding);
+        let mut partial = crate::PartialTurnData {
+            run_id: Some("run-accounting".into()),
+            ..Default::default()
+        };
+        reconcile_failure_accounting(&api, None, &mut partial).await;
+        assert_eq!(partial.prompt_tokens, 11);
+        assert_eq!(partial.completion_tokens, 4);
+        let current = saved.current().unwrap();
+        assert!(!current.refresh_pending);
+        assert_eq!(current.refresh_token, "refresh-must-not-be-sent");
+        assert_eq!(current.access_token, "presented-access-token");
+    }
+
     #[test]
     fn report_turn_failure_persists_filtered_partial_metrics() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
@@ -562,6 +711,13 @@ mod tests {
             persisted.metadata.as_ref().unwrap()["run_id"],
             "run-failure-1"
         );
+        let scope = persisted
+            .producer_scope
+            .as_ref()
+            .expect("exact root producer");
+        assert_eq!(scope.run_id, "run-failure-1");
+        assert_eq!(scope.agent_id.as_deref(), Some("root"));
+        assert!(scope.parent_run_id.is_none());
     }
 
     #[test]
@@ -748,28 +904,20 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
-    fn admission_rejection_keeps_the_previous_recovery_pointer() {
-        let _credentials = crate::tests::isolate_credentials();
-        let mut credentials = crate::cli::cli_config::cli_utils::CredentialsFile::default();
-        credentials.profiles.insert(
-            "default".to_string(),
-            crate::cli::cli_config::cli_utils::Profile {
-                last_session_id: Some("previous-session".to_string()),
-                ..Default::default()
-            },
-        );
-        crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
-
-        let mut state = SessionState::default();
+    fn writer_conflict_names_the_active_session_and_explicit_cancel() {
+        let mut state = SessionState {
+            session_id: Some("sess-from-state".into()),
+            ..SessionState::default()
+        };
         let failure = crate::TurnFailure {
-            error: "workspace is busy".into(),
+            error: "[invalid_request] Error: another controller owns this canonical session branch"
+                .into(),
             partial: crate::PartialTurnData {
-                session_id: Some("draft-session".into()),
-                error_code: Some("execution_workspace_claimed".into()),
+                error_code: Some("session_writer_conflict".into()),
                 error_metadata: Some(serde_json::json!({
                     "admission_state": "rejected",
-                    "owner_session_id": "owner-session"
+                    "recovery_action": "wait_or_cancel_session",
+                    "session_id": "sess-active"
                 })),
                 admission_rejected: true,
                 ..Default::default()
@@ -777,15 +925,73 @@ mod tests {
         };
         let mut ui = crate::tests::TestUi::default();
 
-        report_admission_rejection(&mut state, &failure, &mut ui);
+        report_admission_rejection(&mut state, "list workspaces", &failure, &mut ui);
 
-        assert_eq!(
-            crate::cli::cli_config::cli_utils::load_credentials().profiles["default"]
-                .last_session_id
-                .as_deref(),
-            Some("previous-session"),
-            "a rejected draft must never replace the last resumable session"
+        assert_eq!(ui.restored_inputs, vec!["list workspaces"]);
+        let shown = ui.errors.join("\n");
+        assert!(shown.contains("Another run still owns this session"));
+        let cancel_at = shown
+            .find("astra session cancel sess-active")
+            .expect("cancel command");
+        let resume_at = shown
+            .find("astra --resume sess-active")
+            .expect("resume command");
+        assert!(
+            cancel_at < resume_at,
+            "session cancel leaves the Session cancelled, so resume must follow it"
         );
+        assert!(!shown.contains("invalid_request"));
+        assert!(!shown.contains("will be cancelled"));
+    }
+
+    #[test]
+    fn cursor_only_writer_conflict_asks_for_retry_without_cancellation() {
+        let mut state = SessionState::default();
+        let failure = crate::TurnFailure {
+            error: "conflict".into(),
+            partial: crate::PartialTurnData {
+                error_code: Some("session_writer_conflict".into()),
+                error_metadata: Some(serde_json::json!({
+                    "admission_state": "rejected",
+                    "recovery_action": "retry_session",
+                    "session_id": "sess-active"
+                })),
+                admission_rejected: true,
+                ..Default::default()
+            },
+        };
+        let mut ui = crate::tests::TestUi::default();
+
+        report_admission_rejection(&mut state, "list workspaces", &failure, &mut ui);
+
+        let shown = ui.errors.join("\n");
+        assert!(shown.contains("session cursor changed"));
+        assert!(shown.contains("do not cancel"));
+        assert!(!shown.contains("astra session cancel"));
+        assert!(!shown.contains("astra --resume"));
+    }
+
+    #[test]
+    fn occupied_execution_slot_has_the_same_explicit_recovery_as_writer_conflict() {
+        let mut state = SessionState {
+            session_id: Some("session-blocked".into()),
+            ..Default::default()
+        };
+        let failure = crate::TurnFailure {
+            error: "conflict".into(),
+            partial: crate::PartialTurnData {
+                error_code: Some("session_execution_slot_occupied".into()),
+                admission_rejected: true,
+                ..Default::default()
+            },
+        };
+        let mut ui = crate::tests::TestUi::default();
+        report_admission_rejection(&mut state, "synthetic request", &failure, &mut ui);
+        assert_eq!(ui.restored_inputs, vec!["synthetic request"]);
+        let shown = ui.errors.join("\n");
+        assert!(shown.contains("Another run still owns this session"));
+        assert!(shown.contains("astra session cancel session-blocked"));
+        assert!(shown.contains("astra --resume session-blocked"));
     }
 
     #[test]

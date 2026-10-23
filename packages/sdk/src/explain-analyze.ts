@@ -1,11 +1,20 @@
 import { EXPLAIN_ANALYZE_HTML_STYLE } from "./explain-analyze-html-style";
 import { layoutExplainAnalyzeGraph } from "./explain-analyze-layout";
-import { renderExplainAnalyzeText } from "./explain-analyze-text";
+import {
+  explainAnalyzeDecisionDetailLine,
+  renderExplainAnalyzeText,
+} from "./explain-analyze-text";
 import type {
   ExplainAnalyzeEventV1,
   ExplainAnalyzeCoverageGapV1,
   ExplainAnalyzeUsageV1,
   ExplainAnalyzeContextMetricsV1,
+  ExplainAnalyzeAuxiliaryDetailsV1,
+  ExplainAnalyzeAdmissionSettlementV1,
+  ExplainAnalyzeDecisionDetailV1,
+  ExplainAnalyzeRequestJudgmentResultV1,
+  ExplainAnalyzeRequestJudgmentFieldV1,
+  MemorySelectionReport,
 } from "./types";
 
 export type ExplainAnalyzeNodeV1 = {
@@ -23,8 +32,11 @@ export type ExplainAnalyzeNodeV1 = {
   endElapsedMs?: number;
   durationMs?: number;
   outcome?: ExplainAnalyzeEventV1["outcome"];
+  decisionDetail?: ExplainAnalyzeDecisionDetailV1;
   usage?: ExplainAnalyzeUsageV1;
   context?: ExplainAnalyzeContextMetricsV1;
+  auxiliaryUsage?: ExplainAnalyzeEventV1["auxiliary_usage"];
+  auxiliaryDetails?: ExplainAnalyzeEventV1["auxiliary_details"];
   coverageGaps: ExplainAnalyzeCoverageGapV1[];
   startObserved: boolean;
   terminalObserved: boolean;
@@ -52,6 +64,8 @@ export type ExplainAnalyzeGraphV1 = {
   duplicateEventCount: number;
   conflictedNodeIds: string[];
   coverageGaps: ExplainAnalyzeCoverageGapV1[];
+  /** Sticky evidence loss when a conflicting incoming turn fact is discarded. */
+  auxiliaryCaptureConflicted?: boolean;
 };
 
 const nodeKinds = new Set([
@@ -60,6 +74,7 @@ const nodeKinds = new Set([
   "admission",
   "preparation",
   "context_assembly",
+  "judgment",
   "model_round",
   "provider_attempt",
   "tool_batch",
@@ -106,9 +121,10 @@ const allowedEventKeys = new Set([
   "start_elapsed_ms",
   "duration_ms",
   "outcome",
+  "decision_detail",
   "usage",
   "context",
-  "coverage_gaps",
+  "coverage_gaps", "auxiliary_usage", "auxiliary_details",
 ]);
 const coverageGaps = new Set<ExplainAnalyzeCoverageGapV1>([
   "user_input_wait_intervals",
@@ -147,6 +163,14 @@ export function isExplainAnalyzeEventV1(
   ) {
     return false;
   }
+  if (value.auxiliary_usage !== undefined &&
+      (value.kind !== "turn" || value.transition !== "finished" || !isAuxiliaryUsage(value.auxiliary_usage))) return false;
+  if (value.auxiliary_details !== undefined &&
+      (value.kind !== "turn" || value.transition !== "finished" || !isExplainAnalyzeAuxiliaryDetails(value.auxiliary_details, value.elapsed_ms))) return false;
+  if (value.decision_detail !== undefined &&
+      (value.kind !== "admission" || value.transition !== "finished" ||
+        (value.outcome !== "blocked" && value.outcome !== "rejected") ||
+        !isExplainAnalyzeDecisionDetail(value.decision_detail))) return false;
   if (value.coverage_gaps !== undefined &&
     (value.kind !== "turn" || value.transition !== "finished" ||
       !isCoverageGapList(value.coverage_gaps))) {
@@ -164,7 +188,9 @@ export function isExplainAnalyzeEventV1(
       value.start_elapsed_ms === undefined &&
       value.duration_ms === undefined &&
       value.outcome === undefined &&
+      value.decision_detail === undefined &&
       value.usage === undefined && value.context === undefined && value.coverage_gaps === undefined
+        && value.auxiliary_details === undefined
     );
   }
   if (
@@ -182,6 +208,296 @@ export function isExplainAnalyzeEventV1(
       (value.usage === undefined && (value.kind === "context_assembly" || value.kind === "preparation") && isExplainContext(value.context, value.kind)));
 }
 
+function isAuxiliaryUsage(value: unknown): boolean {
+  if (!isRecord(value) || Object.keys(value).some(k => !["available", "truncated", "attempts"].includes(k)) ||
+      typeof value.available !== "boolean" ||
+      (value.truncated !== undefined && typeof value.truncated !== "boolean") ||
+      !Array.isArray(value.attempts) || (!value.available && (value.attempts.length > 0 || value.truncated === true))) return false;
+  const seen = new Set<string>();
+  return value.attempts.every(a => {
+    if (!isRecord(a) || Object.keys(a).some(k => !["attempt_id","usage_status","provider","offering_id","model_name","purpose","operation_id","usage"].includes(k))) return false;
+    for (const key of ["attempt_id","provider","offering_id","purpose","operation_id"]) {
+      if (!nonEmptyString(a[key],512) || /[\s\u0000-\u001f\u007f]/u.test(a[key] as string)) return false;
+    }
+    if (!nonEmptyString(a.model_name,255) || /[\u0000-\u001f\u007f]/u.test(a.model_name) || seen.has(a.attempt_id as string)) return false;
+    seen.add(a.attempt_id as string);
+    if (!["provider_exact","provider_partial","unavailable"].includes(a.usage_status as string)) return false;
+    if (a.usage_status === "unavailable") return a.usage === undefined;
+    if (a.usage === undefined) return a.usage_status === "provider_partial";
+    return isExplainAnalyzeUsage(a.usage) && a.usage.basis === a.usage_status;
+  });
+}
+
+const admissionStatuses = new Set([
+  "accepted", "rejected", "unavailable", "not_dispatched",
+]);
+const admissionReasonKinds = new Set([
+  "accepted", "classifier_uncertain", "classifier_conflicting",
+  "invalid_classifier_response", "provider_rejected", "planning_rejected",
+  "reconciliation_rejected", "unavailable", "not_dispatched",
+]);
+const judgmentFields = new Set<ExplainAnalyzeRequestJudgmentFieldV1>([
+  "required", "defer", "mutation.read_only", "mutation.may_mutate",
+  "mutation.must_mutate", "scope.workspace", "scope.external", "scope.mixed",
+  "scope.unknown", "domain.none", "domain.github", "domain.git", "domain.code",
+  "domain.memory", "domain.web", "domain.system", "domain.database",
+  "parallel_subruns", "capability.web",
+]);
+const judgmentDomains = new Set([
+  "github", "git", "code", "memory", "web", "system", "database",
+]);
+const judgmentMutations = new Set(["read_only", "may_mutate", "must_mutate"]);
+const judgmentScopes = new Set(["workspace", "external", "mixed", "unknown"]);
+const judgmentCapabilities = new Set(["web", "agent_spawner"]);
+const invalidJudgmentReasons = new Set([
+  "malformed_json", "invalid_contract", "unsupported_combination",
+]);
+const preDispatchReasons = new Set([
+  "no_offering", "capacity_pressure", "invalid_request", "output_budget",
+  "route_unavailable", "durable_material_unavailable", "preparation_deadline",
+  "cancelled",
+]);
+const unavailableReasons = new Set([
+  "execution_error", "deadline", "cancelled", "provider_ptl_error",
+  "unexpected_finish",
+]);
+const judgmentDeliveries = new Set(["unresolved", "response_received"]);
+
+function isExplainAnalyzeAuxiliaryDetails(
+  value: unknown,
+  terminalElapsedMs: number,
+): value is ExplainAnalyzeAuxiliaryDetailsV1 {
+  const calls = isRecord(value) && value.calls === undefined ? [] : isRecord(value) ? value.calls : undefined;
+  if (!isRecord(value) || Object.keys(value).some((key) => !["calls", "truncated", "admission"].includes(key)) ||
+      (value.truncated !== undefined && typeof value.truncated !== "boolean") ||
+      !Array.isArray(calls) || calls.length > 16 ||
+      !calls.every((call) => isExplainAnalyzeAuxiliaryCall(call, terminalElapsedMs))) return false;
+  const callIds = new Set<string>();
+  if (calls.some((call) => {
+    const id = isRecord(call) ? call.call_id : undefined;
+    if (typeof id !== "string" || callIds.has(id)) return true;
+    callIds.add(id);
+    return false;
+  })) return false;
+  return value.admission === undefined || isExplainAnalyzeAdmissionSettlement(value.admission);
+}
+
+function isExplainAnalyzeAuxiliaryCall(value: unknown, terminalElapsedMs: number): boolean {
+  if (!isRecord(value) || Object.keys(value).some((key) =>
+    !["call_id", "operation_id", "stage", "start_elapsed_ms", "duration_ms", "outcome"].includes(key))) return false;
+  return isExplainId(value.call_id) && isExplainId(value.operation_id) && isExplainId(value.stage) &&
+    isNonNegativeInteger(value.start_elapsed_ms) && isNonNegativeInteger(value.duration_ms) &&
+    value.start_elapsed_ms <= terminalElapsedMs &&
+    value.duration_ms <= terminalElapsedMs - value.start_elapsed_ms + 1 &&
+    typeof value.outcome === "string" && outcomes.has(value.outcome);
+}
+
+function isExplainAnalyzeDecisionDetail(
+  value: unknown,
+): value is ExplainAnalyzeDecisionDetailV1 {
+  return isRecord(value) &&
+    Object.keys(value).length === 3 &&
+    value.kind === "delegation_catalog_resolution" &&
+    isNonNegativeInteger(value.requirement_index) && value.requirement_index < 16 &&
+    isNonNegativeInteger(value.match_count) && value.match_count !== 1;
+}
+
+function isExplainId(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0 &&
+    new TextEncoder().encode(value).length <= 512;
+}
+
+function isExplainAnalyzeAdmissionSettlement(value: unknown): value is ExplainAnalyzeAdmissionSettlementV1 {
+  if (!isRecord(value) || Object.keys(value).some((key) =>
+    !["status", "reason", "classification", "decision"].includes(key)) ||
+      typeof value.status !== "string" || !admissionStatuses.has(value.status) ||
+      !isExplainAnalyzeAdmissionReason(value.reason)) return false;
+  if (value.classification !== undefined && !isExplainAnalyzeRequestJudgmentResult(value.classification)) return false;
+  if (value.decision !== undefined && !isExplainAnalyzeRequestJudgmentResult(value.decision)) return false;
+  const reason = value.reason as Record<string, unknown>;
+  switch (value.status) {
+    case "accepted":
+      return reason.kind === "accepted" &&
+        value.decision !== undefined && value.decision.result === "decided";
+    case "rejected":
+      return reason.kind !== "accepted" && reason.kind !== "unavailable" &&
+        reason.kind !== "not_dispatched" && value.decision === undefined;
+    case "unavailable":
+      return reason.kind === "unavailable" && value.decision === undefined;
+    case "not_dispatched":
+      return reason.kind === "not_dispatched" && value.decision === undefined;
+    default:
+      return false;
+  }
+}
+
+function isExplainAnalyzeAdmissionReason(value: unknown): boolean {
+  if (!isRecord(value) || Object.keys(value).some((key) => !["kind", "reason"].includes(key)) ||
+      typeof value.kind !== "string" || !admissionReasonKinds.has(value.kind)) return false;
+  if (value.kind === "unavailable") {
+    return typeof value.reason === "string" && unavailableReasons.has(value.reason);
+  }
+  if (value.kind === "not_dispatched") {
+    return typeof value.reason === "string" && preDispatchReasons.has(value.reason);
+  }
+  return value.reason === undefined;
+}
+
+function isExplainAnalyzeRequestJudgmentResult(
+  value: unknown,
+): value is ExplainAnalyzeRequestJudgmentResultV1 {
+  if (!isRecord(value) || typeof value.result !== "string") return false;
+  switch (value.result) {
+    case "decided": {
+      if (Object.keys(value).some((key) => !["result", "classification"].includes(key)) ||
+          !isRecord(value.classification) ||
+          Object.keys(value.classification).some((key) => ![
+            "work_required", "activation_deferred", "domain", "mutation", "scope",
+            "parallel_subruns", "capabilities",
+          ].includes(key))) return false;
+      const classification = value.classification;
+      return typeof classification.work_required === "boolean" &&
+        typeof classification.activation_deferred === "boolean" &&
+        (classification.domain === null || (typeof classification.domain === "string" && judgmentDomains.has(classification.domain))) &&
+        typeof classification.mutation === "string" && judgmentMutations.has(classification.mutation) &&
+        typeof classification.scope === "string" && judgmentScopes.has(classification.scope) &&
+        typeof classification.parallel_subruns === "boolean" &&
+        Array.isArray(classification.capabilities) && classification.capabilities.length <= 2 &&
+        classification.capabilities.every((capability) => typeof capability === "string" && judgmentCapabilities.has(capability)) &&
+        new Set(classification.capabilities).size === classification.capabilities.length &&
+        (!classification.activation_deferred || classification.work_required) &&
+        (classification.mutation === "must_mutate" || classification.scope === "unknown");
+    }
+    case "abstained": {
+      if (Object.keys(value).some((key) => !["result", "uncertain_fields", "assessment"].includes(key)) ||
+          !isJudgmentFieldList(value.uncertain_fields) || !isRecord(value.assessment) ||
+          Object.keys(value.assessment).some((key) => !["provenance", "fields"].includes(key)) ||
+          typeof value.assessment.provenance !== "string" ||
+          !["provider_probability", "discrete_decision"].includes(value.assessment.provenance) ||
+          !Array.isArray(value.assessment.fields) || value.assessment.fields.length === 0 ||
+          value.assessment.fields.length > 19) return false;
+      const fields = value.assessment.fields;
+      const seen = new Set<string>();
+      if (fields.some((field) => !isRecord(field) || Object.keys(field).some((key) => !["field", "score"].includes(key)) ||
+          typeof field.field !== "string" || !judgmentFields.has(field.field as ExplainAnalyzeRequestJudgmentFieldV1) ||
+          seen.has(field.field) || (seen.add(field.field), typeof field.score !== "number" || !Number.isFinite(field.score) || field.score < 0 || field.score > 1))) return false;
+      if (value.assessment.provenance === "discrete_decision" && fields.some((field) => ![0, 0.5, 1].includes(field.score))) return false;
+      return value.uncertain_fields.every((field) => fields.some((assessment) => assessment.field === field));
+    }
+    case "conflicting":
+      return Object.keys(value).every((key) => ["result", "fields"].includes(key)) && isJudgmentFieldList(value.fields);
+    case "invalid":
+      return Object.keys(value).every((key) => ["result", "reason"].includes(key)) &&
+        typeof value.reason === "string" && invalidJudgmentReasons.has(value.reason);
+    case "not_dispatched":
+      return Object.keys(value).every((key) => ["result", "reason"].includes(key)) &&
+        typeof value.reason === "string" && preDispatchReasons.has(value.reason);
+    case "unavailable":
+      return Object.keys(value).every((key) => ["result", "reason", "delivery"].includes(key)) &&
+        typeof value.reason === "string" && unavailableReasons.has(value.reason) &&
+        typeof value.delivery === "string" && judgmentDeliveries.has(value.delivery) &&
+        ((value.reason === "provider_ptl_error" || value.reason === "unexpected_finish") ===
+          (value.delivery === "response_received"));
+    default:
+      return false;
+  }
+}
+
+function isJudgmentFieldList(value: unknown): value is ExplainAnalyzeRequestJudgmentFieldV1[] {
+  return Array.isArray(value) && value.length > 0 && value.length <= 19 &&
+    value.every((field) => typeof field === "string" && judgmentFields.has(field as ExplainAnalyzeRequestJudgmentFieldV1)) &&
+    new Set(value).size === value.length;
+}
+
+/** Auxiliary physical attempts are separate from timed main-model node usage. */
+export function explainAnalyzeAuxiliaryUsageLines(graph: ExplainAnalyzeGraphV1): string[] {
+  type Attempt = NonNullable<ExplainAnalyzeEventV1["auxiliary_usage"]>["attempts"][number];
+  const attempts = new Map<string, Attempt>();
+  const known = new Map<string, (number | undefined)[]>();
+  const buckets = (a: Attempt) => [a.usage?.fresh_input_tokens, a.usage?.output_tokens, a.usage?.cache_read_tokens, a.usage?.cache_creation_tokens];
+  const identity = (a: Attempt) => JSON.stringify([a.provider, a.offering_id, a.model_name, a.purpose, a.operation_id]);
+  const rank = { unavailable: 0, provider_partial: 1, provider_exact: 2 };
+  const preferred = (a: Attempt, b: Attempt) => {
+    const left = [rank[a.usage_status], Number(!!a.usage), ...buckets(a).map(v => v ?? -1)];
+    const right = [rank[b.usage_status], Number(!!b.usage), ...buckets(b).map(v => v ?? -1)];
+    for (let i = 0; i < left.length; i++) if (left[i] !== right[i]) return left[i] > right[i];
+    return false;
+  };
+  let conflicted = graph.auxiliaryCaptureConflicted === true || graph.nodes.some(n => n.conflicted && (n.kind === "turn" || !!n.auxiliaryUsage || !!n.auxiliaryDetails));
+  let unavailable = false;
+  let truncated = false;
+  for (const node of graph.nodes) {
+    if (!node.terminalObserved || node.conflicted || !node.auxiliaryUsage) continue;
+    unavailable ||= !node.auxiliaryUsage.available;
+    truncated ||= node.auxiliaryUsage.truncated === true;
+    for (const attempt of node.auxiliaryUsage.attempts) {
+      const existing = attempts.get(attempt.attempt_id);
+      const previous = known.get(attempt.attempt_id) ?? buckets(attempt);
+      if (existing) conflicted ||= identity(existing) !== identity(attempt);
+      buckets(attempt).forEach((value, index) => {
+        if (value !== undefined) {
+          if (previous[index] !== undefined && previous[index] !== value) conflicted = true;
+          previous[index] ??= value;
+        }
+      });
+      known.set(attempt.attempt_id, previous);
+      // Consensus is only conflict evidence; never synthesize a richer record.
+      if (!existing || preferred(attempt, existing)) attempts.set(attempt.attempt_id, attempt);
+    }
+  }
+  if (conflicted) return ["Auxiliary tokens · capture unavailable: conflicting attribution or usage facts; totals unavailable"];
+  const groups = new Map<string, Attempt[]>();
+  for (const attempt of attempts.values()) {
+    const key = JSON.stringify([attempt.provider,attempt.offering_id,attempt.model_name,attempt.purpose,attempt.operation_id]);
+    const group = groups.get(key) ?? []; group.push(attempt); groups.set(key,group);
+  }
+  const purposeLabels = new Map<string,string>([["memory_retrieval_rerank","Memory judgment"], ["tool_result_rerank","Tool result selection"], ["memory_extraction","Memory extraction"], ["introspection","Request analysis"], ["verification_judge","Verification"], ["reflection","Reflection"], ["required_compaction","Context summary"]]);
+  const operationLabels = new Map<string,string>([["request_judgment","Request classification"], ["skill_auto_route","Skill selection"], ["work_plan","Work planning"]]);
+  const lines = [...groups.entries()].sort(([a],[b]) => a.localeCompare(b)).map(([,group]) => {
+    const first = group[0]; const reported = group.flatMap(a => a.usage ? [a.usage] : []);
+    const provider = first.provider === "typesafe" ? "Jev" : first.provider;
+    const lanes = [["in","fresh_input_tokens"],["cache read","cache_read_tokens"],["cache write","cache_creation_tokens"],["out","output_tokens"]] as const;
+    const values = reported.length === 0 ? "usage unavailable" : lanes.map(([name,key]) => {
+      const counters = reported.flatMap(u => u[key] === undefined ? [] : [BigInt(u[key])]);
+      const qualifier = truncated || unavailable || counters.length !== group.length ? "at least " : "";
+      return `${name} ${counters.length === 0 ? "unknown" : qualifier + counters.reduce((a,b)=>a+b,0n).toString()}`;
+    }).join(" · ");
+    const partial = reported.length !== group.length || group.some(a => a.usage_status === "provider_partial") ? " · partial" : "";
+    const scope = truncated || unavailable ? " captured" : "";
+    return `Auxiliary tokens · ${provider} (${first.model_name}) · ${operationLabels.get(first.operation_id) ?? purposeLabels.get(first.purpose) ?? "Auxiliary inference"} · operation ${first.operation_id} · offering ${first.offering_id} · ${values} · ${reported.length}/${group.length}${scope} requests reported${partial}`;
+  });
+  if (unavailable) lines.push("Auxiliary tokens · capture unavailable");
+  if (truncated) lines.push("Auxiliary tokens · capture truncated; request counts cover captured attempts only; token sums are lower bounds");
+  return lines;
+}
+
+/** Render logical auxiliary timing and typed admission facts separately from
+ * physical provider usage. Intervals may overlap and are never added together. */
+export function explainAnalyzeAuxiliaryDetailsLines(graph: ExplainAnalyzeGraphV1): string[] {
+  const terminalTurns = graph.nodes
+    .filter((node) => node.kind === "turn" && node.terminalObserved && !node.conflicted && node.auxiliaryDetails)
+    .sort((left, right) => left.nodeId.localeCompare(right.nodeId));
+  const lines: string[] = [];
+  for (const node of terminalTurns) {
+    const details = node.auxiliaryDetails!;
+    lines.push(`Auxiliary scope · ${node.nodeId}`);
+    for (const call of [...(details.calls ?? [])].sort((left, right) =>
+      left.start_elapsed_ms - right.start_elapsed_ms || left.call_id.localeCompare(right.call_id))) {
+      lines.push(`Auxiliary timing · ${call.operation_id} · call ${call.call_id} · operation ${call.operation_id} · stage ${call.stage} · ${formatMs(call.duration_ms)} · client outcome ${call.outcome} · starts +${formatMs(call.start_elapsed_ms)} · logical client interval; overlapping intervals are not added`);
+    }
+    if (details.truncated === true) {
+      lines.push("Auxiliary timing · capture truncated · only the bounded set of logical calls is shown");
+    }
+    if (details.admission) {
+      const admission = details.admission;
+      const status = admission.status.replace("_", " ");
+      const jsonOrUnavailable = (value: unknown) => value === undefined ? "unavailable" : JSON.stringify(value);
+      lines.push(`Admission settlement · status ${status} · reason ${jsonOrUnavailable(admission.reason)} · classifier result ${jsonOrUnavailable(admission.classification)} · reconciled decision ${jsonOrUnavailable(admission.decision)}`);
+    }
+  }
+  return lines;
+}
+
 function isCoverageGapList(value: unknown): value is ExplainAnalyzeCoverageGapV1[] {
   if (!Array.isArray(value) || value.length > coverageGaps.size ||
     !value.every((gap): gap is ExplainAnalyzeCoverageGapV1 =>
@@ -195,7 +511,7 @@ function isCoverageGapList(value: unknown): value is ExplainAnalyzeCoverageGapV1
 const contextSourceKinds = new Set([
   "identity", "self_model", "project_context", "deferred_tools", "available_skills",
   "memory", "working_memory", "history", "constraints", "skills", "runtime_identity",
-  "runtime_volatile", "emergent_skills", "emergent_memory", "emergent_summary",
+  "runtime_volatile",
 ]);
 const budgetFields = ["estimated_input_tokens", "estimated_system_tokens", "tool_schema_tokens",
   "requested_output_tokens", "reserved_protocol_tokens", "effective_input_limit_tokens",
@@ -216,8 +532,9 @@ function isExplainContext(value: unknown, kind: string): value is ExplainAnalyze
     if (kind !== "context_assembly") return false;
     const assembly = value.assembly;
     if (!isRecord(assembly) || assembly.basis !== "runtime_text_estimate" ||
-      Object.keys(assembly).some((key) => key !== "basis" && key !== "sources") ||
+      Object.keys(assembly).some((key) => !["basis", "sources", "edge_memory_selection"].includes(key)) ||
       !Array.isArray(assembly.sources) || assembly.sources.length > contextSourceKinds.size) return false;
+    if (assembly.edge_memory_selection !== undefined && (!Array.isArray(assembly.edge_memory_selection) || assembly.edge_memory_selection.length > 2 || !assembly.edge_memory_selection.every(isMemorySelectionReport))) return false;
     const seen = new Set<string>();
     for (const source of assembly.sources) {
       if (!isRecord(source) || typeof source.kind !== "string" || !contextSourceKinds.has(source.kind) ||
@@ -229,6 +546,61 @@ function isExplainContext(value: unknown, kind: string): value is ExplainAnalyze
     }
   }
   return true;
+}
+
+function isMemorySelectionReport(value: unknown): value is MemorySelectionReport {
+  if (!isRecord(value) || Object.keys(value).some(k => !["session_id", "turn", "operation", "method", "reason", "model", "candidates", "selection_order", "elapsed_ms", "candidate_coverage", "prompt_projection"].includes(k)) ||
+      typeof value.session_id !== "string" || value.session_id.length === 0 || new TextEncoder().encode(value.session_id).length > 512 || /[\u0000-\u001f\u007f-\u009f]/u.test(value.session_id) ||
+      !isNonNegativeInteger(value.turn) || value.turn === 0 || value.turn > 0xffff_ffff ||
+      !["relevance", "dismissal", "reuse"].includes(String(value.operation)) ||
+      !["model", "lexical", "none", "reuse"].includes(String(value.method)) ||
+      !["completed", "no_candidates", "no_selector", "call_unavailable", "invalid_response", "retrieval_unavailable", "retrieval_timeout", "reused"].includes(String(value.reason)) ||
+      !(value.model === null || (typeof value.model === "string" && value.model.trim().length > 0 && new TextEncoder().encode(value.model).length <= 160 && !/[\u0000-\u001f\u007f-\u009f]/u.test(value.model))) ||
+      !isNonNegativeInteger(value.elapsed_ms) || !Array.isArray(value.candidates) || value.candidates.length > 256) return false;
+  if (!value.candidates.every((c, i) => isRecord(c) && c.index === i && typeof c.selected === "boolean" &&
+    Object.keys(c).every(k => ["index", "selected", "probability_bps"].includes(k)) &&
+    (c.probability_bps === null || (isNonNegativeInteger(c.probability_bps) && c.probability_bps <= 10000)))) return false;
+  const r = value as MemorySelectionReport;
+  if (!Array.isArray(r.selection_order) || r.selection_order.length !== r.candidates.filter(c => c.selected).length ||
+      new Set(r.selection_order).size !== r.selection_order.length || !r.selection_order.every(i => isNonNegativeInteger(i) && r.candidates[i]?.selected)) return false;
+  if (r.candidate_coverage !== undefined &&
+      (!isRecord(r.candidate_coverage) || Object.keys(r.candidate_coverage).some(k => !["source_items", "evaluated_candidates", "truncated"].includes(k)) ||
+       !isNonNegativeInteger(r.candidate_coverage.source_items) || !isNonNegativeInteger(r.candidate_coverage.evaluated_candidates) ||
+       r.candidate_coverage.evaluated_candidates !== r.candidates.length || r.candidate_coverage.source_items < r.candidate_coverage.evaluated_candidates ||
+       typeof r.candidate_coverage.truncated !== "boolean")) return false;
+  if (r.prompt_projection !== undefined &&
+      (!isRecord(r.prompt_projection) || Object.keys(r.prompt_projection).some(k => !["selected_candidates", "included_candidates"].includes(k)) ||
+       r.operation === "dismissal" || !isNonNegativeInteger(r.prompt_projection.selected_candidates) ||
+       r.prompt_projection.selected_candidates !== r.selection_order.length ||
+       !(r.prompt_projection.included_candidates === null ||
+         (isNonNegativeInteger(r.prompt_projection.included_candidates) && r.prompt_projection.included_candidates <= r.prompt_projection.selected_candidates)))) return false;
+  const noScores = r.candidates.every(c => c.probability_bps === null);
+  switch (r.reason) {
+    case "completed": return r.method === "model" && r.operation !== "reuse" && r.model !== null && r.candidates.length > 0;
+    case "no_candidates": return r.method === "none" && r.operation !== "reuse" && r.model === null && r.candidates.length === 0;
+    case "retrieval_unavailable": case "retrieval_timeout": return r.method === "none" && r.operation === "relevance" && r.model === null && r.candidates.length === 0;
+    case "reused": return r.method === "reuse" && r.operation === "reuse" && r.model === null && noScores && r.candidates.every(c => c.selected);
+    default: return noScores && r.candidates.length > 0 && (r.operation === "relevance" ? r.method === "lexical" : r.operation === "dismissal" && r.method === "none" && r.candidates.every(c => !c.selected));
+  }
+}
+
+export function memorySelectionLines(report: MemorySelectionReport): string[] {
+  const reasons = { completed: "completed", no_candidates: "no candidates", no_selector: report.operation === "dismissal" ? "no selector available; memories kept" : "no selector available; ranked locally, candidates kept",
+    call_unavailable: report.operation === "dismissal" ? "selector unavailable; memories kept" : "selector unavailable; ranked locally, candidates kept", invalid_response: report.operation === "dismissal" ? "invalid selector response; memories kept" : "invalid selector response; ranked locally, candidates kept",
+    retrieval_unavailable: "retrieval failed", retrieval_timeout: "retrieval timed out", reused: "no new relevance check" };
+  const selected = report.candidates.filter(c => c.selected).length;
+  const action = report.operation === "dismissal" ? "dismissed" : report.operation === "reuse" ? "reused" : "selected";
+  const method = report.method === "model" ? report.model ?? "model" : report.method === "lexical" ? "local keyword matching" : report.method === "reuse" ? "session cache" : "not run";
+  const coverage = report.candidate_coverage?.truncated ? ` · bounded ${report.candidate_coverage.source_items} source items to ${report.candidate_coverage.evaluated_candidates} candidates` : "";
+  const projection = report.prompt_projection === undefined ? "" : report.prompt_projection.selected_candidates === 0 ? " · no memory entered request" :
+    report.prompt_projection.included_candidates === null ? " · request inclusion unknown" : ` · ${report.prompt_projection.included_candidates}/${report.prompt_projection.selected_candidates} entered request`;
+  const summary = report.reason.startsWith("retrieval_") ? `Memory retrieval unavailable · ${reasons[report.reason]}` :
+    `Memory selection · ${method} · ${report.candidates.length} candidates → ${selected} ${action} · ${report.elapsed_ms}ms · ${reasons[report.reason]}${coverage}${projection}`;
+  const projectionDetail = report.prompt_projection === undefined ? "final request projection unavailable" : "final request projection measured";
+  return [summary, `Reported by CLI/Edge · turn ${report.turn} · same decision across request rounds · ${projectionDetail}`, ...report.candidates.map(c => {
+    const decision = report.operation === "dismissal" ? (c.selected ? "dismissed" : "kept") : (c.selected ? "selected" : "not selected");
+    return `Candidate ${c.index + 1} · ${decision}${c.probability_bps === null ? "" : ` · model score ${(c.probability_bps / 100).toFixed(2)}%`}`;
+  })];
 }
 
 function isExplainAnalyzeUsage(value: unknown): value is ExplainAnalyzeUsageV1 {
@@ -255,7 +627,6 @@ const contextSourceLabels: Record<string, string> = {
   deferred_tools: "Deferred tools", available_skills: "Skill catalog", memory: "Retrieved memory",
   working_memory: "Working memory", history: "Conversation history", constraints: "Response constraints",
   skills: "Active skills", runtime_identity: "Runtime context", runtime_volatile: "Turn instructions",
-  emergent_skills: "Discovered skills", emergent_memory: "Prefetched memory", emergent_summary: "Tool summaries",
 };
 
 /** Shared readable projection; assembly estimates never enter billed token totals. */
@@ -273,6 +644,12 @@ export function explainAnalyzeContextSections(context: ExplainAnalyzeContextMetr
         .concat([{ label: "Visible tools", value: String(budget.visible_tool_count) }]) });
   }
   if (context.assembly) {
+    for (const report of context.assembly.edge_memory_selection ?? []) {
+      const [summary, ...details] = memorySelectionLines(report);
+      sections.push({ title: report.operation === "dismissal" ? "Memory feedback" : report.operation === "reuse" ? "Memory reuse" : "Memory relevance", description: summary,
+        rows: details.map((value, index) => index === 0 ? { label: "Observation", value } :
+          { label: `Candidate ${index}`, value: value.split(" · ").slice(1).join(" · ") }) });
+    }
     sections.push({ title: "Context sources", description: "Text estimates at assembly time. Later request preparation may change the input.",
       rows: context.assembly.sources.map((source) => ({ label: contextSourceLabels[source.kind],
         value: `${source.estimated_tokens.toLocaleString("en-US")} tokens · ${source.section_count} ${source.section_count === 1 ? "section" : "sections"}` })) });
@@ -282,6 +659,7 @@ export function explainAnalyzeContextSections(context: ExplainAnalyzeContextMetr
 
 export function formatExplainAnalyzeContext(context: ExplainAnalyzeContextMetricsV1): string {
   if (context.budget) return `Input ≈${context.budget.estimated_input_tokens.toLocaleString("en-US")} / ${context.budget.effective_input_limit_tokens.toLocaleString("en-US")}`;
+  if (context.assembly?.edge_memory_selection?.length) return context.assembly.edge_memory_selection.map(r => memorySelectionLines(r)[0]).join(" · ");
   return `${context.assembly?.sources.length ?? 0} context sources`;
 }
 
@@ -293,6 +671,7 @@ export function reduceExplainAnalyzeEvents(
   const nodes = new Map<string, ExplainAnalyzeNodeV1>();
   const conflictedNodeIds = new Set<string>();
   let duplicateEventCount = 0;
+  let auxiliaryCaptureConflicted = false;
   const diagnostics: ExplainAnalyzeDiagnosticV1[] = [];
 
   for (const value of events) {
@@ -307,6 +686,7 @@ export function reduceExplainAnalyzeEvents(
     if (seen !== undefined) {
       duplicateEventCount += 1;
       if (seen !== fingerprint) {
+        auxiliaryCaptureConflicted ||= value.kind === "turn" || !!value.auxiliary_usage || !!value.auxiliary_details;
         conflictedNodeIds.add(value.node_id);
         // A reused event identity can also point at a different node.
         const original = JSON.parse(seen) as { node_id: string };
@@ -341,6 +721,9 @@ export function reduceExplainAnalyzeEvents(
               outcome: value.outcome,
               ...(value.usage ? { usage: value.usage } : {}),
               ...(value.context ? { context: value.context } : {}),
+              ...(value.auxiliary_usage ? { auxiliaryUsage: value.auxiliary_usage } : {}),
+              ...(value.auxiliary_details ? { auxiliaryDetails: value.auxiliary_details } : {}),
+              ...(value.decision_detail ? { decisionDetail: value.decision_detail } : {}),
             }
           : {}),
         startObserved: value.transition === "started",
@@ -383,6 +766,9 @@ export function reduceExplainAnalyzeEvents(
         node.outcome !== value.outcome ||
         stableJson(node.usage ?? null) !== stableJson(value.usage ?? null) ||
         stableJson(node.context ?? null) !== stableJson(value.context ?? null) ||
+        stableJson(node.auxiliaryUsage ?? null) !== stableJson(value.auxiliary_usage ?? null) ||
+        stableJson(node.auxiliaryDetails ?? null) !== stableJson(value.auxiliary_details ?? null) ||
+        stableJson(node.decisionDetail ?? null) !== stableJson(value.decision_detail ?? null) ||
         stableJson(node.coverageGaps) !== stableJson(value.coverage_gaps ?? [])
       ) {
         node.conflicted = true;
@@ -398,10 +784,16 @@ export function reduceExplainAnalyzeEvents(
       node.outcome = value.outcome;
       node.usage = value.usage;
       node.context = value.context;
+      node.auxiliaryUsage = value.auxiliary_usage;
+      node.auxiliaryDetails = value.auxiliary_details;
+      node.decisionDetail = value.decision_detail;
       node.coverageGaps = value.coverage_gaps ?? [];
       node.terminalObserved = true;
     }
-    if (node.conflicted) conflictedNodeIds.add(node.nodeId);
+    if (node.conflicted) {
+      conflictedNodeIds.add(node.nodeId);
+      auxiliaryCaptureConflicted ||= value.kind === "turn" || !!value.auxiliary_usage || !!value.auxiliary_details;
+    }
   }
 
   const orderedNodes = [...nodes.values()];
@@ -445,6 +837,7 @@ export function reduceExplainAnalyzeEvents(
     duplicateEventCount,
     conflictedNodeIds: [...conflictedNodeIds].sort(),
     coverageGaps: [...new Set(orderedNodes.flatMap((node) => node.coverageGaps))].sort(),
+    auxiliaryCaptureConflicted,
   };
 }
 
@@ -594,6 +987,7 @@ export function renderExplainAnalyzeHtml(
   const nodeGraph = renderHtmlNodeGraph(graph);
   const graphDetails = renderHtmlGraphDetails(graph);
   const plainTree = renderExplainAnalyzeText(events, { degraded: options.degraded });
+  const auxiliaryDetails = explainAnalyzeAuxiliaryDetailsLines(graph);
   const providerAttempts = graph.nodes.filter(
     (node) => node.kind === "provider_attempt",
   );
@@ -644,7 +1038,7 @@ export function renderExplainAnalyzeHtml(
     : "";
   const statusClass = isDegraded || statusLabel === "Mixed outcomes" ? "state-running" : status === "failed" || status === "interrupted" ? "state-failed" : status === "waiting" ? "state-running" : "state-complete";
   return `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>${title} · Explain Analyze</title><style>${EXPLAIN_ANALYZE_HTML_STYLE}</style></head><body><main class="shell"><div class="topline"><div class="brand"><span class="brand-mark" aria-hidden="true">A</span><span>ASTRA <b>/</b> Explain Analyze</span></div><div class="top-actions"><a href="#plain-text-tree">Copy</a><a href="#secondary-graph">Graph</a></div></div><header class="report-head"><div><p class="eyebrow">Explain Analyze</p><h1>${title}</h1><p class="subtitle">What ran, when it ran, and which measurements are available.</p></div><div class="report-result"><strong>${turnDuration === undefined ? "Not recorded" : escapeHtml(formatMs(turnDuration))}</strong><span class="state ${statusClass}">${escapeHtml(statusLabel)}</span></div></header><p class="report-facts">${escapeHtml(timingSummary)}</p><p class="report-facts">${escapeHtml(measuredOverlap)}</p>${coverageSummary ? `<p class="report-facts report-facts-warning">${escapeHtml(coverageSummary)}</p>` : ""}<p class="token-summary">${escapeHtml(tokenSummary)}</p>${waitSummary ? `<p class="wait-summary">${escapeHtml(waitSummary)}</p>` : ""}${warning}<section class="tree-panel" id="tree-view" aria-labelledby="tree-heading"><div class="tree-heading"><div><h2 id="tree-heading">Execution tree</h2><p>Recorded containment is shown with branches. Open a group to inspect its children.</p></div><span class="tree-search-hint">Find a stage with Ctrl/Cmd+F</span></div><div class="tree-actions"><a href="#plain-text-tree">Copy plain-text tree</a><span>Use Tab and Enter on groups to expand or collapse.</span></div><div class="text-tree">${tree || "<p class=\"empty\">No execution facts were captured.</p>"}</div></section><section class="copy-panel" id="plain-text-tree"><h2>Copy plain-text tree</h2><textarea readonly aria-label="Copyable plain-text execution tree" rows="${Math.max(4, Math.min(24, graph.nodes.length + clockDomains.length + 2))}">${escapeHtml(plainTree)}</textarea><p>Select the text and copy it; this report is a script-free snapshot.</p></section><section class="secondary-views" aria-label="Secondary Explain Analyze views"><details class="secondary-view" id="secondary-graph"><summary><span>Graph view</span><small>Explicit parent and dependency edges</small></summary><div class="graph-node-view">${nodeGraph}${graphDetails}</div></details><details class="secondary-view" id="secondary-timeline"><summary><span>Timeline view</span><small>Measured spans by clock domain</small></summary><div class="graph-scroll">${timeline || "<div class=\"empty\">No execution facts were captured.</div>"}</div></details></section><footer class="footer"><span>Amber intervals are measured waits. Tool I/O wait is shown only when separately recorded.</span><strong>Saved report · script-free snapshot</strong></footer></main></body></html>`;
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>${title} · Explain Analyze</title><style>${EXPLAIN_ANALYZE_HTML_STYLE}</style></head><body><main class="shell"><div class="topline"><div class="brand"><span class="brand-mark" aria-hidden="true">A</span><span>ASTRA <b>/</b> Explain Analyze</span></div><div class="top-actions"><a href="#plain-text-tree">Copy</a><a href="#secondary-graph">Graph</a></div></div><header class="report-head"><div><p class="eyebrow">Explain Analyze</p><h1>${title}</h1><p class="subtitle">What ran, when it ran, and which measurements are available.</p></div><div class="report-result"><strong>${turnDuration === undefined ? "Not recorded" : escapeHtml(formatMs(turnDuration))}</strong><span class="state ${statusClass}">${escapeHtml(statusLabel)}</span></div></header><p class="report-facts">${escapeHtml(timingSummary)}</p><p class="report-facts">${escapeHtml(measuredOverlap)}</p>${coverageSummary ? `<p class="report-facts report-facts-warning">${escapeHtml(coverageSummary)}</p>` : ""}<p class="token-summary">${escapeHtml(tokenSummary)}</p>${explainAnalyzeAuxiliaryUsageLines(graph).length ? `<section class="panel"><h2>Auxiliary model usage</h2>${explainAnalyzeAuxiliaryUsageLines(graph).map(line => `<p>${escapeHtml(line)}</p>`).join("")}</section>` : ""}${auxiliaryDetails.length ? `<section class="panel"><h2>Auxiliary execution details</h2>${auxiliaryDetails.map(line => `<p>${escapeHtml(line)}</p>`).join("")}</section>` : ""}${waitSummary ? `<p class="wait-summary">${escapeHtml(waitSummary)}</p>` : ""}${warning}<section class="tree-panel" id="tree-view" aria-labelledby="tree-heading"><div class="tree-heading"><div><h2 id="tree-heading">Execution tree</h2><p>Recorded containment is shown with branches. Open a group to inspect its children.</p></div><span class="tree-search-hint">Find a stage with Ctrl/Cmd+F</span></div><div class="tree-actions"><a href="#plain-text-tree">Copy plain-text tree</a><span>Use Tab and Enter on groups to expand or collapse.</span></div><div class="text-tree">${tree || "<p class=\"empty\">No execution facts were captured.</p>"}</div></section><section class="copy-panel" id="plain-text-tree"><h2>Copy plain-text tree</h2><textarea readonly aria-label="Copyable plain-text execution tree" rows="${Math.max(4, Math.min(24, graph.nodes.length + clockDomains.length + 2))}">${escapeHtml(plainTree)}</textarea><p>Select the text and copy it; this report is a script-free snapshot.</p></section><section class="secondary-views" aria-label="Secondary Explain Analyze views"><details class="secondary-view" id="secondary-graph"><summary><span>Graph view</span><small>Explicit parent and dependency edges</small></summary><div class="graph-node-view">${nodeGraph}${graphDetails}</div></details><details class="secondary-view" id="secondary-timeline"><summary><span>Timeline view</span><small>Measured spans by clock domain</small></summary><div class="graph-scroll">${timeline || "<div class=\"empty\">No execution facts were captured.</div>"}</div></details></section><footer class="footer"><span>Amber intervals are measured waits. Tool I/O wait is shown only when separately recorded.</span><strong>Saved report · script-free snapshot</strong></footer></main></body></html>`;
 }
 
 function renderHtmlTokenSummary(
@@ -827,7 +1221,8 @@ function renderHtmlNodeGraph(graph: ExplainAnalyzeGraphV1): string {
       const kind = node.kind.replace(/_/g, "-");
       const duration = node.durationMs === undefined ? "Not recorded" : formatMs(node.durationMs);
       const usage = node.usage ? formatUsage(node.usage) : node.context ? formatExplainAnalyzeContext(node.context) : "";
-      return `<a class="dag-card dag-kind-${kind} dag-status-${status.className}" href="#${detailIds.get(node.nodeId)}" style="left:${position.x}px;top:${position.y}px;width:${position.width}px;height:${position.height}px" aria-label="Inspect ${escapeHtml(node.label)}, ${escapeHtml(status.label)}, ${duration}"><span class="dag-card-head"><i aria-hidden="true"></i><span>${escapeHtml(status.label)}</span><b>${duration}</b></span><strong class="dag-card-title">${escapeHtml(node.label)}</strong>${usage ? `<span class="dag-card-usage" title="${escapeHtml(usage)}">${escapeHtml(usage)}</span>` : `<span class="dag-card-usage">${escapeHtml(formatMs(node.startElapsedMs))} → ${node.endElapsedMs === undefined ? "End not recorded" : escapeHtml(formatMs(node.endElapsedMs))}</span>`}</a>`;
+      const decision = node.decisionDetail ? explainAnalyzeDecisionDetailLine(node.decisionDetail) : "";
+      return `<a class="dag-card dag-kind-${kind} dag-status-${status.className}" href="#${detailIds.get(node.nodeId)}" style="left:${position.x}px;top:${position.y}px;width:${position.width}px;height:${position.height}px" aria-label="Inspect ${escapeHtml(node.label)}, ${escapeHtml(status.label)}, ${duration}${decision ? `, ${escapeHtml(decision)}` : ""}"><span class="dag-card-head"><i aria-hidden="true"></i><span>${escapeHtml(status.label)}</span><b>${duration}</b></span><strong class="dag-card-title">${escapeHtml(node.label)}</strong>${usage ? `<span class="dag-card-usage" title="${escapeHtml(usage)}">${escapeHtml(usage)}</span>` : `<span class="dag-card-usage">${escapeHtml(formatMs(node.startElapsedMs))} → ${node.endElapsedMs === undefined ? "End not recorded" : escapeHtml(formatMs(node.endElapsedMs))}</span>`}</a>`;
     }).join("");
     return `<section class="dag-domain" aria-label="Execution graph timeline ${domainIndex + 1}"><div class="dag-domain-head"><strong>Timeline ${domainIndex + 1}</strong><span><i class="dag-key-parent"></i> Nested stage <i class="dag-key-dependency"></i> Runs after</span></div><div class="dag-scroll"><div class="dag-canvas" style="width:${domain.width}px;height:${domain.height}px"><svg width="${domain.width}" height="${domain.height}" aria-hidden="true"><defs><marker id="${markerId}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#7376df"/></marker></defs>${edges}</svg>${cards}</div></div></section>`;
   }).join("");
@@ -836,9 +1231,12 @@ function renderHtmlNodeGraph(graph: ExplainAnalyzeGraphV1): string {
 function renderHtmlGraphDetails(graph: ExplainAnalyzeGraphV1): string {
   return graph.nodes.map((node, index) => {
     const status = nodeStatus(node);
+    const decision = node.decisionDetail
+      ? `<p>${escapeHtml(explainAnalyzeDecisionDetailLine(node.decisionDetail))}</p>`
+      : "";
     const usage = node.usage ? `<p>${escapeHtml(formatUsageDetail(node.usage))}</p>` : "";
     const context = node.context ? explainAnalyzeContextSections(node.context).map((section) => `<h4>${escapeHtml(section.title)}</h4><p>${escapeHtml(section.description)}</p><dl>${section.rows.map((row) => `<dt>${escapeHtml(row.label)}</dt><dd>${escapeHtml(row.value)}</dd>`).join("")}</dl>`).join("") : "";
-    return `<section id="report-stage-${index}" class="dag-inspection" tabindex="-1"><a href="#secondary-graph" class="dag-close">Close details</a><h3>${escapeHtml(node.label)}</h3><p>${escapeHtml(status.label)} · ${formatMs(node.startElapsedMs)} → ${node.endElapsedMs === undefined ? "End not recorded" : formatMs(node.endElapsedMs)} · ${node.durationMs === undefined ? "Duration not recorded" : formatMs(node.durationMs)}</p>${usage}${context}</section>`;
+    return `<section id="report-stage-${index}" class="dag-inspection" tabindex="-1"><a href="#secondary-graph" class="dag-close">Close details</a><h3>${escapeHtml(node.label)}</h3><p>${escapeHtml(status.label)} · ${formatMs(node.startElapsedMs)} → ${node.endElapsedMs === undefined ? "End not recorded" : formatMs(node.endElapsedMs)} · ${node.durationMs === undefined ? "Duration not recorded" : formatMs(node.durationMs)}</p>${decision}${usage}${context}</section>`;
   }).join("");
 }
 

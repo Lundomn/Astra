@@ -31,6 +31,9 @@ pub const USER_PROMPT_RESPOND: &str = "/user-prompts/respond";
 /// `POST` — submit or cancel an opaque provider interaction.
 pub const PROVIDER_INTERACTION_RESPOND: &str = "/provider-interactions/respond";
 
+/// `POST` — register and await an interaction from an active Edge invocation.
+pub const TOOL_INTERACTION_REQUEST: &str = "/tools/interactions/request";
+
 /// `GET` — list durable runs.
 pub const RUNS: &str = "/runs";
 
@@ -132,6 +135,35 @@ pub fn work_branch_execution_targets(work_id: &str, branch_id: &str) -> Option<S
     work_branch_execution(work_id, branch_id).map(|path| format!("{path}/targets"))
 }
 
+/// Read the immutable progress boundaries recorded for one Work branch.
+#[inline]
+pub fn work_branch_recovery_points(work_id: &str, branch_id: &str) -> Option<String> {
+    if !is_safe_path_segment(work_id) || !is_safe_path_segment(branch_id) {
+        return None;
+    }
+    Some(format!(
+        "{WORKS}/{work_id}/branches/{branch_id}/recovery-points"
+    ))
+}
+
+/// Read one immutable progress boundary for a Work branch.
+#[inline]
+pub fn work_branch_recovery_point(
+    work_id: &str,
+    branch_id: &str,
+    recovery_point_id: &str,
+) -> Option<String> {
+    if !is_safe_path_segment(work_id)
+        || !is_safe_path_segment(branch_id)
+        || !is_safe_path_segment(recovery_point_id)
+    {
+        return None;
+    }
+    Some(format!(
+        "{WORKS}/{work_id}/branches/{branch_id}/recovery-points/{recovery_point_id}"
+    ))
+}
+
 /// `GET` — optional tool capacity from server and connected edge providers.
 pub const RUNTIME_CAPABILITIES: &str = "/runtime/capabilities";
 
@@ -163,6 +195,10 @@ pub fn session(id: &str) -> String {
 }
 
 #[inline]
+pub fn session_memory_finalize(id: &str) -> String {
+    format!("/sessions/{}/memory/finalize", model_segment(id))
+}
+
 pub fn session_close(id: &str) -> String {
     format!("/sessions/{id}/close")
 }
@@ -215,16 +251,6 @@ pub fn session_transcript(id: &str) -> String {
 #[inline]
 pub fn session_artifacts(id: &str) -> String {
     format!("/sessions/{id}/artifacts")
-}
-
-#[inline]
-pub fn session_replay(id: &str) -> String {
-    format!("/sessions/{id}/replay")
-}
-
-#[inline]
-pub fn session_replay_compare(id: &str) -> String {
-    format!("/sessions/{id}/replay/compare")
 }
 
 /// Returns `None` if `artifact_kind` contains path-unsafe characters.
@@ -336,6 +362,7 @@ pub const HEALTH: &str = "/health";
 
 pub const MODELS: &str = "/models";
 pub const MODEL_ACCESS: &str = "/model-access";
+pub const MODEL_ACCESS_ADMIT: &str = "/model-access/admit";
 pub const ME_MODELS: &str = "/me/models";
 pub const ME_MODEL_VALIDATE_ENDPOINT: &str = "/me/models/validate-endpoint";
 
@@ -399,7 +426,6 @@ pub const ADMIN_USERS_GRANT_ROLE: &str = "/admin/users/grant-role";
 pub const ADMIN_USERS_REVOKE_ROLE: &str = "/admin/users/revoke-role";
 pub const ADMIN_TOKENS: &str = "/admin/tokens";
 pub const ADMIN_PROMPTS_OPTIMIZE: &str = "/admin/prompts/optimize";
-pub const ADMIN_FEEDBACK_STATS: &str = "/admin/feedback/stats";
 pub const ADMIN_FEEDBACK_EXPORT: &str = "/admin/feedback/export";
 pub const ADMIN_CONFIG: &str = "/admin/config";
 
@@ -454,6 +480,10 @@ pub fn session_audit_errors(session_id: &str) -> String {
     format!("/sessions/{session_id}/audit/errors")
 }
 
+pub fn chat_run_permission_mode(run_id: &str) -> String {
+    format!("{}/permission-mode", chat_run(run_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,7 +523,6 @@ mod tests {
             ADMIN_USERS_REVOKE_ROLE,
             ADMIN_TOKENS,
             ADMIN_PROMPTS_OPTIMIZE,
-            ADMIN_FEEDBACK_STATS,
             ADMIN_FEEDBACK_EXPORT,
             ADMIN_CONFIG,
             AUDIT_SESSIONS,
@@ -550,16 +579,6 @@ mod tests {
     #[test]
     fn session_artifacts_path() {
         assert_eq!(session_artifacts("s1"), "/sessions/s1/artifacts");
-    }
-
-    #[test]
-    fn session_replay_path() {
-        assert_eq!(session_replay("s1"), "/sessions/s1/replay");
-    }
-
-    #[test]
-    fn session_replay_compare_path() {
-        assert_eq!(session_replay_compare("s1"), "/sessions/s1/replay/compare");
     }
 
     #[test]
@@ -773,6 +792,14 @@ mod tests {
             Some("/v1/works/work-1/branches/branch.main/execution/targets")
         );
         assert_eq!(
+            work_branch_recovery_points("work-1", "branch.main").as_deref(),
+            Some("/v1/works/work-1/branches/branch.main/recovery-points")
+        );
+        assert_eq!(
+            work_branch_recovery_point("work-1", "branch.main", "rp-1").as_deref(),
+            Some("/v1/works/work-1/branches/branch.main/recovery-points/rp-1")
+        );
+        assert_eq!(
             work_branch_attachment("work-1", "branch.main", "attachment-1").as_deref(),
             Some("/v1/works/work-1/branches/branch.main/attachments/attachment-1")
         );
@@ -789,8 +816,11 @@ mod tests {
             assert!(work_branch_activity("work-1", unsafe_id).is_none());
             assert!(work_branch_execution("work-1", unsafe_id).is_none());
             assert!(work_branch_execution_targets("work-1", unsafe_id).is_none());
+            assert!(work_branch_recovery_points("work-1", unsafe_id).is_none());
+            assert!(work_branch_recovery_point("work-1", unsafe_id, "rp-1").is_none());
             assert!(work_branch_attachment("work-1", "branch-1", unsafe_id).is_none());
             assert!(work_branch_control_operations("work-1", unsafe_id).is_none());
+            assert!(work_branch_recovery_point("work-1", "branch-1", unsafe_id).is_none());
         }
     }
 }

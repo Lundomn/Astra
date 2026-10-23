@@ -1,4 +1,6 @@
+use crate::CancellationSafePoolConnection;
 use crate::pagination::MAX_API_LIST_LIMIT;
+use crate::runs::SessionAdmissionFacts;
 use crate::session_lifecycle::{SessionTableDeleteOutcome, hard_delete_session};
 use crate::storage::{log_session_audit, session_record_from_row};
 use astra_core::{
@@ -10,7 +12,7 @@ use axum::{Json, http::StatusCode};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{MySql, QueryBuilder, Row, query};
+use sqlx::{Connection, MySql, QueryBuilder, Row, query};
 use uuid::Uuid;
 
 const MAX_SESSION_ACTIVITY_ROWS: u32 = 200;
@@ -32,6 +34,94 @@ const SESSION_ACTIVITY_SELECT_AFTER_SQL: &str = "SELECT log_id, action, \
        AND (created_at < ? OR (created_at = ? AND log_id < ?)) \
      ORDER BY created_at DESC, log_id DESC LIMIT ?";
 
+/// Non-secret proof that a local Astra session was active when a run started.
+/// It is an absolute ceiling, not a token, refresh credential, or new session
+/// authority. Reauthorization requires the original session to remain active
+/// and this frozen ceiling to remain unexpired, even after session refresh.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionContinuationGrant {
+    pub user_id: String,
+    pub session_id: String,
+    pub expires_at_unix: i64,
+}
+
+impl ExecutionContinuationGrant {
+    pub(super) fn from_active_session(
+        user_id: String,
+        session_id: String,
+        expires_at_unix: i64,
+    ) -> Self {
+        Self {
+            user_id,
+            session_id,
+            expires_at_unix,
+        }
+    }
+
+    pub(super) fn belongs_to(&self, user_id: &str, session_id: &str) -> bool {
+        !self.user_id.is_empty()
+            && !self.session_id.is_empty()
+            && self.user_id == user_id
+            && self.session_id == session_id
+            && self.expires_at_unix > 0
+    }
+}
+
+impl super::AuthPrincipal {
+    pub fn internal(user: super::AuthUserRecord) -> Self {
+        Self {
+            user,
+            session_id: None,
+            execution_continuation: None,
+            origin: super::AuthPrincipalOrigin::Internal,
+        }
+    }
+
+    pub(super) fn from_local_jwt(
+        user: super::AuthUserRecord,
+        session_id: String,
+        execution_continuation: ExecutionContinuationGrant,
+    ) -> Self {
+        Self {
+            user,
+            session_id: Some(session_id),
+            execution_continuation: Some(execution_continuation),
+            origin: super::AuthPrincipalOrigin::Internal,
+        }
+    }
+
+    pub(super) fn from_verified_provider_session(
+        user: super::AuthUserRecord,
+        session_id: String,
+        provider_id: String,
+        external_subject: String,
+        execution_continuation: Option<ExecutionContinuationGrant>,
+    ) -> Self {
+        Self {
+            user,
+            session_id: Some(session_id),
+            execution_continuation,
+            origin: super::AuthPrincipalOrigin::VerifiedProvider {
+                provider_id,
+                external_subject,
+            },
+        }
+    }
+
+    pub(super) fn from_provider_request(
+        user: super::AuthUserRecord,
+        context: super::AuthProviderAuthorizedRequestContext,
+    ) -> Self {
+        Self {
+            user,
+            session_id: None,
+            execution_continuation: None,
+            origin: super::AuthPrincipalOrigin::ProviderAuthorizedRequest(context),
+        }
+    }
+}
+
 #[async_trait]
 pub trait SessionService: Send + Sync {
     async fn create_session(
@@ -39,6 +129,20 @@ pub trait SessionService: Send + Sync {
         user_id: String,
         request: SessionCreateRequestData,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)>;
+
+    /// Create a Session and return any facts observed in the same insert
+    /// transaction. The default preserves the older create/read contract for
+    /// custom implementations.
+    async fn create_session_with_admission_facts(
+        &self,
+        user_id: String,
+        request: SessionCreateRequestData,
+    ) -> Result<(SessionRecord, Option<SessionAdmissionFacts>), (StatusCode, Json<ErrorResponse>)>
+    {
+        self.create_session(user_id, request)
+            .await
+            .map(|session| (session, None))
+    }
 
     async fn create_provider_session(
         &self,
@@ -63,6 +167,21 @@ pub trait SessionService: Send + Sync {
         session_id: String,
         user_id: String,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)>;
+
+    /// Resolve an owned Session and return request-local facts that were
+    /// already present in that same authenticated read. Implementations that
+    /// cannot provide extra facts retain the safe fallback: the lifecycle
+    /// performs its own authoritative lookup when needed.
+    async fn get_session_with_admission_facts(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<(SessionRecord, Option<SessionAdmissionFacts>), (StatusCode, Json<ErrorResponse>)>
+    {
+        self.get_session(session_id, user_id)
+            .await
+            .map(|session| (session, None))
+    }
 
     /// Resolve a session for an already authenticated provider request.
     /// Implementations may classify confirmed absence as `session_not_found`;
@@ -164,6 +283,7 @@ impl ProviderSessionCreationIdentity {
 pub struct SessionCreationResult {
     pub session: SessionRecord,
     pub created: bool,
+    pub admission_facts: SessionAdmissionFacts,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -426,7 +546,6 @@ pub struct DatabaseSessionService {
 struct SessionDeletionOutcome {
     session: SessionRecord,
     database_rows_deleted: u64,
-    session_references_cleared: u64,
     workspace_cleanup_debts_enqueued: u64,
     database_tables_deleted: Vec<SessionTableDeleteOutcome>,
     local_bytes_freed: u64,
@@ -452,7 +571,14 @@ impl DatabaseSessionService {
             .unwrap_or_else(|| format!("Session {}", Utc::now().format("%Y-%m-%d %H:%M")));
         let metadata = serde_json::Value::Object(request.metadata.unwrap_or_default()).to_string();
 
-        let mut tx = pool.begin().await.map_err(internal_error)?;
+        let mut connection = CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(internal_error)?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(internal_error)?;
         crate::storage::lock_agent_session_write_fence(&mut tx, &session_id, &user_id)
             .await
             .map_err(internal_error)?;
@@ -472,14 +598,16 @@ impl DatabaseSessionService {
                         "session_creation_conflict",
                     ));
                 }
-                let record = self
-                    .fetch_session_for_user(&mut *tx, &session_id, &user_id)
+                let (record, admission_facts) = self
+                    .fetch_session_for_user_with_admission_facts(&mut *tx, &session_id, &user_id)
                     .await?
                     .ok_or_else(|| internal_error("failed to read idempotent session"))?;
                 tx.commit().await.map_err(internal_error)?;
+                connection.release();
                 return Ok(SessionCreationResult {
                     session: record,
                     created: false,
+                    admission_facts,
                 });
             }
             crate::resource_governor::enforce_session_create_quota(quota)?;
@@ -503,11 +631,13 @@ impl DatabaseSessionService {
         // can use an older MatrixOne snapshot and miss a successfully committed
         // session. Keep database-generated fields, but only return after commit
         // succeeds so a commit failure cannot be reported as successful creation.
-        let record = self
-            .fetch_session_for_user(&mut *tx, &session_id, &user_id)
+        let (record, admission_facts) = self
+            .fetch_session_for_user_with_admission_facts(&mut *tx, &session_id, &user_id)
             .await?
             .ok_or_else(|| internal_error("failed to read created session"))?;
+        debug_assert_eq!(admission_facts.active_plan_id, None);
         tx.commit().await.map_err(internal_error)?;
+        connection.release();
         let details = serde_json::json!({
             "title": record.title,
             "agent_id": record.agent_id,
@@ -516,6 +646,7 @@ impl DatabaseSessionService {
         Ok(SessionCreationResult {
             session: record,
             created: true,
+            admission_facts,
         })
     }
 
@@ -532,8 +663,21 @@ impl DatabaseSessionService {
         session_id: &str,
         user_id: &str,
     ) -> Result<Option<SessionRecord>, (StatusCode, Json<ErrorResponse>)> {
-        query(
+        self.fetch_session_for_user_with_admission_facts(executor, session_id, user_id)
+            .await
+            .map(|record| record.map(|(session, _)| session))
+    }
+
+    async fn fetch_session_for_user_with_admission_facts(
+        &self,
+        executor: impl sqlx::Executor<'_, Database = MySql>,
+        session_id: &str,
+        user_id: &str,
+    ) -> Result<Option<(SessionRecord, SessionAdmissionFacts)>, (StatusCode, Json<ErrorResponse>)>
+    {
+        let row = query(
             "SELECT session_id, user_id, agent_id, title, status, event_count, \
+             active_plan_id, \
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at, \
              DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s') AS updated_at, \
              DATE_FORMAT(ended_at, '%Y-%m-%dT%H:%i:%s') AS ended_at, \
@@ -544,9 +688,13 @@ impl DatabaseSessionService {
         .bind(user_id)
         .fetch_optional(executor)
         .await
-        .map_err(internal_error)?
-        .map(session_record_from_row)
-        .transpose()
+        .map_err(internal_error)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let active_plan_id = row.try_get("active_plan_id").map_err(internal_error)?;
+        let session = session_record_from_row(row)?;
+        Ok(Some((session, SessionAdmissionFacts { active_plan_id })))
     }
 
     async fn delete_session_lifecycle(
@@ -600,13 +748,19 @@ impl DatabaseSessionService {
                 }
                 return Err(internal_error(error));
             }
+            Err(error) if error.starts_with("delete_session.recovery_point_retained:") => {
+                return Err(error_response_coded(
+                    StatusCode::CONFLICT,
+                    error.trim_start_matches("delete_session.recovery_point_retained: "),
+                    "session_has_saved_work",
+                ));
+            }
             Err(error) => return Err(internal_error(error)),
         };
 
         Ok(SessionDeletionOutcome {
             session: existing,
             database_rows_deleted: hard_delete.database_rows_deleted,
-            session_references_cleared: hard_delete.session_references_cleared,
             workspace_cleanup_debts_enqueued: hard_delete.workspace_cleanup_debts_enqueued,
             database_tables_deleted: hard_delete.database_tables_deleted,
             local_bytes_freed: hard_delete.local_bytes_freed,
@@ -643,6 +797,17 @@ impl SessionService for DatabaseSessionService {
         self.create_session_record(user_id, Uuid::new_v4().to_string(), request, None)
             .await
             .map(|result| result.session)
+    }
+
+    async fn create_session_with_admission_facts(
+        &self,
+        user_id: String,
+        request: SessionCreateRequestData,
+    ) -> Result<(SessionRecord, Option<SessionAdmissionFacts>), (StatusCode, Json<ErrorResponse>)>
+    {
+        self.create_session_record(user_id, Uuid::new_v4().to_string(), request, None)
+            .await
+            .map(|result| (result.session, Some(result.admission_facts)))
     }
 
     async fn create_provider_session(
@@ -756,6 +921,24 @@ impl SessionService for DatabaseSessionService {
         Ok(session)
     }
 
+    async fn get_session_with_admission_facts(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<(SessionRecord, Option<SessionAdmissionFacts>), (StatusCode, Json<ErrorResponse>)>
+    {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        self.fetch_session_for_user_with_admission_facts(&pool, &session_id, &user_id)
+            .await?
+            .map(|(session, facts)| (session, Some(facts)))
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("Session {session_id} 不存在"),
+                )
+            })
+    }
+
     async fn get_session_for_provider_request(
         &self,
         session_id: String,
@@ -823,7 +1006,19 @@ impl SessionService for DatabaseSessionService {
             return Ok(existing);
         }
 
-        let mut tx = pool.begin().await.map_err(internal_error)?;
+        // A disconnected cancel request can drop this future before BEGIN
+        // is acknowledged. Keep the physical connection guarded until commit.
+        let mut connection = CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(internal_error)?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(internal_error)?;
+        crate::storage::lock_agent_session_write_fence(&mut tx, &session_id, &user_id)
+            .await
+            .map_err(internal_error)?;
         let locked = query(
             "SELECT IFNULL(CAST(`metadata` AS CHAR), '{}') AS metadata_json \
              FROM agent_sessions WHERE session_id = ? AND user_id = ? FOR UPDATE",
@@ -897,8 +1092,18 @@ impl SessionService for DatabaseSessionService {
                 format!("Session {session_id} 不存在"),
             ));
         }
+        if status.as_deref() == Some("closed") {
+            crate::session_memory_lifecycle::request_finalization_tx(
+                &mut tx,
+                &user_id,
+                &session_id,
+            )
+            .await
+            .map_err(internal_error)?;
+        }
         tx.commit().await.map_err(internal_error)?;
 
+        connection.release();
         let updated = self
             .fetch_session_for_user(&pool, &session_id, &user_id)
             .await?
@@ -926,7 +1131,6 @@ impl SessionService for DatabaseSessionService {
         let details = serde_json::json!({
             "title": outcome.session.title,
             "database_rows_deleted": outcome.database_rows_deleted,
-            "session_references_cleared": outcome.session_references_cleared,
             "workspace_cleanup_debts_enqueued": outcome.workspace_cleanup_debts_enqueued,
             "database_tables_deleted": outcome.database_tables_deleted,
             "local_bytes_freed": outcome.local_bytes_freed,
@@ -1100,24 +1304,21 @@ mod tests {
     use super::*;
 
     fn provider_principal(provider: &str, subject: &str, scope: &str) -> crate::AuthPrincipal {
-        crate::AuthPrincipal {
-            user: crate::AuthUserRecord {
+        crate::AuthPrincipal::from_provider_request(
+            crate::AuthUserRecord {
                 user_id: "mapped-user".to_string(),
                 username: "mapped-user".to_string(),
                 email: "mapped@example.test".to_string(),
                 display_name: None,
             },
-            session_id: None,
-            origin: crate::AuthPrincipalOrigin::ProviderAuthorizedRequest(
-                crate::AuthProviderAuthorizedRequestContext {
-                    provider_id: provider.to_string(),
-                    external_subject: subject.to_string(),
-                    provider_scope_id: scope.to_string(),
-                    request_authorization_id: "request-1".to_string(),
-                    edge_agent_id: None,
-                },
-            ),
-        }
+            crate::AuthProviderAuthorizedRequestContext {
+                provider_id: provider.to_string(),
+                external_subject: subject.to_string(),
+                provider_scope_id: scope.to_string(),
+                request_authorization_id: "request-1".to_string(),
+                edge_agent_id: None,
+            },
+        )
     }
 
     #[test]

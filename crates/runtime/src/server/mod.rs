@@ -26,13 +26,15 @@ pub mod artifact_retention_sweeper;
 mod audit_handlers;
 mod auth_handlers;
 mod capability_handlers;
+mod capability_source;
 mod chat_handlers;
 mod cleanup_retry;
-pub mod conflict_resolver;
+pub(crate) mod context_history_artifact;
 pub mod delegation;
 pub(crate) mod deployment_tool_policy;
 pub mod device_lease_sweeper;
 mod edge;
+pub(crate) use edge::edge_capacity_handler::validate_relay_origin;
 pub(crate) mod explain_analyze_artifact;
 pub mod harness;
 pub(crate) mod header_utils;
@@ -42,15 +44,17 @@ mod interaction_metrics;
 mod llm_trusted_domains_handlers;
 mod mcp_handlers;
 mod meta_handlers;
-mod model_execution_admission;
+pub(crate) mod model_execution_admission;
 mod platform_handlers;
 mod preferences_handlers;
-mod product_harness_handlers;
 mod provider_runtime_context;
+#[cfg(any(test, feature = "e2e-hooks"))]
+pub mod provider_test_support;
 mod reflect_handlers;
 mod request_trace;
 mod resource_handlers;
 mod router_builder;
+mod router_rollout_handlers;
 pub mod run;
 mod runtime_maintenance_sweeper;
 pub(crate) mod runtime_mcp;
@@ -61,11 +65,10 @@ pub(crate) mod server_bash_execution;
 pub mod server_loop_host;
 pub mod server_skill_subrun;
 pub(crate) mod session;
+pub(crate) mod session_memory_runtime;
 pub(crate) mod session_turn;
-mod skillify_agent_executor;
 mod state_builder;
 pub mod sweeper_lease;
-pub mod team;
 pub(crate) mod tool_admission;
 pub(crate) mod tool_agent_info;
 pub(crate) mod tool_agent_runtime;
@@ -78,7 +81,6 @@ pub(crate) mod tool_edge_transport;
 pub(crate) mod tool_execution_binding;
 pub(crate) mod tool_execution_result;
 pub(crate) mod tool_execution_service;
-pub(crate) mod tool_external_transport;
 pub(crate) mod tool_file_runtime;
 pub(crate) mod tool_introspect;
 pub mod tool_invocation_compactor;
@@ -86,11 +88,13 @@ pub(crate) mod tool_invocation_decision;
 pub(crate) mod tool_invocation_runtime;
 pub(crate) mod tool_local_execution;
 pub(crate) mod tool_local_transport;
+pub(crate) mod tool_model_catalog;
 mod work_branch_deletion_runtime;
 mod work_handlers;
 mod work_patch_commit_runtime;
 mod work_patch_export_runtime;
 mod work_patch_materialization_runtime;
+mod work_patch_workspace;
 
 fn external_request_descriptor(
     method: &Method,
@@ -294,6 +298,10 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         bg_cancel.clone(),
     ));
     if let Some(ref pool) = state.shared_pool {
+        bg_handles.push(session_memory_runtime::spawn_session_memory_recovery(
+            state.clone(),
+            bg_cancel.clone(),
+        ));
         bg_handles.push(spawn_data_cleanup(pool.clone(), bg_cancel.clone()));
         bg_handles.push(spawn_edge_dispatch_cleanup(
             state.execution.edge_dispatch_service.clone(),
@@ -323,11 +331,13 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         bg_handles.push(
             work_patch_materialization_runtime::spawn_work_patch_materialization_recovery(
                 pool.clone(),
+                state.execution.run_lifecycle_service.clone(),
                 bg_cancel.clone(),
             ),
         );
         bg_handles.push(work_patch_commit_runtime::spawn_work_patch_commit_recovery(
             pool.clone(),
+            state.execution.run_lifecycle_service.clone(),
             bg_cancel.clone(),
         ));
         // Spawn background cleanup-debt retry task
@@ -669,6 +679,7 @@ pub use astra_server_types::edge_connection_pool;
 
 #[cfg(test)]
 mod tests {
+    use crate::{AppState, ServiceInfo};
     use std::sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -681,7 +692,12 @@ mod tests {
         multi_agent::{EdgeDispatchIdentity, EdgeDispatchRow, EdgeDispatchService},
     };
     use async_trait::async_trait;
-    use axum::{Json, http::StatusCode};
+    use axum::{
+        Json,
+        body::Body,
+        http::{Method, Request, StatusCode},
+    };
+    use tower::ServiceExt;
 
     #[derive(Default)]
     struct RecordingEdgeDispatchService {
@@ -729,7 +745,7 @@ mod tests {
         async fn wait_result(
             &self,
             _identity: &EdgeDispatchIdentity,
-            _timeout: std::time::Duration,
+            _timeout: Option<std::time::Duration>,
         ) -> Result<Option<String>, String> {
             unreachable!("wait_result is not used in cleanup tests")
         }
@@ -805,7 +821,8 @@ mod tests {
             _run_id: String,
             _user_id: String,
             _last_index: u32,
-        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+        ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>
+        {
             unreachable!("stream_run is not used in shutdown tests")
         }
 
@@ -882,5 +899,37 @@ mod tests {
 
         assert_eq!(run_lifecycle.drain_calls.load(Ordering::SeqCst), 1);
         assert_eq!(run_lifecycle.stop_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn production_router_allows_workspace_blob_over_process_body_limit() {
+        let app = super::build_app(AppState::new(
+            ServiceInfo::default(),
+            Arc::new(crate::app_state::MatrixOneHealthChecker::new(
+                astra_core::MatrixOneSettings::mock(),
+            )),
+        ));
+        let digest = format!("sha256:{}", "0".repeat(64));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!(
+                        "/v1/works/work-1/branches/branch-1/workspace-recovery-artifacts/artifact-1/chunks/{digest}"
+                    ))
+                    .header(astra_server_types::WORK_API_MAJOR_HEADER, "1")
+                    .body(Body::from(vec![
+                        0_u8;
+                        astra_runtime_env::WORKSPACE_SNAPSHOT_MAX_BLOB_BYTES / 2
+                    ]))
+                    .expect("workspace upload request should build"),
+            )
+            .await
+            .expect("production router should return a response");
+
+        // The route-specific limit must supersede the 4 MiB process default;
+        // the unconfigured test auth service then rejects the request after
+        // the body has been extracted.
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 }

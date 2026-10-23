@@ -157,7 +157,7 @@ def classify(paths: list[str]) -> dict[str, bool]:
             _enable(result, *RUST_SCOPES)
             continue
         if path == ".nvmrc":
-            _enable(result, "sdk", "web")
+            _enable(result, "sdk", "web", "test_cli")
             continue
         if path.startswith("vendor/"):
             # Vendored Rust code is a compiler input, not an unknown-area
@@ -170,6 +170,9 @@ def classify(paths: list[str]) -> dict[str, bool]:
             continue
         if path.startswith("web/"):
             _enable(result, "web")
+            continue
+        if path.startswith("scripts/tui-reflow/"):
+            _enable(result, "test_cli")
             continue
         if path.startswith("scripts/harness/"):
             _enable(result, "harness")
@@ -211,14 +214,36 @@ def changed_paths_from_event() -> list[str]:
     event = json.loads(Path(event_path).read_text(encoding="utf-8"))
     if "pull_request" in event:
         base = event["pull_request"]["base"]["sha"]
-        head = event["pull_request"]["head"]["sha"]
+        pull_request_head = event["pull_request"]["head"]["sha"]
+        head = os.environ.get("GITHUB_SHA")
+        if not head:
+            raise RuntimeError("GITHUB_SHA is not set for pull request scope detection")
+
+        # GitHub tests pull requests at a synthetic merge commit. Diffing the
+        # current base tip directly against the feature head also includes
+        # base-only changes when the branches have diverged, which can select
+        # unrelated expensive lanes. Trust the tested merge only after its
+        # parents match the event's base and head commits exactly.
+        parents = subprocess.check_output(
+            ["git", "rev-list", "--parents", "-n", "1", head],
+            stderr=subprocess.STDOUT,
+            text=True,
+        ).strip().split()
+        if parents != [head, base, pull_request_head]:
+            raise RuntimeError(
+                "GITHUB_SHA is not the pull request merge commit described by the event"
+            )
     else:
         base = event.get("before")
         head = event.get("after") or os.environ.get("GITHUB_SHA")
     if not base or not head or set(base) == {"0"}:
         return []
+    # A rename affects both the source and destination scopes. Name-only
+    # output with rename detection reports just the destination, which can
+    # silently skip validation for the code removed from the source area.
     output = subprocess.check_output(
-        ["git", "diff", "--name-only", "-z", base, head], stderr=subprocess.STDOUT
+        ["git", "diff", "--no-renames", "--name-only", "-z", base, head],
+        stderr=subprocess.STDOUT,
     )
     return [item.decode("utf-8") for item in output.split(b"\0") if item]
 

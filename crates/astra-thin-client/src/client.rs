@@ -6,7 +6,9 @@ use std::time::Duration;
 use astra_server_types::{
     WORK_API_MAJOR, WORK_API_MAJOR_HEADER, WorkBranchActivityResponseV1, WorkBranchAttachRequestV1,
     WorkBranchControlOperationRequestV1, WorkCreateRequestV1, WorkExecutionTargetPageV1,
-    WorkExecutionViewV1, WorkSessionBindingResponseV1, WorkTurnRequestV1,
+    WorkExecutionViewV1, WorkRecoveryPointCaptureRequestV1, WorkRecoveryPointCursorV1,
+    WorkRecoveryPointPageV1, WorkRecoveryPointViewV1, WorkSessionBindingResponseV1,
+    WorkTurnRequestV1,
 };
 use astra_sync_protocol::{
     SYNC_OUTBOX_SIGNATURE_HEADER, SyncOutboxAck, sync_outbox_request_signature,
@@ -27,18 +29,21 @@ use crate::protocol::{
     ApprovalRespondRequest, ChatStreamRequest, EdgeHeartbeatRequest, EdgeHeartbeatResponse,
     EdgeRegisterRequest, ProviderInteractionRespondRequest, RunUserIntentRequest,
     RunUserIntentResponse, SessionCreateRequest, SessionTranscriptPage, SessionTranscriptReadScope,
-    SessionUpdateRequest, StreamEvent, ToolResultRequest, UserPromptRespondRequest,
+    SessionUpdateRequest, StreamEvent, ToolInteractionRequest, ToolResultRequest,
+    UserPromptRespondRequest,
 };
 use crate::sse::SseParser;
-use crate::work::WorkTaskGraphPageV2;
+use crate::work::{WorkCatalogCursorV1, WorkCatalogPageV1, WorkTaskGraphPageV2};
 
 const HTTP_STREAM_CONNECT_TIMEOUT_SECS: u64 = 60;
 const AUTHED_TEXT_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Edge callbacks are control-plane acknowledgements, not long-lived streams.
 /// A peer that accepts bytes but never returns response headers must not stop
-/// the SSE consumer indefinitely. Server handlers are idempotent for an
+/// the SSE consumer indefinitely. The budget has to outlast one slow database
+/// transaction; 10 seconds was short enough for the client to disconnect before
+/// the acknowledgement returned. Server handlers are idempotent for an
 /// identical request, so one immediate transport retry is safe.
-const CONTROL_CALLBACK_TIMEOUT_SECS: u64 = 10;
+const CONTROL_CALLBACK_TIMEOUT_SECS: u64 = 30;
 const CONTROL_CALLBACK_ATTEMPTS: usize = 2;
 const HEALTH_REQUEST_TIMEOUT_SECS: u64 = 10;
 
@@ -58,6 +63,70 @@ fn stream_event_is_terminal(event: &StreamEvent) -> bool {
                 ..
             }
     )
+}
+
+/// Decode one already-admitted SSE response with the same terminal-event
+/// semantics for every streaming endpoint. A transport close after a
+/// terminal event is considered a clean end; EOF before a terminal event is
+/// surfaced as an error so callers cannot report a partial Work turn as
+/// completed.
+fn classified_sse_response(
+    resp: Response,
+) -> impl Stream<Item = Result<StreamEvent, ThinClientError>> + Send + 'static {
+    stream! {
+        let mut parser = SseParser::new();
+        let mut byte_stream = resp.bytes_stream();
+        let mut saw_terminal = false;
+        while let Some(chunk) = byte_stream.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    if saw_terminal {
+                        return;
+                    }
+                    yield Err(e.into());
+                    return;
+                }
+            };
+            match parser.push_bytes(&chunk) {
+                Ok(events) => {
+                    for event in events {
+                        saw_terminal |= stream_event_is_terminal(&event);
+                        yield Ok(event);
+                    }
+                }
+                Err(error) => {
+                    if saw_terminal {
+                        return;
+                    }
+                    yield Err(error);
+                    return;
+                }
+            }
+        }
+        match parser.finish() {
+            Ok(events) => {
+                for event in events {
+                    saw_terminal |= stream_event_is_terminal(&event);
+                    yield Ok(event);
+                }
+            }
+            Err(error) => {
+                if saw_terminal {
+                    return;
+                }
+                yield Err(error);
+                return;
+            }
+        }
+        if !saw_terminal {
+            yield Err(ThinClientError::SseParse(
+                "SSE stream ended before a terminal event (run_finished, turn_complete, or interruption)"
+                    .to_string(),
+            ));
+        }
+    }
+    .boxed()
 }
 
 #[cfg(test)]
@@ -126,7 +195,7 @@ fn base_is_loopback(base: &Url) -> bool {
 }
 
 fn client_builder_for_base(base: &Url) -> reqwest::ClientBuilder {
-    let builder = Client::builder();
+    let builder = Client::builder().redirect(reqwest::redirect::Policy::none());
     if base_is_loopback(base) {
         // Loopback is a process-local control-plane boundary, never an
         // outbound destination. Bypass inherited proxy variables even when
@@ -157,7 +226,11 @@ fn streaming_http_client(base: &Url) -> Result<Client, reqwest::Error> {
 }
 
 /// Stateless façade over the astra HTTP API (thin client).
-#[derive(Debug, Clone)]
+pub trait BearerProvider: std::fmt::Debug + Send + Sync {
+    fn token(&self) -> futures_util::future::BoxFuture<'_, Result<String, ThinClientError>>;
+}
+
+#[derive(Clone)]
 pub struct ThinClient {
     http: Client,
     /// Separate client for SSE streams — auto-decompression disabled to prevent
@@ -167,6 +240,15 @@ pub struct ThinClient {
     base: Url,
     /// Default bearer when call sites omit per-request token (optional).
     bearer_token: Option<String>,
+    bearer_provider: Option<std::sync::Arc<dyn BearerProvider>>,
+}
+
+impl std::fmt::Debug for ThinClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThinClient")
+            .field("base", &self.base)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ThinClient {
@@ -183,7 +265,21 @@ impl ThinClient {
             http_stream,
             base,
             bearer_token,
+            bearer_provider: None,
         })
+    }
+
+    /// Credentials stay owned by the caller. The transport asks the owner at
+    /// dispatch time, including reconnects and background requests.
+    pub fn with_bearer_provider(mut self, provider: std::sync::Arc<dyn BearerProvider>) -> Self {
+        self.bearer_provider = Some(provider);
+        self
+    }
+
+    /// Explicit token-bound requests must not inherit another provider.
+    pub fn without_bearer_provider(mut self) -> Self {
+        self.bearer_provider = None;
+        self
     }
 
     /// Shared `reqwest::Client` (TLS / proxy policy aligned with thin API). For optional in-library LLM tool surface and ad-hoc calls to other origins (e.g. Memoria health).
@@ -211,28 +307,27 @@ impl ThinClient {
         Ok(h)
     }
 
-    fn auth_headers_for(&self, token_override: Option<&str>) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        let token = token_override.or(self.bearer_token.as_deref());
-        if let Some(t) = token
-            && let Ok(v) = HeaderValue::from_str(&format!("Bearer {t}"))
-        {
-            h.insert(header::AUTHORIZATION, v);
+    async fn auth_headers_for(
+        &self,
+        token_override: Option<&str>,
+    ) -> Result<HeaderMap, ThinClientError> {
+        if let Some(provider) = &self.bearer_provider {
+            return Self::bearer_headers(&provider.token().await?);
         }
-        h
+        let token = token_override.or(self.bearer_token.as_deref());
+        match token {
+            Some(t) => Self::bearer_headers(t),
+            None => Ok(HeaderMap::new()),
+        }
     }
 
-    fn work_api_headers(token: &str) -> Result<HeaderMap, ThinClientError> {
-        let mut headers = Self::bearer_headers(token)?;
+    async fn work_api_headers(&self, token: &str) -> Result<HeaderMap, ThinClientError> {
+        let mut headers = self.auth_headers_for(Some(token)).await?;
         headers.insert(
             WORK_API_MAJOR_HEADER,
             HeaderValue::from_static(WORK_API_MAJOR),
         );
         Ok(headers)
-    }
-
-    fn resolved_bearer_token<'a>(&'a self, token_override: Option<&'a str>) -> Option<&'a str> {
-        token_override.or(self.bearer_token.as_deref())
     }
 
     async fn text_or_api(resp: Response) -> Result<String, ThinClientError> {
@@ -283,7 +378,10 @@ impl ThinClient {
         query: &[(&str, String)],
     ) -> Result<String, ThinClientError> {
         let url = self.url(path)?;
-        let mut req = self.http.get(url).headers(Self::bearer_headers(token)?);
+        let mut req = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(Some(token)).await?);
         if !query.is_empty() {
             req = req.query(query);
         }
@@ -299,7 +397,10 @@ impl ThinClient {
         query: &[(&str, String)],
     ) -> Result<T, ThinClientError> {
         let url = self.url(path)?;
-        let mut req = self.http.get(url).headers(Self::bearer_headers(token)?);
+        let mut req = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(Some(token)).await?);
         if !query.is_empty() {
             req = req.query(query);
         }
@@ -318,7 +419,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .header(header::CONTENT_TYPE, "application/json")
             .json(body)
             .send()
@@ -337,7 +438,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .header(header::CONTENT_TYPE, "application/json")
             .json(body)
             .send()
@@ -356,7 +457,7 @@ impl ThinClient {
         let resp = self
             .http
             .put(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .header(header::CONTENT_TYPE, "application/json")
             .json(body)
             .send()
@@ -374,7 +475,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         Self::text_or_api(resp).await
@@ -390,7 +491,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         Self::typed_json_or_error(resp).await
@@ -406,7 +507,7 @@ impl ThinClient {
         let resp = self
             .http
             .delete(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         Self::text_or_api(resp).await
@@ -472,7 +573,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         Self::text_or_api(resp).await
@@ -498,7 +599,7 @@ impl ThinClient {
         Ok(self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .timeout(timeout)
             .send()
             .await?)
@@ -535,8 +636,13 @@ impl ThinClient {
         token: &str,
         timeout: Duration,
     ) -> Result<Response, ThinClientError> {
-        self.get_models_page_response_timeout(token, timeout, None)
-            .await
+        self.get_models_page_response_timeout(
+            token,
+            timeout,
+            None,
+            astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+        )
+        .await
     }
 
     /// Fetch one authoritative model-catalog page. The cursor is the complete
@@ -547,6 +653,7 @@ impl ThinClient {
         token: &str,
         timeout: Duration,
         cursor: Option<(&str, &str, &str)>,
+        purpose: astra_core::model_wire::purpose::ModelCatalogPurpose,
     ) -> Result<Response, ThinClientError> {
         let url = self.url(paths::MODELS)?;
         tracing::debug!(
@@ -560,8 +667,9 @@ impl ThinClient {
         let mut request = self
             .http
             .get(url.clone())
-            .headers(Self::bearer_headers(token)?)
-            .timeout(timeout);
+            .headers(self.auth_headers_for(Some(token)).await?)
+            .timeout(timeout)
+            .query(&[("purpose", purpose.as_str())]);
         if let Some((provider, model_name, model_id)) = cursor {
             request = request.query(&[
                 ("after_provider", provider),
@@ -606,7 +714,7 @@ impl ThinClient {
         let mut request = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .timeout(timeout);
         if let Some((provider, model_name, model_id)) = cursor {
             request = request.query(&[
@@ -627,7 +735,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         Self::text_or_api(resp).await
@@ -644,7 +752,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .json(body)
             .send()
             .await?;
@@ -660,7 +768,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .query(query)
             .send()
             .await?;
@@ -676,7 +784,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         Self::text_or_api(resp).await
@@ -691,7 +799,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         Self::text_or_api(resp).await
@@ -706,10 +814,85 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         Self::text_or_api(resp).await
+    }
+
+    /// Request cancellation and wait for the server's execution-settlement
+    /// proof. A display status alone is not evidence that tools have stopped.
+    /// Polling is bounded and never deletes history or forces a checkout unlock.
+    pub async fn cancel_session_until_settled_text(
+        &self,
+        token: &str,
+        session_id: &str,
+        budget: Duration,
+    ) -> Result<String, ThinClientError> {
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut reason = "execution shutdown is not yet confirmed".to_owned();
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ThinClientError::SessionCancellationPending {
+                    session_id: session_id.to_owned(),
+                    reason,
+                });
+            }
+            let body =
+                tokio::time::timeout_at(deadline, self.post_session_cancel_text(token, session_id))
+                    .await
+                    .map_err(|_| ThinClientError::SessionCancellationPending {
+                        session_id: session_id.to_owned(),
+                        reason: reason.clone(),
+                    })??;
+            let value: Value = serde_json::from_str(&body)?;
+            if value.get("session_id").and_then(Value::as_str) != Some(session_id) {
+                return Err(ThinClientError::InvalidSessionCancellationResponse(
+                    "server did not confirm the requested session identity".into(),
+                ));
+            }
+            match value.get("execution_settled").and_then(Value::as_bool) {
+                Some(true) if value.get("status").and_then(Value::as_str) == Some("cancelled") => {
+                    return Ok(body);
+                }
+                Some(false)
+                    if value.get("status").and_then(Value::as_str)
+                        == Some("cancellation_requested") => {}
+                _ => {
+                    return Err(ThinClientError::InvalidSessionCancellationResponse(
+                        "server did not provide consistent execution-settlement evidence; upgrade or restart the Server".into(),
+                    ));
+                }
+            }
+            reason = match value.get("execution_blocker").and_then(Value::as_str) {
+                Some("execution_slot" | "active_run") => "an execution is still stopping",
+                Some("settlement_pending") => {
+                    "execution stopped but its durable settlement is incomplete"
+                }
+                Some("writer_or_reservation") => {
+                    "a conversation write or turn admission is still in progress"
+                }
+                Some("binding_not_ready") => {
+                    "the execution provider is switching or needs attention"
+                }
+                Some("unresolved_tool") => {
+                    "a tool's external outcome is still unknown; the Session remains protected"
+                }
+                Some("owner_unavailable") => "the previous execution state could not be verified",
+                _ => "execution shutdown is not yet confirmed",
+            }
+            .to_owned();
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ThinClientError::SessionCancellationPending {
+                    session_id: session_id.to_owned(),
+                    reason,
+                });
+            }
+            tokio::time::sleep_until(
+                deadline.min(tokio::time::Instant::now() + Duration::from_millis(200)),
+            )
+            .await;
+        }
     }
 
     pub async fn delete_session_text(
@@ -721,7 +904,7 @@ impl ThinClient {
         let resp = self
             .http
             .delete(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         Self::text_or_api(resp).await
@@ -740,7 +923,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         Self::text_or_api(resp).await
@@ -759,7 +942,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .send()
             .await?;
         let status = resp.status();
@@ -774,38 +957,6 @@ impl ThinClient {
         Ok((bytes.to_vec(), filename))
     }
 
-    pub async fn post_session_replay_json(
-        &self,
-        token: &str,
-        session_id: &str,
-        body: &Value,
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(&paths::session_replay(session_id))?;
-        let resp = self
-            .http
-            .post(url)
-            .headers(Self::bearer_headers(token)?)
-            .json(body)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
-    pub async fn get_session_replay_compare_text(
-        &self,
-        token: &str,
-        session_id: &str,
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(&paths::session_replay_compare(session_id))?;
-        let resp = self
-            .http
-            .get(url)
-            .headers(Self::bearer_headers(token)?)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
     // ── Skills ───────────────────────────────────────────────────────────────
 
     pub async fn get_skills_query_text(
@@ -817,7 +968,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .query(query)
             .timeout(authed_text_request_timeout())
             .send()
@@ -835,7 +986,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .query(query)
             .timeout(authed_text_request_timeout())
             .send()
@@ -852,7 +1003,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .query(query)
             .send()
             .await?;
@@ -870,7 +1021,7 @@ impl ThinClient {
         Ok(self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .json(body)
             .send()
             .await?)
@@ -885,7 +1036,7 @@ impl ThinClient {
         Ok(self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .json(body)
             .send()
             .await?)
@@ -900,7 +1051,7 @@ impl ThinClient {
         Ok(self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .json(body)
             .send()
             .await?)
@@ -915,7 +1066,7 @@ impl ThinClient {
         Ok(self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .json(body)
             .send()
             .await?)
@@ -935,7 +1086,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .timeout(
                 std::time::Duration::from_millis(request.timeout_ms)
                     .saturating_add(std::time::Duration::from_secs(5)),
@@ -958,11 +1109,57 @@ impl ThinClient {
         let response = self
             .http
             .post(url)
-            .headers(Self::work_api_headers(token)?)
+            .headers(self.work_api_headers(token).await?)
             .json(request)
             .send()
             .await?;
         Self::json_or_error(response).await
+    }
+
+    /// List the authenticated owner's Work catalog in stable creation order.
+    /// This is the discovery path used by a fresh TUI session: it never
+    /// resumes or attaches a Session, and choosing a row remains an explicit
+    /// user action.
+    pub async fn list_works(
+        &self,
+        token: &str,
+        cursor: Option<&WorkCatalogCursorV1>,
+        limit: u16,
+    ) -> Result<WorkCatalogPageV1, ThinClientError> {
+        if limit == 0 || limit > WorkCatalogPageV1::MAX_ENTRIES as u16 {
+            return Err(ThinClientError::InvalidInput(
+                "Work catalog limit must be between 1 and 50".into(),
+            ));
+        }
+        let mut url = self.url(paths::WORKS)?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("limit", &limit.to_string());
+            if let Some(cursor) = cursor {
+                if cursor.work_id.is_empty()
+                    || cursor
+                        .work_id
+                        .bytes()
+                        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+                {
+                    return Err(ThinClientError::InvalidInput(
+                        "invalid Work catalog cursor".into(),
+                    ));
+                }
+                query.append_pair("before_created_at", &cursor.created_at);
+                query.append_pair("before_work_id", &cursor.work_id);
+            }
+        }
+        let response = self
+            .http
+            .get(url)
+            .headers(self.work_api_headers(token).await?);
+        let response = response.send().await?;
+        let page: WorkCatalogPageV1 = Self::typed_json_or_error(response).await?;
+        page.validate().map_err(|error| {
+            ThinClientError::Json(<serde_json::Error as serde::de::Error>::custom(error))
+        })?;
+        Ok(page)
     }
 
     /// Read one bounded public Work observation.
@@ -972,7 +1169,7 @@ impl ThinClient {
         let response = self
             .http
             .get(self.url(&path)?)
-            .headers(Self::work_api_headers(token)?)
+            .headers(self.work_api_headers(token).await?)
             .send()
             .await?;
         Self::json_or_error(response).await
@@ -990,7 +1187,7 @@ impl ThinClient {
         let response = self
             .http
             .get(self.url(&path)?)
-            .headers(Self::work_api_headers(token)?)
+            .headers(self.work_api_headers(token).await?)
             .send()
             .await?;
         Self::typed_json_or_error(response).await
@@ -1010,7 +1207,7 @@ impl ThinClient {
         let response = self
             .http
             .get(self.url(&path)?)
-            .headers(Self::work_api_headers(token)?)
+            .headers(self.work_api_headers(token).await?)
             .send()
             .await?;
         let execution: WorkExecutionViewV1 = Self::typed_json_or_error(response).await?;
@@ -1038,7 +1235,7 @@ impl ThinClient {
         let response = self
             .http
             .get(self.url(&path)?)
-            .headers(Self::work_api_headers(token)?)
+            .headers(self.work_api_headers(token).await?)
             .send()
             .await?;
         let targets: WorkExecutionTargetPageV1 = Self::typed_json_or_error(response).await?;
@@ -1050,6 +1247,108 @@ impl ThinClient {
             ));
         }
         Ok(targets)
+    }
+
+    /// Record the current stable Work/Session boundary. The server derives
+    /// the manifest from canonical state and returns an explicit capability
+    /// projection; callers must not treat this as a portable workspace.
+    pub async fn post_work_branch_recovery_point(
+        &self,
+        token: &str,
+        work_id: &str,
+        branch_id: &str,
+        request: &WorkRecoveryPointCaptureRequestV1,
+    ) -> Result<WorkRecoveryPointViewV1, ThinClientError> {
+        let path = paths::work_branch_recovery_points(work_id, branch_id)
+            .ok_or_else(|| ThinClientError::InvalidInput("invalid Work branch identity".into()))?;
+        let response = self
+            .http
+            .post(self.url(&path)?)
+            .headers(self.work_api_headers(token).await?)
+            .json(request)
+            .send()
+            .await?;
+        let point: WorkRecoveryPointViewV1 = Self::typed_json_or_error(response).await?;
+        validate_recovery_point_identity(&point, work_id, branch_id, None)?;
+        Ok(point)
+    }
+
+    /// List immutable progress boundaries with a stable keyset cursor.
+    pub async fn get_work_branch_recovery_points(
+        &self,
+        token: &str,
+        work_id: &str,
+        branch_id: &str,
+        cursor: Option<&WorkRecoveryPointCursorV1>,
+        limit: u16,
+    ) -> Result<WorkRecoveryPointPageV1, ThinClientError> {
+        if limit == 0 || limit > 256 {
+            return Err(ThinClientError::InvalidInput(
+                "recovery point limit must be between 1 and 256".into(),
+            ));
+        }
+        if let Some(cursor) = cursor
+            && (cursor.recovery_point_id.is_empty()
+                || cursor.recovery_point_id == "."
+                || cursor.recovery_point_id == ".."
+                || !cursor.recovery_point_id.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'.'
+                })
+                || cursor.created_at.is_empty())
+        {
+            return Err(ThinClientError::InvalidInput(
+                "invalid recovery point cursor".into(),
+            ));
+        }
+        let path = paths::work_branch_recovery_points(work_id, branch_id)
+            .ok_or_else(|| ThinClientError::InvalidInput("invalid Work branch identity".into()))?;
+        let mut query = vec![("limit", limit.to_string())];
+        if let Some(cursor) = cursor {
+            query.push(("before_created_at", cursor.created_at.clone()));
+            query.push(("before_recovery_point_id", cursor.recovery_point_id.clone()));
+        }
+        let response = self
+            .http
+            .get(self.url(&path)?)
+            .headers(self.work_api_headers(token).await?)
+            .query(&query)
+            .send()
+            .await?;
+        let page: WorkRecoveryPointPageV1 = Self::typed_json_or_error(response).await?;
+        if page.schema_version != 1 || page.work_id != work_id || page.branch_id != branch_id {
+            return Err(ThinClientError::Json(
+                <serde_json::Error as serde::de::Error>::custom(
+                    "recovery point page identity disagrees with the requested branch",
+                ),
+            ));
+        }
+        for point in &page.points {
+            validate_recovery_point_identity(point, work_id, branch_id, None)?;
+        }
+        Ok(page)
+    }
+
+    /// Read one immutable progress boundary without changing Work authority.
+    pub async fn get_work_branch_recovery_point(
+        &self,
+        token: &str,
+        work_id: &str,
+        branch_id: &str,
+        recovery_point_id: &str,
+    ) -> Result<WorkRecoveryPointViewV1, ThinClientError> {
+        let path = paths::work_branch_recovery_point(work_id, branch_id, recovery_point_id)
+            .ok_or_else(|| {
+                ThinClientError::InvalidInput("invalid recovery point identity".into())
+            })?;
+        let response = self
+            .http
+            .get(self.url(&path)?)
+            .headers(self.work_api_headers(token).await?)
+            .send()
+            .await?;
+        let point: WorkRecoveryPointViewV1 = Self::typed_json_or_error(response).await?;
+        validate_recovery_point_identity(&point, work_id, branch_id, Some(recovery_point_id))?;
+        Ok(point)
     }
 
     /// Resolve one already-known session to the public Work branch that owns
@@ -1065,7 +1364,7 @@ impl ThinClient {
         let response = self
             .http
             .get(self.url(&path)?)
-            .headers(Self::work_api_headers(token)?)
+            .headers(self.work_api_headers(token).await?)
             .send()
             .await?;
         Self::typed_json_or_error(response).await
@@ -1085,7 +1384,7 @@ impl ThinClient {
         let response = self
             .http
             .post(self.url(&path)?)
-            .headers(Self::work_api_headers(token)?)
+            .headers(self.work_api_headers(token).await?)
             .json(request)
             .send()
             .await?;
@@ -1132,7 +1431,7 @@ impl ThinClient {
         } else {
             response.query(&query)
         }
-        .headers(Self::work_api_headers(token)?)
+        .headers(self.work_api_headers(token).await?)
         .send()
         .await?;
         let page: WorkTaskGraphPageV2 = Self::typed_json_or_error(response).await?;
@@ -1155,7 +1454,7 @@ impl ThinClient {
         let response = self
             .http
             .post(self.url(&path)?)
-            .headers(Self::work_api_headers(token)?)
+            .headers(self.work_api_headers(token).await?)
             .json(request)
             .send()
             .await?;
@@ -1175,7 +1474,7 @@ impl ThinClient {
         let response = self
             .http
             .post(self.url(&path)?)
-            .headers(Self::work_api_headers(token)?)
+            .headers(self.work_api_headers(token).await?)
             .json(request)
             .send()
             .await?;
@@ -1198,7 +1497,7 @@ impl ThinClient {
         let response = self
             .http
             .delete(self.url(&path)?)
-            .headers(Self::work_api_headers(token)?)
+            .headers(self.work_api_headers(token).await?)
             .send()
             .await?;
         Self::text_or_api(response).await.map(|_| ())
@@ -1215,7 +1514,7 @@ impl ThinClient {
     ) -> Result<Response, ThinClientError> {
         let path = paths::work_branch_turns(work_id, branch_id)
             .ok_or_else(|| ThinClientError::InvalidInput("invalid work_id or branch_id".into()))?;
-        let mut headers = Self::work_api_headers(token)?;
+        let mut headers = self.work_api_headers(token).await?;
         headers.insert(
             header::ACCEPT,
             HeaderValue::from_static("text/event-stream"),
@@ -1231,6 +1530,44 @@ impl ThinClient {
 
     // ── Reflect / decision trace ─────────────────────────────────────────────
 
+    /// Read finite inspection JSON with a byte ceiling, including error bodies.
+    /// Callers own the overall deadline when combining multiple reads.
+    pub async fn get_authed_json_bounded<T: DeserializeOwned>(
+        &self,
+        token: &str,
+        path_with_query: &str,
+        max_bytes: usize,
+    ) -> Result<T, ThinClientError> {
+        let mut resp = self
+            .http
+            .get(self.url(path_with_query)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
+            .timeout(authed_text_request_timeout())
+            .send()
+            .await?;
+        if resp
+            .content_length()
+            .is_some_and(|length| length > max_bytes as u64)
+        {
+            return Err(ThinClientError::ResponseTooLarge { limit: max_bytes });
+        }
+        let status = resp.status();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            if chunk.len() > max_bytes.saturating_sub(bytes.len()) {
+                return Err(ThinClientError::ResponseTooLarge { limit: max_bytes });
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if !status.is_success() {
+            return Err(ThinClientError::Api {
+                status,
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
     /// `path_with_query` is relative to origin, e.g. `chat/session/sid/reflect?topic=execution&facet=trace`.
     pub async fn get_authed_path_text(
         &self,
@@ -1243,7 +1580,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(Self::bearer_headers(token)?)
+            .headers(self.auth_headers_for(Some(token)).await?)
             .timeout(authed_text_request_timeout())
             .send()
             .await?;
@@ -1262,22 +1599,39 @@ impl ThinClient {
         token: &str,
         payload: &Value,
     ) -> Result<Response, ThinClientError> {
+        self.post_developer_loop_with_payload(token, &mut || Ok(payload.clone()))
+            .await
+    }
+
+    async fn post_developer_loop_with_payload<F>(
+        &self,
+        token: &str,
+        payload_for_attempt: &mut F,
+    ) -> Result<Response, ThinClientError>
+    where
+        F: FnMut() -> Result<Value, ThinClientError>,
+    {
         let url = self.url(paths::CHAT_STREAM)?;
         tracing::debug!(
             target: "astra_cli::http_proxy",
             url = %url,
             "starting Server-owned developer loop"
         );
-        let mut headers = Self::bearer_headers(token)?;
+        let mut headers = self.auth_headers_for(Some(token)).await?;
         headers.insert(
             header::ACCEPT,
             HeaderValue::from_static("text/event-stream"),
         );
+        // Credential preparation can wait for a refresh or owner lock. Check
+        // the caller's admission guard and publish dispatch evidence only
+        // after that wait, with no intervening await before sending. Once
+        // sending begins, retain this same response for exact-run recovery.
+        let payload = payload_for_attempt()?;
         let response = self
             .http_stream
             .post(url)
             .headers(headers)
-            .json(payload)
+            .json(&payload)
             .send()
             .await?;
         if response.status().is_success() {
@@ -1308,9 +1662,33 @@ impl ThinClient {
         max_attempts: u32,
         quiet: bool,
     ) -> Result<Response, ThinClientError> {
+        self.post_developer_loop_retry_429_with_payload(token, max_attempts, quiet, || {
+            Ok(payload.clone())
+        })
+        .await
+    }
+
+    /// Retry admission with a fresh payload at every physical attempt, after
+    /// asynchronous credential preparation and immediately before dispatch.
+    /// The factory may reject admission and record sticky dispatch evidence.
+    /// Callers with an absolute execution deadline use this to publish a
+    /// monotonically shrinking budget after 429 or transport waits.
+    pub async fn post_developer_loop_retry_429_with_payload<F>(
+        &self,
+        token: &str,
+        max_attempts: u32,
+        quiet: bool,
+        mut payload_for_attempt: F,
+    ) -> Result<Response, ThinClientError>
+    where
+        F: FnMut() -> Result<Value, ThinClientError>,
+    {
         let mut last_err: Option<ThinClientError> = None;
         for attempt in 0..max_attempts {
-            match self.post_developer_loop(token, payload).await {
+            match self
+                .post_developer_loop_with_payload(token, &mut payload_for_attempt)
+                .await
+            {
                 Ok(resp) => {
                     if resp.status().as_u16() == 429 && attempt + 1 < max_attempts {
                         let delay_secs =
@@ -1371,12 +1749,10 @@ impl ThinClient {
                 .boxed();
             }
         };
-        let req = self
-            .http
-            .post(url)
-            .headers(self.auth_headers_for(bearer_override))
-            .json(body);
+        let req = self.http.post(url).json(body);
+        let bearer_override = bearer_override.map(str::to_owned);
         let fut = async move {
+            let req = req.headers(self.auth_headers_for(bearer_override.as_deref()).await?);
             let resp = req.send().await?;
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -1394,56 +1770,73 @@ impl ThinClient {
                     return;
                 }
             };
-            let mut parser = SseParser::new();
-            let mut byte_stream = resp.bytes_stream();
-            let mut saw_terminal = false;
-            while let Some(chunk) = byte_stream.next().await {
-                let chunk = match chunk {
-                    Ok(c) => c,
-                    Err(e) => {
-                        if saw_terminal {
-                            return;
-                        }
-                        yield Err(e.into());
-                        return;
-                    }
-                };
-                match parser.push_bytes(&chunk) {
-                    Ok(evs) => {
-                        for ev in evs {
-                            saw_terminal |= stream_event_is_terminal(&ev);
-                            yield Ok(ev);
-                        }
-                    }
-                    Err(e) => {
-                        if saw_terminal {
-                            return;
-                        }
-                        yield Err(e);
-                        return;
-                    }
-                }
+            let mut events = classified_sse_response(resp);
+            while let Some(event) = events.next().await {
+                yield event;
             }
-            match parser.finish() {
-                Ok(evs) => {
-                    for ev in evs {
-                        saw_terminal |= stream_event_is_terminal(&ev);
-                        yield Ok(ev);
-                    }
+        }
+        .boxed()
+    }
+
+    /// `POST /v1/works/:work_id/branches/:branch_id/turns` — yields the same
+    /// classified lifecycle events as ordinary chat streaming. Work callers
+    /// consume this stream as a projection only; SessionInfo/RunBound events
+    /// must never be applied to the caller's ordinary Session UI.
+    pub fn work_branch_turn_stream(
+        &self,
+        token: &str,
+        work_id: &str,
+        branch_id: &str,
+        request: &WorkTurnRequestV1,
+    ) -> impl Stream<Item = Result<StreamEvent, ThinClientError>> + Send + '_ {
+        let path = match paths::work_branch_turns(work_id, branch_id) {
+            Some(path) => path,
+            None => {
+                return stream! {
+                    yield Err(ThinClientError::InvalidInput(
+                        "invalid work_id or branch_id".into(),
+                    ));
                 }
-                Err(e) => {
-                    if saw_terminal {
-                        return;
-                    }
-                    yield Err(e);
+                .boxed();
+            }
+        };
+        let url = match self.url(&path) {
+            Ok(url) => url,
+            Err(error) => {
+                return stream! {
+                    yield Err(error);
+                }
+                .boxed();
+            }
+        };
+        let token = token.to_owned();
+        let req = self.http_stream.post(url).json(request);
+        let fut = async move {
+            let mut headers = self.work_api_headers(&token).await?;
+            headers.insert(
+                header::ACCEPT,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            let response = req.headers(headers).send().await?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(ThinClientError::Api { status, body });
+            }
+            Ok(response)
+        };
+
+        stream! {
+            let response = match fut.await {
+                Ok(response) => response,
+                Err(error) => {
+                    yield Err(error);
                     return;
                 }
-            }
-            if !saw_terminal {
-                yield Err(ThinClientError::SseParse(
-                    "SSE stream ended before a terminal event (run_finished, turn_complete, or interruption)"
-                        .to_string(),
-                ));
+            };
+            let mut events = classified_sse_response(response);
+            while let Some(event) = events.next().await {
+                yield event;
             }
         }
         .boxed()
@@ -1473,7 +1866,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .json(body)
             .timeout(std::time::Duration::from_secs(10))
             .send()
@@ -1490,7 +1883,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .send()
             .await?;
         Self::json_or_error(resp).await
@@ -1507,7 +1900,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .query(&[("limit", limit)])
             .send()
             .await?;
@@ -1540,7 +1933,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .query(&query)
             .send()
             .await?;
@@ -1557,7 +1950,7 @@ impl ThinClient {
         let resp = self
             .http
             .put(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .json(body)
             .send()
             .await?;
@@ -1573,7 +1966,7 @@ impl ThinClient {
         let resp = self
             .http
             .delete(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .send()
             .await?;
         Self::json_or_error(resp).await
@@ -1589,10 +1982,62 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .send()
             .await?;
         Self::json_or_error(resp).await
+    }
+
+    /// Best-effort read that already holds a still-valid token. The installed
+    /// bearer provider is not consulted, so this cannot start a native rotation.
+    pub async fn get_run_with_presented_bearer(
+        &self,
+        bearer: &str,
+        run_id: &str,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(&paths::chat_run(run_id))?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(Self::bearer_headers(bearer)?)
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
+    /// Request a policy for the next model round; acceptance is not application.
+    pub async fn request_run_permission_mode(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+        body: &astra_turn_types::RunPermissionModeRequest,
+    ) -> Result<astra_turn_types::RunPermissionModeSelection, ThinClientError> {
+        let url = self.url(&paths::chat_run_permission_mode(run_id))?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(self.auth_headers_for(bearer_override).await?)
+            .json(body)
+            .send()
+            .await?;
+        Self::typed_json_or_error(resp).await
+    }
+    /// Read bounded requested/applied acknowledgements while a change is pending.
+    pub async fn get_run_permission_mode(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+        expected_session_id: &str,
+    ) -> Result<astra_turn_types::RunPermissionModeSnapshot, ThinClientError> {
+        let url = self.url(&paths::chat_run_permission_mode(run_id))?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(bearer_override).await?)
+            .query(&[("expected_session_id", expected_session_id)])
+            .send()
+            .await?;
+        Self::typed_json_or_error(resp).await
     }
 
     /// `POST /chat/runs/{run_id}/intents` — guide the active durable run.
@@ -1606,7 +2051,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .json(body)
             .send()
             .await?;
@@ -1623,7 +2068,7 @@ impl ThinClient {
         let resp = self
             .http
             .delete(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .send()
             .await?;
         Self::json_or_error(resp).await
@@ -1639,7 +2084,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .send()
             .await?;
         Self::json_or_error(resp).await
@@ -1655,7 +2100,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .send()
             .await?;
         Self::json_or_error(resp).await
@@ -1680,7 +2125,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .query(&query)
             .send()
             .await?;
@@ -1729,12 +2174,10 @@ impl ThinClient {
         if replay_only {
             query.push(("replay_only", "true".to_string()));
         }
-        let req = self
-            .http
-            .get(url)
-            .headers(self.auth_headers_for(bearer_override))
-            .query(&query);
+        let req = self.http.get(url).query(&query);
+        let bearer_override = bearer_override.map(str::to_owned);
         let fut = async move {
+            let req = req.headers(self.auth_headers_for(bearer_override.as_deref()).await?);
             let resp = req.send().await?;
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -1827,7 +2270,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .json(body)
             .send()
             .await?;
@@ -1844,7 +2287,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .send()
             .await?;
         Self::json_or_error(resp).await
@@ -1861,7 +2304,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .json(&serde_json::json!({"expected_session_id": expected_session_id}))
             .send()
             .await?;
@@ -1879,7 +2322,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .json(&serde_json::json!({"expected_session_id": expected_session_id}))
             .send()
             .await?;
@@ -1896,7 +2339,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .json(body)
             .timeout(std::time::Duration::from_secs(10))
             .send()
@@ -1911,8 +2354,12 @@ impl ThinClient {
         body: &Value,
     ) -> Result<SyncOutboxAck, ThinClientError> {
         let url = self.url(paths::SYNC_OUTBOX_EVENTS)?;
-        let mut headers = self.auth_headers_for(bearer_override);
-        if let Some(token) = self.resolved_bearer_token(bearer_override) {
+        let mut headers = self.auth_headers_for(bearer_override).await?;
+        if let Some(token) = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+        {
             let signature = sync_outbox_request_signature(token, body);
             let header = HeaderValue::from_str(&signature).map_err(|error| {
                 ThinClientError::InvalidInput(format!(
@@ -1942,7 +2389,7 @@ impl ThinClient {
         let resp = self
             .http
             .get(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await?;
@@ -1979,7 +2426,7 @@ impl ThinClient {
             let mut req = self
                 .http
                 .post(url.clone())
-                .headers(self.auth_headers_for(bearer_override))
+                .headers(self.auth_headers_for(bearer_override).await?)
                 .timeout(timeout)
                 .json(body);
             if let Some(id) = edge_executor_id
@@ -2025,7 +2472,7 @@ impl ThinClient {
             match self
                 .http
                 .post(url.clone())
-                .headers(self.auth_headers_for(bearer_override))
+                .headers(self.auth_headers_for(bearer_override).await?)
                 .timeout(timeout)
                 .json(body)
                 .send()
@@ -2069,7 +2516,7 @@ impl ThinClient {
             match self
                 .http
                 .post(url.clone())
-                .headers(self.auth_headers_for(bearer_override))
+                .headers(self.auth_headers_for(bearer_override).await?)
                 .timeout(timeout)
                 .json(body)
                 .send()
@@ -2085,6 +2532,155 @@ impl ThinClient {
         unreachable!("at least one callback attempt is required")
     }
 
+    /// Register and await a native question through its canonical invocation.
+    /// The timeout is the admitted remaining stage budget, not a short callback
+    /// ACK timeout. Retrying a submitted question belongs to its durable owner.
+    pub async fn post_tool_interaction_request(
+        &self,
+        bearer_override: Option<&str>,
+        edge_transport_id: &str,
+        body: &ToolInteractionRequest,
+        timeout: Duration,
+        required_events: tokio::sync::mpsc::Sender<Value>,
+    ) -> Result<astra_turn_types::ProviderInteractionResponse, ThinClientError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| {
+                ThinClientError::InvalidInput("interaction deadline is outside clock range".into())
+            })?;
+        let response = tokio::time::timeout_at(deadline, async {
+            self.http
+                .post(self.url(paths::TOOL_INTERACTION_REQUEST)?)
+                .headers(self.auth_headers_for(bearer_override).await?)
+                .header(ASTRA_EDGE_ID_HEADER, edge_transport_id)
+                .timeout(timeout)
+                .json(body)
+                .send()
+                .await
+                .map_err(ThinClientError::from)
+        })
+        .await
+        .map_err(|_| ThinClientError::AdmissionDeadlineExpired)??;
+        if !response.status().is_success() {
+            return Self::typed_json_or_error(response).await;
+        }
+        let receive = async {
+            let mut parser = SseParser::with_max_frame_bytes(256 * 1024);
+            let mut chunks = response.bytes_stream();
+            let mut required_index = None;
+            while let Some(chunk) = chunks.next().await {
+                let chunk = chunk?;
+                for feed in chunk.chunks(16 * 1024) {
+                    for event in parser.push_bytes(feed)? {
+                        let (event_type, raw) = match event {
+                            StreamEvent::Other { event_type, raw } => (event_type, raw),
+                            StreamEvent::Error { raw, .. } => {
+                                let status = raw
+                                    .get("status")
+                                    .and_then(Value::as_u64)
+                                    .and_then(|status| u16::try_from(status).ok())
+                                    .and_then(|status| reqwest::StatusCode::from_u16(status).ok())
+                                    .filter(|status| {
+                                        status.is_client_error() || status.is_server_error()
+                                    })
+                                    .unwrap_or(reqwest::StatusCode::CONFLICT);
+                                return Err(ThinClientError::Api {
+                                    status,
+                                    body: "native interaction request rejected".into(),
+                                });
+                            }
+                            _ => {
+                                return Err(ThinClientError::InvalidProviderInteractionResponse(
+                                    "unexpected interaction stream event".into(),
+                                ));
+                            }
+                        };
+                        match event_type.as_str() {
+                            "provider_interaction_required" => {
+                                let identity: astra_turn_types::ToolInvocationIdentity =
+                                    serde_json::from_value(
+                                        raw.pointer("/tool_invocation_origin/identity")
+                                            .cloned()
+                                            .ok_or_else(|| {
+                                                ThinClientError::InvalidProviderInteractionResponse(
+                                                    "required event has no invocation origin"
+                                                        .into(),
+                                                )
+                                            })?,
+                                    )?;
+                                let interaction: astra_turn_types::ProviderInteractionRequest =
+                                    serde_json::from_value(
+                                        raw.get("interaction").cloned().ok_or_else(|| {
+                                            ThinClientError::InvalidProviderInteractionResponse(
+                                                "required event has no interaction".into(),
+                                            )
+                                        })?,
+                                    )?;
+                                let index =
+                                    raw.get("index").and_then(Value::as_u64).ok_or_else(|| {
+                                        ThinClientError::InvalidProviderInteractionResponse(
+                                            "required event has no durable index".into(),
+                                        )
+                                    })?;
+                                if identity != body.identity
+                                    || interaction != body.interaction
+                                    || raw.get("run_id").and_then(Value::as_str)
+                                        != Some(body.identity.run_id.as_str())
+                                    || raw
+                                        .pointer("/tool_invocation_origin/edge_agent_id")
+                                        .and_then(Value::as_str)
+                                        != Some(body.edge_agent_id.as_str())
+                                    || required_index.is_some_and(|previous| previous != index)
+                                {
+                                    return Err(
+                                        ThinClientError::InvalidProviderInteractionResponse(
+                                            "required event changed interaction identity".into(),
+                                        ),
+                                    );
+                                }
+                                if required_index.is_none() {
+                                    required_events.send(raw).await.map_err(|_| {
+                                        ThinClientError::InvalidProviderInteractionResponse(
+                                            "interaction consumer closed".into(),
+                                        )
+                                    })?;
+                                    required_index = Some(index);
+                                }
+                            }
+                            "tool_interaction_response" => {
+                                let response: astra_turn_types::ProviderInteractionResponse =
+                                    serde_json::from_value(
+                                        raw.get("response").cloned().ok_or_else(|| {
+                                            ThinClientError::InvalidProviderInteractionResponse(
+                                                "missing terminal interaction response".into(),
+                                            )
+                                        })?,
+                                    )?;
+                                response.validate_for(&body.interaction).map_err(|error| {
+                                    ThinClientError::InvalidProviderInteractionResponse(
+                                        error.to_string(),
+                                    )
+                                })?;
+                                return Ok(response);
+                            }
+                            _ => {
+                                return Err(ThinClientError::InvalidProviderInteractionResponse(
+                                    "unexpected interaction stream event".into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(ThinClientError::InvalidProviderInteractionResponse(
+                "interaction stream ended without a terminal response".into(),
+            ))
+        };
+        tokio::time::timeout_at(deadline, receive)
+            .await
+            .map_err(|_| ThinClientError::AdmissionDeadlineExpired)?
+    }
+
     /// Submit a response to a durable provider interaction.
     pub async fn post_provider_interaction_response(
         &self,
@@ -2095,7 +2691,7 @@ impl ThinClient {
         let resp = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .json(body)
             .send()
             .await?;
@@ -2114,7 +2710,7 @@ impl ThinClient {
         let mut req = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .json(body);
         if let Some(id) = edge_transport_id
             && let Ok(v) = HeaderValue::from_str(id)
@@ -2136,7 +2732,7 @@ impl ThinClient {
         let mut req = self
             .http
             .post(url)
-            .headers(self.auth_headers_for(bearer_override))
+            .headers(self.auth_headers_for(bearer_override).await?)
             .json(body);
         if let Some(id) = edge_transport_id
             && let Ok(v) = HeaderValue::from_str(id)
@@ -2146,6 +2742,26 @@ impl ThinClient {
         let resp = req.send().await?;
         Self::typed_json_or_error(resp).await
     }
+}
+
+fn validate_recovery_point_identity(
+    point: &WorkRecoveryPointViewV1,
+    work_id: &str,
+    branch_id: &str,
+    recovery_point_id: Option<&str>,
+) -> Result<(), ThinClientError> {
+    if point.schema_version != 1
+        || point.work_id != work_id
+        || point.branch_id != branch_id
+        || recovery_point_id.is_some_and(|expected| point.recovery_point_id != expected)
+    {
+        return Err(ThinClientError::Json(
+            <serde_json::Error as serde::de::Error>::custom(
+                "recovery point identity disagrees with the requested resource",
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn attachment_filename(headers: &HeaderMap) -> Option<String> {
@@ -2175,8 +2791,272 @@ fn attachment_filename(headers: &HeaderMap) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::work::WorkCatalogAttentionV1;
     use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn tool_interaction_response_preserves_identity_and_rejects_mismatch() {
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).unwrap();
+        let body = ToolInteractionRequest {
+            identity: astra_turn_types::ToolInvocationIdentity::new(
+                "user", "session", "run", "chain", "call",
+            )
+            .unwrap(),
+            edge_agent_id: "edge".into(),
+            physical_workspace_id: "physical-test".into(),
+            interaction: astra_turn_types::ProviderInteractionRequest {
+                request_id: "question".into(),
+                payload: serde_json::json!({"question": "Choose a direction"}),
+                timeout_ms: Some(10_000),
+            },
+        };
+        for (case, terminal_id, required_run, expected_ok) in [
+            ("resolved", Some("question"), None, true),
+            ("wrong-final", Some("other-question"), None, false),
+            ("required", Some("question"), Some("run"), true),
+            ("wrong-origin", Some("question"), Some("other-run"), false),
+            ("eof", None, Some("run"), false),
+        ] {
+            server.reset().await;
+            let mut frames = Vec::new();
+            if let Some(run_id) = required_run {
+                let mut identity = body.identity.clone();
+                identity.run_id = run_id.into();
+                let required = serde_json::json!({
+                    "type":"provider_interaction_required", "index":3,
+                    "run_id":run_id, "request_id":body.interaction.request_id,
+                    "interaction":body.interaction,
+                    "tool_invocation_origin":{"identity":identity,"edge_agent_id":body.edge_agent_id}
+                });
+                frames.push(required.clone());
+                frames.push(required); // An exact replay must not open twice.
+            }
+            if let Some(request_id) = terminal_id {
+                frames.push(serde_json::json!({
+                    "type":"tool_interaction_response",
+                    "response":{"request_id":request_id,"outcome":"submitted","payload":{"answer":"A"}}
+                }));
+            }
+            let stream_body = frames
+                .iter()
+                .map(|frame| format!("data: {frame}\n\n"))
+                .collect::<String>();
+            Mock::given(method("POST"))
+                .and(path(paths::TOOL_INTERACTION_REQUEST))
+                .and(header("authorization", "Bearer test-token"))
+                .and(header(ASTRA_EDGE_ID_HEADER, "edge-transport"))
+                .and(body_json(serde_json::to_value(&body).unwrap()))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(stream_body),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (required_tx, mut required_rx) = tokio::sync::mpsc::channel(1);
+            let result = client
+                .post_tool_interaction_request(
+                    Some("test-token"),
+                    "edge-transport",
+                    &body,
+                    Duration::from_secs(10),
+                    required_tx,
+                )
+                .await;
+            let observed = required_rx.try_recv().ok();
+            assert_eq!(observed.is_some(), required_run == Some("run"), "{case}");
+            assert!(
+                required_rx.try_recv().is_err(),
+                "duplicate required must not reopen: {case}"
+            );
+            if expected_ok {
+                assert_eq!(
+                    result.unwrap().payload,
+                    Some(serde_json::json!({"answer": "A"}))
+                );
+            } else {
+                let error = result.unwrap_err();
+                assert!(matches!(
+                    error,
+                    ThinClientError::InvalidProviderInteractionResponse(_)
+                ));
+                assert!(!error.is_transport(), "{case}");
+            }
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn inspection_json_has_a_response_byte_ceiling_and_preserves_http_errors() {
+        let server = MockServer::start().await;
+        let client = ThinClient::new(&server.uri(), None).unwrap();
+        for (route, status, body, limit, expected) in [
+            ("/valid", 200, "{\"ok\":true}", 11, "ok"),
+            ("/too-large", 200, "{\"ok\":true}", 10, "limit"),
+            ("/error", 403, "denied", 6, "api"),
+            ("/large-error", 403, "denied", 5, "limit"),
+            ("/invalid", 200, "not-json", 8, "json"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .and(header("authorization", "Bearer inspection-token"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let result = client
+                .get_authed_json_bounded::<serde_json::Value>("inspection-token", route, limit)
+                .await;
+            match (expected, result) {
+                ("ok", Ok(value)) => assert_eq!(value["ok"], true),
+                ("limit", Err(ThinClientError::ResponseTooLarge { limit: actual })) => {
+                    assert_eq!(actual, limit);
+                }
+                ("api", Err(ThinClientError::Api { status, body })) => {
+                    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+                    assert_eq!(body, "denied");
+                }
+                ("json", Err(ThinClientError::Json(_))) => (),
+                (_, result) => panic!("unexpected inspection result: {result:?}"),
+            }
+        }
+        server.verify().await;
+    }
+
+    #[derive(Debug, Default)]
+    struct RotatingBearer(std::sync::atomic::AtomicUsize);
+
+    #[tokio::test]
+    async fn inspection_chunked_body_enforces_the_accumulated_byte_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+                assert!(request.len() < 4096);
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\n{\"ok\":\r\n5\r\ntrue}\r\n0\r\n\r\n").await.unwrap();
+        });
+        let client = ThinClient::new(&format!("http://{address}"), None).unwrap();
+        let result = client
+            .get_authed_json_bounded::<Value>("inspection-token", "/", 10)
+            .await;
+        assert!(matches!(
+            result,
+            Err(ThinClientError::ResponseTooLarge { limit: 10 })
+        ));
+        server.await.unwrap();
+    }
+
+    impl BearerProvider for RotatingBearer {
+        fn token(&self) -> futures_util::future::BoxFuture<'_, Result<String, ThinClientError>> {
+            Box::pin(async move {
+                let generation = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if generation >= 3 {
+                    return Err(ThinClientError::InvalidInput("session logged out".into()));
+                }
+                Ok(format!("synthetic-fresh-{generation}"))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_token_binding_does_not_inherit_a_provider() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(paths::AUTH_ME))
+            .and(header("authorization", "Bearer captured-token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"owner":"captured"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = ThinClient::new(&server.uri(), Some("ambient-default".into()))
+            .unwrap()
+            .with_bearer_provider(std::sync::Arc::new(RotatingBearer::default()))
+            .without_bearer_provider();
+        let response = client.get_auth_me_text("captured-token").await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()["owner"],
+            "captured"
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn credential_owner_is_consulted_for_http_work_and_stream_without_legacy_fallback() {
+        let server = MockServer::start().await;
+        for (verb, route, generation) in [
+            ("GET", paths::AUTH_ME, 0),
+            ("GET", "/v1/works/work-1", 1),
+            ("POST", paths::CHAT_STREAM, 2),
+        ] {
+            Mock::given(method(verb))
+                .and(path(route))
+                .and(header(
+                    "authorization",
+                    format!("Bearer synthetic-fresh-{generation}"),
+                ))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header(
+                            astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER,
+                            astra_server_types::AGENT_INTERACTION_API_MAJOR,
+                        )
+                        .set_body_json(serde_json::json!({"ok":true})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let client = ThinClient::new(&server.uri(), Some("legacy-default-must-not-escape".into()))
+            .unwrap()
+            .with_bearer_provider(std::sync::Arc::new(RotatingBearer::default()));
+        client
+            .get_auth_me_text("stale-per-request-token")
+            .await
+            .unwrap();
+        client
+            .get_work("stale-per-request-token", "work-1")
+            .await
+            .unwrap();
+        client
+            .post_developer_loop("stale-per-request-token", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(
+            client
+                .get_auth_me_text("stale-per-request-token")
+                .await
+                .is_err()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+        assert!(!format!("{client:?}").contains("legacy-default"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_requests_do_not_follow_redirects() {
+        let source = MockServer::start().await;
+        let target = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/leak", target.uri())),
+            )
+            .expect(1)
+            .mount(&source)
+            .await;
+        let client = ThinClient::new(&source.uri(), None).unwrap();
+        let _ = client.get_auth_me_text("synthetic-secret").await;
+        assert!(target.received_requests().await.unwrap().is_empty());
+    }
 
     /// Override `sleep_between_attempts` to `ms` for the duration of a test,
     /// clearing the probe counter as it goes. Returns a guard that resets
@@ -2244,13 +3124,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn work_catalog_is_typed_and_keeps_cursor_pinned_to_page_tail() {
+        let srv = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/works"))
+            .and(query_param("limit", "2"))
+            .and(header("authorization", "Bearer work-token"))
+            .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 1,
+                "entries": [{
+                    "work_id": "work-2",
+                    "goal": "Ship the second boundary",
+                    "work_revision": 2,
+                    "delivery_branch_id": "branch-2",
+                    "delivery_branch_revision": 3,
+                    "graph_revision": 4,
+                    "graph_item_count": 2,
+                    "pending_decision_count": 0,
+                    "event_head": 5,
+                    "seen_through_event_seq": 4,
+                    "unseen_event_count": 1,
+                    "attention": "updated",
+                    "delivery_branch_activity": "working",
+                    "created_at": "2026-08-02T00:00:00Z",
+                    "last_activity_at": "2026-08-02T00:01:00Z"
+                },
+                {
+                    "work_id": "work-1",
+                    "goal": "Ship the first boundary",
+                    "work_revision": 1,
+                    "delivery_branch_id": "branch-1",
+                    "delivery_branch_revision": 1,
+                    "graph_revision": 1,
+                    "graph_item_count": 1,
+                    "pending_decision_count": 1,
+                    "event_head": 1,
+                    "seen_through_event_seq": 1,
+                    "unseen_event_count": 0,
+                    "attention": "needs_review",
+                    "delivery_branch_activity": "idle",
+                    "created_at": "2026-08-01T00:00:00Z",
+                    "last_activity_at": "2026-08-01T00:02:00Z"
+                }],
+                "next_cursor": {
+                    "created_at": "2026-08-01T00:00:00Z",
+                    "work_id": "work-1"
+                }
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let page = client.list_works("work-token", None, 2).await.unwrap();
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(page.entries[0].work_id, "work-2");
+        assert_eq!(
+            page.entries[1].attention,
+            WorkCatalogAttentionV1::NeedsReview
+        );
+        assert_eq!(page.next_cursor.as_ref().unwrap().work_id, "work-1");
+    }
+
+    #[tokio::test]
     async fn work_attachment_and_turn_keep_session_authority_server_side() {
         let srv = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/works/work-1/branches/branch-1/attachments"))
             .and(header("authorization", "Bearer work-token"))
             .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
-            .and(body_json(serde_json::json!({"request_id": "attach-1"})))
+            .and(body_json(serde_json::json!({
+                "request_id": "attach-1",
+                "surface": "cli"
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "work_id": "work-1",
                 "branch_id": "branch-1",
@@ -2282,6 +3228,8 @@ mod tests {
                 "branch-1",
                 &WorkBranchAttachRequestV1 {
                     request_id: "attach-1".into(),
+                    client_id: None,
+                    surface: astra_turn_types::SessionSurfaceV1::Cli,
                 },
             )
             .await
@@ -2482,6 +3430,124 @@ mod tests {
             .await
             .expect_err("a response for another Work must never be projected");
         assert!(matches!(error, ThinClientError::Json(_)));
+    }
+
+    #[tokio::test]
+    async fn work_recovery_points_are_typed_keyset_reads_and_identity_checked() {
+        let srv = MockServer::start().await;
+        let point = serde_json::json!({
+            "schema_version": 1,
+            "work_id": "work-1",
+            "branch_id": "branch-1",
+            "recovery_point_id": "rp-1",
+            "request_id": "save-1",
+            "status": "captured",
+            "reason": "user_requested",
+            "created_at": "2026-09-16T00:00:00Z",
+            "updated_at": "2026-09-16T00:00:00Z",
+            "manifest_hash": format!("sha256:{}", "a".repeat(64)),
+            "work_revision": 1,
+            "branch_revision": 1,
+            "graph_revision": 1,
+            "goal_revision": 1,
+            "criteria_set_revision": 1,
+            "session_cursor": {
+                "completed_turn": 1,
+                "journal_event_seq": 2,
+                "conversation_seq": 1,
+                "canonical_root_hash": "b".repeat(64),
+                "compaction_generation": 0
+            },
+            "execution": {
+                "placement": "server",
+                "executor_id": "server",
+                "binding_generation": 1
+            },
+            "coverage": {
+                "session_state": true,
+                "work_state": true,
+                "workspace": false,
+                "run_frontier": false,
+                "artifacts": false
+            },
+            "capabilities": {
+                "can_restore_conversation": false,
+                "can_continue_in_original_environment": false,
+                "has_portable_workspace": false,
+                "requires_target_environment_check": false,
+                "requires_effect_review": false
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/works/work-1/branches/branch-1/recovery-points"))
+            .and(header("authorization", "Bearer work-token"))
+            .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+            .and(body_json(serde_json::json!({
+                "request_id": "save-1",
+                "expected_work_revision": 1,
+                "expected_branch_revision": 1,
+                "reason": "user_requested"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(point.clone()))
+            .mount(&srv)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/works/work-1/branches/branch-1/recovery-points"))
+            .and(query_param("limit", "1"))
+            .and(header("authorization", "Bearer work-token"))
+            .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 1,
+                "work_id": "work-1",
+                "branch_id": "branch-1",
+                "points": [point.clone()],
+                "next_cursor": null
+            })))
+            .mount(&srv)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/v1/works/work-1/branches/branch-1/recovery-points/rp-1",
+            ))
+            .and(header("authorization", "Bearer work-token"))
+            .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+            .respond_with(ResponseTemplate::new(200).set_body_json(point.clone()))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let captured = client
+            .post_work_branch_recovery_point(
+                "work-token",
+                "work-1",
+                "branch-1",
+                &WorkRecoveryPointCaptureRequestV1 {
+                    request_id: "save-1".into(),
+                    expected_work_revision: 1,
+                    expected_branch_revision: 1,
+                    reason: astra_server_types::WorkRecoveryPointReasonV1::UserRequested,
+                    workspace_artifact_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(captured.recovery_point_id, "rp-1");
+        let page = client
+            .get_work_branch_recovery_points("work-token", "work-1", "branch-1", None, 1)
+            .await
+            .unwrap();
+        assert_eq!(page.points.len(), 1);
+        let loaded = client
+            .get_work_branch_recovery_point("work-token", "work-1", "branch-1", "rp-1")
+            .await
+            .unwrap();
+        assert_eq!(loaded.manifest_hash, format!("sha256:{}", "a".repeat(64)));
+
+        let unsafe_error = client
+            .get_work_branch_recovery_point("work-token", "work-1", "branch-1", "../other")
+            .await
+            .expect_err("path fragments must fail before transport");
+        assert!(matches!(unsafe_error, ThinClientError::InvalidInput(_)));
     }
 
     #[tokio::test]
@@ -2729,6 +3795,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wiremock_work_branch_turn_stream_uses_work_contract_and_terminal_events() {
+        for native in [false, true] {
+            let srv = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/works/work-1/branches/branch-1/turns"))
+                .and(header(
+                    "authorization",
+                    if native {
+                        "Bearer synthetic-fresh-0"
+                    } else {
+                        "Bearer work-token"
+                    },
+                ))
+                .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+                .and(header("accept", "text/event-stream"))
+                .and(body_json(serde_json::json!({
+                    "request_id": "turn-1",
+                    "attachment_id": "attachment-1",
+                    "message": "Continue the Work."
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+                    "data: {\"type\":\"text_delta\",\"content\":\"continued\"}\n\n",
+                    "data: {\"type\":\"turn_complete\",\"assistant_text\":\"continued\"}\n\n"
+                )))
+                .mount(&srv)
+                .await;
+
+            let mut client = ThinClient::new(&srv.uri(), None).unwrap();
+            if native {
+                client =
+                    client.with_bearer_provider(std::sync::Arc::new(RotatingBearer::default()));
+            }
+            let request = WorkTurnRequestV1 {
+                request_id: "turn-1".into(),
+                attachment_id: "attachment-1".into(),
+                message: "Continue the Work.".into(),
+            };
+            let events = futures_util::StreamExt::collect::<Vec<_>>(
+                client.work_branch_turn_stream("work-token", "work-1", "branch-1", &request),
+            )
+            .await;
+            assert_eq!(events.len(), 2);
+            assert!(matches!(events[0], Ok(StreamEvent::TextDelta { .. })));
+            assert!(matches!(events[1], Ok(StreamEvent::TurnComplete { .. })));
+        }
+    }
+
+    #[tokio::test]
     async fn wiremock_post_session() {
         let srv = MockServer::start().await;
         Mock::given(method("POST"))
@@ -2776,6 +3890,96 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&response).unwrap()["status"],
             "cancelled"
         );
+    }
+
+    #[tokio::test]
+    async fn session_cancel_waits_for_execution_settlement_not_display_status() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let srv = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        Mock::given(method("POST"))
+            .and(path("/sessions/session-1/cancel"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(move |_: &wiremock::Request| {
+                let settled = observed.fetch_add(1, Ordering::SeqCst) > 0;
+                ResponseTemplate::new(if settled { 200 } else { 202 }).set_body_json(
+                    serde_json::json!({
+                        "session_id": "session-1", "status": if settled { "cancelled" } else { "cancellation_requested" },
+                        "execution_settled": settled,
+                    }),
+                )
+            })
+            .mount(&srv)
+            .await;
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let body = client
+            .cancel_session_until_settled_text("tok", "session-1", Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap()["execution_settled"],
+            true
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn session_cancel_deadline_preserves_pending_and_does_not_delete() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sessions/session-1/cancel"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "session_id": "session-1", "status": "cancellation_requested", "execution_settled": false,
+                "execution_blocker": "unresolved_tool",
+            })))
+            .mount(&srv)
+            .await;
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let result = client
+            .cancel_session_until_settled_text("tok", "session-1", Duration::from_millis(500))
+            .await;
+        assert!(
+            matches!(result, Err(ThinClientError::SessionCancellationPending { session_id, reason }) if session_id == "session-1" && reason.contains("external outcome is still unknown"))
+        );
+        assert!(
+            srv.received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method == "POST"
+                    && request.url.path() == "/sessions/session-1/cancel")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_cancel_rejects_missing_proof_or_wrong_identity() {
+        for response in [
+            serde_json::json!({"session_id": "session-1", "status": "cancelled"}),
+            serde_json::json!({"session_id": "other", "status": "cancelled", "execution_settled": true}),
+            serde_json::json!({"session_id": "session-1", "status": "active", "execution_settled": true}),
+            serde_json::json!({"session_id": "session-1", "execution_settled": false}),
+            serde_json::json!({"session_id": "session-1", "status": 42, "execution_settled": false}),
+            serde_json::json!({"session_id": "session-1", "status": "cancelled", "execution_settled": false}),
+        ] {
+            let srv = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/sessions/session-1/cancel"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                .expect(1)
+                .mount(&srv)
+                .await;
+            let client = ThinClient::new(&srv.uri(), None).unwrap();
+            assert!(matches!(
+                client
+                    .cancel_session_until_settled_text("tok", "session-1", Duration::from_secs(1))
+                    .await,
+                Err(ThinClientError::InvalidSessionCancellationResponse(_))
+            ));
+        }
     }
 
     #[tokio::test]
@@ -2975,7 +4179,6 @@ mod tests {
                     "reasoning_status": "done",
                     "created_at": "2026-07-11T00:00:00"
                 }],
-                "page_refs": [],
                 "next_before_seq": 41,
                 "has_more": false
             })))
@@ -3018,7 +4221,6 @@ mod tests {
                     "content": "Root answer only.",
                     "created_at": "2026-07-11T00:00:00"
                 }],
-                "page_refs": [],
                 "next_before_seq": 41,
                 "has_more": false
             })))
@@ -3058,6 +4260,50 @@ mod tests {
         let client = ThinClient::new(&srv.uri(), None).unwrap();
         let response = client.cancel_run(Some("tok"), "run-1").await.unwrap();
         assert_eq!(response["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn wiremock_permission_mode_request_and_snapshot() {
+        let srv = MockServer::start().await;
+        let selected = serde_json::json!({"request_id":"mode-1","mode":"bypass","revision":12});
+        Mock::given(method("POST")).and(path("/chat/runs/run-1/permission-mode"))
+            .and(header("authorization","Bearer tok"))
+            .and(body_json(serde_json::json!({"expected_session_id":"session-1","request_id":"mode-1","mode":"bypass"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&selected)).expect(1).mount(&srv).await;
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/run-1/permission-mode"))
+            .and(wiremock::matchers::query_param(
+                "expected_session_id",
+                "session-1",
+            ))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"requested":selected,"applied":null})),
+            )
+            .expect(1)
+            .mount(&srv)
+            .await;
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let receipt = client
+            .request_run_permission_mode(
+                Some("tok"),
+                "run-1",
+                &astra_turn_types::RunPermissionModeRequest {
+                    expected_session_id: "session-1".into(),
+                    request_id: "mode-1".into(),
+                    mode: astra_turn_types::PermissionMode::Bypass,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.revision, 12);
+        let snapshot = client
+            .get_run_permission_mode(Some("tok"), "run-1", "session-1")
+            .await
+            .unwrap();
+        assert_eq!(snapshot.requested, Some(receipt));
+        assert!(snapshot.applied.is_none());
     }
 
     #[tokio::test]
@@ -3635,6 +4881,7 @@ mod tests {
             .and(query_param("after_provider", "bedrock/openai"))
             .and(query_param("after_name", "model two"))
             .and(query_param("after_offering_id", "offer/2"))
+            .and(query_param("purpose", "typed_judgment"))
             .and(header("authorization", "Bearer t"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "items": [],
@@ -3652,6 +4899,7 @@ mod tests {
                 "t",
                 Duration::from_secs(1),
                 Some(("bedrock/openai", "model two", "offer/2")),
+                astra_core::model_wire::purpose::ModelCatalogPurpose::TypedJudgment,
             )
             .await
             .unwrap();
@@ -4184,6 +5432,92 @@ mod tests {
             Some(1),
             "Retry-After: 1 should be honoured over default exponential backoff"
         );
+    }
+
+    #[tokio::test]
+    async fn retry_admission_builds_a_fresh_payload_after_rate_limit() {
+        let _guard = set_test_retry_sleep_ms(0);
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/stream"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
+            .up_to_n_times(1)
+            .mount(&srv)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/stream"))
+            .respond_with(ResponseTemplate::new(200).insert_header(
+                astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER,
+                astra_server_types::AGENT_INTERACTION_API_MAJOR,
+            ))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let mut remaining = 60;
+        let response = client
+            .post_developer_loop_retry_429_with_payload("t", 3, true, || {
+                let current = remaining;
+                remaining -= 20;
+                Ok(serde_json::json!({"execution_time_budget": {"remaining_seconds": current}}))
+            })
+            .await
+            .expect("second admission succeeds");
+        assert_eq!(response.status().as_u16(), 200);
+        let requests = srv.received_requests().await.expect("request history");
+        assert_eq!(requests.len(), 2);
+        let budgets = requests
+            .iter()
+            .map(|request| {
+                serde_json::from_slice::<Value>(&request.body)
+                    .expect("JSON request")
+                    ["execution_time_budget"]["remaining_seconds"]
+                    .as_u64()
+                    .expect("budget")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(budgets, [60, 40]);
+    }
+
+    #[tokio::test]
+    async fn expired_admission_dispatches_no_request() {
+        let srv = MockServer::start().await;
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let error = client
+            .post_developer_loop_retry_429_with_payload("t", 3, true, || {
+                Err(ThinClientError::AdmissionDeadlineExpired)
+            })
+            .await
+            .expect_err("expired admission must stop before POST");
+        assert!(matches!(error, ThinClientError::AdmissionDeadlineExpired));
+        assert_eq!(srv.received_requests().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn expired_admission_after_rate_limit_dispatches_no_retry() {
+        let _guard = set_test_retry_sleep_ms(0);
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/stream"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
+            .mount(&srv)
+            .await;
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let mut attempts = 0;
+        let error = client
+            .post_developer_loop_retry_429_with_payload("t", 3, true, || {
+                attempts += 1;
+                if attempts == 1 {
+                    Ok(serde_json::json!({"msg": "first attempt"}))
+                } else {
+                    Err(ThinClientError::AdmissionDeadlineExpired)
+                }
+            })
+            .await
+            .expect_err("expired retry must stop before a second POST");
+        assert!(matches!(error, ThinClientError::AdmissionDeadlineExpired));
+        assert_eq!(attempts, 2);
+        assert_eq!(srv.received_requests().await.unwrap().len(), 1);
     }
 
     #[test]

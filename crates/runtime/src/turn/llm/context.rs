@@ -15,6 +15,111 @@ use sha2::{Digest, Sha256};
 use super::super::agentic_loop::host::AgenticLoopState;
 use super::super::prompt_cache::PromptCacheConfig;
 
+const ACTIVE_TURN_FRAME_MAX_CHARS: usize = 2_000;
+const ACTIVE_TURN_FRAME_INSTRUCTION: &str = "Resolve the current human request against the immediately preceding user-assistant exchange. Treat older transcript and runtime context as background unless the user explicitly broadens the scope.";
+
+fn bounded_active_turn_text(value: &str) -> (String, bool) {
+    let mut chars = value.chars();
+    let mut bounded = chars
+        .by_ref()
+        .take(ACTIVE_TURN_FRAME_MAX_CHARS)
+        .collect::<String>();
+    let truncated = chars.next().is_some();
+    if truncated {
+        bounded.push_str("...");
+    }
+    (bounded, truncated)
+}
+
+/// Build the dynamic, typed anchor for one real human turn.
+///
+/// The full canonical transcript remains available to the model. This frame
+/// only identifies the latest request and its nearest textual exchange so an
+/// elliptical follow-up does not accidentally promote an old topic. It lives
+/// in the volatile lane; the stable focus policy remains the cacheable rule.
+fn active_turn_frame_payload(messages: &[Value], user_content: &str) -> Option<Value> {
+    let current_index = messages
+        .iter()
+        .rposition(astra_turn_types::is_human_user_message)?;
+    let current_text =
+        astra_turn_core::prompt_facing::extract_text_content(messages.get(current_index)?)?;
+    // Only the latest canonical human message can own this frame. If the host
+    // has not appended the current request yet, do not accidentally anchor an
+    // older identical request.
+    if current_text.trim() != user_content.trim() {
+        return None;
+    }
+
+    let mut prior_assistant = None;
+    let mut prior_user = None;
+    for message in messages[..current_index].iter().rev() {
+        if message.get("role").and_then(Value::as_str) == Some("assistant")
+            && prior_assistant.is_none()
+        {
+            if let Some(text) = astra_turn_core::prompt_facing::extract_text_content(message)
+                .filter(|text| !text.trim().is_empty())
+            {
+                prior_assistant = Some(bounded_active_turn_text(&text));
+            }
+            continue;
+        }
+        if astra_turn_types::is_human_user_message(message) && prior_assistant.is_some() {
+            if let Some(text) = astra_turn_core::prompt_facing::extract_text_content(message)
+                .filter(|text| !text.trim().is_empty())
+            {
+                prior_user = Some(bounded_active_turn_text(&text));
+            }
+            break;
+        }
+    }
+
+    let (current_preview, current_truncated) = bounded_active_turn_text(&current_text);
+    let mut payload = json!({
+        "schema": "active_turn_frame.v1",
+        "instruction": ACTIVE_TURN_FRAME_INSTRUCTION,
+        "latest_user_message_preview": current_preview,
+        "latest_user_message_truncated": current_truncated,
+        "canonical_source": "conversation_history",
+        "preview_limit_chars": ACTIVE_TURN_FRAME_MAX_CHARS,
+    });
+    if let Some((prior_user, truncated)) = prior_user {
+        payload["immediate_prior_user_request_preview"] = Value::String(prior_user);
+        payload["immediate_prior_user_request_truncated"] = Value::Bool(truncated);
+    }
+    if let Some((prior_assistant, truncated)) = prior_assistant {
+        payload["immediate_prior_assistant_response_preview"] = Value::String(prior_assistant);
+        payload["immediate_prior_assistant_response_truncated"] = Value::Bool(truncated);
+    }
+    Some(payload)
+}
+
+fn enqueue_active_turn_frame(state: &mut AgenticLoopState, user_content: &str) {
+    // Round zero is the one provider boundary for a human turn. Internal
+    // re-assemblies in that round replace the singleton with the same
+    // canonical payload; later tool rounds must not create another frame.
+    if state.current_round_index != 0 {
+        return;
+    }
+    let Some(payload) = active_turn_frame_payload(&state.messages, user_content) else {
+        return;
+    };
+    // Preserve the exact frame through context-memory reruns and bounded
+    // history recomposition. Rebuilding from a shorter projection would make
+    // the same human turn lose context or change its cache suffix.
+    if state.volatile_pending.iter().any(|injection| {
+        injection.kind == crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame
+    }) || state.messages.iter().enumerate().any(|(index, message)| {
+        astra_turn_types::runtime_authority_kind(message) == Some("active_turn_frame")
+            && astra_turn_types::append_only_runtime_authority_is_active(&state.messages, index)
+    }) {
+        return;
+    }
+    state.push_volatile_payload(
+        crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame,
+        payload,
+    );
+}
+
 pub(crate) fn cache_capability_from_model_metadata(
     value: Option<astra_services::PromptCacheCapabilityData>,
 ) -> Option<astra_turn_core::cache_placement::CacheCapability> {
@@ -353,7 +458,7 @@ pub(crate) struct LlmContextAssemblyOutput {
 }
 
 const EXPLAIN_ANALYZE_CONTEXT_SOURCE_ORDER: [astra_turn_types::ExplainAnalyzeContextSourceKindV1;
-    15] = [
+    12] = [
     astra_turn_types::ExplainAnalyzeContextSourceKindV1::Identity,
     astra_turn_types::ExplainAnalyzeContextSourceKindV1::SelfModel,
     astra_turn_types::ExplainAnalyzeContextSourceKindV1::ProjectContext,
@@ -366,9 +471,6 @@ const EXPLAIN_ANALYZE_CONTEXT_SOURCE_ORDER: [astra_turn_types::ExplainAnalyzeCon
     astra_turn_types::ExplainAnalyzeContextSourceKindV1::Skills,
     astra_turn_types::ExplainAnalyzeContextSourceKindV1::RuntimeIdentity,
     astra_turn_types::ExplainAnalyzeContextSourceKindV1::RuntimeVolatile,
-    astra_turn_types::ExplainAnalyzeContextSourceKindV1::EmergentSkills,
-    astra_turn_types::ExplainAnalyzeContextSourceKindV1::EmergentMemory,
-    astra_turn_types::ExplainAnalyzeContextSourceKindV1::EmergentSummary,
 ];
 
 fn explain_analyze_source_kind(
@@ -390,9 +492,6 @@ fn explain_analyze_source_kind(
         SectionKind::Skills => SourceKind::Skills,
         SectionKind::RuntimeIdentity => SourceKind::RuntimeIdentity,
         SectionKind::RuntimeVolatile => SourceKind::RuntimeVolatile,
-        SectionKind::EmergentSkills => SourceKind::EmergentSkills,
-        SectionKind::EmergentMemory => SourceKind::EmergentMemory,
-        SectionKind::EmergentSummary => SourceKind::EmergentSummary,
     }
 }
 
@@ -427,6 +526,7 @@ fn explain_analyze_context_assembly_metrics(
     }
 
     let assembly = astra_turn_types::ExplainAnalyzeContextAssemblyV1 {
+        edge_memory_selection: Vec::new(),
         basis: astra_turn_types::ExplainAnalyzeContextAssemblyBasisV1::RuntimeTextEstimate,
         sources: sources
             .into_iter()
@@ -434,6 +534,78 @@ fn explain_analyze_context_assembly_metrics(
             .collect(),
     };
     assembly.is_valid().then_some(assembly)
+}
+
+/// Accept only current-turn facts from the selected CLI/Edge context.
+fn edge_memory_selection_reports(
+    edge_profile: &Map<String, Value>,
+    session_id: &str,
+    turn: u32,
+) -> Vec<astra_turn_types::MemorySelectionReport> {
+    edge_profile
+        .get("memory_selection_reports")
+        .and_then(|value| {
+            serde_json::from_value::<Vec<astra_turn_types::MemorySelectionReport>>(value.clone())
+                .ok()
+        })
+        .filter(|reports| {
+            reports.len() <= 2
+                && reports
+                    .iter()
+                    .all(|r| r.is_valid() && r.session_id == session_id && r.turn == turn)
+        })
+        .unwrap_or_default()
+}
+
+/// Attach a consumer-side receipt only after the final system prompt has been
+/// serialized. The edge report records what the selector recommended; this
+/// receipt records whether that exact selected lesson payload reached the
+/// model-visible request. Dismissal decisions describe removal and therefore
+/// do not claim prompt inclusion.
+fn memory_selection_reports_with_projection(
+    edge_profile: &Map<String, Value>,
+    session_id: &str,
+    turn: u32,
+    final_system_blocks: &[astra_turn_core::context_serializer::SerializedSystemBlock],
+) -> Vec<astra_turn_types::MemorySelectionReport> {
+    let mut reports = edge_memory_selection_reports(edge_profile, session_id, turn);
+    // Projection is runtime-owned evidence. Never trust a caller-supplied
+    // value, including on an earlier report when a turn carries both a
+    // relevance and reuse decision.
+    for report in &mut reports {
+        report.prompt_projection = None;
+    }
+    let lessons_text = edge_profile
+        .get("lessons_text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty());
+    let Some(report) = reports.iter_mut().rev().find(|report| {
+        matches!(
+            report.operation,
+            astra_turn_types::MemorySelectionOperation::Relevance
+                | astra_turn_types::MemorySelectionOperation::Reuse
+        )
+    }) else {
+        return reports;
+    };
+    let selected_candidates = report.selected_indices().len() as u32;
+    let included_candidates = if selected_candidates == 0 {
+        Some(0)
+    } else if lessons_text.is_some_and(|text| {
+        final_system_blocks.iter().any(|block| {
+            block.kind == astra_turn_core::section_types::SectionKind::RuntimeIdentity
+                && block.text.contains(text)
+        })
+    }) {
+        Some(selected_candidates)
+    } else {
+        None
+    };
+    report.prompt_projection = Some(astra_turn_types::MemoryPromptProjection {
+        selected_candidates,
+        included_candidates,
+    });
+    reports
 }
 
 /// A compaction rerun is the authoritative final assembly even if it cannot
@@ -906,11 +1078,6 @@ pub(crate) struct LlmWireAssemblyInput<'a> {
     pub volatile_preamble: Vec<Value>,
     pub compacted_messages: Vec<Value>,
     pub state: &'a mut AgenticLoopState,
-    /// A real compaction boundary rewrote the history for this request.
-    /// Invoked-skill results normally remain in `compacted_messages`; replay
-    /// their bounded recovery attachments only when this typed boundary is
-    /// present, otherwise every provider round would create a fresh suffix.
-    pub compaction_boundary_hit: bool,
     pub thinking: &'a astra_turn_core::thinking_config::ThinkingConfig,
     pub session_id: &'a str,
     pub provider: &'a str,
@@ -925,7 +1092,7 @@ pub(crate) struct ContextManifestProjectionInput<'a> {
     pub run_id: &'a str,
     pub turn_index: usize,
     pub llm_attempt_index: u32,
-    pub pre_llm_messages: &'a [Value],
+    pub message_tokens: ContextManifestMessageTokens,
     pub tool_results: &'a [Value],
     pub schema_tokens: u32,
     pub result_prompt_tokens: Option<u32>,
@@ -1066,6 +1233,30 @@ fn is_tool_result_wire_message(message: &Value) -> bool {
         })
 }
 
+/// Request-time zone totals; no transcript bytes survive the provider await.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ContextManifestMessageTokens {
+    message_tokens: u32,
+    tool_result_tokens: u32,
+}
+
+impl ContextManifestMessageTokens {
+    pub(crate) fn from_messages(messages: &[Value]) -> Self {
+        messages
+            .iter()
+            .fold(Self::default(), |mut totals, message| {
+                let tokens = estimate_json_tokens(message);
+                let zone = if is_tool_result_wire_message(message) {
+                    &mut totals.tool_result_tokens
+                } else {
+                    &mut totals.message_tokens
+                };
+                *zone = zone.saturating_add(tokens);
+                totals
+            })
+    }
+}
+
 /// Build the persisted context-manifest projection for a single LLM call.
 ///
 /// This is deliberately inside `llm_context` so manifest rows are derived by
@@ -1077,18 +1268,10 @@ pub(crate) fn build_context_manifest_projection(
 ) -> ContextManifestProjection {
     let budget_allocation = astra_services::budget_for_turn_intent(Some(input.turn_intent));
     let budget = budget_allocation.budget.clone();
-    let (message_tokens, tool_result_tokens) =
-        input
-            .pre_llm_messages
-            .iter()
-            .fold((0_u32, 0_u32), |(messages, tool_results), message| {
-                let tokens = estimate_json_tokens(message);
-                if is_tool_result_wire_message(message) {
-                    (messages, tool_results.saturating_add(tokens))
-                } else {
-                    (messages.saturating_add(tokens), tool_results)
-                }
-            });
+    let ContextManifestMessageTokens {
+        message_tokens,
+        tool_result_tokens,
+    } = input.message_tokens;
     let total_estimated_tokens = input.result_prompt_tokens.unwrap_or_else(|| {
         message_tokens
             .saturating_add(tool_result_tokens)
@@ -1292,6 +1475,8 @@ pub(crate) fn assemble_context_pipeline(
         ));
     }
 
+    enqueue_active_turn_frame(state, input.user_content);
+
     let mut external = build_external_sources(
         input.runtime_signals.edge_profile,
         state,
@@ -1460,11 +1645,19 @@ pub(crate) fn assemble_context_pipeline(
         }
     }
 
-    let explain_analyze_context_assembly =
-        explain_analyze_context_assembly_metrics(&pipeline_output.serialized.system_blocks);
     let plain = astra_turn_core::context_serializer::flatten_serialized_system_blocks(
         &pipeline_output.serialized,
     );
+    let mut explain_analyze_context_assembly =
+        explain_analyze_context_assembly_metrics(&pipeline_output.serialized.system_blocks);
+    if let Some(assembly) = &mut explain_analyze_context_assembly {
+        assembly.edge_memory_selection = memory_selection_reports_with_projection(
+            input.runtime_signals.edge_profile,
+            input.session_id,
+            state.session_turn,
+            &pipeline_output.serialized.system_blocks,
+        );
+    }
     let system_prompt_override = input
         .runtime_signals
         .edge_profile
@@ -1522,10 +1715,10 @@ pub(crate) fn assemble_context_pipeline(
             let mut stable_text = String::new();
             let mut volatile_text = String::new();
             for block in &pipeline_output.serialized.system_blocks {
-                // Strict-history providers suppress ordinary volatile text to
-                // keep prior messages byte-stable. Capability-epoch metadata
-                // (including deferred discovery) is already marked Session by
-                // the canonical planner, so scope alone decides placement.
+                // Scope separates stable system content from runtime context.
+                // The independent delivery policy decides which runtime classes
+                // are admitted; CurrentUserOnly only selects their wire boundary.
+                // Capability-epoch metadata is already Session-scoped by the planner.
                 if block.scope != CacheScope::None {
                     stable_text.push_str(&block.text);
                 } else {
@@ -1569,18 +1762,24 @@ pub(crate) fn assemble_context_pipeline(
             astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
         ),
     );
-    volatile_preamble.extend(
-        runtime_volatile_injections
-            .iter()
-            .filter(|injection| {
-                matches!(
-                    injection.delivery_class,
-                    astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext
-                        | astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::DecisionFeedback
-                )
-            })
-            .filter_map(crate::turn::wire_assembly::runtime_volatile_preamble_message),
-    );
+    for injection in runtime_volatile_injections.iter().filter(|injection| {
+        matches!(
+            injection.delivery_class,
+            astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext
+                | astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::DecisionFeedback
+        )
+    }) {
+        volatile_preamble.extend(
+            crate::turn::wire_assembly::runtime_volatile_preamble_messages(injection).map_err(
+                |error| {
+                    astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        error.to_string(),
+                    )
+                },
+            )?,
+        );
+    }
     let stable_system_message_count = system_messages.len();
     let volatile_preamble_count = volatile_preamble.len();
     let system_prompt_tokens = system_messages
@@ -1701,7 +1900,7 @@ fn classify_pipeline_abort(
 /// placement instead of each host rebuilding this logic.  The caller must
 /// explicitly mark a real history rewrite; ordinary provider rounds must not
 /// replay skill bodies that are already carried by canonical history.
-#[cfg(any(test, feature = "e2e-hooks"))]
+#[cfg(test)]
 pub(crate) fn assemble_wire_messages(
     mut input: LlmWireAssemblyInput<'_>,
 ) -> Result<Vec<Value>, astra_core::ClassifiedError> {
@@ -1752,19 +1951,20 @@ pub(crate) fn assemble_wire_messages_with_drained(
         &input.compacted_messages,
         input.artifact_recovery_route,
     );
-    let invoked_skills = if input.compaction_boundary_hit {
-        let mut skills: Vec<_> = input.state.skills.execution.invoked.values().collect();
-        skills.sort_by_key(|skill| std::cmp::Reverse(skill.invoked_at_turn));
-        skills
-            .iter()
-            .map(|skill| crate::turn::wire_assembly::InvokedSkillRef {
-                name: skill.name.as_str(),
-                content: skill.content.as_str(),
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let mut skills: Vec<_> = input.state.skills.execution.invoked.values().collect();
+    skills.sort_by(|left, right| {
+        right
+            .invoked_at_turn
+            .cmp(&left.invoked_at_turn)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let invoked_skills = skills
+        .into_iter()
+        .map(|skill| crate::turn::wire_assembly::InvokedSkillRef {
+            name: skill.name.as_str(),
+            content: skill.content.as_str(),
+        })
+        .collect();
     let attachments = crate::turn::wire_assembly::PostCompactAttachments { invoked_skills };
 
     let assembly =
@@ -2315,7 +2515,14 @@ mod context_cache_contract_tests {
             .copied()
             .map(explain_analyze_source_kind)
             .collect::<HashSet<_>>();
-        assert_eq!(mapped.len(), 15);
+        assert_eq!(
+            mapped.len(),
+            astra_turn_core::section_types::SectionKind::all_planned().len()
+        );
+        assert_eq!(
+            mapped,
+            EXPLAIN_ANALYZE_CONTEXT_SOURCE_ORDER.into_iter().collect()
+        );
     }
 
     #[test]
@@ -2422,6 +2629,695 @@ mod context_cache_contract_tests {
                 .join("\n"),
             _ => String::new(),
         }
+    }
+
+    /// Defaults only: every test still invokes the production assembler with
+    /// its real typed tool surface, runtime signals, and session state.
+    fn context_contract_input<'a>(
+        state: &'a mut AgenticLoopState,
+        tool_surface: ToolSurfacePlan<'a>,
+        runtime_signals: RuntimeSignals<'a>,
+        cache_cfg: &'a PromptCacheConfig,
+    ) -> LlmContextAssemblyInput<'a> {
+        LlmContextAssemblyInput {
+            state,
+            session_id: "sid-context-contract",
+            tool_surface,
+            runtime_signals,
+            cache_cfg,
+            provider: "openai",
+            model_name: "gpt-4o",
+            context_window: Some(200_000),
+            max_completion_tokens: None,
+            cache_capability: None,
+            user_content: "continue the task",
+            query_source: "test",
+        }
+    }
+
+    #[test]
+    fn shared_assembly_preserves_normal_tool_descriptions() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        let mut schema = tool("bash");
+        schema["function"]["description"] =
+            json!("Execute a shell command. Runs inside a sandbox with a two-minute timeout.");
+        let tools = vec![schema];
+        let restricted = HashSet::new();
+        let edge = Map::new();
+        let cache = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let output = assemble_context_pipeline(context_contract_input(
+            &mut state,
+            ToolSurfacePlan::from_visible_tools(&tools, &restricted),
+            RuntimeSignals::new(&edge, None),
+            &cache,
+        ))
+        .expect("shared pipeline");
+        assert_eq!(
+            output.tier,
+            astra_turn_core::compaction_types::CompactionTier::Normal
+        );
+        assert_eq!(output.tool_schemas, tools);
+        assert!(!output.system_messages.is_empty());
+        assert!(output.breakdown.repository_memories.is_empty());
+        assert!(output.breakdown.session_memory_injected.is_none());
+        assert_eq!(
+            output.breakdown.total_tokens,
+            output
+                .system_messages
+                .iter()
+                .map(estimate_json_tokens)
+                .sum::<u32>()
+        );
+    }
+
+    #[test]
+    fn shared_assembly_keeps_profiles_lessons_and_plain_text_in_their_real_lanes() {
+        let _lock = astra_core::sync_poison::recover_mutex_lock(
+            &crate::turn::prompt_cache::CACHE_ENV_MUTEX,
+        );
+        let available = astra_tools::schemas::all_tool_schemas()
+            .into_iter()
+            .filter(|schema| matches!(schema["function"]["name"].as_str(), Some("bash" | "memory")))
+            .collect::<Vec<_>>();
+        assert_eq!(available.len(), 2);
+        for tools in [Vec::new(), available] {
+            for profile in [false, true] {
+                let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+                let restricted = HashSet::new();
+                let mut edge = Map::new();
+                let entries = if profile {
+                    edge.insert("cwd".into(), json!("/tmp/TestProj"));
+                    edge.insert("git_branch".into(), json!("fixture-profile-main"));
+                    edge.insert(
+                        "lessons_text".into(),
+                        json!("Use the project's declared test command"),
+                    );
+                    edge.insert(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS.into(), json!(["## System Prompt Override\nOrdinary required context"]));
+                    vec![
+                        astra_turn_core::context_sources::MemoryEntry::new("prefers Rust")
+                            .with_memory_identity("profile-rust", "profile"),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                let cache = PromptCacheConfig {
+                    cache_enabled: false,
+                    is_anthropic: false,
+                };
+                let output = assemble_context_pipeline(context_contract_input(
+                    &mut state,
+                    ToolSurfacePlan::from_visible_tools(&tools, &restricted),
+                    RuntimeSignals::new(&edge, None).with_memory_entries(&entries),
+                    &cache,
+                ))
+                .expect("actual context pipeline");
+                assert_eq!(output.tool_schemas, tools);
+                assert!(!output.system_messages.is_empty());
+                assert!(
+                    output
+                        .system_messages
+                        .iter()
+                        .all(|message| !message_text(message).trim().is_empty())
+                );
+                let model_text = output
+                    .system_messages
+                    .iter()
+                    .chain(&output.volatile_preamble)
+                    .map(message_text)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(model_text.contains("NEVER fabricate"));
+                assert!(!model_text.contains("Memory Rules"));
+                assert!(
+                    !output.breakdown.context_signals.system_prompt_override,
+                    "ordinary text does not grant override provenance"
+                );
+                assert_eq!(model_text.contains("## Session Lessons"), profile);
+                assert_eq!(model_text.contains("prefers Rust"), profile);
+                if profile {
+                    assert!(model_text.contains("/tmp/TestProj"));
+                    assert!(model_text.contains("Branch: fixture-profile-main"));
+                    assert!(model_text.contains("## Session Lessons (Learned from Past Corrections)\nUse the project's declared test command"));
+                    assert!(model_text.contains("## System Prompt Override"));
+                    assert_eq!(
+                        output.breakdown.repository_memories[0].memory_id,
+                        "profile-rust"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_assembly_measures_history_without_lossy_reduction() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.messages = (0..16)
+            .map(|index| {
+                json!({
+                    "role": if index % 2 == 0 { "user" } else { "assistant" },
+                    "content": format!("round {index}: {}", "working context ".repeat(700)),
+                })
+            })
+            .collect();
+        let history = state.messages.clone();
+        let tools = vec![
+            astra_tools::schemas::all_tool_schemas()
+                .into_iter()
+                .find(|schema| schema["function"]["name"] == "introspect")
+                .expect("canonical introspect schema"),
+        ];
+        let restricted = HashSet::new();
+        let edge = Map::new();
+        let cache = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let mut input = context_contract_input(
+            &mut state,
+            ToolSurfacePlan::from_visible_tools(&tools, &restricted),
+            RuntimeSignals::new(&edge, None),
+            &cache,
+        );
+        input.context_window = Some(8_000);
+        let output = assemble_context_pipeline(input).expect("shared pipeline");
+        assert_eq!(
+            output.tier,
+            astra_turn_core::compaction_types::CompactionTier::AggressivePrune
+        );
+        assert_eq!(output.messages, history);
+        assert_eq!(state.messages, history);
+        for field in ["explain", "artifact", "offset", "max_bytes"] {
+            assert!(
+                output.tool_schemas[0]["function"]["parameters"]["properties"]
+                    .get(field)
+                    .is_some(),
+                "pressure must retain recovery field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_assembly_preserves_large_runtime_section_sets() {
+        use crate::prompts::{CacheScope, PromptSection, PromptTokenBucket};
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        let stable: Vec<_> = (0..125)
+            .map(|index| {
+                PromptSection::stable(format!("[stable-extra-{index}]"), CacheScope::Session)
+            })
+            .collect();
+        let volatile: Vec<_> = (0..125)
+            .map(|index| {
+                PromptSection::dynamic(
+                    format!("[volatile-extra-{index}]"),
+                    PromptTokenBucket::Environment,
+                )
+            })
+            .collect();
+        let tools = vec![tool("bash")];
+        let restricted = HashSet::new();
+        let edge = Map::new();
+        let cache = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let output = assemble_context_pipeline(context_contract_input(
+            &mut state,
+            ToolSurfacePlan::from_visible_tools(&tools, &restricted),
+            RuntimeSignals::new(&edge, None).with_extra_sections(&stable, &volatile),
+            &cache,
+        ))
+        .expect("shared pipeline");
+        let stable_text = output
+            .system_messages
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let volatile_text = output
+            .volatile_preamble
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for index in 0..125 {
+            assert!(stable_text.contains(&format!("[stable-extra-{index}]")));
+            assert!(volatile_text.contains(&format!("[volatile-extra-{index}]")));
+        }
+        assert!(!stable_text.contains("[volatile-extra-"));
+        assert!(!volatile_text.contains("[stable-extra-"));
+    }
+
+    #[test]
+    fn shared_assembly_ranks_recall_and_keeps_session_memory_volatile() {
+        use astra_turn_core::context_sources::MemoryEntry;
+        for provider in ["openai", "anthropic"] {
+            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+            let tools = vec![tool("bash")];
+            let restricted = HashSet::new();
+            let edge = Map::new();
+            let cache = PromptCacheConfig {
+                cache_enabled: true,
+                is_anthropic: provider == "anthropic",
+            };
+            let entries = vec![
+                MemoryEntry::scored("lower value memory", 1.0),
+                MemoryEntry::scored("higher value memory", 2.0),
+            ];
+            let mut input = context_contract_input(
+                &mut state,
+                ToolSurfacePlan::from_visible_tools(&tools, &restricted),
+                RuntimeSignals::new(&edge, None)
+                    .with_memory_entries(&entries)
+                    .with_session_memory_entry(Some(
+                        MemoryEntry::new("## Session State\nLatest working progress")
+                            .with_source("turn_learning"),
+                    )),
+                &cache,
+            );
+            input.provider = provider;
+            let output = assemble_context_pipeline(input).expect("shared pipeline");
+            let stable = output
+                .system_messages
+                .iter()
+                .map(message_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let volatile = output
+                .volatile_preamble
+                .iter()
+                .map(message_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let high = volatile
+                .find("higher value memory")
+                .expect("high-priority recall visible");
+            let low = volatile
+                .find("lower value memory")
+                .expect("low-priority recall visible");
+            assert!(high < low);
+            assert!(volatile.contains("## Session State\nLatest working progress"));
+            for text in [
+                "higher value memory",
+                "lower value memory",
+                "## Session State\nLatest working progress",
+            ] {
+                assert!(
+                    !stable.contains(text),
+                    "memory must stay outside stable prefix: {provider}"
+                );
+            }
+            let memory = output
+                .breakdown
+                .session_memory_injected
+                .as_ref()
+                .expect("session memory trace");
+            assert_eq!(memory.memory_id, "session-memory");
+            assert_eq!(memory.memory_type, "turn_learning");
+            assert_eq!(
+                memory.tokens,
+                astra_turn_core::section_types::estimate_text_tokens(
+                    "## Session State\nLatest working progress"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn shared_assembly_places_system_override_in_runtime_identity() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        let tools = vec![tool("bash")];
+        let restricted = HashSet::new();
+        let mut edge = Map::new();
+        edge.insert(
+            "system_prompt_override".into(),
+            json!("Stable custom instruction"),
+        );
+        let cache = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let output = assemble_context_pipeline(context_contract_input(
+            &mut state,
+            ToolSurfacePlan::from_visible_tools(&tools, &restricted),
+            RuntimeSignals::new(&edge, None),
+            &cache,
+        ))
+        .expect("shared pipeline");
+        assert!(
+            output
+                .system_messages
+                .iter()
+                .any(|message| message_text(message).contains("Stable custom instruction"))
+        );
+        assert!(
+            !output
+                .volatile_preamble
+                .iter()
+                .any(|message| message_text(message).contains("Stable custom instruction"))
+        );
+        assert!(output.breakdown.context_signals.system_prompt_override);
+    }
+
+    #[test]
+    fn shared_assembly_preserves_typed_recall_identity_without_prefix_churn() {
+        let _lock = astra_core::sync_poison::recover_mutex_lock(
+            &crate::turn::prompt_cache::CACHE_ENV_MUTEX,
+        );
+        use astra_turn_core::context_sources::MemoryEntry;
+        let tools = vec![tool("bash")];
+        let restricted = HashSet::new();
+        let edge = Map::new();
+        let cache = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+        let assemble = |id: &str, content: &str| {
+            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+            let entries = vec![
+                MemoryEntry::scored(content, 0.9)
+                    .with_memory_identity(id, "semantic")
+                    .with_source("memoria.prefetch"),
+            ];
+            let mut input = context_contract_input(
+                &mut state,
+                ToolSurfacePlan::from_visible_tools(&tools, &restricted),
+                RuntimeSignals::new(&edge, None).with_memory_entries(&entries),
+                &cache,
+            );
+            input.provider = "anthropic";
+            let output = assemble_context_pipeline(input).expect("shared pipeline");
+            assert_eq!(
+                output.breakdown.repository_memories[0].tokens,
+                entries[0].token_estimate
+            );
+            output
+        };
+        let first = assemble("m1", "first typed recall evidence");
+        let second = assemble("m2", "second typed recall evidence");
+        assert_eq!(first.system_messages, second.system_messages);
+        assert_ne!(first.volatile_preamble, second.volatile_preamble);
+        for (output, id, text) in [
+            (&first, "m1", "first typed recall evidence"),
+            (&second, "m2", "second typed recall evidence"),
+        ] {
+            assert!(
+                output
+                    .volatile_preamble
+                    .iter()
+                    .any(|message| message_text(message).contains(text))
+            );
+            assert!(
+                !output
+                    .system_messages
+                    .iter()
+                    .any(|message| message_text(message).contains(text))
+            );
+            let recall = &output.breakdown.repository_memories[0];
+            assert_eq!(recall.memory_id, id);
+            assert_eq!(recall.memory_type, "semantic");
+            assert_eq!(recall.relevance_score, 0.9);
+        }
+    }
+
+    #[test]
+    fn shared_assembly_versions_capability_prefix_from_real_surfaces() {
+        let _lock = astra_core::sync_poison::recover_mutex_lock(
+            &crate::turn::prompt_cache::CACHE_ENV_MUTEX,
+        );
+        for provider in ["openai", "anthropic"] {
+            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+            let restricted = HashSet::new();
+            let edge = Map::new();
+            let cache = PromptCacheConfig {
+                cache_enabled: true,
+                is_anthropic: provider == "anthropic",
+            };
+            let mut assemble = |tools: &[Value], manifest: &str| {
+                let mut input = context_contract_input(
+                    &mut state,
+                    ToolSurfacePlan::from_visible_tools(tools, &restricted)
+                        .with_deferred_tools_block(manifest),
+                    RuntimeSignals::new(&edge, None),
+                    &cache,
+                );
+                input.provider = provider;
+                assemble_context_pipeline(input).expect("shared pipeline")
+            };
+            let bash = vec![tool("bash")];
+            let first = assemble(&bash, "<deferred-tools>github</deferred-tools>");
+            let changed_manifest =
+                assemble(&bash, "<deferred-tools>github web_fetch</deferred-tools>");
+            assert_ne!(first.system_messages, changed_manifest.system_messages);
+            assert_eq!(first.volatile_preamble, changed_manifest.volatile_preamble);
+            let changed_tools = assemble(
+                &[tool("bash"), tool("tool_search")],
+                "<deferred-tools>github web_fetch</deferred-tools>",
+            );
+            assert_ne!(
+                changed_manifest.system_messages,
+                changed_tools.system_messages
+            );
+            assert_eq!(
+                changed_manifest.volatile_preamble,
+                changed_tools.volatile_preamble
+            );
+            let stable = changed_tools
+                .system_messages
+                .iter()
+                .map(message_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(stable.contains("tool_search"));
+            assert!(stable.contains("<deferred-tools>"));
+            let dynamic = changed_tools
+                .volatile_preamble
+                .iter()
+                .map(message_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!dynamic.contains("<deferred-tools>"));
+            if provider == "anthropic" {
+                assert!(cache_control_count(&json!(changed_tools.system_messages)) > 0);
+            }
+        }
+    }
+
+    #[test]
+    fn shared_assembly_keeps_edge_runtime_advice_and_extra_text_volatile() {
+        let _lock = astra_core::sync_poison::recover_mutex_lock(
+            &crate::turn::prompt_cache::CACHE_ENV_MUTEX,
+        );
+        use crate::prompts::{PromptSection, PromptTokenBucket};
+        let tools = vec![tool("bash")];
+        let restricted = HashSet::new();
+        let cache = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let extra = vec![
+            PromptSection::dynamic(
+                "## Session Anchor\nKeep the accepted goal.",
+                PromptTokenBucket::Environment,
+            ),
+            PromptSection::dynamic(
+                "## Feedback Rules\nReport validation failures.",
+                PromptTokenBucket::Environment,
+            ),
+        ];
+        let assemble = |advice: &str| {
+            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+            let mut edge = Map::new();
+            edge.insert(
+                "system_prompt_override".into(),
+                json!("Stable session contract"),
+            );
+            edge.insert(
+                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS
+                    .into(),
+                json!([format!(
+                    "## Runtime Turn Context\n{{\"raw_advice\":\"{advice}\"}}"
+                )]),
+            );
+            assemble_context_pipeline(context_contract_input(
+                &mut state,
+                ToolSurfacePlan::from_visible_tools(&tools, &restricted),
+                RuntimeSignals::new(&edge, None).with_extra_sections(&[], &extra),
+                &cache,
+            ))
+            .expect("shared pipeline")
+        };
+        let first = assemble("first");
+        let second = assemble("second");
+        assert_eq!(first.system_messages, second.system_messages);
+        assert_ne!(first.volatile_preamble, second.volatile_preamble);
+        for (output, advice) in [(&first, "first"), (&second, "second")] {
+            let stable = output
+                .system_messages
+                .iter()
+                .map(message_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let dynamic = output
+                .volatile_preamble
+                .iter()
+                .map(message_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(stable.contains("Stable session contract"));
+            assert!(!stable.contains("raw_advice"));
+            assert!(dynamic.contains(&format!("\"raw_advice\":\"{advice}\"")));
+            for text in [
+                "## Session Anchor\nKeep the accepted goal.",
+                "## Feedback Rules\nReport validation failures.",
+            ] {
+                assert!(dynamic.contains(text));
+                assert!(!stable.contains(text));
+            }
+        }
+    }
+
+    #[test]
+    fn shared_assembly_uses_declared_layout_and_stable_bytes() {
+        let _lock = astra_core::sync_poison::recover_mutex_lock(
+            &crate::turn::prompt_cache::CACHE_ENV_MUTEX,
+        );
+        use astra_turn_core::cache_placement::{
+            CacheCapability, CacheProtocol, VolatileDeliveryPolicy, VolatilePlacement,
+        };
+        let explicit = CacheCapability {
+            protocol: CacheProtocol::MarkerExplicit,
+            volatile_placement: VolatilePlacement::MarkerIsolated,
+            volatile_delivery: VolatileDeliveryPolicy::All,
+            reuse_scope: None,
+        };
+        for (provider, capability, blocks) in [
+            ("openai", None, false),
+            ("anthropic", None, true),
+            ("openai", Some(explicit), true),
+        ] {
+            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+            let tools = vec![tool("bash")];
+            let restricted = HashSet::new();
+            let edge = Map::new();
+            let cache = PromptCacheConfig {
+                cache_enabled: true,
+                is_anthropic: blocks,
+            };
+            let mut assemble = || {
+                let mut input = context_contract_input(
+                    &mut state,
+                    ToolSurfacePlan::from_visible_tools(&tools, &restricted),
+                    RuntimeSignals::new(&edge, None),
+                    &cache,
+                );
+                input.provider = provider;
+                input.cache_capability = capability;
+                assemble_context_pipeline(input).expect("shared pipeline")
+            };
+            let first = assemble();
+            let second = assemble();
+            assert_eq!(
+                serde_json::to_vec(&first.system_messages).unwrap(),
+                serde_json::to_vec(&second.system_messages).unwrap()
+            );
+            assert!(!first.system_messages.is_empty());
+            for message in &first.system_messages {
+                if blocks {
+                    assert!(
+                        message["content"]
+                            .as_array()
+                            .is_some_and(|blocks| !blocks.is_empty())
+                    );
+                } else {
+                    assert!(
+                        message["content"]
+                            .as_str()
+                            .is_some_and(|text| !text.is_empty())
+                    );
+                }
+            }
+            assert_eq!(
+                cache_control_count(&json!(first.system_messages)) > 0,
+                blocks
+            );
+            let stable = first
+                .system_messages
+                .iter()
+                .map(message_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let dynamic = first
+                .volatile_preamble
+                .iter()
+                .map(message_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!stable.contains("Model: gpt-4o"));
+            assert!(dynamic.contains("Model: gpt-4o"));
+        }
+    }
+
+    #[test]
+    fn shared_assembly_prompt_override_is_cached_until_new_session() {
+        let _lock = astra_core::sync_poison::recover_mutex_lock(
+            &crate::turn::prompt_cache::CACHE_ENV_MUTEX,
+        );
+        struct RestoreOverride(Option<std::ffi::OsString>);
+        impl Drop for RestoreOverride {
+            fn drop(&mut self) {
+                // SAFETY: this test holds the shared prompt environment mutex.
+                unsafe {
+                    if let Some(value) = self.0.take() {
+                        std::env::set_var("ASTRA_PROMPT_OVERRIDES_DIR", value);
+                    } else {
+                        std::env::remove_var("ASTRA_PROMPT_OVERRIDES_DIR");
+                    }
+                }
+            }
+        }
+        let _restore = RestoreOverride(std::env::var_os("ASTRA_PROMPT_OVERRIDES_DIR"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core_rules.txt");
+        // SAFETY: this test holds the shared prompt environment mutex.
+        unsafe {
+            std::env::set_var("ASTRA_PROMPT_OVERRIDES_DIR", dir.path());
+        }
+        let tools = vec![tool("bash")];
+        let restricted = HashSet::new();
+        let edge = Map::new();
+        let cache = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let assemble = |state: &mut AgenticLoopState| {
+            let output = assemble_context_pipeline(context_contract_input(
+                state,
+                ToolSurfacePlan::from_visible_tools(&tools, &restricted),
+                RuntimeSignals::new(&edge, None),
+                &cache,
+            ))
+            .expect("shared pipeline");
+            output
+                .system_messages
+                .iter()
+                .map(message_text)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        std::fs::write(&path, "FIRST_OVERRIDE_SENTINEL").unwrap();
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        let first = assemble(&mut state);
+        assert!(first.contains("FIRST_OVERRIDE_SENTINEL"));
+        std::fs::write(&path, "SECOND_OVERRIDE_SENTINEL").unwrap();
+        let cached = assemble(&mut state);
+        assert!(cached.contains("FIRST_OVERRIDE_SENTINEL"));
+        assert!(!cached.contains("SECOND_OVERRIDE_SENTINEL"));
+        let refreshed = assemble(&mut crate::turn::agentic_loop::host::make_test_loop_state());
+        assert!(refreshed.contains("SECOND_OVERRIDE_SENTINEL"));
+        assert!(!refreshed.contains("FIRST_OVERRIDE_SENTINEL"));
     }
 
     #[test]
@@ -2622,8 +3518,68 @@ mod context_cache_contract_tests {
     }
 
     #[test]
+    fn memory_selection_projection_distinguishes_selection_from_final_inclusion() {
+        let mut edge_profile = serde_json::Map::new();
+        edge_profile.insert(
+            "memory_selection_reports".into(),
+            json!([{
+                "session_id": "session-1", "turn": 2,
+                "operation": "relevance", "method": "model", "reason": "completed",
+                "model": "jev-test", "elapsed_ms": 12,
+                "selection_order": [0], "candidates": [
+                    {"index": 0, "selected": true, "probability_bps": 9000},
+                    {"index": 1, "selected": false, "probability_bps": 1000}
+                ]
+            }]),
+        );
+        edge_profile.insert(
+            "lessons_text".into(),
+            Value::String("prompt_shape:rust:run cargo test".into()),
+        );
+
+        let included = memory_selection_reports_with_projection(
+            &edge_profile,
+            "session-1",
+            2,
+            &[astra_turn_core::context_serializer::SerializedSystemBlock {
+                kind: astra_turn_core::section_types::SectionKind::RuntimeIdentity,
+                scope: astra_turn_core::section_types::CacheScope::Session,
+                text: "## Session Lessons\nprompt_shape:rust:run cargo test".into(),
+                cache_control: None,
+            }],
+        );
+        assert_eq!(
+            included[0].prompt_projection,
+            Some(astra_turn_types::MemoryPromptProjection {
+                selected_candidates: 1,
+                included_candidates: Some(1),
+            })
+        );
+
+        let omitted = memory_selection_reports_with_projection(
+            &edge_profile,
+            "session-1",
+            2,
+            &[astra_turn_core::context_serializer::SerializedSystemBlock {
+                kind: astra_turn_core::section_types::SectionKind::WorkingMemory,
+                scope: astra_turn_core::section_types::CacheScope::Session,
+                text: "prompt_shape:rust:run cargo test".into(),
+                cache_control: None,
+            }],
+        );
+        assert_eq!(
+            omitted[0].prompt_projection,
+            Some(astra_turn_types::MemoryPromptProjection {
+                selected_candidates: 1,
+                included_candidates: None,
+            })
+        );
+    }
+
+    #[test]
     fn assemble_context_pipeline_keeps_required_runtime_system_context_for_strict_history() {
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.session_turn = 1;
         state
             .messages
             .push(json!({"role": "user", "content": "which model are you?"}));
@@ -2631,6 +3587,21 @@ mod context_cache_contract_tests {
         let runtime_policy =
             "Terminal Control Policy: the delegated action must be first and terminal.";
         let mut edge_profile = serde_json::Map::new();
+        edge_profile.insert(
+            "memory_selection_reports".into(),
+            json!([{
+                "session_id": "sid-deepseek", "turn": 1,
+                "operation": "relevance", "method": "model", "reason": "completed",
+                "model": "jev-test", "elapsed_ms": 12,
+                "selection_order": [0], "candidates": [{"index": 0, "selected": true, "probability_bps": 9000}]
+            }]),
+        );
+        edge_profile.insert(
+            "lessons_text".into(),
+            Value::String("prompt_shape:rust:run cargo test".into()),
+        );
+        assert!(edge_memory_selection_reports(&edge_profile, "other-session", 1).is_empty());
+        assert!(edge_memory_selection_reports(&edge_profile, "sid-deepseek", 2).is_empty());
         edge_profile.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS
                 .to_string(),
@@ -2641,7 +3612,7 @@ mod context_cache_contract_tests {
                 .to_string(),
             json!(["## Volatile\nmust be suppressed"]),
         );
-        let visible_tools = vec![tool("bash")];
+        let visible_tools = vec![tool("bash"), tool("agent")];
         let restricted_tools = HashSet::new();
         let cache_cfg = PromptCacheConfig {
             cache_enabled: false,
@@ -2672,6 +3643,27 @@ mod context_cache_contract_tests {
         })
         .expect("context pipeline should assemble");
 
+        let decisions = &output
+            .explain_analyze_context_assembly
+            .as_ref()
+            .unwrap()
+            .edge_memory_selection;
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].selected_indices(), vec![0]);
+        assert_eq!(
+            decisions[0].prompt_projection,
+            Some(astra_turn_types::MemoryPromptProjection {
+                selected_candidates: 1,
+                included_candidates: Some(1),
+            })
+        );
+        assert_eq!(decisions[0].candidates[0].probability_bps, Some(9000));
+        assert!(
+            !serde_json::to_string(&output.system_messages)
+                .unwrap()
+                .contains("probability_bps")
+        );
+
         let primary_text = output
             .system_messages
             .first()
@@ -2683,6 +3675,10 @@ mod context_cache_contract_tests {
             "runtime model identity must stay out of the strict-history prefix: {primary_text}"
         );
         assert!(!primary_text.contains("via openai"));
+        assert!(
+            primary_text.contains("prompt_shape:rust:run cargo test"),
+            "selected session lesson should enter the strict-history stable request: {primary_text}"
+        );
         assert!(
             !primary_text.contains("must be suppressed"),
             "ordinary volatile content must stay out of strict-history stable prompt: {primary_text}"
@@ -2786,6 +3782,16 @@ mod context_cache_contract_tests {
             }),
             "required control policy must reach the strict-history provider wire: {wire:#?}"
         );
+        assert!(
+            wire.iter().any(
+                |message| message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text
+                        .contains("the first native call is `agent(action=\"spawn\", ...)`"))
+            ),
+            "ordinary delegation guidance must survive strict-history wire assembly"
+        );
         assert_eq!(
             wire.last(),
             Some(&json!({"role": "user", "content": "which model are you?"}))
@@ -2867,7 +3873,6 @@ mod context_cache_contract_tests {
             volatile_preamble: Vec::new(),
             compacted_messages: state.messages.clone(),
             state: &mut state,
-            compaction_boundary_hit: false,
             thinking: &thinking,
             session_id: "sid",
             provider: "openai",
@@ -2907,11 +3912,11 @@ mod context_cache_contract_tests {
             "short request".to_string(),
             "bounded input data ".repeat(5_000),
         ] {
-            for compaction_boundary_hit in [false, true] {
+            for round in [0, 3] {
                 let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
                 state.message = text.clone();
                 state.user_intent = text.clone();
-                state.current_round_index = if compaction_boundary_hit { 3 } else { 0 };
+                state.current_round_index = round;
                 state.messages = vec![json!({"role":"user", "content":text})];
                 let original = state.messages.clone();
                 let canonical_bytes = serde_json::to_vec(&original).unwrap().len();
@@ -2924,7 +3929,6 @@ mod context_cache_contract_tests {
                     volatile_preamble: Vec::new(),
                     compacted_messages: original.clone(),
                     state: &mut state,
-                    compaction_boundary_hit,
                     thinking: &thinking,
                     session_id: "focus-bound",
                     provider: "openai",
@@ -2989,7 +3993,6 @@ mod context_cache_contract_tests {
                 volatile_preamble: Vec::new(),
                 compacted_messages: state.messages.clone(),
                 state,
-                compaction_boundary_hit: true,
                 thinking: &thinking,
                 session_id: "artifact-session",
                 provider: "openai",
@@ -3084,7 +4087,6 @@ mod context_cache_contract_tests {
             volatile_preamble: vec![malformed],
             compacted_messages: state.messages.clone(),
             state: &mut state,
-            compaction_boundary_hit: false,
             thinking: &thinking,
             session_id: "sid",
             provider: "openai",
@@ -3106,7 +4108,6 @@ mod context_cache_contract_tests {
             volatile_preamble: Vec::new(),
             compacted_messages: state.messages.clone(),
             state: &mut state,
-            compaction_boundary_hit: false,
             thinking: &thinking,
             session_id: "sid",
             provider: "openai",
@@ -3148,7 +4149,6 @@ mod context_cache_contract_tests {
             volatile_preamble: Vec::new(),
             compacted_messages: state.messages.clone(),
             state: &mut state,
-            compaction_boundary_hit: false,
             thinking: &thinking,
             session_id: "sid",
             provider: "openai",
@@ -3183,8 +4183,233 @@ mod context_cache_contract_tests {
     }
 
     #[test]
-    fn edge_profile_active_turn_frame_cannot_churn_strict_provider_prefix() {
-        fn provider_messages(frame_value: &str) -> Vec<Value> {
+    fn active_turn_frame_is_canonical_once_per_human_turn() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.messages = vec![
+            json!({"role": "user", "content": "investigate the old issue"}),
+            json!({"role": "assistant", "content": "old issue findings"}),
+            json!({"role": "user", "content": "summarize the current issue"}),
+        ];
+
+        enqueue_active_turn_frame(&mut state, "summarize the current issue");
+        let first = state
+            .volatile_pending
+            .iter()
+            .find(|injection| {
+                injection.kind == crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame
+            })
+            .expect("first human turn gets one active frame")
+            .clone();
+        assert_eq!(first.round_index, 0);
+        assert_eq!(first.payload["schema"], "active_turn_frame.v1");
+        assert_eq!(
+            first.payload["latest_user_message_preview"],
+            "summarize the current issue"
+        );
+        assert_eq!(first.payload["latest_user_message_truncated"], false);
+        assert_eq!(
+            first.payload["immediate_prior_user_request_preview"],
+            "investigate the old issue"
+        );
+        assert_eq!(
+            first.payload["immediate_prior_assistant_response_preview"],
+            "old issue findings"
+        );
+
+        // Context-memory reruns in the same provider round replace the
+        // singleton with the same payload instead of stacking prompt noise.
+        enqueue_active_turn_frame(&mut state, "summarize the current issue");
+        assert_eq!(
+            state
+                .volatile_pending
+                .iter()
+                .filter(|injection| {
+                    injection.kind == crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame
+                })
+                .count(),
+            1
+        );
+        assert_eq!(state.volatile_pending[0].payload, first.payload);
+
+        // Later tool rounds already have the current goal in canonical
+        // history and must not mint a second frame.
+        state.current_round_index = 1;
+        enqueue_active_turn_frame(&mut state, "summarize the current issue");
+        assert_eq!(state.volatile_pending.len(), 1);
+        assert_eq!(state.volatile_pending[0].payload, first.payload);
+    }
+
+    #[test]
+    fn active_turn_frame_projects_to_append_only_runtime_authority() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.messages = vec![
+            json!({"role": "user", "content": "investigate the old issue"}),
+            json!({"role": "assistant", "content": "old issue findings"}),
+            json!({"role": "user", "content": "summarize the current issue"}),
+        ];
+        enqueue_active_turn_frame(&mut state, "summarize the current issue");
+
+        let capability = astra_turn_core::cache_placement::CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement:
+                astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
+        };
+        let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+        let wire = assemble_wire_messages(LlmWireAssemblyInput {
+            artifact_recovery_route: crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
+            system_messages: vec![json!({"role": "system", "content": "stable"})],
+            volatile_preamble: Vec::new(),
+            compacted_messages: state.messages.clone(),
+            state: &mut state,
+            thinking: &thinking,
+            session_id: "active-frame-append-only",
+            provider: "openai",
+            model_name: "deepseek-v4-flash",
+            cache_capability: Some(capability),
+            cache_cfg: &PromptCacheConfig::latch("openai"),
+        })
+        .expect("append-only active frame must assemble");
+
+        let frame = state
+            .messages
+            .iter()
+            .find(|message| {
+                astra_turn_types::runtime_authority_kind(message) == Some("active_turn_frame")
+            })
+            .expect("append-only frame persisted in canonical history");
+        assert_eq!(frame["role"], "user");
+        assert_eq!(
+            astra_turn_types::runtime_authority_lifetime(frame),
+            Some(astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn)
+        );
+        assert!(!astra_turn_types::is_human_user_message(frame));
+        assert!(wire.iter().any(|message| {
+            astra_turn_types::runtime_authority_kind(message) == Some("active_turn_frame")
+        }));
+        assert!(wire.iter().any(|message| {
+            message_text(message).contains("immediate_prior_assistant_response_preview")
+        }));
+    }
+
+    #[test]
+    fn active_turn_frame_reuses_immutable_context_after_failed_retry_and_history_trim() {
+        let long_current = format!(
+            "{} keep this scope and disable tools at the end",
+            "x".repeat(2_200)
+        );
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.messages = vec![
+            json!({"role": "user", "content": "investigate the old issue"}),
+            json!({"role": "assistant", "content": "old issue findings"}),
+            json!({"role": "user", "content": long_current}),
+        ];
+        enqueue_active_turn_frame(&mut state, &long_current);
+        let original = state.volatile_pending[0].payload.clone();
+        assert_eq!(original["latest_user_message_truncated"], true);
+        assert!(
+            original["latest_user_message_preview"]
+                .as_str()
+                .expect("preview text")
+                .ends_with("...")
+        );
+        assert!(
+            !original["latest_user_message_preview"]
+                .as_str()
+                .expect("preview text")
+                .contains("disable tools at the end")
+        );
+        assert_eq!(
+            state
+                .messages
+                .last()
+                .and_then(|message| message.get("content")),
+            Some(&Value::String(long_current.clone())),
+            "the full current request remains in canonical conversation history"
+        );
+        assert_eq!(
+            original["canonical_source"], "conversation_history",
+            "the bounded field must identify itself as a non-authoritative preview"
+        );
+
+        state.lease_volatile_pending().expect("lease first attempt");
+        state.restore_volatile_attempt_lease();
+        state.messages.truncate(1);
+        state
+            .messages
+            .push(json!({"role": "user", "content": long_current}));
+        enqueue_active_turn_frame(&mut state, &long_current);
+        assert_eq!(state.volatile_pending.len(), 1);
+        assert_eq!(
+            state.volatile_pending[0].payload, original,
+            "retry must reuse the exact frame instead of rebuilding from trimmed history"
+        );
+
+        let append_only = astra_turn_core::cache_placement::CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement:
+                astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
+        };
+        let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+        let _wire = assemble_wire_messages(LlmWireAssemblyInput {
+            artifact_recovery_route: crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
+            system_messages: vec![json!({"role": "system", "content": "stable"})],
+            volatile_preamble: Vec::new(),
+            compacted_messages: state.messages.clone(),
+            state: &mut state,
+            thinking: &thinking,
+            session_id: "active-frame-canonical",
+            provider: "openai",
+            model_name: "deepseek-v4-flash",
+            cache_capability: Some(append_only),
+            cache_cfg: &PromptCacheConfig::latch("openai"),
+        })
+        .expect("append-only frame must commit after retry");
+        let canonical = state
+            .messages
+            .iter()
+            .find(|message| {
+                astra_turn_types::runtime_authority_kind(message) == Some("active_turn_frame")
+            })
+            .expect("committed active frame")
+            .clone();
+        state.messages = vec![
+            json!({"role": "user", "content": long_current}),
+            canonical.clone(),
+        ];
+        state.volatile_pending.clear();
+        enqueue_active_turn_frame(&mut state, &long_current);
+        assert!(state.volatile_pending.is_empty());
+        assert!(state.messages.iter().any(|message| message == &canonical));
+
+        state.current_round_index = 0;
+        state
+            .messages
+            .push(json!({"role": "assistant", "content": "done"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "new request"}));
+        state.volatile_pending.clear();
+        enqueue_active_turn_frame(&mut state, "new request");
+        assert_eq!(state.volatile_pending.len(), 1);
+        assert_ne!(state.volatile_pending[0].payload, original);
+        assert_eq!(
+            state.volatile_pending[0].payload["latest_user_message_preview"],
+            "new request"
+        );
+    }
+
+    #[test]
+    fn edge_profile_advisory_delivery_respects_cache_capability() {
+        fn provider_messages(
+            frame_value: &str,
+            cache_cap: astra_turn_core::cache_placement::CacheCapability,
+        ) -> Vec<Value> {
             let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
             state.messages = vec![
                 json!({"role": "user", "content": "review the current change"}),
@@ -3195,18 +4420,26 @@ mod context_cache_contract_tests {
             edge_profile.insert(
                 astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS
                     .to_string(),
-                json!([astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
-                    kind: "active_turn_frame".to_string(),
-                    delivery_class: astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext,
-                    payload: json!({"latest_user_message": frame_value, "turn_id": frame_value}),
-                    round_index: 1,
-                    authority_lifetime: None,
-                }]),
+                json!([
+                    astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
+                        kind: "active_turn_frame".to_string(),
+                        delivery_class: astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext,
+                        payload: json!({"latest_user_message": frame_value, "turn_id": frame_value}),
+                        round_index: 1,
+                        authority_lifetime: None,
+                    },
+                    astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
+                        kind: "policy_advisory".to_string(),
+                        delivery_class: astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::AdvisoryEvidence,
+                        payload: json!({"revision": 3, "instruction": frame_value}),
+                        round_index: 1,
+                        authority_lifetime: None,
+                    }
+                ]),
             );
             let visible_tools = vec![tool("bash")];
             let restricted_tools = HashSet::new();
             let cache_cfg = PromptCacheConfig::latch("openai");
-            let strict_history = strict_history_cache_capability();
             let output = assemble_context_pipeline(LlmContextAssemblyInput {
                 state: &mut state,
                 session_id: "sid-edge-frame",
@@ -3220,7 +4453,7 @@ mod context_cache_contract_tests {
                 model_name: "deepseek-v4-flash",
                 context_window: Some(200_000),
                 max_completion_tokens: Some(16_384),
-                cache_capability: Some(strict_history),
+                cache_capability: Some(cache_cap),
                 user_content: "summarize it",
                 query_source: "test",
             })
@@ -3235,18 +4468,19 @@ mod context_cache_contract_tests {
                 "openai",
                 "deepseek-v4-flash",
                 &astra_turn_core::thinking_config::ThinkingConfig::Off,
-                Some(strict_history),
+                Some(cache_cap),
                 &cache_cfg,
             );
             crate::turn::llm::client::consolidate_system_messages_for_provider(
                 &wire,
                 "openai",
-                Some(strict_history),
+                Some(cache_cap),
             )
         }
 
-        let first = provider_messages("frame-alpha-dynamic-value");
-        let second = provider_messages("frame-beta-dynamic-value");
+        let strict = strict_history_cache_capability();
+        let first = provider_messages("frame-alpha-dynamic-value", strict);
+        let second = provider_messages("frame-beta-dynamic-value", strict);
         assert_eq!(first[0]["role"], "system");
         assert_eq!(
             first[0], second[0],
@@ -3256,6 +4490,50 @@ mod context_cache_contract_tests {
         assert!(system.contains("active_turn_focus_policy.v1"));
         assert!(!system.contains("frame-alpha-dynamic-value"));
         assert!(!message_text(&second[0]).contains("frame-beta-dynamic-value"));
+        assert!(
+            first
+                .iter()
+                .all(|message| { !message_text(message).contains("runtime-advisory-evidence") }),
+            "required-only cache capability must suppress optional advisory"
+        );
+        let all = astra_turn_core::cache_placement::CacheCapability {
+            volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
+            ..strict
+        };
+        let delivered_first = provider_messages("frame-alpha-dynamic-value", all);
+        let delivered_second = provider_messages("frame-beta-dynamic-value", all);
+        let advisory_index = delivered_first
+            .iter()
+            .position(|message| message_text(message).contains("runtime-advisory-evidence"))
+            .expect("all-delivery capability must include advisory on the wire");
+        assert!(
+            advisory_index >= 3,
+            "current-user placement must retain the preceding conversation prefix"
+        );
+        assert_eq!(
+            delivered_first[advisory_index + 1]["role"],
+            "user",
+            "required active-turn context must remain after optional advisory"
+        );
+        assert!(message_text(&delivered_first[advisory_index + 1]).contains("active_turn_frame"));
+        assert_eq!(delivered_first[advisory_index + 2]["role"], "user");
+        assert_eq!(
+            message_text(&delivered_first[advisory_index + 2]),
+            "summarize it"
+        );
+        assert_eq!(
+            &delivered_first[..advisory_index],
+            &delivered_second[..advisory_index],
+            "dynamic advisory must not churn the provider prefix before its tail"
+        );
+        assert!(delivered_first.iter().any(|message| {
+            message_text(message).contains("runtime-advisory-evidence")
+                && message_text(message).contains("frame-alpha-dynamic-value")
+        }));
+        assert!(delivered_second.iter().any(|message| {
+            message_text(message).contains("runtime-advisory-evidence")
+                && message_text(message).contains("frame-beta-dynamic-value")
+        }));
         assert!(first.iter().any(|message| {
             message.get("role").and_then(Value::as_str) == Some("user")
                 && message_text(message) == "summarize it"
@@ -3280,7 +4558,6 @@ mod context_cache_contract_tests {
             volatile_preamble: Vec::new(),
             compacted_messages: state.messages.clone(),
             state: &mut state,
-            compaction_boundary_hit: false,
             thinking: &thinking,
             session_id: "sid",
             provider: "openai",
@@ -3299,168 +4576,219 @@ mod context_cache_contract_tests {
         assert!(state.volatile_pending.is_empty());
     }
 
-    #[test]
-    fn invoked_skill_recovery_is_scoped_to_history_rewrite() {
-        fn assemble(compaction_boundary_hit: bool) -> Vec<Value> {
-            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
-            state.messages = vec![
-                json!({"role": "user", "content": "load the review skill"}),
-                json!({
-                    "role": "assistant",
-                    "content": null,
-                    "tool_calls": [{
-                        "id": "skill-1",
-                        "type": "function",
-                        "function": {"name": "skill", "arguments": "{\"name\":\"review\"}"}
-                    }]
-                }),
-                json!({
-                    "role": "tool",
-                    "tool_call_id": "skill-1",
-                    "content": "review instructions"
-                }),
-            ];
-            state.skills.execution.invoked.insert(
-                "review".to_string(),
-                crate::turn::skill_tool::InvokedSkill {
-                    name: "review".to_string(),
-                    content: "review instructions".to_string(),
-                    invoked_at_turn: 1,
-                    reentry_count: 0,
-                    execution_topology: None,
-                },
-            );
-            let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
-            assemble_wire_messages(LlmWireAssemblyInput {
-                artifact_recovery_route:
-                    crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
-                system_messages: vec![json!({"role": "system", "content": "stable"})],
-                volatile_preamble: Vec::new(),
-                compacted_messages: state.messages.clone(),
-                state: &mut state,
-                compaction_boundary_hit,
-                thinking: &thinking,
-                session_id: "skill-recovery",
-                provider: "openai",
-                model_name: "deployment",
-                cache_capability: None,
-                cache_cfg: &PromptCacheConfig::latch("openai"),
-            })
-            .expect("wire assembly should preserve the canonical skill result")
-        }
-
-        let is_skill_recovery = |message: &Value| {
-            crate::turn::wire_assembly::runtime_authority_kind_for_projection(message)
-                .is_some_and(|kind| kind.starts_with("invoked_skill_context:"))
+    fn skill_recovery_wire(
+        state: &mut AgenticLoopState,
+        placement: astra_turn_core::cache_placement::VolatilePlacement,
+    ) -> Vec<Value> {
+        let capability = astra_turn_core::cache_placement::CacheCapability {
+            volatile_placement: placement,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            ..astra_turn_core::cache_placement::CacheCapability::for_provider("openai")
         };
-
-        let ordinary = assemble(false);
-        assert_eq!(
-            ordinary
-                .iter()
-                .filter(|message| is_skill_recovery(message))
-                .count(),
-            0,
-            "an ordinary tool round must not replay a skill already present in canonical history"
-        );
-
-        let recovered = assemble(true);
-        assert_eq!(
-            recovered
-                .iter()
-                .filter(|message| is_skill_recovery(message))
-                .count(),
-            1,
-            "a real history rewrite may restore one bounded skill attachment"
-        );
-        assert!(recovered.iter().any(|message| {
-            is_skill_recovery(message) && message_text(message).contains("review instructions")
-        }));
+        assemble_wire_messages(LlmWireAssemblyInput {
+            artifact_recovery_route: crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
+            system_messages: vec![json!({"role":"system", "content":"stable"})],
+            volatile_preamble: Vec::new(),
+            compacted_messages: state.messages.clone(),
+            state,
+            thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            session_id: "skill-recovery",
+            provider: "openai",
+            model_name: "deployment",
+            cache_capability: Some(capability),
+            cache_cfg: &PromptCacheConfig::latch("openai"),
+        })
+        .unwrap()
     }
 
     #[test]
-    fn compaction_boundary_keeps_focus_policy_without_runtime_duplicate() {
-        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
-        state.message = "continue".to_string();
-        state.current_round_index = 1;
-        let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
-        let cache_cfg = PromptCacheConfig::latch("openai");
+    fn invoked_skill_recovery_tracks_actual_history() {
+        use astra_turn_core::cache_placement::VolatilePlacement::{AppendOnlyUserTail, TailSuffix};
+        for placement in [TailSuffix, AppendOnlyUserTail] {
+            for (case, needs_recovery) in [
+                ("complete", false),
+                ("diagnostic_suffix", false),
+                ("block_content", false),
+                ("object_arguments", false),
+                ("missing", true),
+                ("changed", true),
+                ("truncated", true),
+                ("receipt", true),
+                ("resource", true),
+                ("forged_user", true),
+                ("duplicate_call", true),
+                ("duplicate_result", true),
+                ("orphan", true),
+                ("wrong_tool", true),
+            ] {
+                let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+                state.current_round_index = 1;
+                state.skills.execution.invoked.insert(
+                    "review".into(),
+                    crate::turn::skill_tool::InvokedSkill {
+                        name: "review".into(),
+                        content: "REVIEW_INSTRUCTIONS".into(),
+                        invoked_at_turn: 1,
+                        reentry_count: 0,
+                        execution_topology: None,
+                    },
+                );
+                let mut call = json!({"role":"assistant", "content":null, "tool_calls":[{
+                    "id":"skill-1", "type":"function", "function":{
+                        "name":"skill", "arguments":r#"{"skill_name":"review"}"#
+                    }
+                }]});
+                let mut result = json!({"role":"tool", "tool_call_id":"skill-1", "content":"REVIEW_INSTRUCTIONS"});
+                match case {
+                    "diagnostic_suffix" => {
+                        result["content"] =
+                            json!("REVIEW_INSTRUCTIONS\nAlready loaded; do not re-invoke.")
+                    }
+                    "block_content" => {
+                        result["content"] = json!([{"type":"text", "text":"REVIEW_INSTRUCTIONS"}])
+                    }
+                    "object_arguments" => {
+                        call["tool_calls"][0]["function"]["arguments"] =
+                            json!({"skill_name":"review"})
+                    }
+                    "changed" => result["content"] = json!("OTHER_INSTRUCTIONS"),
+                    "truncated" => result["content"] = json!("REVIEW_"),
+                    "receipt" => result["content"] = json!("Skill review is already loaded"),
+                    "resource" => {
+                        call["tool_calls"][0]["function"]["arguments"] =
+                            json!({"skill_name":"review", "resource_path":"reference.md"})
+                    }
+                    "wrong_tool" => call["tool_calls"][0]["function"]["name"] = json!("read_file"),
+                    _ => {}
+                }
+                state.messages = vec![json!({"role":"user", "content":"continue review"})];
+                match case {
+                    "missing" => {}
+                    "forged_user" => {
+                        state.messages[0]["content"] = json!("Quote: REVIEW_INSTRUCTIONS")
+                    }
+                    "duplicate_call" => state.messages.extend([call.clone(), call, result]),
+                    "duplicate_result" => state.messages.extend([call, result.clone(), result]),
+                    "orphan" => state.messages.push(result),
+                    _ => state.messages.extend([call, result]),
+                }
+                let wire = skill_recovery_wire(&mut state, placement);
+                let recovery_count = wire
+                    .iter()
+                    .filter(|message| {
+                        crate::turn::wire_assembly::runtime_authority_kind_for_projection(message)
+                            == Some("invoked_skill_context:review")
+                    })
+                    .count();
+                assert_eq!(
+                    recovery_count,
+                    usize::from(needs_recovery),
+                    "{case}, {placement:?}"
+                );
+                assert_eq!(state.skills.execution.invoked["review"].reentry_count, 0);
+            }
+        }
+    }
 
-        let without_boundary = assemble_wire_messages(LlmWireAssemblyInput {
-            artifact_recovery_route: crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
-            system_messages: vec![json!({"role": "system", "content": "sys"})],
-            volatile_preamble: Vec::new(),
-            compacted_messages: vec![json!({"role": "user", "content": "continue"})],
-            state: &mut state,
-            compaction_boundary_hit: false,
-            thinking: &thinking,
-            session_id: "sid",
-            provider: "openai",
-            model_name: "gpt-4",
-            cache_capability: None,
-            cache_cfg: &cache_cfg,
-        })
-        .unwrap();
-        assert!(
-            !without_boundary
-                .iter()
-                .any(|message| { message_text(message).contains("Post-compaction context: file") })
-        );
-
-        let with_boundary = assemble_wire_messages(LlmWireAssemblyInput {
-            artifact_recovery_route: crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
-            system_messages: vec![json!({"role": "system", "content": "sys"})],
-            volatile_preamble: Vec::new(),
-            compacted_messages: vec![json!({"role": "user", "content": "continue"})],
-            state: &mut state,
-            compaction_boundary_hit: true,
-            thinking: &thinking,
-            session_id: "sid",
-            provider: "openai",
-            model_name: "gpt-4",
-            cache_capability: None,
-            cache_cfg: &cache_cfg,
-        })
-        .unwrap();
-        assert!(with_boundary.iter().any(|message| {
-            message.get("role").and_then(Value::as_str) == Some("system")
-                && message_text(message).contains("active_turn_focus_policy.v1")
-        }));
-        assert!(
-            with_boundary
-                .iter()
-                .all(|message| !message_text(message).contains("Post-compaction context: file"))
-        );
-
-        // A second stateless request may cross another real boundary in the
-        // same user turn. Its compacted history is independent of the first
-        // request, but the invariant focus policy remains the same stable
-        // system section. Compaction itself stays workspace-I/O-free; fresh
-        // bytes require an ordinary governed read_file call.
-        let with_second_boundary = assemble_wire_messages(LlmWireAssemblyInput {
-            artifact_recovery_route: crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
-            system_messages: vec![json!({"role": "system", "content": "sys"})],
-            volatile_preamble: Vec::new(),
-            compacted_messages: vec![json!({"role": "user", "content": "continue"})],
-            state: &mut state,
-            compaction_boundary_hit: true,
-            thinking: &thinking,
-            session_id: "sid",
-            provider: "openai",
-            model_name: "gpt-4",
-            cache_capability: None,
-            cache_cfg: &cache_cfg,
-        })
-        .unwrap();
-        assert!(with_second_boundary.iter().any(|message| {
-            message.get("role").and_then(Value::as_str) == Some("system")
-                && message_text(message).contains("active_turn_focus_policy.v1")
-        }));
-        assert!(
-            with_second_boundary
-                .iter()
-                .all(|message| !message_text(message).contains("Post-compaction context: file"))
-        );
+    #[test]
+    fn invoked_skills_survive_ordinary_rounds_and_continuation_restore() {
+        use crate::turn::agentic_loop::host::OriginalLoopExecutionFacts;
+        use astra_turn_core::cache_placement::VolatilePlacement::{AppendOnlyUserTail, TailSuffix};
+        for placement in [TailSuffix, AppendOnlyUserTail] {
+            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+            state.current_round_index = 1;
+            state.messages = vec![
+                astra_turn_core::cloud::history_summary::history_summary_message(
+                    "Earlier work completed; review remains active.".into(),
+                ),
+                json!({"role":"user", "content":"continue review"}),
+            ];
+            // Equal activation turns must still give a stable prefix across
+            // reconstruction from the persisted execution facts.
+            for name in ["verify", "review"] {
+                state.skills.execution.invoked.insert(
+                    name.into(),
+                    crate::turn::skill_tool::InvokedSkill {
+                        name: name.into(),
+                        content: format!("{name}_UNIQUE_INSTRUCTIONS"),
+                        invoked_at_turn: 1,
+                        reentry_count: 3,
+                        execution_topology: None,
+                    },
+                );
+            }
+            for generation in 0..2 {
+                let admitted = state.messages.clone();
+                state.initialize_canonical_rewrite_proof(
+                    &admitted,
+                    &astra_turn_types::canonical_conversation_root(&admitted),
+                    generation,
+                );
+                for _ in 0..2 {
+                    let wire = skill_recovery_wire(&mut state, placement);
+                    let delivered =
+                        crate::turn::llm::client::consolidate_system_messages_for_provider(
+                            &wire,
+                            "openai",
+                            Some(astra_turn_core::cache_placement::CacheCapability {
+                                volatile_placement: placement,
+                                ..astra_turn_core::cache_placement::CacheCapability::for_provider(
+                                    "openai",
+                                )
+                            }),
+                        );
+                    let body = crate::turn::llm::client::build_provider_request_body(
+                        &delivered,
+                        &[],
+                        "deployment",
+                        "openai",
+                        Some(256),
+                        None,
+                        true,
+                        &astra_turn_core::thinking_config::ThinkingConfig::Off,
+                    );
+                    let text = body.to_string();
+                    for name in ["review", "verify"] {
+                        assert_eq!(
+                            text.matches(&format!("{name}_UNIQUE_INSTRUCTIONS")).count(),
+                            1,
+                            "{placement:?}, generation {generation}"
+                        );
+                        assert_eq!(state.skills.execution.invoked[name].reentry_count, 3);
+                    }
+                    assert!(
+                        text.find("review_UNIQUE").unwrap() < text.find("verify_UNIQUE").unwrap()
+                    );
+                    state
+                        .messages
+                        .push(json!({"role":"assistant", "content":"Continue authorized checks"}));
+                    state.current_round_index += 1;
+                }
+                let facts = OriginalLoopExecutionFacts::capture(&state).unwrap();
+                let restored: OriginalLoopExecutionFacts =
+                    serde_json::from_value(serde_json::to_value(facts).unwrap()).unwrap();
+                let (mode, packs) = crate::turn::canonical_commit::canonical_commit_delta(
+                    &admitted,
+                    true,
+                    &state.messages,
+                    state.canonical_rewrite_proof(),
+                    false,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
+                let mut committed = admitted;
+                committed.extend(packs.into_iter().flatten());
+                let history = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
+                    committed,
+                ).unwrap();
+                state = crate::turn::agentic_loop::host::make_test_loop_state();
+                state.current_round_index = 3;
+                state.messages = history;
+                state.skills.execution = restored.skill_execution;
+            }
+        }
     }
 
     #[test]
@@ -3682,7 +5010,7 @@ mod context_cache_contract_tests {
             run_id: "run-a",
             turn_index: 3,
             llm_attempt_index: 2,
-            pre_llm_messages: &messages,
+            message_tokens: ContextManifestMessageTokens::from_messages(&messages),
             tool_results: &[],
             schema_tokens: 7,
             result_prompt_tokens: Some(1_100),
@@ -3715,7 +5043,7 @@ mod context_cache_contract_tests {
 
     #[test]
     fn context_manifest_estimates_each_final_wire_zone_once() {
-        let messages = vec![
+        let mut messages = vec![
             json!({"role": "user", "content": "inspect"}),
             json!({
                 "role": "assistant",
@@ -3741,13 +5069,21 @@ mod context_cache_contract_tests {
             "result": "file body"
         })];
         let schema_tokens = 7;
+        let expected_wire_tokens = messages
+            .iter()
+            .map(estimate_json_tokens)
+            .fold(schema_tokens, u32::saturating_add);
+        let message_tokens = ContextManifestMessageTokens::from_messages(&messages);
+        // Hosts may compact canonical history while assembling the request.
+        // The persisted pre-request zone totals must not follow that mutation.
+        messages.clear();
         let projection = build_context_manifest_projection(ContextManifestProjectionInput {
             owner_id: "user-a",
             session_id: "session-a",
             run_id: "run-a",
             turn_index: 3,
             llm_attempt_index: 2,
-            pre_llm_messages: &messages,
+            message_tokens,
             tool_results: &duplicate_runtime_projection,
             schema_tokens,
             result_prompt_tokens: None,
@@ -3761,10 +5097,6 @@ mod context_cache_contract_tests {
             context_window_tokens: 64_000,
         });
 
-        let expected_wire_tokens = messages
-            .iter()
-            .map(estimate_json_tokens)
-            .fold(schema_tokens, u32::saturating_add);
         assert_eq!(projection.total_estimated_tokens, expected_wire_tokens);
         let zone_used_total = projection.manifest_json["zones"]
             .as_object()
@@ -3797,7 +5129,7 @@ mod context_cache_contract_tests {
             run_id: "run-a",
             turn_index: 3,
             llm_attempt_index: 2,
-            pre_llm_messages: &[],
+            message_tokens: ContextManifestMessageTokens::default(),
             tool_results: &tool_results,
             schema_tokens: 0,
             result_prompt_tokens: None,
@@ -3840,7 +5172,7 @@ mod context_cache_contract_tests {
             run_id: "run-a",
             turn_index: 3,
             llm_attempt_index: 2,
-            pre_llm_messages: &[],
+            message_tokens: ContextManifestMessageTokens::default(),
             tool_results: &invalid_results,
             schema_tokens: 0,
             result_prompt_tokens: None,
@@ -3882,7 +5214,7 @@ mod context_cache_contract_tests {
             run_id: "run-a",
             turn_index: 3,
             llm_attempt_index: 2,
-            pre_llm_messages: &[],
+            message_tokens: ContextManifestMessageTokens::default(),
             tool_results: &bounded_results,
             schema_tokens: 0,
             result_prompt_tokens: None,
@@ -3959,6 +5291,9 @@ mod context_cache_contract_tests {
             .expect("prepare provider body once");
             let wire = prepared.identity();
             attempts.push(crate::turn::llm::durable::DurableProviderAttemptFact {
+                qualified_usage: Some(
+                    astra_turn_types::CanonicalTokenUsage::new(None, None, None, None).unwrap(),
+                ),
                 request: crate::turn::llm::durable::DurableProviderRequestIdentity {
                     request_id: format!("attempt-{attempt}"),
                     request_hash: wire.provider_wire_hash.clone(),

@@ -29,9 +29,29 @@ matching as a correctness issue. Safety, admission, routing, blocking, retry,
 recovery, evaluation, and state transitions must use typed fields such as enums,
 `ErrorKind`, `result_class`, `exit_semantics`, structured JSON, protocol
 parsers, AST/token parsers, or exact machine-owned sentinel fields. Text
-matching is acceptable only for UI display/search, rendered-text tests, or
-explicitly named legacy `fallback` parsers that are not the primary decision
-path.
+matching is acceptable for UI display/search and rendered-text tests, not for
+legacy fallback decision paths.
+
+## Review Contract
+
+- Evaluate the requested product behavior and canonical owner, not just whether
+  the patch compiles. A systemic repair may require replacement or deletion;
+  unnecessary new layers and old/new mixed implementations are not progress.
+- Astra is treated as a fresh system: do not request backward compatibility,
+  data migration, dual paths, or legacy shims unless the user explicitly changes
+  that requirement. Distinguish this from required current crash/retry recovery.
+- A review authorizes inspection, not fixes, commits, pushes, or PR mutations.
+  Broader cleanup recommendations must stay separate from verified defects.
+- Perform ordinary review with the current agent. Independent review and model
+  or effort overrides apply only when required by the user or an applicable
+  configured workflow; this skill supplies no reviewer or model default.
+  Configure required overrides in the actual invocation, not just the prompt.
+  Record the requested and reported model/effort when available, reviewed
+  commit/diff identity, and review outcome. Do not infer hidden backend identity.
+- If the requested model or delegation is unavailable, disclose it; continue
+  safe inspection but do not silently substitute, present self-review as
+  independent review, or claim the required pre-commit review is complete.
+  A reviewer must not recursively delegate another review of itself.
 
 ## Task
 
@@ -46,6 +66,9 @@ git status --short
 git diff --stat
 ```
 
+These are inspections: omit Bash `mode`. `mode=verify` requests a separate
+unchanged-workspace proof after edits, not a check that a diagnostic command ran.
+
 Target resolution:
 
 | Target                    | Diff command                                                                    |
@@ -55,7 +78,7 @@ Target resolution:
 | `unstaged`                | `git diff`                                                                      |
 | `branch:<name>`           | `git diff <name>...HEAD`                                                        |
 | `commit:<sha>`            | `git show --stat <sha>` then `git show <sha>`                                   |
-| `commits:<N>`             | `git log --oneline -N`, then `git show` for every one of the N commits          |
+| `commits:<N>`             | Freeze N identities with `git log --oneline -N`; inspect summaries, file maps and bounded hunks for each |
 | `pr:<number>` / PR URL    | `gh pr diff` if `gh` is installed and authenticated; otherwise ask for the diff |
 
 For a commit, take file/add/delete totals from Git's canonical summary:
@@ -65,6 +88,11 @@ an `awk`/parser pipeline. Do not replace Git's shortstat with hand-summed raw
 `git show --numstat` output.
 
 If the diff is empty after checking staged and unstaged changes, report "No changes found."
+
+For PR feedback, fetch the latest review comments/threads and current head using
+read-only operations. Check whether each applies to the current code; explain
+adoption, rejection, or remaining uncertainty. Do not blindly implement comments
+or claim to have checked remote feedback from a stale local diff.
 
 Hard rule for `commits:<N>`: cover all N commits before presenting a full review,
 but inspect them in bounded commit/file sections instead of requesting one
@@ -80,6 +108,10 @@ capability is unavailable. The parent coordinates coverage and validates results
 it must not perform a duplicate broad review while the reviewers are running.
 Read-only reviewers may share immutable source. Use separate worktrees only when a
 reviewer may mutate files or reviewers need different refs.
+
+When independent review is required, hand off the frozen identities, owned scope
+and evidence locations, not copied diffs or file contents. The child reads its
+own evidence; the parent validates findings and investigates concrete gaps.
 
 Keep review evidence bounded at the source. Prefer per-file hunks and exact line
 ranges over full repository/commit dumps. If a tool returns an artifact reference,
@@ -100,7 +132,7 @@ For broad diffs, group files by owner before reading details:
 Then inspect the highest-risk files first:
 
 1. Public API or schema changes.
-2. Persistence writes, migrations, sync, restore.
+2. Persistence reads/writes, schema bootstrap, sync, restore.
 3. Async/concurrency/cancellation code.
 4. Auth/permissions/capability/tool visibility.
 5. Error handling and retry paths.
@@ -118,6 +150,20 @@ Treat an unwired implementation, dual writable truth, or a replacement that
 leaves the old owner active as a correctness finding. Do not recommend another
 compensating layer until the canonical owner and retirement path are clear.
 
+For affected hot paths and observation boundaries, check:
+
+- Does each I/O have a purpose, or can existing facts eliminate it? Are batching,
+  cache freshness/invalidation, tenant isolation, and transaction contention
+  demonstrated rather than inferred from a single-session result?
+- Are concurrency, pool/queue bounds, cancellation, unknown commit outcomes, and
+  retry ownership safe at the claimed session scale? Do not demand one transaction
+  per session or global batching without workload and atomicity evidence.
+- Do Trace/Explain/Introspect/Reflect share facts and correlation IDs? Are all
+  physical model calls, auxiliary judgments, and paid retries counted once, with
+  cache percentages, usage coverage, estimates, and overlapping timing explained?
+- Does any judge/router output actually change subsequent execution, with effect
+  evidence, or does the change merely record an unused recommendation?
+
 ## Step 3: Validate Findings
 
 Before reporting a finding:
@@ -132,6 +178,10 @@ reviewers does not raise confidence by itself. The parent must confirm each find
 against current source, a reachable failure sequence, and the actual ownership
 boundary before calling it verified. Stop exploring once every changed ownership
 boundary has evidence and every reported finding passes this gate.
+
+Check the latest diff again after fixes. Reuse evidence for unchanged boundaries
+and re-review material deltas; report partial coverage explicitly rather than
+restarting an unbounded audit or carrying an obsolete approval forward.
 
 Do not report:
 
@@ -160,9 +210,14 @@ Questions:
 
 Summary:
 - <one or two sentences on scope>
+- <deleted/consolidated owners and tests; remaining complexity and measured benefit>
 
 Tests:
 - <tests inspected or missing>
+- <real DB/performance evidence; unavailable checks are not passes>
+
+Review provenance:
+- <reviewed revision/diff; requested/reported model and effort; coverage limits>
 ```
 
 If no material issues are found, say so directly and mention residual risk or unrun tests.

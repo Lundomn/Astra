@@ -7,10 +7,11 @@ use super::turn_settlement::TurnDispatch;
 use super::turn_stream_runner::{
     TurnAttempt, TurnExecutionInput, TurnExecutionRequest, execute_stream_turn,
 };
-use crate::cli::session::session_adaptation::{finalize_turn_adaptation, prepare_turn_adaptation};
+use crate::cli::session::session_adaptation::prepare_turn_adaptation;
 use crate::cli::session::session_input::{finalize_effective_line, prepare_input};
 use crate::cli::session::session_runtime;
 use crate::cli::session::session_state::SessionState;
+use crate::cli::stream::streaming_types::UsageAttribution;
 use astra_services::session_journal::{
     JournalWriter, SessionExecutionLease, SessionExecutionLeaseError,
 };
@@ -137,6 +138,7 @@ fn is_high_severity_risk(risk: &astra_runtime::tool_sandbox::CommandRisk) -> boo
 pub(crate) struct TurnContext<'a> {
     pub(crate) api: &'a astra_thin_client::ThinClient,
     pub(crate) profile: Option<&'a str>,
+    pub(crate) admission: Option<TurnAdmission<'a>>,
     /// TUI installs a bounded, serialized post-commit worker. Headless
     /// callers leave this empty and await their own derived projections.
     pub(crate) post_commit_tx:
@@ -146,19 +148,129 @@ pub(crate) struct TurnContext<'a> {
     pub(crate) explain_analyze_terminal_degraded: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
+/// A queued input's immutable attachment, checked again at admission/retry.
+pub(crate) struct TurnAdmission<'a> {
+    pub(crate) owner: &'a crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    pub(crate) session_id: Option<&'a str>,
+    pub(crate) attachment_epoch: u64,
+}
+
+impl TurnContext<'_> {
+    pub(crate) fn permits_admission(&self, state: &SessionState) -> bool {
+        self.admission.as_ref().is_none_or(|admission| {
+            admission.session_id.is_some()
+                && admission.session_id == state.session_id.as_deref()
+                && admission.attachment_epoch == state.session_attachment_epoch
+                && admission.owner.is_current()
+        })
+    }
+}
+
+/// Provider usage for the just-settled turn. This is captured from the
+/// canonical StreamResult/partial failure rather than inferred by subtracting
+/// session-lifetime counters, which may be refreshed or advanced by another
+/// executor while the turn is running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TurnUsage {
+    pub(crate) prompt_tokens: u64,
+    pub(crate) completion_tokens: u64,
+    pub(crate) cache_read_tokens: u64,
+    pub(crate) cache_creation_tokens: u64,
+    pub(crate) usage_attribution: UsageAttribution,
+    /// A provider usage attempt or unavailable capture was observed even if
+    /// no numeric lane survived into the attribution projection.
+    pub(crate) usage_observed: bool,
+}
+
+impl TurnUsage {
+    pub(crate) fn from_stream_result(result: &crate::StreamResult) -> Option<Self> {
+        let usage = Self {
+            prompt_tokens: result.prompt_tokens,
+            completion_tokens: result.completion_tokens,
+            cache_read_tokens: result.cache_read_tokens,
+            cache_creation_tokens: result.cache_creation_tokens,
+            usage_attribution: result.usage_attribution.clone(),
+            usage_observed: false,
+        };
+        let usage_observed = result.token_usage_coverage.attempts > 0
+            || result.token_usage_coverage.unavailable > 0
+            || usage.has_values()
+            || usage.usage_attribution.has_observed_state();
+        usage_observed.then_some(Self {
+            usage_observed,
+            ..usage
+        })
+    }
+
+    pub(crate) fn from_partial(partial: &crate::PartialTurnData) -> Option<Self> {
+        let usage = Self {
+            prompt_tokens: partial.prompt_tokens,
+            completion_tokens: partial.completion_tokens,
+            cache_read_tokens: partial.cache_read_tokens,
+            cache_creation_tokens: partial.cache_creation_tokens,
+            usage_attribution: partial.usage_attribution.clone(),
+            usage_observed: false,
+        };
+        let usage_observed = partial.token_usage_coverage.attempts > 0
+            || partial.token_usage_coverage.unavailable > 0
+            || usage.has_values()
+            || usage.usage_attribution.has_observed_state();
+        usage_observed.then_some(Self {
+            usage_observed,
+            ..usage
+        })
+    }
+
+    pub(crate) fn has_values(&self) -> bool {
+        self.prompt_tokens > 0
+            || self.completion_tokens > 0
+            || self.cache_read_tokens > 0
+            || self.cache_creation_tokens > 0
+    }
+}
+
 async fn run_chat_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {
     let TurnExecutionRequest { state, input } = request;
-    ensure_default_turn_model(state, input.api, input.token).await;
+    if let Err(error) = ensure_default_turn_model(state, input.api, input.token).await {
+        return TurnAttempt::NotStarted(Box::new(session_runtime::model_catalog_turn_failure(
+            error,
+            Some(input.session_id),
+        )));
+    }
     if let Some(failure) = model_selection_preflight_failure(
         state.model.as_deref(),
         Some(input.session_id),
         state.turn.saturating_add(1),
     ) {
-        return TurnAttempt::Completed(Box::new(Err(failure)));
+        return TurnAttempt::NotStarted(Box::new(failure));
     }
     prepare_turn_adaptation(state, input.api, input.token, input.message).await;
     let attempt = execute_stream_turn(TurnExecutionRequest { state, input }).await;
-    finalize_turn_adaptation(state, matches!(attempt, TurnAttempt::Interrupted(_))).await;
+    let not_started = match &attempt {
+        TurnAttempt::NotStarted(_) => true,
+        TurnAttempt::Interrupted(result) => result
+            .as_ref()
+            .as_ref()
+            .is_err_and(|failure| failure.partial.server_admission_not_dispatched),
+        TurnAttempt::Completed(_) => false,
+    };
+    if not_started {
+        return attempt;
+    }
+    if state
+        .resume_guidance
+        .as_ref()
+        .is_some_and(|guidance| input.input_runtime_required_texts.contains(guidance))
+    {
+        state.resume_guidance = None;
+    }
+    if state
+        .diagnostics_context
+        .as_ref()
+        .is_some_and(|diagnostics| input.input_runtime_required_texts.contains(diagnostics))
+    {
+        state.diagnostics_context = None;
+    }
     attempt
 }
 
@@ -178,17 +290,29 @@ pub(super) async fn ensure_interactive_session_identity(
     if let Some(session_id) = state.session_id.clone() {
         return Ok(session_id);
     }
-    crate::cli::slash::slash_state::bind_initial_session(api, profile, token, state).await
+    let session_id =
+        crate::cli::slash::slash_state::bind_initial_session(api, profile, token, state).await?;
+    // The canonical session is committed before provider admission. Publish
+    // its identity now: the SSE executor already has this binding and may
+    // never emit a changed-identity event (including preflight failures).
+    if let Some(tx) = &state.tui_stream_event_tx {
+        let _ = tx
+            .send(crate::cli::chat_stream::StreamEvent::SessionBound(
+                session_id.clone(),
+            ))
+            .await;
+    }
+    Ok(session_id)
 }
 
 async fn ensure_default_turn_model(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
     token: &str,
-) {
+) -> Result<(), astra_core::ClassifiedError> {
     let had_model =
         astra_core::model_override::normalize_model_override(state.model.as_deref()).is_some();
-    if let Some(model) = session_runtime::ensure_state_default_model(api, token, state).await
+    if let Some(model) = session_runtime::ensure_state_default_model(api, token, state).await?
         && !had_model
     {
         tracing::info!(
@@ -197,6 +321,7 @@ async fn ensure_default_turn_model(
             "selected default model from server model list for CLI turn"
         );
     }
+    Ok(())
 }
 
 fn model_selection_preflight_failure(
@@ -229,30 +354,78 @@ fn run_chat_turn_boxed<'a>(
     Box::pin(run_chat_turn(request))
 }
 
+/// A handled startup failure is not a completed turn. Follow-up input queued
+/// while authentication was still pending must be restored, not sent.
+#[derive(Clone, Debug)]
+pub(crate) enum InteractiveTurnOutcome {
+    Completed(Option<Box<TurnUsage>>),
+    /// Authentication or another startup gate stopped the turn before it ran.
+    NotStarted,
+    /// The turn was attempted and settled as failed or interrupted.
+    /// Usage already captured for that attempt stays with the outcome.
+    Failed(Option<Box<TurnUsage>>),
+}
+
+fn interactive_outcome(
+    settlement: TurnSettlementOutcome,
+    usage: Option<TurnUsage>,
+) -> InteractiveTurnOutcome {
+    let usage = usage.map(Box::new);
+    match settlement {
+        TurnSettlementOutcome::NotStarted => InteractiveTurnOutcome::NotStarted,
+        TurnSettlementOutcome::Succeeded => InteractiveTurnOutcome::Completed(usage),
+        TurnSettlementOutcome::Interrupted | TurnSettlementOutcome::Failed => {
+            InteractiveTurnOutcome::Failed(usage)
+        }
+    }
+}
+
+/// Input purpose is supplied by the surface, never inferred from its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChatInput {
+    Interactive(String),
+    Conversation(String),
+}
+
 pub(crate) async fn handle_chat_input(
-    line: String,
+    input: ChatInput,
     current_token: Option<&str>,
     state: &mut SessionState,
     ctx: TurnContext<'_>,
 ) -> Result<(), String> {
     handle_chat_input_with_ui(
-        line,
+        input,
         current_token,
+        crate::cli::session::session_runtime::AccessMiss::NotLoggedIn,
         state,
         ctx,
         &mut crate::cli::ui_adapter::LineUiAdapter,
     )
     .await
+    .map(|_| ())
 }
 
 pub(crate) async fn handle_chat_input_with_ui(
-    line: String,
+    input: ChatInput,
     current_token: Option<&str>,
+    missing_access: crate::cli::session::session_runtime::AccessMiss,
     state: &mut SessionState,
     ctx: TurnContext<'_>,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
-) -> Result<(), String> {
-    if let Some(decision) = classify_shell_passthrough(&line) {
+) -> Result<InteractiveTurnOutcome, String> {
+    let (line, interactive) = match input {
+        ChatInput::Interactive(line) => (line, true),
+        ChatInput::Conversation(line) => (line, false),
+    };
+    if !ctx.permits_admission(state) {
+        ui.show_warning("The account or conversation changed. This instruction was not sent.");
+        let _ = ui.restore_input(&line, state.session_id.as_deref());
+        return Ok(InteractiveTurnOutcome::NotStarted);
+    }
+    if let Some(decision) = interactive
+        .then(|| classify_shell_passthrough(&line))
+        .flatten()
+    {
         match decision {
             ShellPassthroughDecision::Empty => {}
             ShellPassthroughDecision::DenyHighRisk { cmd, risks } => {
@@ -281,26 +454,69 @@ pub(crate) async fn handle_chat_input_with_ui(
                 }
             }
         }
-        return Ok(());
+        return Ok(InteractiveTurnOutcome::Completed(None));
     }
 
     let token = match current_token {
         Some(token) => token,
         None => {
-            ui.show_warning("  Not logged in. Use /login to authenticate.");
-            return Ok(());
+            ui.show_warning(missing_access.user_warning());
+            let _ = ui.restore_input(&line, state.session_id.as_deref());
+            return Ok(InteractiveTurnOutcome::NotStarted);
         }
     };
 
     let session_id =
-        ensure_interactive_session_identity(state, ctx.api, ctx.profile, token).await?;
+        match ensure_interactive_session_identity(state, ctx.api, ctx.profile, token).await {
+            Ok(session_id) => session_id,
+            Err(error) => {
+                let _ = ui.restore_input(&line, state.session_id.as_deref());
+                return Err(error);
+            }
+        };
+    if !ctx.permits_admission(state) {
+        let _ = ui.restore_input(&line, state.session_id.as_deref());
+        return Ok(InteractiveTurnOutcome::NotStarted);
+    }
+
+    // Native collaborator capacity is prepared only after the canonical
+    // session/permission attachment exists. The helper is a no-op for
+    // headless callers, and failure is optional capacity rather than a
+    // reason to reject the ordinary Astra turn.
+    crate::cli::edge_lifecycle::native_delivery::ensure_session_native_delivery(
+        state,
+        ctx.api,
+        token,
+        &session_id,
+    )
+    .await;
 
     // Admission is per actual model turn, not per TUI lifetime. Keep this
     // token in scope through retry and Turn/TurnError settlement, then release
     // it so the next interactive turn (or another surface) can proceed.
-    let _execution_lease = acquire_interactive_turn_admission(state)?;
+    let admission =
+        match acquire_interactive_turn_admission(state, ctx.api, ctx.profile, token).await {
+            Ok(lease) => lease,
+            Err(error) => {
+                let _ = ui.restore_input(&line, state.session_id.as_deref());
+                return Err(error);
+            }
+        };
 
-    ensure_multi_agent_runtime_for_turn(state, ctx.api, token, ctx.profile).await;
+    let token = admission
+        .as_ref()
+        .and_then(|admission| admission.server_turn.as_ref())
+        .map_or(token, |turn| turn.bearer.as_str());
+
+    let ctx = TurnContext {
+        api: admission
+            .as_ref()
+            .and_then(|admission| admission.server_turn.as_ref())
+            .map_or(ctx.api, |turn| &turn.api),
+        ..ctx
+    };
+
+    ensure_agent_projection_for_turn(state);
 
     ui.blank_line();
 
@@ -308,15 +524,8 @@ pub(crate) async fn handle_chat_input_with_ui(
         crate::cli::slash::slash_plan::enter_local_plan_mode_with_goal(state, &line);
     }
 
-    let resume_guidance = state.resume_guidance.take();
     let consumed_bg_notifications = state.pending_bg_notifications.clone();
-    let finalized_input = finalize_effective_line(
-        prepare_input(&line, state, ui),
-        line.clone(),
-        resume_guidance,
-        state,
-    )
-    .await;
+    let finalized_input = finalize_effective_line(prepare_input(&line, state), line.clone(), state);
     let turn_start = Instant::now();
     let local_run_control =
         astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control).clone();
@@ -329,9 +538,11 @@ pub(crate) async fn handle_chat_input_with_ui(
             message: &finalized_input.user_message,
             user_intent: &finalized_input.user_intent,
             input_runtime_required_texts: &finalized_input.runtime_required_texts,
-            input_active_system_skills: &finalized_input.active_system_skill_names,
             input_runtime_volatile_texts: &finalized_input.runtime_volatile_texts,
             session_id: &session_id,
+            admitted_server_turn: admission
+                .as_ref()
+                .and_then(|admission| admission.server_turn.as_ref()),
             semantic_query_override: None,
             explain_analyze_terminal_degraded: ctx.explain_analyze_terminal_degraded,
         },
@@ -344,19 +555,23 @@ pub(crate) async fn handle_chat_input_with_ui(
         *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control) =
             Some(run_control.clone());
     }
+    let turn_usage_sink = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mut dispatch = TurnDispatch {
         ctx: &ctx,
         line: &line,
         effective_line: &finalized_input.user_message,
         user_intent: &finalized_input.user_intent,
         input_runtime_required_texts: &finalized_input.runtime_required_texts,
-        input_active_system_skills: &finalized_input.active_system_skill_names,
         input_runtime_volatile_texts: &finalized_input.runtime_volatile_texts,
         token,
         session_id: &session_id,
+        admitted_server_turn: admission
+            .as_ref()
+            .and_then(|admission| admission.server_turn.as_ref()),
         semantic_query_override: None,
         turn_start,
         ui,
+        turn_usage_sink: Some(&turn_usage_sink),
     };
 
     let settlement =
@@ -374,7 +589,11 @@ pub(crate) async fn handle_chat_input_with_ui(
             .pending_bg_notifications
             .extend(notifications_arriving_during_settlement);
     }
-    Ok(())
+    let usage = turn_usage_sink
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    Ok(interactive_outcome(settlement, usage))
 }
 
 /// Resume an idle root from runtime-owned background facts without inventing
@@ -388,24 +607,45 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
     state: &mut SessionState,
     ctx: TurnContext<'_>,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
-) -> Result<(), String> {
+) -> Result<InteractiveTurnOutcome, String> {
     if state.pending_bg_notifications.is_empty() {
-        return Ok(());
+        return Ok(InteractiveTurnOutcome::Completed(None));
     }
     let token = match current_token {
         Some(token) => token,
         None => {
             ui.show_warning("  Background work finished, but Astra is not logged in; the update will be kept for your next turn.");
-            return Ok(());
+            return Ok(InteractiveTurnOutcome::NotStarted);
         }
     };
 
     let session_id =
         ensure_interactive_session_identity(state, ctx.api, ctx.profile, token).await?;
 
-    let _execution_lease = acquire_interactive_turn_admission(state)?;
+    crate::cli::edge_lifecycle::native_delivery::ensure_session_native_delivery(
+        state,
+        ctx.api,
+        token,
+        &session_id,
+    )
+    .await;
 
-    ensure_multi_agent_runtime_for_turn(state, ctx.api, token, ctx.profile).await;
+    let admission = acquire_interactive_turn_admission(state, ctx.api, ctx.profile, token).await?;
+
+    let token = admission
+        .as_ref()
+        .and_then(|admission| admission.server_turn.as_ref())
+        .map_or(token, |turn| turn.bearer.as_str());
+
+    let ctx = TurnContext {
+        api: admission
+            .as_ref()
+            .and_then(|admission| admission.server_turn.as_ref())
+            .map_or(ctx.api, |turn| &turn.api),
+        ..ctx
+    };
+
+    ensure_agent_projection_for_turn(state);
     let notification_count = state.pending_bg_notifications.len();
     let notifications = state.pending_bg_notifications.join("\n");
     let runtime_required_texts = vec![format!(
@@ -437,9 +677,11 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
             message: &runtime_envelope,
             user_intent: &user_intent,
             input_runtime_required_texts: &runtime_required_texts,
-            input_active_system_skills: &[],
             input_runtime_volatile_texts: &[],
             session_id: &session_id,
+            admitted_server_turn: admission
+                .as_ref()
+                .and_then(|admission| admission.server_turn.as_ref()),
             semantic_query_override: Some(user_intent.as_str()),
             explain_analyze_terminal_degraded: ctx.explain_analyze_terminal_degraded,
         },
@@ -449,19 +691,23 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control) =
             Some(run_control.clone());
     }
+    let turn_usage_sink = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mut dispatch = TurnDispatch {
         ctx: &ctx,
         line: &logical_user_line,
         effective_line: &runtime_envelope,
         user_intent: &user_intent,
         input_runtime_required_texts: &runtime_required_texts,
-        input_active_system_skills: &[],
         input_runtime_volatile_texts: &[],
         token,
         session_id: &session_id,
+        admitted_server_turn: admission
+            .as_ref()
+            .and_then(|admission| admission.server_turn.as_ref()),
         semantic_query_override: Some(user_intent.as_str()),
         turn_start,
         ui,
+        turn_usage_sink: Some(&turn_usage_sink),
     };
     let settlement =
         settle_turn_attempt(state, &mut dispatch, attempt, run_chat_turn_boxed).await?;
@@ -472,12 +718,35 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         let consumed = notification_count.min(state.pending_bg_notifications.len());
         state.pending_bg_notifications.drain(..consumed);
     }
-    Ok(())
+    let usage = turn_usage_sink
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    Ok(interactive_outcome(settlement, usage))
 }
 
-pub(super) fn acquire_interactive_turn_admission(
+pub(crate) const INTERACTIVE_SERVER_RESUME_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+pub(crate) struct AdmittedServerTurn {
+    pub(crate) attachment_owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    pub(crate) auth_owner: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
+    pub(crate) bearer: String,
+    pub(crate) api: astra_thin_client::ThinClient,
+    pub(crate) continuation: crate::cli::session::session_continuation::SessionContinuation,
+}
+
+pub(super) struct InteractiveTurnAdmission {
+    _lease: SessionExecutionLease,
+    pub(super) server_turn: Option<AdmittedServerTurn>,
+}
+
+pub(super) async fn acquire_interactive_turn_admission(
     state: &mut SessionState,
-) -> Result<Option<SessionExecutionLease>, String> {
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    token: &str,
+) -> Result<Option<InteractiveTurnAdmission>, String> {
     let Some(session_id) = state.session_id.clone() else {
         return Ok(None);
     };
@@ -493,11 +762,69 @@ pub(super) fn acquire_interactive_turn_admission(
         }
     };
 
+    // Server authority is attached explicitly at restore and is never inferred
+    // from local journal numbers or a display history. Reject an obsolete binding
+    // rather than falling back to a replica after an account/session change.
+    if let Some((cursor, epoch)) = state.server_resume_attachment.as_ref()
+        && (cursor.session_id != session_id
+            || cursor.owner_id != crate::cli::cli_config::cli_utils::cli_user_id()
+            || *epoch != state.session_attachment_epoch)
+    {
+        return Err("Server resume attachment no longer matches the current account/session; restore the session again".into());
+    }
+    let server_turn = if state.server_resume_attachment.is_some() {
+        let attachment_owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        let request_api = api.clone().without_bearer_provider();
+        eprintln!("  Restoring authoritative Server continuation…");
+        let refresh = tokio::time::timeout(INTERACTIVE_SERVER_RESUME_TIMEOUT, async {
+            let auth_owner =
+                session_runtime::capture_admitted_auth_owner(&request_api, profile, token).await;
+            let (restored, bearer) = crate::cli::session::session_restore_client::fetch_cloud_session_snapshot_with_bearer(
+                &request_api, &session_id, token, auth_owner.as_ref(),
+            ).await?;
+            let restored = restored.ok_or_else(|| "Server continuation is unavailable; restore the session again before continuing".to_string())?;
+            Ok::<_, String>((restored, bearer, auth_owner))
+        });
+        let cancelled = async {
+            match state.tui_cancel_token.as_ref() {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let (restored, bearer, auth_owner) = tokio::select! {
+            biased;
+            _ = cancelled => return Err("Server continuation refresh cancelled before execution".into()),
+            result = refresh => result.map_err(|_| "Server continuation refresh timed out before execution".to_string())??,
+        };
+        if !attachment_owner.is_current()
+            || auth_owner.as_ref().is_some_and(|owner| !owner.is_current())
+        {
+            return Err(
+                "Server resume account changed during restore; restore the session again".into(),
+            );
+        }
+        let bundle = restored.resume_bundle.filter(|bundle| {
+            bundle.source == astra_turn_types::ResumeSourceV1::CanonicalJournal
+        }).ok_or_else(|| "Server continuation is no longer canonical; restore the session again before continuing".to_string())?;
+        let continuation =
+            crate::cli::session::session_continuation::continuation_from_resume_bundle(bundle)
+                .ok_or_else(|| "Server continuation failed causal validation".to_string())?;
+        Some(AdmittedServerTurn {
+            attachment_owner,
+            auth_owner,
+            bearer,
+            api: request_api,
+            continuation,
+        })
+    } else {
+        None
+    };
+
     // The in-memory TUI may have been idle while a headless/app-server turn
     // committed. Refresh every prompt-facing and turn-index authority from one
     // current-generation physical snapshot after admission and before any
-    // model/tool boundary. A remote-only session with no local journal keeps
-    // its already-restored server continuation.
+    // model/tool boundary. This cursor and counter belong to local settlement;
+    // a Server attachment supplies separate request inputs above.
     let writer = JournalWriter::new(&session_id)
         .map_err(|error| format!("failed to open session journal for turn admission: {error}"))?;
     if writer.path().is_file() {
@@ -508,7 +835,6 @@ pub(super) fn acquire_interactive_turn_admission(
             &session_id,
             &events,
         )?;
-        let messages = active.materialize();
         let restored =
             session_runtime::restored_journal_state_from_append_order_events(true, &events);
         state.history = restored.session.history;
@@ -521,41 +847,500 @@ pub(super) fn acquire_interactive_turn_admission(
         state.last_turn_event = restored.last_turn_event;
         state.deferred_tool_activations =
             astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
-                &messages,
+                active.messages(),
                 std::mem::take(&mut state.deferred_tool_activations),
             );
         state.active_conversation = Some(active);
+    } else if server_turn.is_some() {
+        // A Server-only restore starts a new local replica lineage. A remote
+        // cursor must never become the previous cursor of a local journal.
+        state.turn = 0;
+        state.last_turn_event = None;
+        state.active_conversation = Some(
+            astra_turn_core::active_conversation::ActiveConversation::empty(
+                &crate::cli::cli_config::cli_utils::cli_user_id(),
+                &session_id,
+            )
+            .map_err(|error| error.to_string())?,
+        );
     }
-    Ok(Some(lease))
+    if let Some(server_turn) = server_turn.as_ref() {
+        state.history = crate::cli::session::session_continuation::history_pairs_from_messages(
+            &server_turn.continuation.messages,
+        );
+        state.deferred_tool_activations =
+            server_turn.continuation.deferred_tool_activations.clone();
+    }
+    Ok(Some(InteractiveTurnAdmission {
+        _lease: lease,
+        server_turn,
+    }))
 }
 
-async fn ensure_multi_agent_runtime_for_turn(
-    state: &mut SessionState,
-    api: &astra_thin_client::ThinClient,
-    token: &str,
-    profile: Option<&str>,
-) {
+fn ensure_agent_projection_for_turn(state: &mut SessionState) {
     if state.agent_spawner.is_some() {
         return;
     }
-    crate::cli::agent_runtime::initialize_multi_agent_runtime(
-        state,
-        api,
-        token.to_string(),
-        profile,
-    )
-    .await;
+    crate::cli::agent_runtime::initialize_agent_projection(state);
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::turn_retry::TurnSettlementOutcome;
     use super::{
-        ShellPassthroughDecision, TurnContext, acquire_interactive_turn_admission,
-        classify_shell_passthrough, ensure_interactive_session_identity,
-        ensure_multi_agent_runtime_for_turn, handle_chat_input_with_ui,
-        model_selection_preflight_failure,
+        ChatInput, InteractiveTurnOutcome, ShellPassthroughDecision, TurnContext, TurnUsage,
+        acquire_interactive_turn_admission, classify_shell_passthrough,
+        ensure_agent_projection_for_turn, ensure_interactive_session_identity,
+        handle_chat_input_with_ui, interactive_outcome, model_selection_preflight_failure,
     };
     use crate::cli::session::session_state::SessionState;
+    use crate::cli::stream::streaming_types::UsageAttribution;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unsupported_host_preserves_recovery_through_turn_execution_and_settlement() {
+        use crate::cli::chat_stream::WORKSPACE_HOST_VALIDATION_FOR_TEST;
+        use crate::cli::turn::turn_settlement::TurnDispatch;
+        use astra_tools::workspace_observation::WorkspaceLeaseFailure;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _credentials = crate::test_utils::isolate_credentials();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(crate::test_utils::mock_model_catalog_json(&["test-model"])),
+            )
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let mut state = SessionState {
+            session_id: Some(session_id.clone()),
+            model: Some("test-model".into()),
+            turn: 7,
+            history: vec![("original task".into(), "unfinished".into())],
+            resume_guidance: Some("verify unfinished work".into()),
+            diagnostics_context: Some("existing diagnostic".into()),
+            resume_restricted_tools: vec!["bash".into()],
+            pending_bg_notifications: vec!["child completed".into()],
+            session_lessons_loaded: true,
+            perm_manager: crate::cli::permission_manager::PermissionManager::new(true),
+            tui_render_policy: Some(crate::cli::stream::stream_render::RenderPolicy::Silent),
+            unified_skill_registry: astra_runtime::skills::empty_unified_registry().clone(),
+            active_conversation: Some(
+                astra_turn_core::active_conversation::ActiveConversation::empty(
+                    &crate::cli::cli_config::cli_utils::cli_user_id(),
+                    &session_id,
+                )
+                .unwrap(),
+            ),
+            ..SessionState::default()
+        };
+        let required = vec![
+            "verify unfinished work".into(),
+            "existing diagnostic".into(),
+        ];
+        let input = super::TurnExecutionInput {
+            api: &api,
+            profile: None,
+            token: "synthetic-token",
+            message: "continue",
+            user_intent: "continue",
+            input_runtime_required_texts: &required,
+            input_runtime_volatile_texts: &[],
+            session_id: &session_id,
+            admitted_server_turn: None,
+            semantic_query_override: None,
+            explain_analyze_terminal_degraded: None,
+        };
+        let attempt = WORKSPACE_HOST_VALIDATION_FOR_TEST
+            .scope(
+                Err(WorkspaceLeaseFailure::CoordinationHostUnsupported),
+                super::run_chat_turn(super::TurnExecutionRequest {
+                    state: &mut state,
+                    input,
+                }),
+            )
+            .await;
+        let super::TurnAttempt::NotStarted(failure) = &attempt else {
+            panic!("unsupported host must remain an unstarted attempt");
+        };
+        assert_eq!(
+            failure.partial.error_code.as_deref(),
+            Some("workspace_host_unsupported")
+        );
+        assert!(failure.partial.run_id.is_none());
+        let usage = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut ui = crate::tests::TestUi::default();
+        let context = TurnContext {
+            api: &api,
+            profile: None,
+            post_commit_tx: None,
+            admission: None,
+            explain_analyze_terminal_degraded: None,
+        };
+        let mut dispatch = TurnDispatch {
+            ctx: &context,
+            line: "continue",
+            effective_line: "continue",
+            user_intent: "continue",
+            input_runtime_required_texts: &required,
+            input_runtime_volatile_texts: &[],
+            token: "synthetic-token",
+            session_id: &session_id,
+            admitted_server_turn: None,
+            semantic_query_override: None,
+            turn_start: std::time::Instant::now(),
+            ui: &mut ui,
+            turn_usage_sink: Some(&usage),
+        };
+        let settled = super::settle_turn_attempt(&mut state, &mut dispatch, attempt, |_| {
+            Box::pin(async { panic!("unsupported host must not retry") })
+        })
+        .await
+        .unwrap();
+        assert_eq!(settled, TurnSettlementOutcome::NotStarted);
+        assert_eq!(state.turn, 7);
+        assert_eq!(
+            state.history,
+            [("original task".into(), "unfinished".into())]
+        );
+        assert_eq!(
+            state.resume_guidance.as_deref(),
+            Some("verify unfinished work")
+        );
+        assert_eq!(
+            state.diagnostics_context.as_deref(),
+            Some("existing diagnostic")
+        );
+        assert_eq!(state.resume_restricted_tools, ["bash"]);
+        assert_eq!(state.pending_bg_notifications, ["child completed"]);
+        assert!(state.journal.is_none());
+        assert!(usage.lock().unwrap().is_none());
+        assert_eq!(ui.restored_inputs, ["continue"]);
+        assert_eq!(ui.errors.len(), 1);
+        assert!(ui.errors[0].contains("workspace_host_unsupported"));
+        assert!(ui.errors[0].contains("administrator"));
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests.is_empty());
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method.as_str() == "GET" && request.url.path() == "/models"),
+            "no execution or refresh request is allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_input_cannot_execute_local_shell_syntax() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("shell-effect");
+        // The temporary directory is outside the workspace. Explicitly
+        // authorize the interactive control without weakening shell policy.
+        let text = format!("!! touch '{}'", marker.display());
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState::default();
+        let mut ui = crate::tests::TestUi::default();
+        for (input, executes_shell) in [
+            (ChatInput::Conversation(text.clone()), false),
+            (ChatInput::Interactive(text.clone()), true),
+        ] {
+            let outcome = handle_chat_input_with_ui(
+                input,
+                None,
+                crate::cli::session::session_runtime::AccessMiss::NotLoggedIn,
+                &mut state,
+                TurnContext {
+                    api: &api,
+                    profile: None,
+                    post_commit_tx: None,
+                    admission: None,
+                    explain_analyze_terminal_degraded: None,
+                },
+                &mut ui,
+            )
+            .await
+            .unwrap();
+            assert_eq!(marker.exists(), executes_shell);
+            if executes_shell {
+                assert!(matches!(outcome, InteractiveTurnOutcome::Completed(None)));
+            } else {
+                assert!(matches!(outcome, InteractiveTurnOutcome::NotStarted));
+                assert_eq!(ui.restored_inputs.as_slice(), std::slice::from_ref(&text));
+            }
+            assert!(state.session_id.is_none());
+            assert_eq!(state.turn, 0);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stale_bound_input_cannot_execute_shell_or_create_another_session() {
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "bound",
+            Some("owner-a"),
+        )
+        .unwrap();
+        let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        let server = wiremock::MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("must-not-execute");
+        let text = format!("!! touch '{}'", marker.display());
+        let mut state = SessionState::default();
+        state.set_session_id("bound-session");
+        let epoch = state.session_attachment_epoch;
+        state.reset_for_new_session();
+        state.set_session_id("bound-session");
+        for input in [
+            ChatInput::Conversation(text.clone()),
+            ChatInput::Interactive(text.clone()),
+        ] {
+            let mut ui = crate::tests::TestUi::default();
+            let outcome = handle_chat_input_with_ui(
+                input,
+                Some("captured-token"),
+                crate::cli::session::session_runtime::AccessMiss::NotLoggedIn,
+                &mut state,
+                TurnContext {
+                    api: &api,
+                    profile: None,
+                    post_commit_tx: None,
+                    admission: Some(super::TurnAdmission {
+                        owner: &owner,
+                        session_id: Some("bound-session"),
+                        attachment_epoch: epoch,
+                    }),
+                    explain_analyze_terminal_degraded: None,
+                },
+                &mut ui,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(outcome, InteractiveTurnOutcome::NotStarted));
+            assert_eq!(ui.restored_inputs.as_slice(), std::slice::from_ref(&text));
+            assert!(!marker.exists());
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(state.session_id.as_deref(), Some("bound-session"));
+        assert_eq!(state.turn, 0);
+    }
+
+    #[tokio::test]
+    async fn missing_token_restores_the_replayed_line_and_does_not_start() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState::default();
+        let mut ui = crate::tests::TestUi::default();
+        let ctx = TurnContext {
+            api: &api,
+            profile: None,
+            post_commit_tx: None,
+            admission: None,
+            explain_analyze_terminal_degraded: None,
+        };
+        let outcome = handle_chat_input_with_ui(
+            ChatInput::Interactive("replayed follow-up".to_string()),
+            None,
+            crate::cli::session::session_runtime::AccessMiss::NotLoggedIn,
+            &mut state,
+            ctx,
+            &mut ui,
+        )
+        .await
+        .expect("missing credentials are a handled startup failure");
+        assert!(matches!(outcome, InteractiveTurnOutcome::NotStarted));
+        assert_eq!(ui.restored_inputs, vec!["replayed follow-up".to_string()]);
+        assert!(matches!(
+            interactive_outcome(TurnSettlementOutcome::Failed, None),
+            InteractiveTurnOutcome::Failed(None)
+        ));
+        assert!(matches!(
+            interactive_outcome(TurnSettlementOutcome::Succeeded, None),
+            InteractiveTurnOutcome::Completed(None)
+        ));
+    }
+
+    #[test]
+    fn failed_and_interrupted_settlement_keep_partial_usage() {
+        let partial = crate::PartialTurnData {
+            prompt_tokens: 12,
+            completion_tokens: 3,
+            cache_read_tokens: 4,
+            cache_creation_tokens: 1,
+            usage_attribution: UsageAttribution {
+                auxiliary_capture_unavailable: true,
+                ..UsageAttribution::default()
+            },
+            ..Default::default()
+        };
+        let usage = TurnUsage::from_partial(&partial).expect("partial usage must be retained");
+
+        match interactive_outcome(TurnSettlementOutcome::Failed, Some(usage.clone())) {
+            InteractiveTurnOutcome::Failed(Some(kept)) => {
+                assert_eq!(kept.prompt_tokens, 12);
+                assert_eq!(kept.completion_tokens, 3);
+                assert_eq!(kept.cache_read_tokens, 4);
+                assert_eq!(kept.cache_creation_tokens, 1);
+                assert!(kept.usage_attribution.auxiliary_capture_unavailable);
+            }
+            other => panic!("failed settlement dropped usage: {other:?}"),
+        }
+        match interactive_outcome(TurnSettlementOutcome::Interrupted, Some(usage)) {
+            InteractiveTurnOutcome::Failed(Some(kept)) => {
+                assert_eq!(kept.prompt_tokens, 12);
+                assert!(kept.usage_observed);
+            }
+            other => panic!("interrupted settlement dropped usage: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_interactive_session_is_not_resumed_before_the_next_turn() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState {
+            session_id: Some("sess-active".into()),
+            ..SessionState::default()
+        };
+
+        let session_id = ensure_interactive_session_identity(&mut state, &api, None, "token")
+            .await
+            .unwrap();
+
+        assert_eq!(session_id, "sess-active");
+        assert_eq!(state.session_id.as_deref(), Some("sess-active"));
+    }
+
+    #[test]
+    fn partial_usage_snapshot_survives_without_token_numbers() {
+        let partial = crate::PartialTurnData {
+            usage_attribution: UsageAttribution {
+                auxiliary_capture_unavailable: true,
+                ..UsageAttribution::default()
+            },
+            ..Default::default()
+        };
+
+        let usage = TurnUsage::from_partial(&partial).expect("capture state must be retained");
+
+        assert!(usage.usage_attribution.auxiliary_capture_unavailable);
+        assert!(!usage.has_values());
+    }
+
+    #[test]
+    fn partial_usage_coverage_survives_when_every_token_is_unavailable() {
+        let partial = crate::PartialTurnData {
+            token_usage_coverage: astra_turn_core::chat_turn_sse_dispatch::TokenUsageCoverage {
+                attempts: 1,
+                unavailable: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(TurnUsage::from_partial(&partial).is_some());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn background_completion_preserves_context_until_user_submission_carries_it() {
+        let _home = crate::test_utils::HomeGuard::temp();
+        use crate::cli::mock_llm::{MockLlmServer, MockScenario};
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let server = MockLlmServer::start(MockScenario::Slow).await.unwrap();
+        let api = astra_thin_client::ThinClient::new(&server.base_url, None).unwrap();
+        // This exercises interactive TUI turns. Production installs native
+        // prompt channels before using Silent rendering; a bare SessionState
+        // has no approval sink and cannot admit Prompt mode on piped stdin.
+        let (approval_tx, mut approval_rx) =
+            tokio::sync::mpsc::channel::<crate::cli::chat_stream::ApprovalRequest>(
+                crate::cli::chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
+            );
+        let (ask_user_tx, mut ask_user_rx) =
+            tokio::sync::mpsc::channel::<crate::cli::chat_stream::AskUserRequest>(
+                crate::cli::chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
+            );
+        let mut state = SessionState {
+            tui_render_policy: Some(crate::cli::stream::stream_render::RenderPolicy::Silent),
+            tui_approval_request_tx: Some(approval_tx),
+            tui_ask_user_request_tx: Some(ask_user_tx),
+            model: Some("gpt-5".into()),
+            resume_guidance: Some("verify the unfinished result".into()),
+            diagnostics_context: Some("existing diagnostic".into()),
+            pending_bg_notifications: vec!["member finished".into()],
+            ..SessionState::default()
+        };
+        let mut ui = crate::tests::TestUi::default();
+        let context = || TurnContext {
+            api: &api,
+            profile: None,
+            post_commit_tx: None,
+            admission: None,
+            explain_analyze_terminal_degraded: None,
+        };
+        let outcome = super::handle_runtime_notifications_with_ui(
+            Some("token"),
+            &mut state,
+            context(),
+            &mut ui,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, super::InteractiveTurnOutcome::Completed(_)),
+            "{outcome:?}: {:?}",
+            ui.errors
+        );
+        assert!(state.pending_bg_notifications.is_empty());
+        assert_eq!(
+            state.resume_guidance.as_deref(),
+            Some("verify the unfinished result")
+        );
+        assert_eq!(
+            state.diagnostics_context.as_deref(),
+            Some("existing diagnostic")
+        );
+        let outcome = handle_chat_input_with_ui(
+            ChatInput::Conversation("deliver the result".into()),
+            Some("token"),
+            crate::cli::session::session_runtime::AccessMiss::NotLoggedIn,
+            &mut state,
+            context(),
+            &mut ui,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, super::InteractiveTurnOutcome::Completed(_)),
+            "{outcome:?}: {:?}",
+            ui.errors
+        );
+        assert!(state.resume_guidance.is_none());
+        assert!(state.diagnostics_context.is_none());
+        assert_eq!(
+            state.perm_manager.mode(),
+            crate::cli::permission_manager::PermissionMode::Prompt
+        );
+        let requests = server.received_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request["interaction_mode"] == "prompt")
+        );
+        assert!(matches!(
+            approval_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            ask_user_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
 
     #[tokio::test]
     #[serial_test::serial]
@@ -577,33 +1362,45 @@ mod tests {
         let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
         let _credentials_guard = crate::tests::isolate_credentials();
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
         let mut state = SessionState {
+            tui_stream_event_tx: Some(tx),
             // A selected model with no Offering makes the later provider
             // preflight fail deterministically, without spending model tokens.
-            model: Some("mock-model".to_string()),
+            model: Some(("mock-model".to_string()).into()),
             ..SessionState::default()
         };
         let ctx = TurnContext {
             api: &api,
             profile: None,
             post_commit_tx: None,
+            admission: None,
             explain_analyze_terminal_degraded: None,
         };
         let mut ui = crate::tests::TestUi::default();
 
-        handle_chat_input_with_ui("hello".to_string(), Some("token"), &mut state, ctx, &mut ui)
-            .await
-            .expect("a provider preflight failure is settled as a failed turn");
+        handle_chat_input_with_ui(
+            ChatInput::Interactive("hello".to_string()),
+            Some("token"),
+            crate::cli::session::session_runtime::AccessMiss::NotLoggedIn,
+            &mut state,
+            ctx,
+            &mut ui,
+        )
+        .await
+        .expect("a provider preflight failure is settled as a failed turn");
 
         let followup_ctx = TurnContext {
             api: &api,
             profile: None,
             post_commit_tx: None,
+            admission: None,
             explain_analyze_terminal_degraded: None,
         };
         handle_chat_input_with_ui(
-            "hi".to_string(),
+            ChatInput::Interactive("hi".to_string()),
             Some("token"),
+            crate::cli::session::session_runtime::AccessMiss::NotLoggedIn,
             &mut state,
             followup_ctx,
             &mut ui,
@@ -611,6 +1408,17 @@ mod tests {
         .await
         .expect("the next input must reuse the canonical session after a failed first turn");
 
+        let mut bindings = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let crate::cli::chat_stream::StreamEvent::SessionBound(id) = event {
+                bindings.push(id);
+            }
+        }
+        assert_eq!(
+            bindings,
+            std::slice::from_ref(&session_id),
+            "publish the committed identity even when provider preflight fails; retries do not rebind"
+        );
         server.verify().await;
         let requests = server.received_requests().await.unwrap();
         assert_eq!(
@@ -681,21 +1489,36 @@ mod tests {
             .mount(&server)
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let mut state = SessionState::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut state = SessionState {
+            tui_stream_event_tx: Some(tx),
+            ..SessionState::default()
+        };
         let ctx = TurnContext {
             api: &api,
             profile: None,
             post_commit_tx: None,
+            admission: None,
             explain_analyze_terminal_degraded: None,
         };
         let mut ui = crate::tests::TestUi::default();
 
-        let error =
-            handle_chat_input_with_ui("hello".to_string(), Some("token"), &mut state, ctx, &mut ui)
-                .await
-                .expect_err("session creation must fail before turn admission");
+        let error = handle_chat_input_with_ui(
+            ChatInput::Interactive("hello".to_string()),
+            Some("token"),
+            crate::cli::session::session_runtime::AccessMiss::NotLoggedIn,
+            &mut state,
+            ctx,
+            &mut ui,
+        )
+        .await
+        .expect_err("session creation must fail before turn admission");
 
         assert!(error.contains("503"), "{error}");
+        assert!(
+            rx.try_recv().is_err(),
+            "failed session creation must not publish an identity"
+        );
         assert_eq!(state.session_id, None);
         assert_eq!(state.turn, 0);
         assert!(state.history.is_empty());
@@ -716,18 +1539,20 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let mut state = SessionState::default();
         state.set_session_id(session_id.clone());
-        state.model = Some("mock-model".to_string());
+        state.model = Some(("mock-model".to_string()).into());
         let ctx = TurnContext {
             api: &api,
             profile: None,
             post_commit_tx: None,
+            admission: None,
             explain_analyze_terminal_degraded: None,
         };
         let mut ui = crate::tests::TestUi::default();
 
         let error = handle_chat_input_with_ui(
-            "do not execute".to_string(),
+            ChatInput::Interactive("do not execute".to_string()),
             Some("token"),
+            crate::cli::session::session_runtime::AccessMiss::NotLoggedIn,
             &mut state,
             ctx,
             &mut ui,
@@ -748,8 +1573,8 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn interactive_admission_refreshes_terminal_turn_authority_before_execution() {
+    #[tokio::test]
+    async fn interactive_admission_refreshes_terminal_turn_authority_before_execution() {
         use astra_services::session_journal::{JournalEvent, JournalWriter};
 
         let tmp = tempfile::tempdir().unwrap();
@@ -784,7 +1609,9 @@ mod tests {
         state.set_session_id(session_id);
         state.turn = 99;
         state.history = vec![("stale".to_string(), "state".to_string())];
-        let lease = acquire_interactive_turn_admission(&mut state)
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let lease = acquire_interactive_turn_admission(&mut state, &api, None, "test-token")
+            .await
             .expect("admission")
             .expect("known session lease");
 
@@ -794,7 +1621,8 @@ mod tests {
         assert!(state.history[1].1.contains("Previous turn failed"));
         drop(lease);
         assert!(
-            acquire_interactive_turn_admission(&mut state)
+            acquire_interactive_turn_admission(&mut state, &api, None, "test-token")
+                .await
                 .unwrap()
                 .is_some(),
             "the lease is per turn, not held for the full interactive session"
@@ -835,17 +1663,133 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_boundary_initializes_multi_agent_runtime_when_startup_did_not() {
-        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+    async fn default_model_lookup_failure_stops_turn_without_reporting_missing_selection() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Exercise the actual interactive turn entry: a failed lookup must not
+        // reach turn adaptation, inference, or tools. A valid empty projection
+        // still has the existing missing-selection behavior.
+        let empty = serde_json::json!({
+            "accesses": [], "offerings": [], "default_offering_id": null,
+            "default_resolution": {"state": "missing"},
+            "next_cursor": null, "limit": 50, "total": 0,
+            "catalog_revision": "sha256:empty", "observed_at": "2026-09-21T00:00:00Z"
+        });
+        use astra_core::ErrorKind;
+        for (response, expected, kind) in [
+            (
+                ResponseTemplate::new(503).set_body_string("private upstream diagnostic"),
+                "503",
+                ErrorKind::ServerError,
+            ),
+            (ResponseTemplate::new(401), "401", ErrorKind::Auth),
+            (ResponseTemplate::new(403), "403", ErrorKind::Auth),
+            (
+                ResponseTemplate::new(200).set_body_string("not-json"),
+                "not valid JSON",
+                ErrorKind::ContractViolation,
+            ),
+            (
+                ResponseTemplate::new(200).set_delay(
+                    astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT
+                        + std::time::Duration::from_secs(1),
+                ),
+                "timed out",
+                ErrorKind::Network,
+            ),
+            (
+                ResponseTemplate::new(200).set_body_json(empty),
+                "missing_model_selection",
+                ErrorKind::MissingModelSelection,
+            ),
+        ] {
+            let mock = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/model-access"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&mock)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+            let mut state = SessionState::default();
+            let turn = super::run_chat_turn(super::TurnExecutionRequest {
+                state: &mut state,
+                input: super::TurnExecutionInput {
+                    api: &api,
+                    profile: None,
+                    token: "test-token",
+                    message: "hello",
+                    user_intent: "hello",
+                    input_runtime_required_texts: &[],
+                    input_runtime_volatile_texts: &[],
+                    session_id: "catalog-failure-session",
+                    admitted_server_turn: None,
+                    semantic_query_override: None,
+                    explain_analyze_terminal_degraded: None,
+                },
+            });
+            let result = if expected == "timed out" {
+                let expire_request = async {
+                    // Complete real socket I/O before pausing the client clock.
+                    // Exercise the production 30s deadline without exceeding
+                    // nextest's 30s per-test wall-clock budget.
+                    while mock.received_requests().await.unwrap().is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                    tokio::time::pause();
+                    let started = tokio::time::Instant::now();
+                    tokio::time::advance(astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT).await;
+                    started
+                };
+                let (result, started) = tokio::join!(turn, expire_request);
+                let elapsed = started.elapsed();
+                tokio::time::resume();
+                assert!(
+                    elapsed
+                        <= astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT
+                            + std::time::Duration::from_secs(1),
+                    "request exceeded the model catalog deadline: {elapsed:?}"
+                );
+                result
+            } else {
+                turn.await
+            };
+            let super::TurnAttempt::NotStarted(failure) = result else {
+                panic!("catalog lookup must complete with a preflight failure");
+            };
+            assert!(failure.error.contains(expected), "{}", failure.error);
+            assert_eq!(
+                astra_core::ClassifiedError::from(failure.error.clone()).kind,
+                kind
+            );
+            assert_eq!(
+                super::super::turn_auth_retry::should_retry_after_auth_refresh(&failure),
+                expected == "401",
+                "only a catalog session 401 should refresh: {}",
+                failure.error,
+            );
+            assert!(!failure.error.contains("private upstream diagnostic"));
+            assert_eq!(
+                failure.partial.session_id.as_deref(),
+                Some("catalog-failure-session")
+            );
+            assert!(state.model.is_none());
+            assert!(state.history.is_empty());
+            assert_eq!(mock.received_requests().await.unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn turn_boundary_initializes_agent_projection_when_startup_did_not() {
         let mut state = SessionState::default();
         state.set_session_id("turn-session");
 
-        ensure_multi_agent_runtime_for_turn(&mut state, &api, "turn-token", Some("test-profile"))
-            .await;
+        ensure_agent_projection_for_turn(&mut state);
 
         assert!(
             state.agent_spawner.is_some(),
-            "a session-bound turn must have an agent executor binding"
+            "a session-bound turn must have its recovery projection"
         );
     }
 

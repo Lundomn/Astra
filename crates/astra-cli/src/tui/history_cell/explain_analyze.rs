@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
 };
 
+use crate::explain_analyze_format::decision_detail_line;
 use astra_turn_types::ExplainAnalyzeGraphV1;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -330,6 +331,19 @@ fn render_graph(
                     available > remaining_nodes.saturating_add(3)
                 });
             if show_node_details {
+                if let Some(detail) = &node.decision_detail {
+                    if !push_wrapped_node_detail(
+                        &mut lines,
+                        &decision_detail_line(detail),
+                        width,
+                        Style::default().fg(Color::Yellow),
+                        detail_limit,
+                        &detail_ancestors,
+                    ) && !live
+                    {
+                        truncated = true;
+                    }
+                }
                 if let Some(usage) = &node.usage {
                     let lanes = [
                         usage
@@ -445,6 +459,25 @@ fn render_graph(
                         }
                     }
                     if let Some(assembly) = &context.assembly {
+                        for report in &assembly.edge_memory_selection {
+                            let mut details = vec![report.summary()];
+                            if verbose {
+                                details.extend(report.detail_lines());
+                            }
+                            for detail in details {
+                                if !push_wrapped_node_detail(
+                                    &mut lines,
+                                    &detail,
+                                    width,
+                                    Style::default().fg(Color::Cyan),
+                                    detail_limit,
+                                    &detail_ancestors,
+                                ) && !live
+                                {
+                                    truncated = true;
+                                }
+                            }
+                        }
                         if !truncated {
                             if verbose {
                                 if !push_wrapped_node_detail(
@@ -671,6 +704,28 @@ fn render_graph(
             );
         }
     }
+    if !live {
+        for summary in
+            crate::explain_analyze_report::auxiliary_usage_lines_with_detail(graph, verbose)
+        {
+            let _ = push_wrapped_detail(
+                &mut lines,
+                &summary,
+                width,
+                Style::default().fg(Color::DarkGray),
+                content_limit,
+            );
+        }
+        for summary in crate::explain_analyze_report::auxiliary_details_lines(graph) {
+            let _ = push_wrapped_detail(
+                &mut lines,
+                &summary,
+                width,
+                Style::default().fg(Color::DarkGray),
+                content_limit,
+            );
+        }
+    }
     if !graph.diagnostics().is_empty() && !truncated && !live {
         let summary = graph
             .diagnostics()
@@ -759,9 +814,6 @@ fn source_label(kind: astra_turn_types::ExplainAnalyzeContextSourceKindV1) -> &'
         Skills => "Skills",
         RuntimeIdentity => "Runtime identity",
         RuntimeVolatile => "Runtime state",
-        EmergentSkills => "Emergent skills",
-        EmergentMemory => "Emergent memory",
-        EmergentSummary => "Emergent summary",
     }
 }
 
@@ -1129,6 +1181,59 @@ mod tests {
         ExplainAnalyzeTransitionV1, ExplainAnalyzeUsageBasisV1,
     };
 
+    #[test]
+    fn conflicting_auxiliary_usage_is_visible_in_settled_cell() {
+        use astra_turn_types::{
+            ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+            ExplainAnalyzeAuxiliaryUsageV1,
+        };
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        for (index, count) in [731, 947].into_iter().enumerate() {
+            let mut event = finished(
+                &format!("finish-{index}"),
+                &format!("turn-{index}"),
+                None,
+                ExplainAnalyzeNodeKindV1::Turn,
+                "clock",
+                0,
+                10,
+                ExplainAnalyzeOutcomeV1::Succeeded,
+                None,
+                None,
+            );
+            event.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
+                available: true,
+                truncated: false,
+                attempts: vec![ExplainAnalyzeAuxiliaryAttemptV1 {
+                    attempt_id: "same-attempt".into(),
+                    provider: "provider".into(),
+                    offering_id: "offering".into(),
+                    model_name: "model".into(),
+                    purpose: "verification_judge".into(),
+                    operation_id: "request_judgment".into(),
+                    usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+                    usage: Some(ExplainAnalyzeTokenUsageV1 {
+                        basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                        fresh_input_tokens: Some(count),
+                        output_tokens: Some(0),
+                        cache_read_tokens: None,
+                        cache_creation_tokens: None,
+                    }),
+                }],
+            }));
+            graph.apply(event);
+        }
+        graph.finish_ingest();
+        let output = text(&ExplainAnalyzeCell::new(graph, false, false).display_lines(400));
+        assert!(
+            output.contains(
+                "Judgment usage · unavailable · 1 conflicting physical measurement(s); token total unknown"
+            ),
+            "{output}"
+        );
+        assert!(!output.contains("731") && !output.contains("947"));
+    }
+
     fn started(
         event_id: &str,
         node_id: &str,
@@ -1199,6 +1304,8 @@ mod tests {
     ) -> ExplainAnalyzeEventV1 {
         let is_provider = kind == ExplainAnalyzeNodeKindV1::ProviderAttempt;
         ExplainAnalyzeEventV1 {
+            auxiliary_usage: None,
+            auxiliary_details: None,
             schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: event_id.into(),
             run_id: "run-1".into(),
@@ -1217,6 +1324,7 @@ mod tests {
             start_elapsed_ms,
             duration_ms,
             outcome,
+            decision_detail: None,
             usage,
             context,
             coverage_gaps: Vec::new(),
@@ -1284,14 +1392,23 @@ mod tests {
             None,
             Some(ExplainAnalyzeContextMetricsV1 {
                 budget: None,
-                assembly: Some(ExplainAnalyzeContextAssemblyV1 {
+                assembly: Some(Box::new(ExplainAnalyzeContextAssemblyV1 {
+                    edge_memory_selection: vec![
+                        serde_json::from_value(serde_json::json!({
+                            "session_id":"s", "turn":1, "operation":"relevance", "method":"model",
+                            "reason":"completed", "model":"jev-test", "elapsed_ms":398,
+                            "selection_order":[0], "candidates":[{"index":0,"selected":true,"probability_bps":9000},
+                                          {"index":1,"selected":false,"probability_bps":1000}]
+                        }))
+                        .unwrap(),
+                    ],
                     basis: ExplainAnalyzeContextAssemblyBasisV1::RuntimeTextEstimate,
                     sources: vec![ExplainAnalyzeContextSourceV1 {
                         kind: ExplainAnalyzeContextSourceKindV1::Memory,
                         section_count: 4,
                         estimated_tokens: 90,
                     }],
-                }),
+                })),
             }),
         ));
         graph.apply(finished(
@@ -1364,6 +1481,8 @@ mod tests {
         assert!(rendered.contains("recording"), "{rendered}");
         assert!(!rendered.contains("incomplete"), "{rendered}");
         assert!(rendered.contains("+1.2s"), "{rendered}");
+        assert!(rendered.contains("2 candidates → 1 selected"), "{rendered}");
+        assert!(rendered.contains("90.00%"), "{rendered}");
         assert!(rendered.contains("420ms"), "{rendered}");
         assert!(rendered.contains("Failed"), "{rendered}");
         assert!(

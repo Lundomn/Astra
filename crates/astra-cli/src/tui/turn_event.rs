@@ -95,6 +95,11 @@ pub(crate) enum TurnEvent {
         ts: Option<String>,
         level: SystemLevel,
         text: String,
+        /// Optional user-facing action link. The link is kept separate from
+        /// `text` so terminal escape sequences never become part of the
+        /// durable message or prompt-facing content.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<SystemLink>,
     },
 
     /// End-of-turn metric band (the `⏱ … · ⚡ … · Σ …` line).
@@ -109,12 +114,25 @@ pub(crate) enum TurnEvent {
         tokens_in: Option<u64>,
         #[serde(default)]
         tokens_out: Option<u64>,
-        /// Of `tokens_in`, how many were served from the provider's
-        /// prompt cache. Drives the `💾 N%` segment. Absent on older
-        /// transcripts and on providers that don't surface cache
-        /// stats — `#[serde(default)]` keeps the schema additive.
+        /// Cached input, separate from fresh `tokens_in`; absent means unreported.
         #[serde(default)]
         cache_read_tokens: Option<u64>,
+        /// Fresh tokens written to the provider cache. Kept separate from
+        /// `tokens_in` so cache-hit rates do not silently mix lanes.
+        #[serde(default)]
+        cache_creation_tokens: Option<u64>,
+        /// The admitted primary model used for the turn, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_name: Option<String>,
+        /// Human-readable summary of auxiliary judgment/memory calls.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auxiliary_summary: Option<String>,
+        /// Complete primary-input coverage across attempts, independent of output usage.
+        #[serde(default)]
+        input_usage_complete: bool,
+        /// True when primary usage attribution was observed but not complete.
+        #[serde(default)]
+        usage_partial: bool,
         #[serde(default)]
         tools: u32,
         /// Session-cumulative totals at the moment this turn ended.
@@ -135,6 +153,18 @@ pub(crate) enum TurnEvent {
         #[serde(default)]
         delivery_degraded: bool,
     },
+}
+
+/// A durable, presentation-neutral link attached to a system notice.
+///
+/// `uri` is used only when the terminal supports OSC 8. `fallback` remains
+/// visible in plain terminals and non-hyperlink environments, so the notice
+/// stays actionable without leaking the long target into the normal TUI row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SystemLink {
+    pub(crate) uri: String,
+    pub(crate) label: String,
+    pub(crate) fallback: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +294,7 @@ mod tests {
                 ts: None,
                 level: lv,
                 text: "msg".into(),
+                link: None,
             });
         }
     }
@@ -313,6 +344,11 @@ mod tests {
             tokens_in: None,
             tokens_out: None,
             cache_read_tokens: None,
+            cache_creation_tokens: None,
+            model_name: None,
+            auxiliary_summary: None,
+            input_usage_complete: false,
+            usage_partial: false,
             tools: 0,
             cumulative_tokens: None,
             cumulative_cost_usd: None,
@@ -322,6 +358,18 @@ mod tests {
             j.contains(r#""kind":"turn_summary""#),
             "unexpected tag: {j}"
         );
+        let value: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(
+            value.get("cumulative_cost_usd"),
+            Some(&serde_json::Value::Null)
+        );
+        assert!(matches!(
+            serde_json::from_str::<TurnEvent>(&j).unwrap(),
+            TurnEvent::TurnSummary {
+                cumulative_cost_usd: None,
+                ..
+            }
+        ));
     }
 
     #[test]

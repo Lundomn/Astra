@@ -11,18 +11,14 @@ use astra_runtime::{
 };
 use astra_services::runs::{
     AtomicRunInteractionBatchRegistration, AtomicRunInteractionBatchRegistrationRequest,
-    AtomicRunInteractionWaitRequest, CancelRunRecord, ChatRequestData, ChatRunRecord,
-    ChatStreamRecord, DurableRunInteractionKind, DurableRunInteractionResolveOutcome,
-    DurableRunInteractionWaitOutcome, DurableRunRecord, RunLifecycleService, RunListCursor,
-    RunListRecord, RunMutationRecord, RunStateStore, RunStatusRecord, RunUserIntentData,
-    RunUserIntentRecord,
+    AtomicRunInteractionWaitRequest, DurableRunInteractionKind, DurableRunInteractionWaitOutcome,
+    DurableRunRecord, RunStateStore,
 };
 use astra_services::session_workspace::{WorkspaceMetadata, persist_remote_workspace};
 use astra_services::{
-    BubbleUpTarget, COMPACTION_INVARIANT_SQL, ConfidenceAction, ContextManifestItemWrite,
-    ContextManifestWrite, DatabaseContextManifestStore, DatabaseRunStateStore,
-    DatabaseSessionArtifactStore, DatabaseStateProjectionStore, DelegationProjectionUpsert,
-    SessionArtifactJsonRecord, SessionArtifactJsonStore, next_action_confidence_action,
+    ContextManifestItemWrite, ContextManifestWrite, DatabaseContextManifestStore,
+    DatabaseRunStateStore, DatabaseSessionArtifactStore, SessionArtifactJsonRecord,
+    SessionArtifactJsonStore,
 };
 use astra_thin_client::{
     ASTRA_DEVICE_CHALLENGE_ID_HEADER, ASTRA_DEVICE_FINGERPRINT_HEADER, ASTRA_DEVICE_ID_HEADER,
@@ -34,8 +30,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
 use sqlx::Row;
-use test_support::parse_sse_events;
-use tokio::sync::RwLock;
+use test_support::{parse_sse_events, require_db_it_env};
 use uuid::Uuid;
 
 const HTTP_TOKEN: &str = "Bearer e2e-joint-token";
@@ -44,15 +39,6 @@ const OWNER_B_HTTP_TOKEN: &str = "Bearer e2e-owner-b-token";
 
 static SHARED_BOOTSTRAP: tokio::sync::OnceCell<MatrixOneSettings> =
     tokio::sync::OnceCell::const_new();
-
-fn require_db_it_env() -> astra_core::MatrixOneSettings {
-    let enabled = std::env::var("ASTRA_TEST_DB_IT").unwrap_or_default();
-    assert!(
-        enabled == "1",
-        "set ASTRA_TEST_DB_IT=1 for ignored joint E2E tests; got {enabled:?}"
-    );
-    astra_core::MatrixOneSettings::from_env()
-}
 
 async fn setup_pool() -> SharedPool {
     let settings = SHARED_BOOTSTRAP
@@ -214,7 +200,7 @@ async fn insert_run_row(
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, -1, NOW(6), NOW(6))",
         [parent_run_id.is_some(), retry_of.is_some()],
     );
-    sqlx::query(&insert_sql)
+    sqlx::query(insert_sql)
         .bind(run_id)
         .bind(user_id)
         .bind(session_id)
@@ -286,7 +272,7 @@ fn durable_record(run_id: &str, session_id: &str, user_id: &str) -> DurableRunRe
         checkpoint_json: None,
         error_code: None,
         error_message: None,
-        retry_count: 0,
+
         total_prompt_tokens: 0,
         total_completion_tokens: 0,
         total_tool_calls: 0,
@@ -556,262 +542,21 @@ impl SessionService for JointSession {
     }
 }
 
-#[derive(Clone)]
-struct JointRunLifecycle {
-    store: Arc<RwLock<DatabaseRunStateStore>>,
-}
-
-impl JointRunLifecycle {
-    async fn store(&self) -> DatabaseRunStateStore {
-        self.store.read().await.clone()
-    }
-}
-
-#[async_trait]
-impl RunLifecycleService for JointRunLifecycle {
-    async fn create_run(
-        &self,
-        _user_id: String,
-        _request: ChatRequestData,
-    ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!("joint E2E creates durable runs directly")
-    }
-
-    async fn stream_chat(
-        &self,
-        _user_id: String,
-        _request: ChatRequestData,
-    ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!("joint E2E streams existing runs only")
-    }
-
-    async fn get_run_status(
-        &self,
-        run_id: String,
-        user_id: String,
-    ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
-        let run = self
-            .store()
-            .await
-            .load_run(&user_id, &run_id)
-            .await
-            .map_err(service_unavailable)?
-            .ok_or_else(|| not_found("run not found"))?;
-        if run.user_id != user_id {
-            return Err(forbidden("run belongs to another user"));
-        }
-        Ok(RunStatusRecord {
-            artifact_publication: None,
-            run_id,
-            session_id: run.session_id,
-            parent_run_id: run.parent_run_id,
-            root_run_id: run.root_run_id,
-            depth: run.depth,
-            status: run.status,
-            waiting_for: run.waiting_for,
-            events_count: run.events.len() as i64,
-            workspace: None,
-            executor: None,
-            transport: None,
-            accounting: None,
-        })
-    }
-
-    async fn stream_run(
-        &self,
-        run_id: String,
-        user_id: String,
-        last_index: u32,
-    ) -> Result<Vec<Value>, (StatusCode, Json<ErrorResponse>)> {
-        let run = self
-            .store()
-            .await
-            .load_run(&user_id, &run_id)
-            .await
-            .map_err(service_unavailable)?
-            .ok_or_else(|| not_found("run not found"))?;
-        if run.user_id != user_id {
-            return Err(forbidden("run belongs to another user"));
-        }
-        Ok(run.events.into_iter().skip(last_index as usize).collect())
-    }
-
-    async fn get_run_interaction_event(
-        &self,
-        run_id: String,
-        user_id: String,
-        request_id: String,
-        event_type: String,
-    ) -> Result<Option<Value>, (StatusCode, Json<ErrorResponse>)> {
-        self.store()
-            .await
-            .load_run_interaction_event(&user_id, &run_id, &request_id, &event_type)
-            .await
-            .map_err(service_unavailable)
-    }
-
-    async fn resolve_run_interaction(
-        &self,
-        run_id: String,
-        user_id: String,
-        expected_session_id: String,
-        request_id: String,
-        kind: DurableRunInteractionKind,
-        response_data: Value,
-    ) -> Result<DurableRunInteractionResolveOutcome, (StatusCode, Json<ErrorResponse>)> {
-        let store = self.store().await;
-        store
-            .resolve_run_interaction(
-                &user_id,
-                &expected_session_id,
-                &run_id,
-                &request_id,
-                kind,
-                response_data,
-            )
-            .await
-            .map_err(service_unavailable)
-    }
-
-    async fn cancel_run(
-        &self,
-        run_id: String,
-        user_id: String,
-    ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
-        let store = self.store().await;
-        let run = store
-            .load_run(&user_id, &run_id)
-            .await
-            .map_err(service_unavailable)?
-            .ok_or_else(|| not_found("run not found"))?;
-        store
-            .update_run_status(&user_id, &run.session_id, &run_id, "cancelled", None, None)
-            .await
-            .map_err(service_unavailable)?;
-        Ok(CancelRunRecord {
-            run_id,
-            status: "cancelled".to_string(),
-            execution_settled: true,
-        })
-    }
-
-    async fn list_runs_cursor(
-        &self,
-        _user_id: String,
-        limit: u32,
-        _cursor: Option<RunListCursor>,
-    ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
-        Ok(RunListRecord {
-            runs: Vec::new(),
-            total: None,
-            limit,
-            next_cursor: None,
-        })
-    }
-
-    async fn submit_run_user_intent(
-        &self,
-        run_id: String,
-        user_id: String,
-        input: RunUserIntentData,
-    ) -> Result<RunUserIntentRecord, (StatusCode, Json<ErrorResponse>)> {
-        let intent_id = input.intent_id.clone();
-        let store = self.store().await;
-        let run = store
-            .load_run(&user_id, &run_id)
-            .await
-            .map_err(service_unavailable)?
-            .ok_or_else(|| not_found("run not found"))?;
-        if run.user_id != user_id {
-            return Err(forbidden("run belongs to another user"));
-        }
-        let duplicate = run.events.iter().any(|event| {
-            event
-                .get("data")
-                .and_then(|data| data.get("intent_id"))
-                .and_then(Value::as_str)
-                == Some(input.intent_id.as_str())
-        });
-        if !duplicate {
-            store
-                .append_event(
-                    &user_id,
-                    &run.session_id,
-                    &run_id,
-                    json!({
-                        "event_type": "user_intent",
-                        "data": {
-                            "intent_id": input.intent_id,
-                            "delivery": input.delivery,
-                            "input": input.input,
-                        },
-                    }),
-                )
-                .await
-                .map_err(service_unavailable)?;
-        }
-        Ok(RunUserIntentRecord {
-            run_id,
-            intent_id,
-            status: astra_turn_types::UserIntentStatus::AcceptedRemote,
-            duplicate,
-            event_index: 0,
-        })
-    }
-
-    async fn pause_run(
-        &self,
-        run_id: String,
-        user_id: String,
-    ) -> Result<RunMutationRecord, (StatusCode, Json<ErrorResponse>)> {
-        let store = self.store().await;
-        let run = store
-            .load_run(&user_id, &run_id)
-            .await
-            .map_err(service_unavailable)?
-            .ok_or_else(|| not_found("run not found"))?;
-        store
-            .update_run_status(
-                &user_id,
-                &run.session_id,
-                &run_id,
-                "waiting",
-                Some("user"),
-                None,
-            )
-            .await
-            .map_err(service_unavailable)?;
-        Ok(RunMutationRecord::applied(run_id, "waiting", "running"))
-    }
-}
-
-fn service_unavailable(message: String) -> (StatusCode, Json<ErrorResponse>) {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(ErrorResponse::new(message)),
+fn build_joint_app(pool: SharedPool, user_id: String, store: DatabaseRunStateStore) -> Router {
+    let lifecycle = astra_runtime::AgenticRunLifecycleService::new(
+        pool.settings().clone(),
+        test_support::test_fernet_encryptor("joint-durability-fixture"),
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        astra_runtime::RunEngine::new(Arc::new(store)),
     )
-}
-
-fn not_found(message: &str) -> (StatusCode, Json<ErrorResponse>) {
-    (StatusCode::NOT_FOUND, Json(ErrorResponse::new(message)))
-}
-
-fn forbidden(message: &str) -> (StatusCode, Json<ErrorResponse>) {
-    (StatusCode::FORBIDDEN, Json(ErrorResponse::new(message)))
-}
-
-fn build_joint_app(
-    pool: SharedPool,
-    user_id: String,
-    store: Arc<RwLock<DatabaseRunStateStore>>,
-) -> Router {
+    .with_pool(pool.clone());
     let state = AppState::new(ServiceInfo::default(), Arc::new(JointHealth))
         .with_shared_pool(pool)
         .with_auth_service(Arc::new(JointAuth {
             user_id: user_id.clone(),
         }))
         .with_session_service(Arc::new(JointSession { user_id }))
-        .with_run_lifecycle_service(Arc::new(JointRunLifecycle { store }));
+        .with_run_lifecycle_service(Arc::new(lifecycle));
     build_app(state)
 }
 
@@ -871,7 +616,7 @@ async fn get_stream(
 ) -> Vec<Value> {
     let response = client
         .get(format!(
-            "http://{base}/chat/runs/{run_id}/stream?last_index={last_index}"
+            "http://{base}/chat/runs/{run_id}/stream?last_index={last_index}&replay_only=true"
         ))
         .header("authorization", HTTP_TOKEN)
         .send()
@@ -1101,325 +846,6 @@ fn absorb_sse_events(events: Vec<Value>, seen: &mut BTreeSet<i64>, next_index: &
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn save_manifest_turn(
-    store: &DatabaseContextManifestStore,
-    user_id: &str,
-    session_id: &str,
-    run_id: &str,
-    turn: usize,
-    reason: &str,
-    total_tokens: u32,
-    extra_items: Vec<ContextManifestItemWrite>,
-) {
-    let manifest_id = id("manifest");
-    let mut items = vec![ContextManifestItemWrite {
-        session_id: session_id.to_string(),
-        item_order: 0,
-        zone: "recent_tail".to_string(),
-        source_table: "session_transcript_items".to_string(),
-        source_id: format!("{session_id}:{turn}"),
-        source_hash: None,
-        included: true,
-        token_estimate: total_tokens.min(900),
-        budget_tokens: 2_000,
-        reason: reason.to_string(),
-        render_mode: "plain_text".to_string(),
-        raw_ref: Some(format!("conversation_log://{session_id}/turn/{turn}")),
-    }];
-    for (offset, mut item) in extra_items.into_iter().enumerate() {
-        item.item_order = (offset + 1) as i32;
-        items.push(item);
-    }
-    store
-        .save_manifest(
-            ContextManifestWrite {
-                manifest_id: manifest_id.clone(),
-                user_id: user_id.to_string(),
-                session_id: session_id.to_string(),
-                run_id: Some(run_id.to_string()),
-                turn_id: format!("turn-{turn:02}"),
-                model_provider: "mock".to_string(),
-                model_name: "joint-fixed-llm".to_string(),
-                context_window_tokens: 128_000,
-                max_output_tokens: 2_000,
-                total_estimated_tokens: total_tokens,
-                policy_version: "context_manifest_v1".to_string(),
-                tokenizer_id: Some("estimated_v1".to_string()),
-                budget_template_id: Some("budget_v1_128k".to_string()),
-                turn_intent: Some("development".to_string()),
-                reason: reason.to_string(),
-                manifest_json: json!({
-                    "e2e": "joint",
-                    "turn": turn,
-                    "zones": {
-                        "recent_tail": {"used_tokens": total_tokens.min(900), "budget_tokens": 2000}
-                    }
-                }),
-            },
-            items,
-        )
-        .await
-        .expect("save_manifest_turn must persist manifest and items");
-}
-
-#[tokio::test]
-#[allow(unused_attributes)]
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-#[ignore = "e2e_joint"]
-async fn e2e_joint_1_s01_rust_60_turn_refactor_chain() {
-    let pool = setup_pool().await;
-    let user_id = id("user");
-    let session_id = id("session");
-    let run_id = id("run");
-    insert_session(&pool, &user_id, &session_id).await;
-    insert_run_row(
-        &pool,
-        &user_id,
-        &session_id,
-        &run_id,
-        None,
-        &run_id,
-        &run_id,
-        0,
-        "completed",
-        None,
-        "node",
-    )
-    .await;
-    let plan_item = insert_state_item(
-        &pool,
-        &user_id,
-        &session_id,
-        &run_id,
-        "plan_state",
-        "rust-refactor-plan",
-        7,
-    )
-    .await;
-    for category in [
-        "decision",
-        "finding",
-        "benchmark",
-        "citation",
-        "todo_state",
-        "error_state",
-        "delegation_state",
-    ] {
-        insert_state_item(
-            &pool,
-            &user_id,
-            &session_id,
-            &run_id,
-            category,
-            &format!("{category}-seed"),
-            1,
-        )
-        .await;
-    }
-
-    sqlx::query(
-        "INSERT INTO session_history_chunks
-         (chunk_id, user_id, session_id, source_session_id, seq_start, seq_end, chunk_type,
-          source_table, source_id, content_text, content_hash, token_estimate, provenance_json, created_at)
-         VALUES (?, ?, ?, ?, 1, 50, 'code_decision', 'session_transcript_items',
-                 'turn-17', 'borrow checker detail from early refactor', ?, 180, ?, NOW(6))",
-    )
-    .bind(id("chunk"))
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&session_id)
-    .bind(id("hash"))
-    .bind(json!({"retrieval_stage": "structured"}).to_string())
-    .execute(pool.get())
-    .await
-    .expect("S01 retrieval seed chunk must be inserted");
-
-    let artifact_id = id("artifact");
-    sqlx::query(
-        "INSERT INTO session_artifacts
-         (artifact_id, session_id, user_id, owner_run_id, root_run_id, artifact_kind, source,
-          content_json, metadata, access_scope, retention_policy, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'cargo', 'tool_output', ?, ?, 'same_root_tree', 'default',
-                 'active', NOW(6), NOW(6))",
-    )
-    .bind(&artifact_id)
-    .bind(&session_id)
-    .bind(&user_id)
-    .bind(&run_id)
-    .bind(&run_id)
-    .bind(json!({"preview_text": "cargo test failed in crate astra-runtime"}).to_string())
-    .bind(
-        json!({"byte_size": 2 * 1024 * 1024, "summary": "cargo test 2MB output preserved"})
-            .to_string(),
-    )
-    .execute(pool.get())
-    .await
-    .expect("S01 large cargo artifact must be inserted");
-
-    let manifest_store = DatabaseContextManifestStore::new(pool.clone());
-    let projection_store = DatabaseStateProjectionStore::new(pool.clone());
-    let compaction_turns = [8_usize, 38, 58];
-    let mut compaction_runs = 0usize;
-    let turn_count = 60usize;
-    for turn in 0..turn_count {
-        if compaction_turns.contains(&turn) {
-            let compaction_run_id = id("compact");
-            insert_run_row(
-                &pool,
-                &user_id,
-                &session_id,
-                &compaction_run_id,
-                Some(&run_id),
-                &run_id,
-                &format!("{run_id}/{compaction_run_id}"),
-                1,
-                "completed",
-                None,
-                "node",
-            )
-            .await;
-            let results = projection_store
-                .compact_session_state(&user_id, &session_id, &compaction_run_id, 640)
-                .await
-                .expect("S01 compaction must run through DatabaseStateProjectionStore");
-            assert!(
-                results.len() == COMPACTION_INVARIANT_SQL.len(),
-                "S01 compaction must execute all invariants; got {} expected {}",
-                results.len(),
-                COMPACTION_INVARIANT_SQL.len()
-            );
-            assert!(
-                results.iter().all(|(_, violations)| *violations == 0),
-                "S01 compaction invariants must all return 0, got {results:?}"
-            );
-            compaction_runs += 1;
-            continue;
-        }
-        let mut extra = Vec::new();
-        let reason = if turn == 17 {
-            extra.push(ContextManifestItemWrite {
-                session_id: session_id.clone(),
-                item_order: 1,
-                zone: "retrieved_facts".to_string(),
-                source_table: "session_history_chunks".to_string(),
-                source_id: format!("{session_id}:turn-17"),
-                source_hash: None,
-                included: true,
-                token_estimate: 220,
-                budget_tokens: 1_000,
-                reason: "history_recall_structured".to_string(),
-                render_mode: "summary".to_string(),
-                raw_ref: Some(format!("chunk://{session_id}/turn-17")),
-            });
-            "history_recall_structured"
-        } else if turn == 44 {
-            extra.push(ContextManifestItemWrite {
-                session_id: session_id.clone(),
-                item_order: 1,
-                zone: "tool_previews".to_string(),
-                source_table: "session_artifacts".to_string(),
-                source_id: artifact_id.clone(),
-                source_hash: None,
-                included: true,
-                token_estimate: 1_200,
-                budget_tokens: 1_200,
-                reason: "large_tool_output_gated".to_string(),
-                render_mode: "tool_preview".to_string(),
-                raw_ref: Some(format!("artifact://{session_id}/{artifact_id}")),
-            });
-            "large_tool_output_gated"
-        } else {
-            "normal_turn"
-        };
-        save_manifest_turn(
-            &manifest_store,
-            &user_id,
-            &session_id,
-            &run_id,
-            turn,
-            reason,
-            1_200,
-            extra,
-        )
-        .await;
-    }
-
-    let row = sqlx::query(
-        "SELECT COUNT(*) AS manifest_count, SUM(total_estimated_tokens) AS actual_tokens
-         FROM context_manifests WHERE session_id = ?",
-    )
-    .bind(&session_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("S01 manifest count query must succeed");
-    let manifest_count = row.try_get::<i64, _>("manifest_count").unwrap_or_default();
-    let actual_tokens = row
-        .try_get::<Option<i64>, _>("actual_tokens")
-        .unwrap_or(Some(0))
-        .unwrap_or(0);
-    assert!(
-        manifest_count == turn_count as i64,
-        "S01 must persist one manifest per turn; got {manifest_count}, expected {turn_count}"
-    );
-    assert!(
-        compaction_runs == compaction_turns.len(),
-        "S01 must trigger expected compactions; got {compaction_runs}, expected {}",
-        compaction_turns.len()
-    );
-    let plan_version = sqlx::query("SELECT version FROM session_state_items WHERE item_id = ?")
-        .bind(&plan_item)
-        .fetch_one(pool.get())
-        .await
-        .expect("S01 plan_state version query must succeed")
-        .try_get::<i64, _>("version")
-        .unwrap_or_default();
-    assert!(
-        plan_version == 7,
-        "S01 compaction must not spuriously bump plan_state version; got {plan_version}"
-    );
-    let naive_tokens = turn_count as i64 * 3_000;
-    let saved_tokens = naive_tokens.saturating_sub(actual_tokens);
-    assert!(
-        saved_tokens * 100 >= naive_tokens * 50,
-        "S01 token savings must be >=50%; naive={naive_tokens}, actual={actual_tokens}"
-    );
-    let artifact_refs = sqlx::query(
-        "SELECT referenced_by_manifest_count FROM session_artifacts
-         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&artifact_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("S01 artifact reference query must succeed")
-    .try_get::<i64, _>("referenced_by_manifest_count")
-    .unwrap_or_default();
-    assert!(
-        artifact_refs >= 1,
-        "S01 large cargo artifact must be referenced by manifest, got {artifact_refs}"
-    );
-    sqlx::query(
-        "UPDATE session_artifacts SET status = 'expired'
-         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&artifact_id)
-    .execute(pool.get())
-    .await
-    .expect("S01 must be able to expire artifact for placeholder rendering");
-    let rendered = manifest_store
-        .render_artifact_manifest_item(&user_id, &session_id, &artifact_id, None)
-        .await
-        .expect("S01 expired artifact renderer must use persisted summary");
-    assert!(
-        rendered.contains("historical, raw no longer available, summary preserved"),
-        "S01 expired artifact renderer must return historical placeholder, got {rendered}"
-    );
-}
-
 #[tokio::test]
 #[allow(unused_attributes)]
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
@@ -1435,8 +861,8 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
         .insert_run(durable_record(&run_id, &session_id, &user_id))
         .await
         .expect("S04 initial durable run insert must succeed");
-    let shared_store = Arc::new(RwLock::new(initial_store.clone()));
-    let app = build_joint_app(pool.clone(), user_id.clone(), shared_store.clone());
+    let mut writer_store = initial_store.clone();
+    let app = build_joint_app(pool.clone(), user_id.clone(), writer_store.clone());
     let (addr, handle) = spawn_tcp_router(app).await;
     let client = local_client();
     let mut seen = BTreeSet::new();
@@ -1453,7 +879,7 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
             .expect("S04 simulated dropped SSE request must reach router");
         drop(dropped);
 
-        let store = shared_store.read().await.clone();
+        let store = writer_store.clone();
         store
             .append_event(
                 &user_id,
@@ -1489,23 +915,28 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
                 won,
                 "S04 replacement pod must take over agent_runs lease after simulated restart"
             );
-            *shared_store.write().await = replacement;
+            writer_store = replacement;
         }
 
         if reconnect == 5 || reconnect == 12 {
             let approval_id = id("approval");
-            let store = shared_store.read().await.clone();
-            store
-                .update_run_status(
-                    &user_id,
-                    &session_id,
-                    &run_id,
-                    "waiting",
-                    Some("approval"),
-                    None,
-                )
-                .await
-                .expect("S04 approval pause must persist waiting status");
+            let store = writer_store.clone();
+            assert!(
+                store
+                    .update_run_status_with_events_if_current(
+                        &user_id,
+                        &session_id,
+                        &run_id,
+                        &[if reconnect == 5 { "running" } else { "waiting" }],
+                        None,
+                        "waiting",
+                        Some("approval"),
+                        None,
+                        &[]
+                    )
+                    .await
+                    .expect("S04 approval pause must persist waiting status")
+            );
             store
                 .append_event(
                     &user_id,
@@ -1540,7 +971,7 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
         );
     }
 
-    let store = shared_store.read().await.clone();
+    let store = writer_store.clone();
     store
         .append_event(
             &user_id,
@@ -1550,10 +981,26 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
         )
         .await
         .expect("S04 final run_finished event must persist");
-    store
-        .update_run_status(&user_id, &session_id, &run_id, "completed", None, None)
-        .await
-        .expect("S04 final completed status must persist");
+    assert!(
+        store
+            .update_run_status_with_events_if_current(
+                &user_id,
+                &session_id,
+                &run_id,
+                &["waiting"],
+                None,
+                "completed",
+                None,
+                None,
+                &[]
+            )
+            .await
+            .expect("S04 final completed status must persist")
+    );
+    let terminal = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+    assert_eq!(terminal.status, "completed");
+    assert!(terminal.waiting_for.is_none());
+
     absorb_sse_events(
         get_stream(&client, addr, &run_id, next_index).await,
         &mut seen,
@@ -1662,11 +1109,7 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
     )
     .await;
 
-    let owner_app = build_joint_app(
-        pool.clone(),
-        user_id.clone(),
-        Arc::new(RwLock::new(owner_store.clone())),
-    );
+    let owner_app = build_joint_app(pool.clone(), user_id.clone(), owner_store.clone());
     let (owner_addr, owner_handle) = spawn_tcp_router(owner_app).await;
     let client = local_client();
     let pending = get_stream(&client, owner_addr, &approval_run_id, 0).await;
@@ -1689,16 +1132,12 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
         DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("server-only-callback-pod-b");
     let callback_c =
         DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("server-only-callback-pod-c");
-    let (callback_b_addr, callback_b_handle) = spawn_tcp_router(build_joint_app(
-        pool.clone(),
-        user_id.clone(),
-        Arc::new(RwLock::new(callback_b)),
-    ))
-    .await;
+    let (callback_b_addr, callback_b_handle) =
+        spawn_tcp_router(build_joint_app(pool.clone(), user_id.clone(), callback_b)).await;
     let (callback_c_addr, callback_c_handle) = spawn_tcp_router(build_joint_app(
         pool.clone(),
         user_id.clone(),
-        Arc::new(RwLock::new(callback_c.clone())),
+        callback_c.clone(),
     ))
     .await;
     let approval_body = json!({
@@ -1850,7 +1289,7 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
     let (callback_d_addr, callback_d_handle) = spawn_tcp_router(build_joint_app(
         pool.clone(),
         user_id.clone(),
-        Arc::new(RwLock::new(callback_d.clone())),
+        callback_d.clone(),
     ))
     .await;
     let (retry_status, retry_payload) = post_json(
@@ -2002,13 +1441,16 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
         .await
         .expect("S07 durable run insert must succeed");
     store
-        .update_run_status(
+        .update_run_status_with_events_if_current(
             &user_id,
             &session_id,
             &run_id,
+            &["running"],
+            None,
             "waiting",
             Some("approval"),
             None,
+            &[],
         )
         .await
         .expect("S07 approval waiting status must persist");
@@ -2030,8 +1472,8 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
         .await
         .expect("S07 approval_request event must persist");
 
-    let shared_store = Arc::new(RwLock::new(store));
-    let app = build_joint_app(pool.clone(), user_id.clone(), shared_store.clone());
+    let mut writer_store = store;
+    let app = build_joint_app(pool.clone(), user_id.clone(), writer_store.clone());
     let (addr, handle) = spawn_tcp_router(app).await;
     let client = local_client();
     let initial_events = get_stream(&client, addr, &run_id, 0).await;
@@ -2060,7 +1502,7 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
             loaded.status,
             loaded.waiting_for
         );
-        *shared_store.write().await = replacement;
+        writer_store = replacement;
     }
 
     sqlx::query(
@@ -2131,7 +1573,7 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
         json!({"content": "continue with the approved release conditions"}),
     )
     .await;
-    let final_store = shared_store.read().await.clone();
+    let final_store = writer_store.clone();
     final_store
         .append_event(
             &user_id,
@@ -2150,10 +1592,29 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
         )
         .await
         .expect("S07 run_finished must persist");
-    final_store
-        .update_run_status(&user_id, &session_id, &run_id, "completed", None, None)
+    assert!(
+        final_store
+            .update_run_status_with_events_if_current(
+                &user_id,
+                &session_id,
+                &run_id,
+                &["waiting"],
+                None,
+                "completed",
+                None,
+                None,
+                &[]
+            )
+            .await
+            .expect("S07 completed status must persist")
+    );
+    let terminal = final_store
+        .load_run(&user_id, &run_id)
         .await
-        .expect("S07 completed status must persist");
+        .unwrap()
+        .unwrap();
+    assert_eq!(terminal.status, "completed");
+    assert!(terminal.waiting_for.is_none());
 
     let row = sqlx::query(
         "SELECT payload_json FROM session_state_items
@@ -2199,7 +1660,7 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
 #[allow(unused_attributes)]
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
 #[ignore = "e2e_joint"]
-async fn e2e_joint_4_s10_five_level_delegation_bubble_up_and_retry_node() {
+async fn e2e_joint_4_s10_five_level_delegation_and_retry_node() {
     let pool = setup_pool().await;
     let user_id = id("user");
     let session_id = id("session");
@@ -2283,8 +1744,7 @@ async fn e2e_joint_4_s10_five_level_delegation_bubble_up_and_retry_node() {
     .await;
 
     let store = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("joint-delegation");
-    let shared_store = Arc::new(RwLock::new(store));
-    let app = build_joint_app(pool.clone(), user_id.clone(), shared_store);
+    let app = build_joint_app(pool.clone(), user_id.clone(), store);
     let (addr, handle) = spawn_tcp_router(app).await;
     let client = local_client();
     let health = client
@@ -2297,113 +1757,6 @@ async fn e2e_joint_4_s10_five_level_delegation_bubble_up_and_retry_node() {
         "S10 router health expected 200, got {}",
         health.status()
     );
-
-    let projection = DatabaseStateProjectionStore::new(pool.clone());
-    let delegation_rows = [
-        (&l0, &l1, 1_u32, format!("{l0}/{l1}")),
-        (&l1, &l2, 2_u32, format!("{l0}/{l1}/{l2}")),
-        (
-            &l2,
-            &l3_runs[0],
-            3_u32,
-            format!("{l0}/{l1}/{l2}/{}", l3_runs[0]),
-        ),
-        (
-            &l2,
-            &l3_runs[1],
-            3_u32,
-            format!("{l0}/{l1}/{l2}/{}", l3_runs[1]),
-        ),
-        (
-            &l2,
-            &l3_runs[2],
-            3_u32,
-            format!("{l0}/{l1}/{l2}/{}", l3_runs[2]),
-        ),
-        (
-            &l2,
-            &l3_runs[3],
-            3_u32,
-            format!("{l0}/{l1}/{l2}/{}", l3_runs[3]),
-        ),
-        (
-            &l3_runs[1],
-            &l4,
-            4_u32,
-            format!("{l0}/{l1}/{l2}/{}/{}", l3_runs[1], l4),
-        ),
-    ];
-    for (parent, child, depth, path) in delegation_rows {
-        projection
-            .upsert_delegation_projection(DelegationProjectionUpsert {
-                delegation_id: id("delegation"),
-                user_id: user_id.clone(),
-                session_id: session_id.clone(),
-                parent_run_id: parent.to_string(),
-                child_run_id: child.to_string(),
-                root_run_id: l0.clone(),
-                ancestor_path: path,
-                depth,
-                agent_id: Some(format!("agent-depth-{depth}")),
-                title: Some(format!("delegated depth {depth}")),
-                status: "running".to_string(),
-                retry_of: None,
-                retry_scope: "node".to_string(),
-                last_summary_ref: None,
-                last_summary_text: Some(format!("depth {depth} active")),
-                sibling_exposed_artifacts_json: None,
-            })
-            .await
-            .expect("S10 delegation projection upsert must persist table and state item rows");
-    }
-
-    let original_item_id = insert_state_item(
-        &pool,
-        &user_id,
-        &session_id,
-        &l3_runs[1],
-        "finding",
-        "critical-executor-2",
-        1,
-    )
-    .await;
-    projection
-        .bubble_up_finding(
-            &user_id,
-            &l3_runs[1],
-            &original_item_id,
-            "critical",
-            "executor-2 found unsafe retry boundary",
-            &[
-                BubbleUpTarget {
-                    session_id: session_id.clone(),
-                    run_id: l4.clone(),
-                    depth: 4,
-                },
-                BubbleUpTarget {
-                    session_id: session_id.clone(),
-                    run_id: l3_runs[1].clone(),
-                    depth: 3,
-                },
-                BubbleUpTarget {
-                    session_id: session_id.clone(),
-                    run_id: l2.clone(),
-                    depth: 2,
-                },
-                BubbleUpTarget {
-                    session_id: session_id.clone(),
-                    run_id: l1.clone(),
-                    depth: 1,
-                },
-                BubbleUpTarget {
-                    session_id: session_id.clone(),
-                    run_id: l0.clone(),
-                    depth: 0,
-                },
-            ],
-        )
-        .await
-        .expect("S10 bubble_up_finding must insert all ancestor projection events");
 
     let retry_run = id("retry");
     insert_run_row(
@@ -2440,21 +1793,6 @@ async fn e2e_joint_4_s10_five_level_delegation_bubble_up_and_retry_node() {
         path == expected_l4_path,
         "S10 L4 ancestor_path mismatch; expected {expected_l4_path}, got {path}"
     );
-    let bubble_count = sqlx::query(
-        "SELECT COUNT(*) AS c FROM session_state_item_events
-         WHERE session_id = ? AND user_id = ? AND mutation = 'bubble_up'",
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("S10 bubble_up event count query must succeed")
-    .try_get::<i64, _>("c")
-    .unwrap_or_default();
-    assert!(
-        bubble_count == 5,
-        "S10 critical finding must bubble through 5 levels, got {bubble_count}"
-    );
     let retry = sqlx::query("SELECT retry_of, retry_scope FROM agent_runs WHERE run_id = ?")
         .bind(&retry_run)
         .fetch_one(pool.get())
@@ -2488,7 +1826,7 @@ async fn e2e_joint_4_s10_five_level_delegation_bubble_up_and_retry_node() {
 #[allow(unused_attributes)]
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
 #[ignore = "e2e_joint"]
-async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
+async fn four_devices_hydrate_revoke_and_receive_lease_expiry_events() {
     let pool = setup_pool().await;
     let matrixone = require_db_it_env();
     let user_id = id("user");
@@ -2550,18 +1888,33 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
         )
         .await
         .expect("S14 second event must make run_event_high_watermark positive");
-    for seq in 1..=4_i64 {
+    let transcript_child = id("transcript-child");
+    insert_run_row(
+        &pool,
+        &user_id,
+        &session_id,
+        &transcript_child,
+        Some(&run_id),
+        &run_id,
+        &format!("{run_id}/{transcript_child}"),
+        1,
+        "completed",
+        None,
+        "node",
+    )
+    .await;
+    for seq in 1..=60_i64 {
         sqlx::query(
             "INSERT INTO session_transcript_items
-             (session_id, item_seq, user_id, run_id, role, content, source_event_idx, content_hash, created_at)
+             (session_id, item_seq, user_id, run_id, role, content, source_event_id, content_hash, created_at)
              VALUES (?, ?, ?, ?, 'assistant', ?, ?, ?, NOW(6))",
         )
         .bind(&session_id)
         .bind(seq)
         .bind(&user_id)
-        .bind(&run_id)
+        .bind(if seq % 10 == 0 { &transcript_child } else { &run_id })
         .bind(format!("transcript item {seq}"))
-        .bind(seq - 1)
+        .bind(format!("transcript-source-{seq}"))
         .bind(id("hash"))
         .execute(pool.get())
         .await
@@ -2605,8 +1958,7 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
         .await
         .expect("S14 context manifest insert must succeed");
 
-    let shared_store = Arc::new(RwLock::new(store));
-    let app = build_joint_app(pool.clone(), user_id.clone(), shared_store);
+    let app = build_joint_app(pool.clone(), user_id.clone(), store);
     let (addr, handle) = spawn_tcp_router(app).await;
     let client = local_client();
 
@@ -2719,6 +2071,70 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
                 .is_some_and(|items| items.len() == 2),
             "S14 cold-start transcript pagination must return requested page; transcript={transcript}"
         );
+
+        if device_idx == 0 {
+            for (scope, expected) in [
+                (String::new(), (1..=60_i64).collect::<Vec<_>>()),
+                (
+                    "&scope=root_conversation".to_string(),
+                    (1..=60_i64).filter(|seq| seq % 10 != 0).collect(),
+                ),
+                (
+                    format!("&run_id={run_id}"),
+                    (1..=60_i64).filter(|seq| seq % 10 != 0).collect(),
+                ),
+                (
+                    format!("&run_id={transcript_child}"),
+                    (1..=60_i64).filter(|seq| seq % 10 == 0).collect(),
+                ),
+            ] {
+                let mut before = 61;
+                let mut seen = Vec::new();
+                loop {
+                    let page: Value = client.get(format!(
+                        "http://{addr}/sessions/{session_id}/transcript?limit=17&before_seq={before}{scope}"
+                    )).header("authorization", HTTP_TOKEN).send().await.unwrap()
+                        .error_for_status().expect("public transcript page")
+                        .json().await.unwrap();
+                    let rows = page["items"].as_array().expect("transcript items");
+                    assert_eq!(
+                        page.as_object().unwrap().len(),
+                        4,
+                        "item/cursor response contract"
+                    );
+                    let sequences = rows
+                        .iter()
+                        .map(|item| {
+                            let seq = item["item_seq"].as_i64().unwrap();
+                            assert_eq!(item["source_event_id"], format!("transcript-source-{seq}"));
+                            seq
+                        })
+                        .collect::<Vec<_>>();
+                    assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+                    assert!(sequences.iter().all(|seq| *seq < before));
+                    if scope.is_empty() && before == 61 {
+                        sqlx::query(
+                            "INSERT INTO session_transcript_items
+                             (user_id, session_id, item_seq, run_id, role, content, source_event_id, content_hash)
+                             VALUES (?, ?, 61, ?, 'assistant', 'concurrent append', 'transcript-source-61', 'append-hash')",
+                        ).bind(&user_id).bind(&session_id).bind(&run_id)
+                            .execute(pool.get()).await.expect("append between public pages");
+                    }
+                    seen.extend(sequences);
+                    if !page["has_more"].as_bool().unwrap() {
+                        break;
+                    }
+                    let next = page["next_before_seq"].as_i64().expect("older cursor");
+                    assert!(next < before, "pagination must make progress");
+                    before = next;
+                }
+                seen.sort_unstable();
+                assert_eq!(
+                    seen, expected,
+                    "scoped pagination remains stable during append"
+                );
+            }
+        }
         let replay = get_stream(&client, addr, &run_id, 0).await;
         assert!(
             replay
@@ -2844,38 +2260,6 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
             .expect("S14 revoked_at must decode")
             .is_some(),
         "S14 rejected hydration must not erase revocation evidence"
-    );
-
-    let budget = astra_services::budget_for_turn_intent(Some("benchmark_comparison"));
-    let zone_total = budget.budget.input_context_cap();
-    assert!(
-        zone_total <= 7_300,
-        "S14 budget_v1_8k zones must stay <=7300 tokens, got {zone_total}"
-    );
-    assert!(
-        budget.budget.tool_previews == 2_500 && budget.borrowed_from_recent_tail > 0,
-        "S14 benchmark_comparison must flex tool_previews to 2500 from recent_tail; allocation={budget:?}"
-    );
-    assert!(
-        matches!(
-            next_action_confidence_action(0.9, 0, "structured_event", Some("event-1")),
-            ConfidenceAction::AutoAccept
-        ),
-        "S14 high-confidence structured event must auto-accept"
-    );
-    assert!(
-        matches!(
-            next_action_confidence_action(0.65, 0, "rule", Some("event-2")),
-            ConfidenceAction::AskUser
-        ),
-        "S14 medium-confidence action must ask user"
-    );
-    assert!(
-        matches!(
-            next_action_confidence_action(0.95, 0, "small_model", None),
-            ConfidenceAction::AskUser
-        ),
-        "S14 small-model-only action must require confirmation despite high score"
     );
 
     let mut rx = astra_runtime::server::device_lease_sweeper::subscribe_device_lease_events();

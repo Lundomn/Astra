@@ -17,8 +17,9 @@ use astra_services::{
     declare_inference_attempt_settlement, declare_inference_settlement,
     finish_inference_invocation, finish_inference_provider_attempt,
     finish_successful_inference_provider_attempt_and_invocation,
-    load_inference_canonical_transitions_for_session, next_inference_logical_attempt_pair_base,
-    plan_inference_invocation, plan_inference_provider_attempt, reconcile_inference_settlements,
+    load_inference_canonical_transitions_for_session, load_session_auxiliary_capture,
+    next_inference_logical_attempt_pair_base, plan_inference_invocation,
+    plan_inference_provider_attempt, reconcile_inference_settlements,
     renew_inference_invocation_owner, retire_inference_canonical_transitions_through_turn,
     settle_uncertain_inference_admission,
 };
@@ -29,6 +30,214 @@ use sqlx::Row;
 use uuid::Uuid;
 
 const TEST_INFERENCE_OWNER_POD_ID: &str = "inference-db-it-owner";
+
+/// Compare identical real-ledger workloads across revisions; no provider calls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated MatrixOne; ASTRA_TEST_STORAGE_SCALE=1 selects 1000 sessions"]
+async fn default_request_context_storage_cost() {
+    use futures_util::{StreamExt, stream};
+    let (shared, _) = common::setup_pool_and_settings().await;
+    let scale = std::env::var("ASTRA_TEST_STORAGE_SCALE").as_deref() == Ok("1");
+    let sessions = if scale { 1000 } else { 4 };
+    let rounds = if scale { 1 } else { 8 };
+    let nonce = Uuid::new_v4().simple().to_string();
+    let started = std::time::Instant::now();
+    let results = stream::iter(0..sessions).map(|index| {
+        let shared = shared.clone();
+        let user = format!("context-cost-{}-{}", nonce, index % 100);
+        let session = format!("context-cost-{}-{index}", nonce);
+        async move {
+            let run = Uuid::new_v4().to_string();
+            seed_run(shared.get(), &user, &session, &run).await;
+            let mut latency = Vec::new();
+            for round in 0..rounds {
+                let plan = plan_inference_invocation(run_input(&user, &session, &run, round, "storage_cost")).unwrap();
+                let attempt = provider_attempt(&plan, 0);
+                let terminal = InferenceInvocationTerminal::succeeded(InferenceUsage {
+                    input: astra_turn_types::NormalizedPromptCacheUsage::new(13, 8, 2), output_tokens:6,
+                }, Some("fixture-response".into()));
+                let start = std::time::Instant::now();
+                admit_inference_invocation_with_first_provider_attempt(&shared, &plan, &attempt).await.unwrap();
+                finish_successful_inference_provider_attempt_and_invocation(&shared, &plan, &attempt, &terminal).await.unwrap();
+                latency.push(start.elapsed().as_micros());
+            }
+            let bytes: i64 = sqlx::query_scalar("SELECT CAST(SUM(OCTET_LENGTH(event_json)) AS SIGNED) FROM model_request_context_events WHERE user_id = ? AND session_id = ?")
+                .bind(&user).bind(&session).fetch_one(shared.get()).await.unwrap();
+            let read_start = std::time::Instant::now();
+            let events = astra_services::list_model_request_context_events(&shared, &user, &session, rounds * 2).await.unwrap();
+            let read_us = read_start.elapsed().as_micros();
+            assert_eq!(events.len(), rounds as usize * 2);
+            for record in events {
+                assert_eq!(record.event.identity.owner_scope, user);
+                assert_eq!(record.event.identity.session_id.as_deref(), Some(session.as_str()));
+                assert!(!record.event.route.route_id.is_empty());
+                if record.stage == astra_services::ModelRequestEventStage::Terminal {
+                    let usage = record.event.usage.unwrap();
+                    assert_eq!(usage.total_input_tokens(), 23);
+                    assert_eq!(usage.output_tokens, 6);
+                }
+            }
+            cleanup(shared.get(), &user, &session, &run).await;
+            (bytes, read_us, latency)
+        }
+    }).buffer_unordered(16).collect::<Vec<_>>().await;
+    let bytes: i64 = results.iter().map(|item| item.0).sum();
+    let read_us: u128 = results.iter().map(|item| item.1).sum();
+    let mut latency: Vec<_> = results.into_iter().flat_map(|item| item.2).collect();
+    latency.sort_unstable();
+    eprintln!(
+        "model_context_cost sessions={sessions} rounds={rounds} attempts={} json_bytes={bytes} settlement_p50_us={} settlement_p95_us={} read_total_us={read_us} wall_with_setup_cleanup_ms={}",
+        latency.len(),
+        latency[latency.len() / 2],
+        latency[latency.len() * 95 / 100],
+        started.elapsed().as_millis()
+    );
+}
+
+/// Opt-in measurement fixture, not a provider benchmark. Collect statement_info
+/// separately after this emits its connection IDs and DB-clock window.
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1 and ASTRA_LEDGER_COST_PROBE=1"]
+#[serial]
+async fn session_success_ledger_cost_probe() {
+    match std::env::var("ASTRA_LEDGER_COST_PROBE") {
+        Err(std::env::VarError::NotPresent) => {
+            eprintln!("SKIP ledger cost probe: set ASTRA_LEDGER_COST_PROBE=1 to measure");
+            return;
+        }
+        value => assert_eq!(value.as_deref(), Ok("1")),
+    }
+    let mut settings = common::require_db_it_env();
+    assert!(
+        settings.database.starts_with("astra_ledger_cost_probe_"),
+        "cost probe requires an explicitly isolated astra_ledger_cost_probe_* database"
+    );
+    settings.db_pool_max_connections = 2;
+    settings.db_pool_min_connections = 2;
+    let catalog =
+        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+    astra_services::ensure_core_schema(&settings, &catalog)
+        .await
+        .unwrap();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user = format!("ledger-cost-{suffix}");
+    let session = format!("ledger-cost-session-{suffix}");
+    let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    sqlx::query("INSERT INTO agent_sessions (session_id, user_id, status, event_count, project_retention_policy, created_at, updated_at, last_active_at) VALUES (?, ?, 'active', 0, 'session', NOW(6), NOW(6), NOW(6))")
+        .bind(&session).bind(&user).execute(pool.get()).await.unwrap();
+    let mut first = pool.get().acquire().await.unwrap();
+    let mut second = pool.get().acquire().await.unwrap();
+    let mut before_ids = Vec::new();
+    for connection in [&mut first, &mut second] {
+        sqlx::raw_sql("SET SESSION disable_agg_statement = ON")
+            .execute(&mut **connection)
+            .await
+            .unwrap();
+        let enabled: String = sqlx::query_scalar("SELECT @@session.disable_agg_statement")
+            .fetch_one(&mut **connection)
+            .await
+            .unwrap();
+        assert_eq!(enabled, "1");
+        let id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(&mut **connection)
+            .await
+            .unwrap();
+        before_ids.push(id);
+        // UUID-generated hex literal remains identifiable even when trace
+        // does not expand prepared statement bindings.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT '{suffix}' AS astra_cost_begin_sentinel"
+        )))
+        .fetch_one(&mut **connection)
+        .await
+        .unwrap();
+    }
+    before_ids.sort_unstable();
+    assert_ne!(before_ids[0], before_ids[1]);
+    let started: chrono::NaiveDateTime = sqlx::query_scalar("SELECT CAST(NOW(6) AS DATETIME(6))")
+        .fetch_one(&mut *first)
+        .await
+        .unwrap();
+    drop((first, second));
+
+    let mut input = run_input(&user, &session, "unused", 1, "ledger_cost_probe");
+    input.scope = InferenceInvocationScope::Session {
+        session_id: session,
+        turn: 1,
+        round: 1,
+        operation_id: "ledger_cost_probe".into(),
+        logical_attempt: 0,
+    };
+    input.run_authority = None;
+    input.purpose = InferencePurpose::VerificationJudge;
+    let plan = plan_inference_invocation(input).unwrap();
+    let attempt = provider_attempt(&plan, 0);
+    let terminal = InferenceInvocationTerminal::succeeded(
+        InferenceUsage {
+            input: astra_turn_types::NormalizedPromptCacheUsage::new(13, 8, 2),
+            output_tokens: 6,
+        },
+        Some("fixture-response-not-a-provider-call".into()),
+    );
+    let wall = std::time::Instant::now();
+    admit_inference_invocation(&pool, &plan).await.unwrap();
+    let admission_us = wall.elapsed().as_micros();
+    begin_inference_provider_attempt(&pool, &attempt)
+        .await
+        .unwrap();
+    let before_provider_us = wall.elapsed().as_micros();
+    finish_successful_inference_provider_attempt_and_invocation(&pool, &plan, &attempt, &terminal)
+        .await
+        .unwrap();
+    let total_us = wall.elapsed().as_micros();
+
+    let mut first = pool.get().acquire().await.unwrap();
+    let mut second = pool.get().acquire().await.unwrap();
+    let ended: chrono::NaiveDateTime = sqlx::query_scalar("SELECT CAST(NOW(6) AS DATETIME(6))")
+        .fetch_one(&mut *first)
+        .await
+        .unwrap();
+    let mut after_ids = Vec::new();
+    for connection in [&mut first, &mut second] {
+        let id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(&mut **connection)
+            .await
+            .unwrap();
+        after_ids.push(id);
+        let enabled: String = sqlx::query_scalar("SELECT @@session.disable_agg_statement")
+            .fetch_one(&mut **connection)
+            .await
+            .unwrap();
+        assert_eq!(
+            enabled, "1",
+            "measurement connection lost its capture setting"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT '{suffix}' AS astra_cost_end_sentinel"
+        )))
+        .fetch_one(&mut **connection)
+        .await
+        .unwrap();
+    }
+    after_ids.sort_unstable();
+    assert_eq!(
+        before_ids, after_ids,
+        "connection replacement invalidates measurement"
+    );
+    eprintln!(
+        "LEDGER_COST_PROBE {}",
+        serde_json::json!({
+            "capture_status": "pending_external_trace_validation",
+            "database": settings.database, "connection_ids": before_ids,
+            "probe": suffix, "start": started, "end": ended,
+            "admission_us": admission_us, "before_provider_us": before_provider_us,
+            "ledger_total_us": total_us, "provider_calls": 0,
+            "usage": "fixture_not_measured", "physical_write_bytes": null,
+        })
+    );
+    drop((first, second));
+    pool.close().await;
+}
 
 fn run_authority() -> Option<InferenceRunAdmissionAuthority> {
     Some(InferenceRunAdmissionAuthority {
@@ -70,15 +279,19 @@ fn provider_attempt(
     plan: &InferenceInvocationPlan,
     attempt_index: u32,
 ) -> InferenceProviderAttemptPlan {
+    provider_attempt_with_wire(plan, attempt_index, "a".repeat(64))
+}
+
+fn provider_attempt_with_wire(
+    plan: &InferenceInvocationPlan,
+    attempt_index: u32,
+    provider_wire_hash: impl Into<String>,
+) -> InferenceProviderAttemptPlan {
     plan_inference_provider_attempt(
         plan,
         attempt_index,
-        InferenceProviderWireIdentity::new(
-            "openai_compatible",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            2,
-        )
-        .expect("test provider wire identity"),
+        InferenceProviderWireIdentity::new("openai_compatible", provider_wire_hash, 2)
+            .expect("test provider wire identity"),
     )
 }
 
@@ -151,11 +364,11 @@ async fn seed_run(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &st
         "INSERT INTO agent_runs
          (run_id, user_id, session_id, root_run_id, ancestor_path, depth, retry_scope,
           status, execution_mode, owner_pod_id, owner_lease_expires_at,
-          run_generation, last_event_idx, retry_count,
+          run_generation, last_event_idx,
           total_prompt_tokens, total_completion_tokens, total_tool_calls,
           created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, 0, 'node', 'running', 'web_agent', ?,
-                 TIMESTAMPADD(MINUTE, 5, NOW(6)), 0, -1, 0,
+                 TIMESTAMPADD(MINUTE, 5, NOW(6)), 0, -1,
                  0, 0, 0, NOW(6), NOW(6))",
     )
     .bind(run_id)
@@ -244,6 +457,117 @@ async fn assert_independent_query_can_replace_cancelled_checkout(pool: &sqlx::Po
     .expect("cancelled inference checkout must release pool capacity")
     .expect("independent inference query after cancellation");
     assert_eq!(value, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn empty_canonical_wal_retirement_preserves_lifecycle_fencing() {
+    let shared_pool = common::setup_pool().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("empty-retire-user-{suffix}");
+    let session_id = format!("empty-retire-session-{suffix}");
+    let run_id = format!("empty-retire-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    assert_eq!(
+        retire_inference_canonical_transitions_through_turn(&shared_pool, &user_id, &session_id, 1)
+            .await
+            .unwrap(),
+        0,
+        "a missing lifecycle fence still uses ordinary session admission"
+    );
+    let mut locked = pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT session_id FROM agent_session_lifecycle_fences
+         WHERE user_id = ? AND session_id = ? FOR UPDATE",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(&mut *locked)
+    .await
+    .unwrap();
+    let empty = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        retire_inference_canonical_transitions_through_turn(&shared_pool, &user_id, &session_id, 1),
+    )
+    .await
+    .expect("an empty retirement must not open a child-write transaction")
+    .unwrap();
+    assert_eq!(empty, 0);
+    locked.rollback().await.unwrap();
+    sqlx::query(
+        "UPDATE agent_session_lifecycle_fences SET delete_requested_at = NOW(6)
+         WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    let error =
+        retire_inference_canonical_transitions_through_turn(&shared_pool, &user_id, &session_id, 1)
+            .await
+            .expect_err("an empty WAL must not bypass a committed deletion fence");
+    assert_eq!(error.kind, ServiceErrorKind::NotFound);
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_session_lifecycle_fences WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "fixture cleanup must not leave a delete intent"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn empty_canonical_wal_recovery_reuses_its_physical_connection() {
+    let (bootstrap_pool, mut settings) = common::setup_pool_and_settings().await;
+    drop(bootstrap_pool);
+    settings.db_pool_min_connections = 0;
+    settings.db_pool_max_connections = 1;
+    let shared_pool = astra_core::SharedPool::new(&settings)
+        .await
+        .expect("create one-slot canonical WAL recovery pool");
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("empty-wal-user-{suffix}");
+    let session_id = format!("empty-wal-session-{suffix}");
+    let run_id = format!("empty-wal-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let connection_id_before: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(pool)
+        .await
+        .expect("read canonical WAL recovery connection id");
+    for _ in 0..2 {
+        let recovered = load_inference_canonical_transitions_for_session(
+            &shared_pool,
+            &user_id,
+            &session_id,
+            0,
+        )
+        .await
+        .expect("load an empty canonical WAL");
+        assert!(recovered.is_empty());
+    }
+    let connection_id_after: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(pool)
+        .await
+        .expect("read connection id after repeated empty WAL recovery");
+
+    assert_eq!(
+        connection_id_before, connection_id_after,
+        "successful empty WAL recovery must return its healthy connection to the pool"
+    );
+    cleanup(pool, &user_id, &session_id, &run_id).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -350,10 +674,10 @@ async fn cancelled_inference_recovery_and_settlement_close_their_physical_checko
         .expect("finish cancellation-safe terminal fixture");
     sqlx::query(
         "INSERT INTO inference_invocation_settlement_debts
-         (user_id, invocation_id, session_id, harness_run_id,
+         (user_id, invocation_id, session_id,
           terminal_status, terminal_fingerprint, usage_status,
           provider_delivery_state)
-         SELECT user_id, invocation_id, session_id, harness_run_id,
+         SELECT user_id, invocation_id, session_id,
                 status, terminal_fingerprint, usage_status,
                 provider_delivery_state
          FROM inference_invocations
@@ -670,7 +994,7 @@ async fn uncertain_admission_recovery_is_scope_fenced_and_atomic() {
             .await
             .expect("join recovery")
             .expect("recover rollback"),
-        InferenceInvocationAdmissionResolution::Settled
+        (InferenceInvocationAdmissionResolution::Settled, None)
     );
 
     let atomic = sqlx::query(
@@ -748,7 +1072,7 @@ async fn uncertain_admission_recovery_is_scope_fenced_and_atomic() {
         settle_uncertain_inference_admission(&shared_pool, &unknown_plan, &terminal)
             .await
             .expect("strengthen generic debt to pre-delivery"),
-        InferenceInvocationAdmissionResolution::Settled
+        (InferenceInvocationAdmissionResolution::Settled, None)
     );
     let strengthened_delivery_state = sqlx::query_scalar::<_, String>(
         "SELECT provider_delivery_state
@@ -768,7 +1092,10 @@ async fn uncertain_admission_recovery_is_scope_fenced_and_atomic() {
         settle_uncertain_inference_admission(&shared_pool, &conflicting, &terminal)
             .await
             .expect("classify competing admission owner"),
-        InferenceInvocationAdmissionResolution::ConflictingIdentity
+        (
+            InferenceInvocationAdmissionResolution::ConflictingIdentity,
+            None
+        )
     );
     let debt_count = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM inference_invocation_settlement_debts
@@ -1042,6 +1369,7 @@ async fn superseded_payload_owner_can_terminalize_after_its_child_becomes_head()
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
 async fn canonical_transition_wal_is_linear_and_recoverable_across_many_rounds() {
+    let started = std::time::Instant::now();
     let (shared_pool, _) = common::setup_pool_and_settings().await;
     let pool = shared_pool.get();
     let suffix = Uuid::new_v4().simple().to_string();
@@ -1052,12 +1380,19 @@ async fn canonical_transition_wal_is_linear_and_recoverable_across_many_rounds()
 
     let durable_base = astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&[])
         .expect("empty durable base");
-    const ROUNDS: u32 = 300;
+    // Keep the full 300-round workload explicitly reproducible, while the
+    // ordinary DB contract checks the same retry/CAS/recovery invariants on a
+    // short chain. Offline transition tests also cover 256-entry linear growth.
+    let rounds: u32 = if std::env::var("ASTRA_TEST_STORAGE_SCALE").as_deref() == Ok("1") {
+        300
+    } else {
+        32
+    };
     let mut history = Vec::new();
     let mut parent_transition_id = None;
     let mut parent_result = None;
     let mut first_retry_attempt_id = None;
-    for round in 0..ROUNDS {
+    for round in 0..rounds {
         let recovery_delta = if round > 0 {
             let provider_response = serde_json::json!({
                 "role": "assistant",
@@ -1144,7 +1479,7 @@ async fn canonical_transition_wal_is_linear_and_recoverable_across_many_rounds()
         &user_id,
         &session_id,
         &run_id,
-        ROUNDS,
+        rounds,
         "canonical_head_stale_parent",
     ))
     .expect("plan stale-parent invocation");
@@ -1194,7 +1529,7 @@ async fn canonical_transition_wal_is_linear_and_recoverable_across_many_rounds()
     .fetch_all(pool)
     .await
     .expect("measure bounded canonical WAL");
-    assert_eq!(wal_payload_bytes.len(), ROUNDS as usize);
+    assert_eq!(wal_payload_bytes.len(), rounds as usize);
     let minimum = wal_payload_bytes.iter().skip(1).copied().min().unwrap();
     let maximum = wal_payload_bytes.iter().skip(1).copied().max().unwrap();
     let total = wal_payload_bytes.iter().copied().sum::<i64>();
@@ -1203,7 +1538,7 @@ async fn canonical_transition_wal_is_linear_and_recoverable_across_many_rounds()
         "each linked entry must stay proportional to its own append"
     );
     assert!(
-        total <= i64::from(ROUNDS) * 2_048,
+        total <= i64::from(rounds) * 2_048,
         "total WAL bytes must grow linearly with the number of fixed-size appends"
     );
     let attempts: i64 = sqlx::query_scalar(
@@ -1215,7 +1550,7 @@ async fn canonical_transition_wal_is_linear_and_recoverable_across_many_rounds()
     .fetch_one(pool)
     .await
     .expect("count canonical audit rows");
-    assert_eq!(attempts, i64::from(ROUNDS) + 1);
+    assert_eq!(attempts, i64::from(rounds) + 1);
     let root_owner = sqlx::query(
         "SELECT attempt_id, physical_attempt
          FROM inference_canonical_transition_wal
@@ -1238,7 +1573,7 @@ async fn canonical_transition_wal_is_linear_and_recoverable_across_many_rounds()
             .await
             .expect("load the canonical WAL chain");
     assert_eq!(receipts.len(), 1);
-    assert_eq!(receipts[0].transitions.len(), ROUNDS as usize);
+    assert_eq!(receipts[0].transitions.len(), rounds as usize);
     assert_eq!(
         receipts[0]
             .transitions
@@ -1269,6 +1604,183 @@ async fn canonical_transition_wal_is_linear_and_recoverable_across_many_rounds()
     .expect("count retired canonical heads");
     assert_eq!(heads, 0);
     cleanup(pool, &user_id, &session_id, &run_id).await;
+    eprintln!(
+        "canonical WAL: {rounds} rounds, {total} payload bytes, {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn request_context_overflow_prunes_oldest_pairs_only_after_the_limit() {
+    let (shared, _) = common::setup_pool_and_settings().await;
+    let pool = shared.get();
+    let user = Uuid::new_v4().to_string();
+    let foreign_user = Uuid::new_v4().to_string();
+    let session = Uuid::new_v4().to_string();
+    let other_session = Uuid::new_v4().to_string();
+    let run = Uuid::new_v4().to_string();
+    seed_run(pool, &user, &session, &run).await;
+    let fixture_plan =
+        plan_inference_invocation(run_input(&user, &session, &run, 100, "retention-fixture"))
+            .unwrap();
+    let fixture_attempt = provider_attempt(&fixture_plan, 0);
+    admit_inference_invocation_with_first_provider_attempt(
+        &shared,
+        &fixture_plan,
+        &fixture_attempt,
+    )
+    .await
+    .unwrap();
+    finish_successful_inference_provider_attempt_and_invocation(
+        &shared,
+        &fixture_plan,
+        &fixture_attempt,
+        &InferenceInvocationTerminal::succeeded(InferenceUsage::default(), None),
+    )
+    .await
+    .unwrap();
+    let pending_plan =
+        plan_inference_invocation(run_input(&user, &session, &run, 101, "pending-retention"))
+            .unwrap();
+    let pending_attempt = provider_attempt(&pending_plan, 0);
+    admit_inference_invocation_with_first_provider_attempt(
+        &shared,
+        &pending_plan,
+        &pending_attempt,
+    )
+    .await
+    .unwrap();
+    finish_inference_provider_attempt(
+        &shared,
+        &pending_attempt,
+        &InferenceInvocationTerminal::succeeded(InferenceUsage::default(), None),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE model_request_context_events SET created_at=DATE_SUB(NOW(6),INTERVAL 2 MINUTE) WHERE user_id=? AND attempt_id=?")
+        .bind(&user).bind(pending_attempt.attempt_id()).execute(pool).await.unwrap();
+    // Two real pairs and 1,021 retention-consumer fixture pairs. The
+    // fixture supplies canonical owners; it does not simulate producer behavior.
+    // Foreign owner/session rows must neither trigger nor participate in pruning.
+    let mut rows = Vec::new();
+    for (owner, sid, pairs) in [
+        (&user, &session, 1021),
+        (&foreign_user, &session, 1),
+        (&user, &other_session, 1),
+    ] {
+        for pair in 0..pairs {
+            for stage in ["accepted", "terminal"] {
+                rows.push((
+                    owner,
+                    sid,
+                    format!("{sid}-{pair:04}-{stage}"),
+                    format!("{sid}-{pair:04}"),
+                    stage,
+                ));
+            }
+        }
+    }
+    for chunk in rows.chunks(128) {
+        let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "INSERT INTO model_request_context_events (user_id, session_id, run_id, event_id, attempt_id, invocation_id, event_stage, terminal_status, topology, provider, model_family, purpose, event_json, created_at) ",
+        );
+        insert.push_values(chunk, |mut row, (owner, sid, event, attempt, stage)| {
+            row.push_bind(owner)
+                .push_bind(sid)
+                .push_bind(&run)
+                .push_bind(event)
+                .push_bind(attempt)
+                .push_bind(fixture_plan.invocation_id())
+                .push_bind(stage)
+                .push(if *stage == "terminal" {
+                    "'cancelled'"
+                } else {
+                    "NULL"
+                })
+                .push("'server_only'")
+                .push("'openai'")
+                .push("'test'")
+                .push("'primary_agent'")
+                .push("'{}'")
+                .push("DATE_SUB(NOW(6), INTERVAL 1 MINUTE)");
+        });
+        insert.build().execute(pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO inference_provider_attempts
+        (attempt_id,invocation_id,user_id,session_id,run_id,attempt_index,provider,admission_token,provider_protocol,provider_wire_hash,provider_wire_bytes,status,terminal_fingerprint,usage_status)
+        SELECT attempt_id,invocation_id,user_id,session_id,run_id,
+               ROW_NUMBER() OVER (ORDER BY attempt_id),'openai',REPEAT('0',32),'openai_compatible',REPEAT('0',64),2,'cancelled',REPEAT('0',64),'unavailable'
+        FROM model_request_context_events
+        WHERE user_id=? AND session_id=? AND invocation_id=? AND event_stage='accepted' AND attempt_id<>?")
+        .bind(&user).bind(&session).bind(fixture_plan.invocation_id()).bind(fixture_attempt.attempt_id()).execute(pool).await.unwrap();
+    for (round, expected) in [(0, 2048_i64), (1, 1538)] {
+        let plan = plan_inference_invocation(run_input(
+            &user,
+            &session,
+            &run,
+            round,
+            "retention-boundary",
+        ))
+        .unwrap();
+        let attempt = provider_attempt(&plan, 0);
+        admit_inference_invocation_with_first_provider_attempt(&shared, &plan, &attempt)
+            .await
+            .unwrap();
+        let terminal = InferenceInvocationTerminal {
+            status: InferenceTerminalStatus::Cancelled,
+            usage: InferenceUsage::default(),
+            usage_status: InferenceUsageStatus::Unavailable,
+            provider_response_id: None,
+            error_kind: None,
+            error_message: None,
+        };
+        finish_inference_provider_attempt(&shared, &attempt, &terminal)
+            .await
+            .unwrap();
+        finish_inference_invocation(&shared, &plan, &terminal)
+            .await
+            .unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_request_context_events WHERE user_id = ? AND session_id = ?")
+            .bind(&user).bind(&session).fetch_one(pool).await.unwrap();
+        assert_eq!(count, expected, "round {round}: exact limit vs overflow");
+        let current: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_request_context_events WHERE user_id = ? AND attempt_id = ?")
+            .bind(&user).bind(attempt.attempt_id()).fetch_one(pool).await.unwrap();
+        assert_eq!(current, 2, "newest pair survives");
+    }
+    let oldest: String = sqlx::query_scalar("SELECT MIN(attempt_id) FROM model_request_context_events WHERE user_id = ? AND session_id = ? AND invocation_id = ? AND attempt_id <> ?")
+        .bind(&user).bind(&session).bind(fixture_plan.invocation_id()).bind(fixture_attempt.attempt_id()).fetch_one(pool).await.unwrap();
+    assert_eq!(oldest, format!("{session}-0256"));
+    let split: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM (SELECT attempt_id FROM model_request_context_events WHERE user_id = ? AND session_id = ? GROUP BY attempt_id HAVING COUNT(*) <> 2) AS incomplete")
+        .bind(&user).bind(&session).fetch_one(pool).await.unwrap();
+    assert_eq!(split, 0, "compaction never splits a complete pair");
+    reconcile_inference_settlements(&shared, 256).await.unwrap();
+    let pending_status: String = sqlx::query_scalar(
+        "SELECT status FROM inference_invocations WHERE user_id=? AND invocation_id=?",
+    )
+    .bind(&user)
+    .bind(pending_plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pending_status, "succeeded",
+        "the oldest pending settlement must survive compaction"
+    );
+    for (owner, sid) in [(&foreign_user, &session), (&user, &other_session)] {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_request_context_events WHERE user_id = ? AND session_id = ?")
+            .bind(owner).bind(sid).fetch_one(pool).await.unwrap();
+        assert_eq!(count, 2);
+        sqlx::query(
+            "DELETE FROM model_request_context_events WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(owner)
+        .bind(sid)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    cleanup(pool, &user, &session, &run).await;
 }
 
 #[tokio::test]
@@ -1563,19 +2075,19 @@ async fn competing_canonical_children_commit_exactly_one_branch_without_orphans(
     .await;
     history.extend(root.appended_messages.iter().cloned());
 
-    let left = astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_durable_base(
+    let left = astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_deltas(
         root.transition_id.clone(),
         root.result.clone(),
         durable_base.clone(),
-        &history,
+        Vec::new(),
         vec![canonical_authority("left")],
     )
     .expect("construct left fork");
-    let right = astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_durable_base(
+    let right = astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_deltas(
         root.transition_id.clone(),
         root.result.clone(),
         durable_base,
-        &history,
+        Vec::new(),
         vec![canonical_authority("right")],
     )
     .expect("construct right fork");
@@ -1735,11 +2247,11 @@ async fn canonical_wal_capacity_rejects_append_atomically_and_accepts_checkpoint
     .await
     .expect("simulate a WAL head exactly at capacity");
 
-    let append = astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_durable_base(
+    let append = astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_deltas(
         root.transition_id.clone(),
         root.result.clone(),
         durable_base.clone(),
-        &history,
+        Vec::new(),
         vec![canonical_authority("over-capacity")],
     )
     .expect("construct over-capacity append");
@@ -2327,6 +2839,20 @@ async fn deferred_settlement_does_not_consume_another_users_bounded_batch_slot()
     .await
     .expect("defer one owner's retry eligibility");
 
+    // The sweeper is global: other tests can leave eligible settlement debt
+    // in this lane's shared database. Give only our eligible fixture priority
+    // so a one-row batch tests retry eligibility, not unrelated backlog order.
+    sqlx::query(
+        "UPDATE inference_invocation_settlement_debts
+         SET next_retry_at = '2000-01-01 00:00:00.000000'
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plans[1].invocation_id())
+    .execute(pool)
+    .await
+    .expect("prioritize this test's eligible settlement");
+
     assert_eq!(
         reconcile_inference_settlements(&shared_pool, 1)
             .await
@@ -2343,6 +2869,7 @@ async fn deferred_settlement_does_not_consume_another_users_bounded_batch_slot()
     .fetch_all(pool)
     .await
     .expect("load deferred fairness outcomes");
+    assert_eq!(statuses.len(), 2);
     for row in statuses {
         let invocation_id = row.get::<String, _>("invocation_id");
         let expected = if invocation_id == plans[0].invocation_id() {
@@ -2414,9 +2941,9 @@ async fn recovery_discards_unproven_success_without_blocking_later_settlement() 
     ] {
         sqlx::query(
             "INSERT INTO inference_invocation_settlement_debts
-             (user_id, invocation_id, session_id, harness_run_id,
+             (user_id, invocation_id, session_id,
               terminal_status, terminal_fingerprint, error_kind)
-             VALUES (?, ?, ?, NULL, ?, REPEAT(?, 64), ?)",
+             VALUES (?, ?, ?, ?, REPEAT(?, 64), ?)",
         )
         .bind(&user_id)
         .bind(plan.invocation_id())
@@ -2628,6 +3155,19 @@ async fn exact_attempt_debt_recovers_success_without_degrading_provider_facts() 
     reconcile_inference_settlements(&shared_pool, 256)
         .await
         .expect("sweeper applies exact physical and logical terminal");
+    let observations =
+        astra_services::list_model_request_context_events(&shared_pool, &user_id, &session_id, 2)
+            .await
+            .unwrap();
+    let recovered = observations
+        .iter()
+        .find(|row| row.event.terminal_status.is_some())
+        .unwrap();
+    assert_eq!(
+        recovered.event.budget.usage_source.as_deref(),
+        Some("provider_terminal"),
+        "recovery preserves the first committed foreground measurement source"
+    );
 
     let attempt_row = sqlx::query(
         "SELECT status, terminal_fingerprint, input_tokens, output_tokens,
@@ -2831,6 +3371,19 @@ async fn exact_started_attempt_debt_recovers_interrupted_success() {
     reconcile_inference_settlements(&shared_pool, 256)
         .await
         .expect("reconcile exact started-attempt settlement debt");
+    let observations =
+        astra_services::list_model_request_context_events(&shared_pool, &user_id, &session_id, 2)
+            .await
+            .unwrap();
+    let recovered = observations
+        .iter()
+        .find(|row| row.event.terminal_status.is_some())
+        .unwrap();
+    assert_eq!(
+        recovered.event.budget.usage_source.as_deref(),
+        Some("provider_terminal_recovery"),
+        "a terminal first committed by recovery records that measurement source"
+    );
 
     let state = sqlx::query(
         "SELECT invocation.status AS invocation_status,
@@ -3218,10 +3771,10 @@ async fn orphaned_settlement_debt_is_quarantined_out_of_the_active_batch() {
 
     sqlx::query(
         "INSERT INTO inference_invocation_settlement_debts
-         (user_id, invocation_id, session_id, harness_run_id,
+         (user_id, invocation_id, session_id,
           terminal_status, terminal_fingerprint, usage_status,
           provider_delivery_state)
-         VALUES (?, ?, ?, NULL, 'failed', REPEAT('e', 64), 'unavailable', 'unknown')",
+         VALUES (?, ?, ?, 'failed', REPEAT('e', 64), 'unavailable', 'unknown')",
     )
     .bind(&user_id)
     .bind(&invocation_id)
@@ -3250,8 +3803,107 @@ async fn orphaned_settlement_debt_is_quarantined_out_of_the_active_batch() {
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }
 
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn detailed_auxiliary_capture_decodes_multiple_invocations_and_attempts() {
+    let shared_pool = common::setup_pool().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("auxiliary-capture-user-{suffix}");
+    let session_id = format!("auxiliary-capture-session-{suffix}");
+    let run_id = format!("auxiliary-capture-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let terminal = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Cancelled,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("fixture_complete".to_string()),
+        error_message: Some("close auxiliary capture fixture".to_string()),
+    };
+    let mut expected_invocations = std::collections::BTreeSet::new();
+    let mut expected_attempts = std::collections::BTreeSet::new();
+    for round in 0..2 {
+        let plan = plan_inference_invocation(run_input(
+            &user_id,
+            &session_id,
+            &run_id,
+            round,
+            "request_judgment",
+        ))
+        .expect("plan auxiliary capture invocation");
+        expected_invocations.insert(plan.invocation_id().to_string());
+        admit_inference_invocation(&shared_pool, &plan)
+            .await
+            .expect("admit auxiliary capture invocation");
+
+        let first_attempt = provider_attempt(&plan, 0);
+        expected_attempts.insert(first_attempt.attempt_id().to_string());
+        begin_inference_provider_attempt(&shared_pool, &first_attempt)
+            .await
+            .expect("begin first auxiliary capture attempt");
+        finish_inference_provider_attempt(&shared_pool, &first_attempt, &terminal)
+            .await
+            .expect("finish first auxiliary capture attempt");
+
+        if round == 0 {
+            let retry = provider_attempt(&plan, 1);
+            expected_attempts.insert(retry.attempt_id().to_string());
+            begin_inference_provider_attempt(&shared_pool, &retry)
+                .await
+                .expect("begin retry auxiliary capture attempt");
+            finish_inference_provider_attempt(&shared_pool, &retry, &terminal)
+                .await
+                .expect("finish retry auxiliary capture attempt");
+        }
+        finish_inference_invocation(&shared_pool, &plan, &terminal)
+            .await
+            .expect("finish auxiliary capture invocation");
+    }
+
+    let capture = load_session_auxiliary_capture(&shared_pool, &user_id, &session_id, 32, true)
+        .await
+        .expect("decode detailed auxiliary capture");
+    assert!(!capture.facts.truncated);
+    assert_eq!(capture.facts.attempts.len(), expected_attempts.len());
+    assert_eq!(capture.execution.len(), expected_attempts.len());
+    assert_eq!(
+        capture
+            .execution
+            .iter()
+            .map(|fact| fact.invocation_id.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected_invocations
+    );
+    assert_eq!(
+        capture
+            .execution
+            .iter()
+            .map(|fact| fact.attempt_id.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected_attempts
+    );
+    assert!(
+        capture
+            .execution
+            .iter()
+            .all(|fact| fact.attempt_provider == "openai"
+                && fact.attempt_protocol == "openai_compatible"
+                && fact.resolved_model_name == "owner-lease-model"
+                && fact.upstream_model_name == "owner-lease-model")
+    );
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
 async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str, run_id: &str) {
     for (statement, identity) in [
+        (
+            "DELETE FROM agent_session_lifecycle_fences WHERE user_id = ? AND session_id = ?",
+            session_id,
+        ),
         (
             "DELETE FROM model_request_context_events WHERE user_id = ? AND session_id = ?",
             session_id,
@@ -3417,8 +4069,9 @@ async fn context_expiry_and_delayed_terminal_never_split_an_attempt() {
         batch_limit: 1_000,
         ..RuntimeMaintenancePolicy::default()
     };
+    let mut context_cursor = Default::default();
     let (maintenance, terminal) = tokio::join!(
-        maintain_runtime_storage(&shared_pool, None, &maintenance_policy),
+        maintain_runtime_storage(&shared_pool, None, &maintenance_policy, &mut context_cursor),
         finish_inference_provider_attempt(&shared_pool, &attempt, &terminal),
     );
     assert!(
@@ -3461,6 +4114,170 @@ async fn context_expiry_and_delayed_terminal_never_split_an_attempt() {
     }
 
     cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn context_expiry_preserves_recovery_and_counts_each_terminal_once() {
+    let (shared, _) = common::setup_pool_and_settings().await;
+    let pool = shared.get();
+    for physical_success in [false, true] {
+        let user = Uuid::new_v4().to_string();
+        let session = Uuid::new_v4().to_string();
+        let run = Uuid::new_v4().to_string();
+        seed_run(pool, &user, &session, &run).await;
+        let mut input = run_input(&user, &session, &run, 0, "retention-recovery");
+        // Metrics are deliberately low-cardinality, not tenant-scoped. Give
+        // this fixture its own provider dimension to assert exact increments.
+        input.provider = format!("retention-{user}");
+        let provider = input.provider.clone();
+        let plan = plan_inference_invocation(input).unwrap();
+        let attempt = provider_attempt(&plan, 0);
+        admit_inference_invocation_with_first_provider_attempt(&shared, &plan, &attempt)
+            .await
+            .unwrap();
+        if physical_success {
+            finish_inference_provider_attempt(
+                &shared,
+                &attempt,
+                &InferenceInvocationTerminal::succeeded(InferenceUsage::default(), None),
+            )
+            .await
+            .unwrap();
+        }
+        sqlx::query("UPDATE model_request_context_events SET created_at=DATE_SUB(NOW(6),INTERVAL 31 DAY) WHERE user_id=?")
+            .bind(&user).execute(pool).await.unwrap();
+        let mut cursor = Default::default();
+        let page = astra_services::model_request_context::expire_model_request_context_events(
+            &shared,
+            1000,
+            &mut cursor,
+        )
+        .await
+        .unwrap();
+        assert!(page.examined <= 1000);
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM model_request_context_events WHERE user_id=?")
+                .bind(&user)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            if physical_success { 2 } else { 1 },
+            "unsettled evidence stays pinned"
+        );
+        if !physical_success {
+            let mut settings = astra_core::MatrixOneSettings::from_env();
+            settings.db_pool_max_connections = 1;
+            settings.db_pool_min_connections = 0;
+            let starved = astra_core::SharedPool::new(&settings).await.unwrap();
+            let held = starved.get().acquire().await.unwrap();
+            let mut blocked_cursor = Default::default();
+            let bounded = tokio::time::timeout(
+                std::time::Duration::from_millis(1500),
+                astra_services::model_request_context::expire_model_request_context_events(
+                    &starved,
+                    1,
+                    &mut blocked_cursor,
+                ),
+            )
+            .await;
+            assert!(
+                matches!(bounded, Ok(Err(_))),
+                "the page deadline includes pool waiting"
+            );
+            drop(held);
+            astra_services::model_request_context::expire_model_request_context_events(
+                &starved,
+                1,
+                &mut blocked_cursor,
+            )
+            .await
+            .unwrap();
+            starved.close().await;
+        }
+        if !physical_success {
+            sqlx::query("UPDATE inference_invocations SET owner_lease_expires_at=DATE_SUB(NOW(6),INTERVAL 1 MINUTE) WHERE user_id=?")
+                .bind(&user).execute(pool).await.unwrap();
+        }
+        for _ in 0..2 {
+            reconcile_inference_settlements(&shared, 256).await.unwrap();
+        }
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM inference_invocations WHERE user_id=?")
+                .bind(&user)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status,
+            if physical_success {
+                "succeeded"
+            } else {
+                "delivery_unknown"
+            }
+        );
+        let debt: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM inference_invocation_settlement_debts WHERE user_id=?",
+        )
+        .bind(&user)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(debt, 0);
+        let events = astra_services::list_model_request_context_events(&shared, &user, &session, 2)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        let terminal = events
+            .iter()
+            .find(|row| row.stage == astra_services::ModelRequestEventStage::Terminal)
+            .unwrap();
+        assert_eq!(
+            terminal.event.usage_status.as_deref(),
+            Some(if physical_success {
+                "provider_exact"
+            } else {
+                "unavailable"
+            })
+        );
+        assert_eq!(terminal.event.usage.is_some(), physical_success);
+        sqlx::query("UPDATE model_request_context_events SET created_at=DATE_SUB(NOW(6),INTERVAL 31 DAY) WHERE user_id=?")
+            .bind(&user).execute(pool).await.unwrap();
+        cursor = Default::default();
+        astra_services::model_request_context::expire_model_request_context_events(
+            &shared,
+            1000,
+            &mut cursor,
+        )
+        .await
+        .unwrap();
+        let removed: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM model_request_context_events WHERE user_id=?")
+                .bind(&user)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(removed, 0, "settled evidence can be reclaimed");
+        let marked: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inference_provider_attempts WHERE user_id=? AND context_expired_at IS NOT NULL")
+            .bind(&user).fetch_one(pool).await.unwrap();
+        assert_eq!(marked, 1);
+        reconcile_inference_settlements(&shared, 256).await.unwrap();
+        let requests: i64 = sqlx::query_scalar("SELECT CAST(SUM(requests) AS SIGNED) FROM model_request_metric_shards WHERE provider=?")
+            .bind(&provider).fetch_one(pool).await.unwrap();
+        assert_eq!(
+            requests, 1,
+            "reconciliation and pruning never count a request twice"
+        );
+        cleanup(pool, &user, &session, &run).await;
+        sqlx::query("DELETE FROM model_request_metric_shards WHERE provider=?")
+            .bind(&provider)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test]
@@ -3513,6 +4330,9 @@ async fn context_expiry_skips_an_old_attempt_with_a_fresh_terminal() {
     finish_inference_provider_attempt(&shared_pool, &protected_attempt, &failure)
         .await
         .expect("finish protected context attempt");
+    finish_inference_invocation(&shared_pool, &protected_plan, &failure)
+        .await
+        .unwrap();
     sqlx::query(
         "UPDATE model_request_context_events
          SET created_at = DATE_SUB(NOW(6), INTERVAL 32 DAY)
@@ -3554,6 +4374,9 @@ async fn context_expiry_skips_an_old_attempt_with_a_fresh_terminal() {
     finish_inference_provider_attempt(&shared_pool, &eligible_attempt, &failure)
         .await
         .expect("finish eligible context attempt");
+    finish_inference_invocation(&shared_pool, &eligible_plan, &failure)
+        .await
+        .unwrap();
     sqlx::query(
         "UPDATE model_request_context_events
          SET created_at = DATE_SUB(NOW(6), INTERVAL 31 DAY)
@@ -3565,6 +4388,28 @@ async fn context_expiry_skips_an_old_attempt_with_a_fresh_terminal() {
     .await
     .expect("age the eligible context attempt");
 
+    let mut pinned = Vec::new();
+    for round in 2..10 {
+        let plan = plan_inference_invocation(run_input(
+            &user_id,
+            &session_id,
+            &run_id,
+            round,
+            "pinned-expiry-prefix",
+        ))
+        .unwrap();
+        let attempt = provider_attempt(&plan, 0);
+        admit_inference_invocation_with_first_provider_attempt(&shared_pool, &plan, &attempt)
+            .await
+            .unwrap();
+        finish_inference_provider_attempt(&shared_pool, &attempt, &failure)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE model_request_context_events SET created_at=DATE_SUB(NOW(6),INTERVAL 33 DAY) WHERE user_id=? AND invocation_id=?")
+            .bind(&user_id).bind(plan.invocation_id()).execute(pool).await.unwrap();
+        pinned.push(plan);
+    }
+    let mut expiry_cursor = Default::default();
     let maintenance = maintain_runtime_storage(
         &shared_pool,
         None,
@@ -3572,12 +4417,32 @@ async fn context_expiry_skips_an_old_attempt_with_a_fresh_terminal() {
             batch_limit: 1,
             ..RuntimeMaintenancePolicy::default()
         },
+        &mut expiry_cursor,
     )
     .await;
     assert!(
         maintenance.cleanup_errors.is_empty(),
         "runtime maintenance errors: {:?}",
         maintenance.cleanup_errors
+    );
+    let mut more = maintenance.model_request_context_more;
+    for _ in 0..64 {
+        if !more {
+            break;
+        }
+        let page = astra_services::model_request_context::expire_model_request_context_events(
+            &shared_pool,
+            1,
+            &mut expiry_cursor,
+        )
+        .await
+        .unwrap();
+        assert!(page.examined <= 1);
+        more = page.more;
+    }
+    assert!(
+        !more,
+        "a bounded walk advances even through a fully pinned prefix"
     );
     let protected_stages = sqlx::query_scalar::<_, String>(
         "SELECT event_stage FROM model_request_context_events
@@ -3598,6 +4463,57 @@ async fn context_expiry_skips_an_old_attempt_with_a_fresh_terminal() {
     .await
     .expect("count expired context events");
     assert_eq!(eligible_event_count, 0);
+
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("SELECT attempt_id FROM inference_provider_attempts WHERE user_id=? AND invocation_id=? FOR UPDATE")
+        .bind(&user_id).bind(pinned[0].invocation_id()).fetch_all(&mut *held).await.unwrap();
+    let unlocked_page = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        astra_services::model_request_context::expire_model_request_context_events(
+            &shared_pool,
+            1000,
+            &mut expiry_cursor,
+        ),
+    )
+    .await;
+    assert!(
+        matches!(unlocked_page, Ok(Ok(_))),
+        "a locked pinned execution must not stall maintenance"
+    );
+    held.rollback().await.unwrap();
+    for plan in &pinned {
+        let records: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM model_request_context_events WHERE user_id=? AND invocation_id=?",
+        )
+        .bind(&user_id)
+        .bind(plan.invocation_id())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(records, 2, "a pending logical invocation retains its pair");
+        finish_inference_invocation(&shared_pool, plan, &failure)
+            .await
+            .unwrap();
+    }
+    // End-of-pass reset revisits previously pinned rows after they settle.
+    astra_services::model_request_context::expire_model_request_context_events(
+        &shared_pool,
+        1000,
+        &mut expiry_cursor,
+    )
+    .await
+    .unwrap();
+    for plan in &pinned {
+        let records: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM model_request_context_events WHERE user_id=? AND invocation_id=?",
+        )
+        .bind(&user_id)
+        .bind(plan.invocation_id())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(records, 0);
+    }
 
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }
@@ -3814,6 +4730,13 @@ async fn run_inference_admission_fences_generation_owner_lease_guidance_and_canc
     };
     let exact = run_authority().expect("run authority fixture");
 
+    admit_inference_invocation(
+        &shared_pool,
+        &plan_for("exact_empty_control_frontier", exact.clone()),
+    )
+    .await
+    .expect("an exact locked empty control frontier admits without later guidance");
+
     let mut wrong_generation = exact.clone();
     wrong_generation.expected_owner_generation = 1;
     let error = admit_inference_invocation(
@@ -3928,13 +4851,22 @@ async fn run_inference_admission_fences_generation_owner_lease_guidance_and_canc
         .await
         .unwrap();
     append_run_control_event(pool, &user_id, &session_id, &run_id, 1, "user_intent").await;
-    for plan in [&missing, &admitted] {
+    for (plan, resolution) in [
+        (
+            &missing,
+            InferenceInvocationAdmissionResolution::ScopeUnavailable,
+        ),
+        (&admitted, InferenceInvocationAdmissionResolution::Settled),
+    ] {
         for _ in 0..2 {
             assert_eq!(
                 settle_uncertain_inference_admission(&shared_pool, plan, &recovery_terminal)
                     .await
                     .unwrap(),
-                InferenceInvocationAdmissionResolution::GuidancePending
+                (
+                    resolution,
+                    Some(astra_services::InferenceScopeRejection::GuidancePending)
+                )
             );
         }
     }
@@ -4015,7 +4947,10 @@ async fn uncertain_admission_rejects_a_different_terminal_fingerprint_without_pr
         settle_uncertain_inference_admission(&shared_pool, &plan, &recovery_terminal)
             .await
             .expect("classify different terminal fingerprint"),
-        InferenceInvocationAdmissionResolution::ConflictingIdentity
+        (
+            InferenceInvocationAdmissionResolution::ConflictingIdentity,
+            None
+        )
     );
     let attempt_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM inference_provider_attempts
@@ -4355,20 +5290,6 @@ async fn concurrent_logical_cursor_readers_have_one_admission_winner_and_zero_pr
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }
 
-async fn seed_harness_run(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, harness_run_id: &str) {
-    sqlx::query(
-        "INSERT INTO harness_runs
-         (harness_run_id, harness_id, version_id, user_id, session_id, status,
-          input_json, output_json, created_at, updated_at)
-         VALUES (?, 'skillify', 'skillify.v1', ?, NULL, 'running', '{}', '{}', NOW(6), NOW(6))",
-    )
-    .bind(harness_run_id)
-    .bind(user_id)
-    .execute(pool)
-    .await
-    .expect("seed harness inference owner");
-}
-
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
@@ -4496,6 +5417,16 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
     first_terminal.expect("finish first attempt");
     concurrent_terminal.expect("concurrent exact attempt terminal is idempotent");
 
+    // No other attempt is open: exercise duplicate terminal admission itself,
+    // not the invocation-level guard for an already-open retry.
+    assert_eq!(
+        begin_inference_provider_attempt(&shared_pool, &first_attempt)
+            .await
+            .expect_err("terminal attempt must not duplicate accepted context")
+            .kind,
+        ServiceErrorKind::Conflict
+    );
+
     let premature_success = InferenceInvocationTerminal::succeeded(
         InferenceUsage::default(),
         Some("provider-not-recorded".to_string()),
@@ -4512,6 +5443,13 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
     begin_inference_provider_attempt(&shared_pool, &second_attempt)
         .await
         .expect("begin retry as a distinct physical request");
+    assert_eq!(
+        begin_inference_provider_attempt(&shared_pool, &second_attempt)
+            .await
+            .expect_err("open attempt must not duplicate accepted context")
+            .kind,
+        ServiceErrorKind::Conflict
+    );
     let success = InferenceInvocationTerminal::succeeded(
         InferenceUsage {
             input: astra_turn_types::NormalizedPromptCacheUsage::new(120, 80, 10),
@@ -4646,6 +5584,35 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
         .filter(|event| event.stage == astra_services::ModelRequestEventStage::Terminal)
         .count();
     assert_eq!((accepted, terminal), (2, 2));
+    for context in &context_events {
+        let route = &context.event.route;
+        assert_eq!(route.route_id, plan.route_id());
+        assert_eq!(route.invocation_id, plan.invocation_id());
+        assert_eq!(route.execution_placement, ModelExecutionPlacement::Server);
+        assert_eq!(route.access_kind, ModelAccessKind::SelfHosted);
+    }
+    let failed_context = context_events
+        .iter()
+        .find(|event| event.terminal_status.as_deref() == Some("failed"))
+        .expect("failed attempt remains visible");
+    assert_eq!(
+        failed_context.event.usage_status.as_deref(),
+        Some("unavailable")
+    );
+    assert!(failed_context.event.usage.is_none());
+    assert!(failed_context.event.budget.measured_input_tokens.is_none());
+    let missing_usage_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM model_request_context_events
+         WHERE user_id = ? AND attempt_id = ? AND event_stage = 'terminal'
+           AND input_tokens IS NULL AND output_tokens IS NULL
+           AND cache_read_tokens IS NULL AND cache_creation_tokens IS NULL",
+    )
+    .bind(&user_id)
+    .bind(first_attempt.request_id())
+    .fetch_one(pool)
+    .await
+    .expect("unavailable usage persists as unknown rather than measured zero");
+    assert_eq!(missing_usage_columns, 1);
     let successful_context = context_events
         .iter()
         .find(|event| event.terminal_status.as_deref() == Some("succeeded"))
@@ -4759,6 +5726,37 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
     .map(|row| row.get::<i64, _>("round_index"))
     .collect::<Vec<_>>();
     assert_eq!(durable_rounds, vec![2, 3]);
+
+    let page =
+        astra_services::list_model_request_context_events(&shared_pool, &user_id, &session_id, 1)
+            .await
+            .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(
+        page[0], *successful_context,
+        "a terminal-only page hydrates its accepted partner outside the page"
+    );
+    let original: String = sqlx::query_scalar("SELECT event_json FROM model_request_context_events WHERE user_id = ? AND attempt_id = ? AND event_stage = 'accepted'")
+        .bind(&user_id).bind(second_attempt.attempt_id()).fetch_one(pool).await.unwrap();
+    let mut corrupt: serde_json::Value = serde_json::from_str(&original).unwrap();
+    corrupt["identity"]["owner_scope"] = serde_json::json!("another-owner");
+    sqlx::query("UPDATE model_request_context_events SET event_json = ? WHERE user_id = ? AND attempt_id = ? AND event_stage = 'accepted'")
+        .bind(serde_json::to_string(&corrupt).unwrap()).bind(&user_id).bind(second_attempt.attempt_id()).execute(pool).await.unwrap();
+    assert!(
+        astra_services::list_model_request_context_events(&shared_pool, &user_id, &session_id, 1)
+            .await
+            .is_err()
+    );
+    sqlx::query("UPDATE model_request_context_events SET event_json = ?, session_id = ? WHERE user_id = ? AND attempt_id = ? AND event_stage = 'accepted'")
+        .bind(&original).bind(format!("foreign-{session_id}")).bind(&user_id).bind(second_attempt.attempt_id()).execute(pool).await.unwrap();
+    assert!(
+        astra_services::list_model_request_context_events(&shared_pool, &user_id, &session_id, 1)
+            .await
+            .is_err(),
+        "a foreign accepted partner must not hide a terminal row or authorize hydration"
+    );
+    sqlx::query("UPDATE model_request_context_events SET session_id = ? WHERE user_id = ? AND attempt_id = ? AND event_stage = 'accepted'")
+        .bind(&session_id).bind(&user_id).bind(second_attempt.attempt_id()).execute(pool).await.unwrap();
 
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }
@@ -4899,7 +5897,7 @@ async fn bounded_recovery_recovers_success_without_closing_retryable_attempts() 
         .await
         .expect("persist successful provider attempt");
     let pending_success_debt = sqlx::query(
-        "SELECT session_id, harness_run_id FROM inference_invocation_settlement_debts
+        "SELECT session_id FROM inference_invocation_settlement_debts
          WHERE user_id = ? AND invocation_id = ?",
     )
     .bind(&user_id)
@@ -4913,11 +5911,6 @@ async fn bounded_recovery_recovers_success_without_closing_retryable_attempts() 
             .as_deref(),
         Some(session_id.as_str()),
         "recovery evidence must carry the canonical session owner"
-    );
-    assert_eq!(
-        pending_success_debt.get::<Option<String>, _>("harness_run_id"),
-        None,
-        "session recovery evidence must not fabricate a harness owner"
     );
     assert_eq!(
         begin_inference_provider_attempt(&shared_pool, &provider_attempt(&plan, 1))
@@ -5057,6 +6050,97 @@ async fn bounded_recovery_recovers_success_without_closing_retryable_attempts() 
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
+async fn auxiliary_capture_overflow_retains_bounded_physical_evidence() {
+    use astra_services::inference_execution::{
+        load_explain_auxiliary_usage, load_session_auxiliary_usage,
+    };
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("capture-user-{suffix}");
+    let session_id = format!("capture-session-{suffix}");
+    let run_id = format!("capture-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    for round in 0..2 {
+        let plan = plan_inference_invocation(InferenceInvocationInput {
+            user_id: user_id.clone(),
+            scope: InferenceInvocationScope::Session {
+                session_id: session_id.clone(),
+                turn: 1,
+                round,
+                operation_id: "request_judgment".into(),
+                logical_attempt: 0,
+            },
+            offering_id: "capture-offering".into(),
+            resolved_model_name: "capture-model".into(),
+            upstream_model_name: "capture-model".into(),
+            provider: "openai".into(),
+            purpose: InferencePurpose::Introspection,
+            execution_placement: ModelExecutionPlacement::Server,
+            access_kind: ModelAccessKind::SelfHosted,
+            run_authority: None,
+        })
+        .expect("plan judgment");
+        admit_inference_invocation(&shared_pool, &plan)
+            .await
+            .expect("admit judgment");
+        let attempt = provider_attempt(&plan, 0);
+        begin_inference_provider_attempt(&shared_pool, &attempt)
+            .await
+            .expect("begin attempt");
+        let terminal = InferenceInvocationTerminal::succeeded(
+            InferenceUsage {
+                input: astra_turn_types::NormalizedPromptCacheUsage::new(20, 0, 0),
+                output_tokens: 4,
+            },
+            None,
+        );
+        finish_inference_provider_attempt(&shared_pool, &attempt, &terminal)
+            .await
+            .expect("finish attempt");
+        finish_inference_invocation(&shared_pool, &plan, &terminal)
+            .await
+            .expect("finish invocation");
+    }
+    for limit in [0, 1, 2, 3] {
+        let session = load_session_auxiliary_usage(&shared_pool, &user_id, &session_id, limit)
+            .await
+            .expect("session capture");
+        let turn = load_explain_auxiliary_usage(&shared_pool, &user_id, &session_id, 1, limit)
+            .await
+            .expect("turn capture");
+        for facts in [session, turn] {
+            assert!(facts.available && facts.is_valid());
+            assert_eq!(facts.truncated, limit < 2);
+            assert_eq!(facts.attempts.len(), limit.min(2));
+            assert!(
+                facts
+                    .attempts
+                    .iter()
+                    .all(|a| a.usage.as_ref().is_some_and(|u| u.output_tokens == Some(4)))
+            );
+        }
+    }
+    let other_owner =
+        load_session_auxiliary_usage(&shared_pool, "capture-other-owner", &session_id, 1)
+            .await
+            .expect("isolated capture");
+    assert!(other_owner.available && !other_owner.truncated && other_owner.attempts.is_empty());
+    let other_owner_turn =
+        load_explain_auxiliary_usage(&shared_pool, "capture-other-owner", &session_id, 1, 1)
+            .await
+            .expect("isolated turn capture");
+    assert!(
+        other_owner_turn.available
+            && !other_owner_turn.truncated
+            && other_owner_turn.attempts.is_empty()
+    );
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
 async fn session_scoped_auxiliary_inference_is_attributable_without_a_fake_run() {
     let (shared_pool, _) = common::setup_pool_and_settings().await;
     let pool = shared_pool.get();
@@ -5170,7 +6254,7 @@ async fn concurrent_run_and_session_admission_preserve_variant_owner_shapes() {
     session_result.expect("concurrent session-scoped admission");
 
     let rows = sqlx::query(
-        "SELECT scope_kind, session_id, run_id, harness_run_id
+        "SELECT scope_kind, session_id, run_id
          FROM inference_routes
          WHERE user_id = ? AND route_id IN (?, ?)
          ORDER BY scope_kind",
@@ -5188,7 +6272,6 @@ async fn concurrent_run_and_session_admission_preserve_variant_owner_shapes() {
             row.get::<Option<String>, _>("session_id").as_deref(),
             Some(session_id.as_str())
         );
-        assert_eq!(row.get::<Option<String>, _>("harness_run_id"), None);
         match scope_kind.as_str() {
             "run" => assert_eq!(
                 row.get::<Option<String>, _>("run_id").as_deref(),
@@ -5200,195 +6283,6 @@ async fn concurrent_run_and_session_admission_preserve_variant_owner_shapes() {
     }
 
     cleanup(pool, &user_id, &session_id, &run_id).await;
-}
-
-#[tokio::test]
-#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
-#[serial]
-async fn harness_inference_is_owned_without_fabricated_session_coordinates() {
-    let (shared_pool, _) = common::setup_pool_and_settings().await;
-    let pool = shared_pool.get();
-    let suffix = Uuid::new_v4().simple().to_string();
-    let user_id = format!("harness-inf-user-{suffix}");
-    let harness_run_id = format!("harness-run-{suffix}");
-    seed_harness_run(pool, &user_id, &harness_run_id).await;
-
-    let input = InferenceInvocationInput {
-        user_id: user_id.clone(),
-        scope: InferenceInvocationScope::HarnessRun {
-            harness_run_id: harness_run_id.clone(),
-            operation_id: "skillify_extract".to_string(),
-            logical_attempt: 0,
-        },
-        offering_id: "offer-skillify".to_string(),
-        resolved_model_name: "skillify-model".to_string(),
-        upstream_model_name: "skillify-model".to_string(),
-        provider: "openai".to_string(),
-        purpose: InferencePurpose::SkillSynthesis,
-        execution_placement: ModelExecutionPlacement::Server,
-        access_kind: ModelAccessKind::SelfHosted,
-        run_authority: None,
-    };
-
-    let mut wrong_owner_input = input.clone();
-    wrong_owner_input.user_id = format!("other-{suffix}");
-    let wrong_owner = plan_inference_invocation(wrong_owner_input).expect("wrong owner plan");
-    assert_eq!(
-        admit_inference_invocation(&shared_pool, &wrong_owner)
-            .await
-            .expect_err("cross-user harness ownership must reject")
-            .kind,
-        ServiceErrorKind::NotFound
-    );
-
-    let plan = plan_inference_invocation(input).expect("harness inference plan");
-    admit_inference_invocation(&shared_pool, &plan)
-        .await
-        .expect("admit harness inference");
-    let route = sqlx::query(
-        "SELECT scope_kind, session_id, run_id, harness_run_id
-         FROM inference_routes WHERE user_id = ? AND route_id = ?",
-    )
-    .bind(&user_id)
-    .bind(plan.route_id())
-    .fetch_one(pool)
-    .await
-    .expect("load harness route");
-    assert_eq!(route.get::<String, _>("scope_kind"), "harness_run");
-    assert_eq!(route.get::<Option<String>, _>("session_id"), None);
-    assert_eq!(route.get::<Option<String>, _>("run_id"), None);
-    assert_eq!(
-        route.get::<Option<String>, _>("harness_run_id").as_deref(),
-        Some(harness_run_id.as_str())
-    );
-
-    for table in [
-        "model_request_context_events",
-        "inference_invocation_settlement_debts",
-        "inference_provider_attempts",
-        "inference_invocations",
-        "inference_routes",
-    ] {
-        let statement = format!("DELETE FROM {table} WHERE user_id = ? AND harness_run_id = ?");
-        sqlx::query(&statement)
-            .bind(&user_id)
-            .bind(&harness_run_id)
-            .execute(pool)
-            .await
-            .unwrap_or_else(|error| panic!("cleanup `{statement}`: {error}"));
-    }
-    sqlx::query("DELETE FROM harness_runs WHERE user_id = ? AND harness_run_id = ?")
-        .bind(&user_id)
-        .bind(&harness_run_id)
-        .execute(pool)
-        .await
-        .expect("cleanup harness owner");
-}
-
-#[tokio::test]
-#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
-#[serial]
-async fn harness_inference_requires_running_authority_at_admission_and_provider_boundary() {
-    let (shared_pool, _) = common::setup_pool_and_settings().await;
-    let pool = shared_pool.get();
-    let suffix = Uuid::new_v4().simple().to_string();
-    let user_id = format!("harness-state-user-{suffix}");
-    let input_for = |harness_run_id: &str, logical_attempt: u32| InferenceInvocationInput {
-        user_id: user_id.clone(),
-        scope: InferenceInvocationScope::HarnessRun {
-            harness_run_id: harness_run_id.to_string(),
-            operation_id: "skillify_state_fence".to_string(),
-            logical_attempt,
-        },
-        offering_id: "offer-skillify-state".to_string(),
-        resolved_model_name: "skillify-model".to_string(),
-        upstream_model_name: "skillify-model".to_string(),
-        provider: "openai".to_string(),
-        purpose: InferencePurpose::SkillSynthesis,
-        execution_placement: ModelExecutionPlacement::Server,
-        access_kind: ModelAccessKind::SelfHosted,
-        run_authority: None,
-    };
-
-    let mut harness_run_ids = Vec::new();
-    for (logical_attempt, status) in ["completed", "waiting_for_review", "reviewed", "failed"]
-        .into_iter()
-        .enumerate()
-    {
-        let harness_run_id = format!("harness-closed-{logical_attempt}-{suffix}");
-        seed_harness_run(pool, &user_id, &harness_run_id).await;
-        sqlx::query(
-            "UPDATE harness_runs SET status = ?, updated_at = NOW(6)
-             WHERE user_id = ? AND harness_run_id = ?",
-        )
-        .bind(status)
-        .bind(&user_id)
-        .bind(&harness_run_id)
-        .execute(pool)
-        .await
-        .expect("close harness before inference admission");
-        let plan = plan_inference_invocation(input_for(
-            &harness_run_id,
-            u32::try_from(logical_attempt).expect("bounded logical attempt"),
-        ))
-        .expect("plan closed harness inference");
-        assert_eq!(
-            admit_inference_invocation(&shared_pool, &plan)
-                .await
-                .expect_err("non-running harness must not admit inference")
-                .kind,
-            ServiceErrorKind::NotFound
-        );
-        harness_run_ids.push(harness_run_id);
-    }
-
-    let boundary_run_id = format!("harness-boundary-{suffix}");
-    seed_harness_run(pool, &user_id, &boundary_run_id).await;
-    let boundary_plan =
-        plan_inference_invocation(input_for(&boundary_run_id, 10)).expect("boundary plan");
-    admit_inference_invocation(&shared_pool, &boundary_plan)
-        .await
-        .expect("running harness admits logical inference");
-    sqlx::query(
-        "UPDATE harness_runs SET status = 'completed', updated_at = NOW(6)
-         WHERE user_id = ? AND harness_run_id = ?",
-    )
-    .bind(&user_id)
-    .bind(&boundary_run_id)
-    .execute(pool)
-    .await
-    .expect("close harness before provider boundary");
-    assert_eq!(
-        begin_inference_provider_attempt(&shared_pool, &provider_attempt(&boundary_plan, 0))
-            .await
-            .expect_err("terminal harness must fence provider I/O")
-            .kind,
-        ServiceErrorKind::NotFound
-    );
-    harness_run_ids.push(boundary_run_id);
-
-    for table in [
-        "model_request_context_events",
-        "inference_invocation_settlement_debts",
-        "inference_provider_attempts",
-        "inference_invocations",
-        "inference_routes",
-    ] {
-        let statement = format!("DELETE FROM {table} WHERE user_id = ?");
-        sqlx::query(&statement)
-            .bind(&user_id)
-            .execute(pool)
-            .await
-            .unwrap_or_else(|error| panic!("cleanup `{statement}`: {error}"));
-    }
-    for harness_run_id in harness_run_ids {
-        sqlx::query("DELETE FROM harness_runs WHERE user_id = ? AND harness_run_id = ?")
-            .bind(&user_id)
-            .bind(&harness_run_id)
-            .execute(pool)
-            .await
-            .expect("cleanup harness state owner");
-    }
 }
 
 #[tokio::test]
@@ -5820,6 +6714,18 @@ async fn heartbeat_and_expiry_finish_race_have_one_durable_owner() {
             .kind,
         ServiceErrorKind::Conflict
     );
+    // The recovery API intentionally processes a bounded, fair batch shared
+    // by all sessions. Under the full online lane another expired owner may
+    // occupy the first batch, so the contract is eventual bounded recovery,
+    // not that one call must select this particular invocation.
+    reconcile_until_invocation_status(
+        &shared_pool,
+        pool,
+        &user_id,
+        raced.invocation_id(),
+        "delivery_unknown",
+    )
+    .await;
     let raced_fact = sqlx::query(
         "SELECT status, owner_generation, provider_delivery_state
          FROM inference_invocations WHERE user_id = ? AND invocation_id = ?",
@@ -6046,11 +6952,11 @@ async fn combined_successful_settlement_fails_closed_with_multiple_open_attempts
     let shadow_attempt_id = format!("shadow-{suffix}");
     sqlx::query(
         "INSERT INTO inference_provider_attempts
-         (attempt_id, invocation_id, user_id, session_id, run_id, harness_run_id,
+         (attempt_id, invocation_id, user_id, session_id, run_id,
           attempt_index, provider, admission_token, provider_protocol,
           provider_wire_hash, provider_wire_bytes, status, usage_status,
           started_at, terminal_at)
-         SELECT ?, invocation_id, user_id, session_id, run_id, harness_run_id,
+         SELECT ?, invocation_id, user_id, session_id, run_id,
                 attempt_index + 1, provider, ?, provider_protocol,
                 provider_wire_hash, provider_wire_bytes, 'started', 'unavailable',
                 NOW(6), NULL
@@ -6124,7 +7030,7 @@ async fn expired_owner_batch_is_bounded_and_fair_across_300_plus_invocations() {
         "inference_routes",
     ] {
         let statement = format!("DELETE FROM {table} WHERE user_id LIKE 'lease-fair-%'");
-        sqlx::query(&statement)
+        sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))
             .execute(pool)
             .await
             .unwrap_or_else(|error| panic!("cleanup stale fair fixture `{statement}`: {error}"));
@@ -6144,10 +7050,10 @@ async fn expired_owner_batch_is_bounded_and_fair_across_300_plus_invocations() {
         let invocation_id = format!("fair-inv-{index}-{suffix}");
         sqlx::query(
             "INSERT INTO inference_routes
-             (route_id, user_id, session_id, scope_kind, run_id, harness_run_id,
+             (route_id, user_id, session_id, scope_kind, run_id,
               offering_id, resolved_model_name, upstream_model_name, provider,
               execution_placement, access_kind, purpose, created_at)
-             VALUES (?, ?, ?, 'session', NULL, NULL, 'fair-offering', 'fair-model',
+             VALUES (?, ?, ?, 'session', NULL, 'fair-offering', 'fair-model',
                      'fair-model', 'openai', 'server', 'self_hosted',
                      'primary_agent', NOW(6))",
         )
@@ -6160,11 +7066,11 @@ async fn expired_owner_batch_is_bounded_and_fair_across_300_plus_invocations() {
         sqlx::query(
             "INSERT INTO inference_invocations
              (invocation_id, route_id, user_id, session_id, scope_kind, run_id,
-              harness_run_id, admission_token, owner_token, owner_generation,
+              admission_token, owner_token, owner_generation,
               owner_lease_expires_at, turn_index, round_index, operation_id,
               logical_attempt, purpose, status, terminal_fingerprint, usage_status,
               provider_delivery_state, created_at, terminal_at)
-             VALUES (?, ?, ?, ?, 'session', NULL, NULL, ?, ?, 1,
+             VALUES (?, ?, ?, ?, 'session', NULL, ?, ?, 1,
                      TIMESTAMP('1970-01-01 00:00:00.000001'), 1, ?, 'fair_recovery', 0,
                      'primary_agent', 'admitted', NULL, 'unavailable', 'unknown',
                      NOW(6), NULL)",
@@ -6282,7 +7188,7 @@ async fn expired_owner_batch_is_bounded_and_fair_across_300_plus_invocations() {
         "inference_routes",
     ] {
         let statement = format!("DELETE FROM {table} WHERE user_id LIKE ?");
-        sqlx::query(&statement)
+        sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))
             .bind(format!("{user_prefix}%"))
             .execute(pool)
             .await

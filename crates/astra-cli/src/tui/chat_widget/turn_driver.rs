@@ -22,7 +22,7 @@ use ratatui::text::Line;
 
 use super::super::history_cell::HistoryCell;
 use super::{AppEvent, ChatWidget, TurnStats, UserEvent, WireEvent};
-use crate::tui::render::line_utils::sanitize_lines_for_terminal;
+use crate::tui::render::line_utils::history_cell_lines_for_buffer;
 use crate::tui::testing::render::{buffer_to_string, draw_widget};
 
 /// Render the widget's committed history as a single scrollback
@@ -33,7 +33,7 @@ fn render_history(w: &ChatWidget, width: u16) -> String {
     let mut all_lines: Vec<Line<'static>> = Vec::new();
     let history = w.history();
     for (idx, cell) in history.iter().enumerate() {
-        all_lines.extend(sanitize_lines_for_terminal(cell.display_lines(width)));
+        all_lines.extend(history_cell_lines_for_buffer(cell.as_ref(), width));
         let next = history.get(idx + 1).map(|next| next.as_ref());
         for _ in 0..crate::tui::history_cell::separator_rows_after(cell.as_ref(), next) {
             all_lines.push(Line::default());
@@ -61,12 +61,14 @@ fn canonical_turn_commits_every_cell_kind_in_order() {
     )));
 
     // Model reasons first.
-    w.handle_event(AppEvent::wire(WireEvent::ReasoningDelta(
-        "user wants X. ".into(),
-    )));
-    w.handle_event(AppEvent::wire(WireEvent::ReasoningDelta(
-        "I'll do Y.".into(),
-    )));
+    w.handle_event(AppEvent::wire(WireEvent::ReasoningDelta {
+        model_item_id: None,
+        text: "user wants X. ".into(),
+    }));
+    w.handle_event(AppEvent::wire(WireEvent::ReasoningDelta {
+        model_item_id: None,
+        text: "I'll do Y.".into(),
+    }));
     w.handle_event(AppEvent::wire(WireEvent::ReasoningDone));
 
     // Tool invocation mid-turn.
@@ -88,12 +90,14 @@ fn canonical_turn_commits_every_cell_kind_in_order() {
     }));
 
     // Answer streams in two chunks.
-    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta(
-        "Here is the plan:\n\n".into(),
-    )));
-    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta(
-        "- step one\n- step two\n".into(),
-    )));
+    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta {
+        model_item_id: None,
+        text: "Here is the plan:\n\n".into(),
+    }));
+    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta {
+        model_item_id: None,
+        text: "- step one\n- step two\n".into(),
+    }));
 
     // Turn ends — widget emits the summary.
     w.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::new(
@@ -103,6 +107,11 @@ fn canonical_turn_commits_every_cell_kind_in_order() {
             tokens_in: Some(220),
             tokens_out: Some(50),
             cache_read_tokens: None,
+            cache_creation_tokens: None,
+            model_name: None,
+            auxiliary_summary: None,
+            input_usage_complete: false,
+            usage_partial: false,
             tools: 1,
             cumulative_tokens: Some(270),
             cumulative_cost_usd: Some(0.0015),
@@ -147,9 +156,10 @@ fn canonical_turn_snapshots_full_scrollback() {
         tool_use_id: "tu_drv_2".into(),
         parent_tool_use_id: None,
     }));
-    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta(
-        "There are 3 files.".into(),
-    )));
+    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta {
+        model_item_id: None,
+        text: "There are 3 files.".into(),
+    }));
     w.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::new(
         TurnStats {
             elapsed_ms: Some(1_200),
@@ -157,6 +167,11 @@ fn canonical_turn_snapshots_full_scrollback() {
             tokens_in: Some(200),
             tokens_out: Some(40),
             cache_read_tokens: None,
+            cache_creation_tokens: None,
+            model_name: None,
+            auxiliary_summary: None,
+            input_usage_complete: false,
+            usage_partial: false,
             tools: 1,
             cumulative_tokens: Some(240),
             cumulative_cost_usd: None,
@@ -174,10 +189,14 @@ fn interleaved_reasoning_and_answer_collapses_reasoning_first() {
     // Assistant ✓ (not a single mixed cell).
     let mut w = ChatWidget::new("");
     w.handle_event(AppEvent::User(UserEvent::Submit("hi".into())));
-    w.handle_event(AppEvent::wire(WireEvent::ReasoningDelta(
-        "some thought".into(),
-    )));
-    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta("answer".into())));
+    w.handle_event(AppEvent::wire(WireEvent::ReasoningDelta {
+        model_item_id: None,
+        text: "some thought".into(),
+    }));
+    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta {
+        model_item_id: None,
+        text: "answer".into(),
+    }));
     w.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::new(
         TurnStats {
             elapsed_ms: Some(500),
@@ -233,9 +252,10 @@ fn two_back_to_back_tools_both_commit() {
 fn turn_error_mid_stream_commits_partial_assistant_then_error() {
     let mut w = ChatWidget::new("");
     w.handle_event(AppEvent::User(UserEvent::Submit("hi".into())));
-    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta(
-        "half an answer".into(),
-    )));
+    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta {
+        model_item_id: None,
+        text: "half an answer".into(),
+    }));
     w.handle_event(AppEvent::wire(WireEvent::TurnError("rate limited".into())));
 
     // User + partial Assistant + SystemError. No summary on
@@ -260,10 +280,13 @@ async fn partial_interruption_keeps_answer_once_and_renders_safe_notice_separate
     let (tui_tx, mut tui_rx) = stream_bridge::create_channels();
     let (stream_tx, control) = stream_bridge::create_controlled_per_turn_bridge(tui_tx);
     let assistant_text = "The requested file was updated successfully.";
-    let user_message = "The requested execution did not complete. Progress is saved. Continue this session to resume.";
+    let user_message = "Execution did not reach a verified terminal state. Progress is saved. Review the saved progress, then continue to reconcile the unfinished work.";
 
     stream_tx
-        .send(StreamEvent::Token(assistant_text.into()))
+        .send(StreamEvent::Token {
+            model_item_id: None,
+            text: assistant_text.into(),
+        })
         .await
         .expect("partial assistant text should enter the ordered stream");
     stream_tx
@@ -314,6 +337,24 @@ async fn partial_interruption_keeps_answer_once_and_renders_safe_notice_separate
     let rendered = render_history(&w, 100);
     assert_eq!(rendered.matches(assistant_text).count(), 1);
     assert!(!rendered.contains("persistent unresolved tool outcome"));
+}
+
+#[test]
+fn notice_only_interruption_renders_once_without_an_assistant_cell() {
+    let mut widget = ChatWidget::new("");
+    widget.handle_event(AppEvent::User(UserEvent::Submit("inspect the turn".into())));
+    let notice = "The model provider is temporarily rate limited. Please wait before retrying.";
+    widget.handle_event(AppEvent::wire(WireEvent::RunInterrupted(notice.into())));
+    widget.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
+
+    let kinds: Vec<_> = widget
+        .history()
+        .iter()
+        .map(|cell| cell_kind_name(cell.as_ref()))
+        .collect();
+    assert_eq!(kinds, vec!["User", "System", "TurnSummary"]);
+    assert_eq!(render_history(&widget, 200).matches(notice).count(), 1);
+    assert!(widget.active_cell().is_none());
 }
 
 // ── helpers ─────────────────────────────────────────────────────

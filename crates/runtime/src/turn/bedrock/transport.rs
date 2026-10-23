@@ -148,19 +148,13 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
         .set_provider_response_id(bedrock_response_id(&response))
         .map_err(|error| BedrockStreamError::Transport {
             error: error.to_string(),
-            partial: accum
-                .clone()
-                .into_result(model_name, started.elapsed().as_millis() as u64),
+            partial: accum.clone().into_result(model_name),
         })?;
     let mut byte_stream = response.bytes_stream();
     let mut yield_state = StreamYieldState::new(TokioInstant::now());
     let mut delivered_tool_arguments = HashMap::<u64, String>::new();
     let provider_work_deadline = started + provider_work_budget;
-    let partial = |accum: &BedrockStreamAccumulator| {
-        accum
-            .clone()
-            .into_result(model_name, started.elapsed().as_millis() as u64)
-    };
+    let partial = |accum: &BedrockStreamAccumulator| accum.clone().into_result(model_name);
 
     'body: loop {
         if cancel.is_triggered() {
@@ -348,39 +342,16 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
         });
     }
 
-    Ok(accum.into_result(model_name, started.elapsed().as_millis() as u64))
+    Ok(accum.into_result(model_name))
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::server::provider_test_support::eventstream_frame;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    fn eventstream_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
-        fn string_header(out: &mut Vec<u8>, name: &str, value: &str) {
-            out.push(name.len() as u8);
-            out.extend_from_slice(name.as_bytes());
-            out.push(7);
-            out.extend_from_slice(&(value.len() as u16).to_be_bytes());
-            out.extend_from_slice(value.as_bytes());
-        }
-
-        let mut headers = Vec::new();
-        string_header(&mut headers, ":message-type", "event");
-        string_header(&mut headers, ":event-type", event_type);
-        let headers_len = headers.len() as u32;
-        let total_len = 12 + headers_len + payload.len() as u32 + 4;
-        let mut frame = Vec::with_capacity(total_len as usize);
-        frame.extend_from_slice(&total_len.to_be_bytes());
-        frame.extend_from_slice(&headers_len.to_be_bytes());
-        frame.extend_from_slice(&crc32fast::hash(&frame[..8]).to_be_bytes());
-        frame.extend_from_slice(&headers);
-        frame.extend_from_slice(payload);
-        frame.extend_from_slice(&crc32fast::hash(&frame).to_be_bytes());
-        frame
-    }
-
-    async fn spawn_bedrock_stream(include_metadata: bool) -> String {
+    async fn spawn_bedrock_stream(metadata_payload: Option<&'static [u8]>) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind Bedrock fixture");
@@ -401,11 +372,8 @@ mod tests {
                 br#"{"stopReason":"end_turn"}"#,
             ));
 
-            if include_metadata {
-                let metadata = eventstream_frame(
-                    "metadata",
-                    br#"{"usage":{"inputTokens":42,"outputTokens":7,"totalTokens":49}}"#,
-                );
+            if let Some(payload) = metadata_payload {
+                let metadata = eventstream_frame("metadata", payload);
                 socket
                     .write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Type: application/vnd.amazon.eventstream\r\nTransfer-Encoding: chunked\r\nx-amzn-requestid: bedrock-complete\r\nConnection: close\r\n\r\n",
@@ -452,12 +420,12 @@ mod tests {
         format!("http://{address}")
     }
 
-    async fn fixture_response(include_metadata: bool) -> reqwest::Response {
+    async fn fixture_response(metadata_payload: Option<&'static [u8]>) -> reqwest::Response {
         reqwest::Client::builder()
             .no_proxy()
             .build()
             .expect("build direct Bedrock fixture client")
-            .post(spawn_bedrock_stream(include_metadata).await)
+            .post(spawn_bedrock_stream(metadata_payload).await)
             .send()
             .await
             .expect("request Bedrock fixture")
@@ -724,7 +692,10 @@ mod tests {
 
     #[tokio::test]
     async fn drains_usage_metadata_delivered_after_message_stop() {
-        let response = fixture_response(true).await;
+        let response = fixture_response(Some(
+            br#"{"usage":{"inputTokens":42,"outputTokens":7,"totalTokens":49}}"#,
+        ))
+        .await;
         let result = collect_bedrock_stream(
             response,
             "bedrock-test-model",
@@ -744,7 +715,7 @@ mod tests {
 
     #[tokio::test]
     async fn message_stop_without_usage_is_partial_delivery_not_success() {
-        let response = fixture_response(false).await;
+        let response = fixture_response(None).await;
         let error = collect_bedrock_stream(
             response,
             "bedrock-test-model",
@@ -763,6 +734,33 @@ mod tests {
         assert_eq!(partial.response_id.as_deref(), Some("bedrock-partial"));
         assert_eq!(partial.full_text, "evidence");
         assert!(partial.usage.is_empty());
+    }
+
+    #[tokio::test]
+    async fn received_usage_envelope_with_unknown_counts_preserves_success() {
+        for payload in [
+            br#"{"usage":{}}"#.as_slice(),
+            br#"{"usage":{"inputTokens":-1,"outputTokens":"unknown"}}"#.as_slice(),
+        ] {
+            let result = collect_bedrock_stream(
+                fixture_response(Some(payload)).await,
+                "bedrock-test-model",
+                Instant::now(),
+                LlmCancel::None,
+                std::time::Duration::from_secs(1),
+                None,
+            )
+            .await
+            .expect("unknown accounting is not truncated delivery");
+            assert_eq!(result.full_text, "evidence");
+            assert!(result.usage.is_empty());
+            let terminal = crate::turn::llm::client::provider_attempt_terminal_from_result(&result);
+            assert_eq!(
+                terminal.usage_status,
+                astra_services::InferenceUsageStatus::Unavailable
+            );
+            assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+        }
     }
 
     #[tokio::test]

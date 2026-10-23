@@ -19,7 +19,10 @@ use sqlx::{MySql, Row, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{AcquireWriterOutcome, SessionContextCoordinator, SessionContextCoordinatorError};
+use crate::{
+    AcquireWriterOutcome, CancellationSafePoolConnection, SessionContextCoordinator,
+    SessionContextCoordinatorError,
+};
 
 const MAX_IDEMPOTENCY_BYTES: usize = 512;
 const MAX_REASON_BYTES: usize = 1_024;
@@ -85,7 +88,18 @@ impl DatabaseSessionForkCoordinator {
         validate_prepare_request(request)?;
         let request_hash = stable_hash(b"astra.prepare-session-fork.v1\0", request)?;
         let idempotency_hash = identity_hash("prepare", &request.idempotency_key);
-        let mut tx = self.begin("begin_prepare_fork").await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_prepare_fork_connection", source))?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|source| database_error("begin_prepare_fork", source))?;
+        crate::session_context_coordinator::admit_session_lifecycle_writes(
+            &mut tx,
+            [&request.parent_key, &request.child_key],
+        )
+        .await?;
 
         if let Some(row) = sqlx::query(
             "SELECT request_hash, manifest_json FROM session_forks
@@ -108,6 +122,7 @@ impl DatabaseSessionForkCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_prepare_retry", source))?;
+            connection.release();
             return Ok(manifest);
         }
 
@@ -177,6 +192,7 @@ impl DatabaseSessionForkCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_prepare_fork", source))?;
+        connection.release();
         Ok(manifest)
     }
 
@@ -256,7 +272,41 @@ impl DatabaseSessionForkCoordinator {
         validate_key_and_id(parent_key, fork_id)?;
         validate_duration(grace, MAX_ABORT_GRACE, "retention grace")?;
         validate_text("abort detail", detail, MAX_REASON_BYTES)?;
-        let mut tx = self.begin("begin_abort_fork").await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_abort_fork", source))?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|source| database_error("begin_abort_fork", source))?;
+        let child_row = sqlx::query(
+            "SELECT child_session_id, child_branch_id FROM session_forks
+             WHERE isolation_domain = ? AND owner_user_id = ? AND fork_id = ?",
+        )
+        .bind(&parent_key.isolation_domain)
+        .bind(&parent_key.owner_user_id)
+        .bind(fork_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| database_error("load_abort_fork_participants", source))?
+        .ok_or(SessionForkCoordinatorError::NotFound)?;
+        let child_session_id: String = child_row
+            .try_get("child_session_id")
+            .map_err(|source| database_error("decode_abort_fork_child_session", source))?;
+        let child_branch_id: String = child_row
+            .try_get("child_branch_id")
+            .map_err(|source| database_error("decode_abort_fork_child_branch", source))?;
+        let child_key = SessionKeyV1::owner_session(
+            parent_key.isolation_domain.clone(),
+            parent_key.owner_user_id.clone(),
+            child_session_id,
+            child_branch_id,
+        );
+        crate::session_context_coordinator::admit_session_lifecycle_writes(
+            &mut tx,
+            [parent_key, &child_key],
+        )
+        .await?;
         let row = lock_fork(&mut tx, parent_key, fork_id).await?;
         let mut manifest: SessionForkManifestV1 =
             decode_json_row(&row, "manifest_json", "fork_manifest")?;
@@ -265,6 +315,7 @@ impl DatabaseSessionForkCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_abort_retry", source))?;
+            connection.release();
             return Ok(manifest);
         }
         if manifest.state != SessionForkStateV1::Prepared {
@@ -307,6 +358,7 @@ impl DatabaseSessionForkCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_abort_fork", source))?;
+        connection.release();
         Ok(manifest)
     }
 
@@ -382,7 +434,13 @@ impl DatabaseSessionForkCoordinator {
                 "cleanup limit must be between 1 and 10000".into(),
             ));
         }
-        let mut tx = self.begin("begin_release_fork_pins").await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_release_fork_pins", source))?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|source| database_error("begin_release_fork_pins", source))?;
         let now = database_now_ms(&mut tx).await?;
         let result = sqlx::query(
             "DELETE FROM conversation_manifest_pins
@@ -397,6 +455,7 @@ impl DatabaseSessionForkCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_release_fork_pins", source))?;
+        connection.release();
         Ok(result.rows_affected())
     }
 
@@ -413,7 +472,13 @@ impl DatabaseSessionForkCoordinator {
                 "cleanup limit must be between 1 and 10000".into(),
             ));
         }
-        let mut tx = self.begin("begin_collect_orphan_manifests").await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_collect_orphan_manifests", source))?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|source| database_error("begin_collect_orphan_manifests", source))?;
         let now = database_now_ms(&mut tx).await?;
         let result = sqlx::query(
             "DELETE FROM conversation_manifest_nodes
@@ -456,6 +521,7 @@ impl DatabaseSessionForkCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_collect_orphan_manifests", source))?;
+        connection.release();
         Ok(result.rows_affected())
     }
 
@@ -547,7 +613,13 @@ impl DatabaseSessionForkCoordinator {
                 "cleanup limit must be between 1 and 10000".into(),
             ));
         }
-        let mut tx = self.begin("begin_collect_orphan_forks").await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_collect_orphan_forks", source))?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|source| database_error("begin_collect_orphan_forks", source))?;
         let rows = sqlx::query(
             "SELECT isolation_domain, owner_user_id, fork_id
              FROM session_forks
@@ -612,19 +684,9 @@ impl DatabaseSessionForkCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_collect_orphan_forks", source))?;
+        connection.release();
         u64::try_from(rows.len())
             .map_err(|_| SessionForkCoordinatorError::Invalid("cleanup count overflow".into()))
-    }
-
-    async fn begin(
-        &self,
-        operation: &'static str,
-    ) -> Result<Transaction<'_, MySql>, SessionForkCoordinatorError> {
-        self.pool
-            .get()
-            .begin()
-            .await
-            .map_err(|source| database_error(operation, source))
     }
 }
 
@@ -694,13 +756,6 @@ async fn insert_fork_child_session(
     tx: &mut Transaction<'_, MySql>,
     manifest: &SessionForkManifestV1,
 ) -> Result<(), SessionForkCoordinatorError> {
-    crate::storage::lock_agent_session_write_fence(
-        tx,
-        &manifest.child_key.session_id,
-        &manifest.child_key.owner_user_id,
-    )
-    .await
-    .map_err(|source| database_error("lock_fork_child_session_fence", source))?;
     let metadata = serde_json::json!({
         "fork_id": manifest.fork_id,
         "fork_parent_session_id": manifest.parent_key.session_id,

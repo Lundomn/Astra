@@ -146,9 +146,17 @@ pub(crate) fn enqueue_ingestion_for_immediate_drain_pub(
 }
 
 #[derive(Debug)]
+pub(crate) enum OneShotJournalSettlement {
+    Canonical(OneShotJournalCommit),
+    ContentOmitted { persistence_error: Option<String> },
+}
+
+#[derive(Debug)]
 pub(crate) struct OneShotJournalCommit {
     pub(crate) turn: u32,
-    pub(crate) cursor: astra_turn_types::SessionCursorV1,
+    /// Exact canonical messages and cursor committed to the journal. Derived
+    /// stores must not pair this cursor with the unsanitized stream result.
+    pub(crate) conversation: astra_turn_core::active_conversation::ActiveConversation,
     /// Present when append returned an error but exact readback proved that the
     /// intended canonical commit exists. The commit is authoritative; derived
     /// projections and durability health still require repair.
@@ -184,7 +192,7 @@ pub(crate) fn append_one_shot_journal_events(
     result: &StreamResult,
     turn_start: Instant,
     execution_lease: Option<&session_journal::SessionExecutionLease>,
-) -> Result<Option<OneShotJournalCommit>, OneShotJournalCommitError> {
+) -> Result<Option<OneShotJournalSettlement>, OneShotJournalCommitError> {
     let Some(session_id) = session_id.filter(|sid| !sid.is_empty()) else {
         return Ok(None);
     };
@@ -255,6 +263,12 @@ pub(crate) fn append_one_shot_journal_events(
                 "failed to validate canonical one-shot conversation: {error}"
             ))
         })?;
+    if canonical_messages.is_empty() && session_journal::journal_content_redact_enabled() {
+        return Err(OneShotJournalCommitError::NotCommitted(
+            "failed to persist one-shot canonical continuation: canonical messages are empty"
+                .into(),
+        ));
+    }
     let commits = existing_events
         .iter()
         .filter_map(|event| event.conversation_commit.clone())
@@ -295,7 +309,6 @@ pub(crate) fn append_one_shot_journal_events(
             ))
         })?;
     let intended_commit = prepared.commit.clone();
-    let cursor = prepared.commit.cursor.clone();
 
     let mut turn_event = session_journal::JournalEvent::turn(
         Some(session_id),
@@ -317,15 +330,64 @@ pub(crate) fn append_one_shot_journal_events(
     .with_tool_calls(result.tool_call_records.clone())
     .with_run_id(result.run_id.as_deref())
     .with_budget_pressure(result.budget_pressure)
-    .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens)
+    .with_qualified_usage(result.qualified_usage)
     .with_conversation_commit(prepared.commit);
     result.apply_canonical_tool_outcomes(&mut turn_event);
     turn_event.llm_rounds = result.llm_rounds;
+    if session_journal::journal_content_redact_enabled() && turn_event.conversation_commit.is_none()
+    {
+        // Do not write diagnostics/sidecars from the raw stream through another
+        // local content lane. Only this policy-redacted terminal fact settles.
+        turn_event = session_journal::JournalEvent::turn(
+            Some(session_id),
+            turn,
+            model_id,
+            line,
+            &result.full_text,
+            result.tool_calls_count,
+            result.prompt_tokens,
+            result.completion_tokens,
+            turn_start.elapsed().as_millis() as u64,
+        )
+        .with_run_id(result.run_id.as_deref())
+        .with_qualified_usage(result.qualified_usage);
+        turn_event.llm_rounds = result.llm_rounds;
+        turn_event
+            .metadata
+            .get_or_insert_with(|| serde_json::json!({}))["local_continuation"] =
+            serde_json::json!("omitted_by_policy");
+        return match writer.append_content_omitted_turn_cas(
+            execution_lease,
+            expected_base_cursor.as_ref(),
+            turn,
+            &intended_commit,
+            &turn_event,
+        ) {
+            session_journal::CanonicalCommitCasOutcome::ContentOmitted {
+                persistence_warning,
+            } => Ok(Some(OneShotJournalSettlement::ContentOmitted {
+                persistence_error: persistence_warning,
+            })),
+            session_journal::CanonicalCommitCasOutcome::Unknown(reason) => {
+                Err(OneShotJournalCommitError::CommitUnknown(reason))
+            }
+            outcome => Err(OneShotJournalCommitError::NotCommitted(format!(
+                "failed to settle content-redacted one-shot turn: {outcome:?}"
+            ))),
+        };
+    }
     // Content redaction is allowed to suppress the embedded commit. Do not
     // advertise a canonical settlement when the exact intended commit will
     // not actually be part of the journal batch.
     require_intended_conversation_commit(&turn_event, &intended_commit, session_id)?;
     append_events.push(turn_event);
+    append_events.extend(
+        crate::cli::stream::streaming_types::root_run_transcript_events(
+            Some(session_id),
+            result.run_id.as_deref(),
+            &result.run_transcript_messages,
+        ),
+    );
     match writer.append_canonical_commit_cas(
         execution_lease,
         expected_base_cursor.as_ref(),
@@ -335,11 +397,18 @@ pub(crate) fn append_one_shot_journal_events(
     ) {
         session_journal::CanonicalCommitCasOutcome::Committed {
             persistence_warning,
-        } => Ok(Some(OneShotJournalCommit {
-            turn,
-            cursor,
-            persistence_error: persistence_warning,
-        })),
+        } => Ok(Some(OneShotJournalSettlement::Canonical(
+            OneShotJournalCommit {
+                turn,
+                conversation: prepared.next,
+                persistence_error: persistence_warning,
+            },
+        ))),
+        session_journal::CanonicalCommitCasOutcome::ContentOmitted { .. } => {
+            Err(OneShotJournalCommitError::NotCommitted(
+                "canonical append unexpectedly omitted content".into(),
+            ))
+        }
         session_journal::CanonicalCommitCasOutcome::NotCommitted(reason)
         | session_journal::CanonicalCommitCasOutcome::Conflict(reason) => {
             Err(OneShotJournalCommitError::NotCommitted(format!(
@@ -454,6 +523,10 @@ mod tests {
         );
         first.prompt_tokens = 11;
         first.completion_tokens = 7;
+        first.qualified_usage = Some(
+            astra_turn_types::CanonicalTokenUsage::new(Some(11), Some(0), Some(0), Some(7))
+                .unwrap(),
+        );
         first.llm_rounds = Some(2);
         first.pending_context_assembly_trace = Some((
             41,

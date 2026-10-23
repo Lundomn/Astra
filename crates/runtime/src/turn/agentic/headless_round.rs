@@ -41,13 +41,14 @@ pub trait HeadlessActionFence: Send + Sync {
     async fn allow_action(&self, action_id: &str) -> Result<bool, String>;
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct HeadlessRoundOutcome {
     pub superseded_before_action: bool,
     pub action_admission_error: Option<String>,
     /// Exact server call IDs whose terminal event is owned by the shared
     /// headless loop. Runtime-route and edge-owned calls are excluded.
     pub shared_loop_terminal_call_ids: HashSet<String>,
+    pub(crate) accepted_sends: Vec<crate::orchestration::agent_tool::AcceptedAgentSend>,
 }
 
 /// Ordered views of one provider batch at the history/execution boundary.
@@ -59,6 +60,26 @@ pub struct HeadlessRoundOutcome {
 pub struct HeadlessToolCallViews<'a> {
     pub physical: &'a [Value],
     pub logical: &'a [Value],
+}
+
+/// Return the canonical parent-approval wait for the current execution
+/// context. Native provider stages use the same permission gate as ordinary
+/// headless tools, so their approval budget must come from this owner rather
+/// than maintaining a provider-specific timeout.
+pub(crate) async fn effective_permission_timeout(
+    permission_context: Option<&PermissionSyncHandle>,
+) -> Duration {
+    const FOREGROUND: Duration = Duration::from_secs(30);
+    const BACKGROUND: Duration = Duration::from_secs(5);
+
+    let Some(permission_context) = permission_context else {
+        return FOREGROUND;
+    };
+    if permission_context.read().await.inherited.is_background {
+        BACKGROUND
+    } else {
+        FOREGROUND
+    }
 }
 
 impl<'a> HeadlessToolCallViews<'a> {
@@ -79,8 +100,6 @@ impl<'a> HeadlessToolCallViews<'a> {
 
 /// Typed execution context for one headless tool round.
 pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
-    pub task_resolution_authority:
-        Option<&'a astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority>,
     /// Internal agentic step index (0-based) for cache and loop accounting.
     pub turn_index: usize,
     /// User-visible session turn currently in progress (1-based).
@@ -99,6 +118,9 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     /// capability in the same transaction as `Prepared -> Dispatched`.
     pub durable_dispatch_admission:
         Option<crate::server::tool_invocation_runtime::DurableDispatchAdmission>,
+    pub delegation_model_admissions: Option<
+        &'a HashMap<String, crate::turn::agentic_loop::host::PreparedDelegationModelAdmission>,
+    >,
     /// Exact provider calls, used only to append the assistant transcript.
     pub physical_tool_calls: &'a [Value],
     /// Admitted execution targets, used by policy, scheduling, and execution.
@@ -130,13 +152,16 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     pub call_counts: &'a mut HashMap<String, u32>,
     pub max_identical_calls: u32,
     pub max_tools_per_turn: u32,
-    /// Mirrors `AgenticLoopState::repeated_cache_hit_suppression`; threaded
-    /// into the downstream `HeadlessToolExecutionCtx`.
-    pub repeated_cache_hit_suppression: u32,
     /// Mirrors `AgenticLoopState::max_consecutive_empty_name`.
     pub max_consecutive_empty_name: u32,
     pub tool_call_records: &'a mut Vec<ToolCallRecord>,
     pub tool_event_hooks: &'a crate::skills::hooks::ToolEventHookRegistry,
+    /// Existing Skill ledger and current client catalog, borrowed by the final
+    /// result owner so recovery retains the post-hook body before truncation.
+    pub client_skill_execution: Option<(
+        &'a [astra_turn_types::SkillCatalogIdentity],
+        &'a mut crate::turn::agentic_loop::host::SkillExecutionState,
+    )>,
     pub term: &'a mut dyn HeadlessRoundTerminal,
     pub mailbox: Option<&'a mut astra_messaging::router::AgentMailbox>,
     pub permission_context: Option<&'a PermissionSyncHandle>,
@@ -148,10 +173,6 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     /// Optional server-side tool executor for web agent sessions.
     pub runtime_tool_executor:
         Option<&'a crate::server::runtime_tool_executor::RuntimeToolExecutor>,
-    /// Executor-owned external observation scope carried across the bounded
-    /// recovery boundary.  This is structured state, never inferred from a
-    /// Bash command or assistant prose.
-    pub external_effect_recovery_paths: Option<&'a [String]>,
     // ── Observability (Phase 1) ──
     /// Turn start instant for computing start_offset_ms on tool records.
     pub turn_start: Option<std::time::Instant>,
@@ -165,7 +186,7 @@ struct HeadlessPreparedRound<'a> {
     effective_permission_timeout: Duration,
     logical_tool_calls: &'a [Value],
     pre_resolved_ids: HashSet<String>,
-    indices: Vec<astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx>,
+    indices: Vec<usize>,
     step_deadline: HeadlessStepDeadline,
     consumed_edge: Vec<bool>,
 }
@@ -183,19 +204,7 @@ async fn prepare_headless_tool_round<'a, E: EdgeToolRoundRow>(
     step_recorder: &mut StepRecorder,
     llm_round: u32,
 ) -> HeadlessPreparedRound<'a> {
-    const PERMISSION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-    const PERMISSION_REQUEST_TIMEOUT_BACKGROUND: Duration = Duration::from_secs(5);
-
-    let effective_permission_timeout = if let Some(ctx) = permission_context {
-        let guard = ctx.read().await;
-        if guard.inherited.is_background {
-            PERMISSION_REQUEST_TIMEOUT_BACKGROUND
-        } else {
-            PERMISSION_REQUEST_TIMEOUT
-        }
-    } else {
-        PERMISSION_REQUEST_TIMEOUT
-    };
+    let effective_permission_timeout = effective_permission_timeout(permission_context).await;
 
     tool_results.clear();
 
@@ -203,7 +212,6 @@ async fn prepare_headless_tool_round<'a, E: EdgeToolRoundRow>(
         || astra_turn_core::edge_ledger::history_has_reasoning(messages);
     let opening = begin_headless_tool_round_opening_ext(
         physical_tool_calls,
-        edge_tool_round,
         reasoning_content,
         reasoning_signature,
         force_reasoning,
@@ -213,7 +221,8 @@ async fn prepare_headless_tool_round<'a, E: EdgeToolRoundRow>(
     let mut pre_resolved_ids = HashSet::new();
     for result in pre_resolved_results {
         pre_resolved_ids.insert(result.call_id.clone());
-        let content_for_model = tool_result_content_for_model("pre_resolved", &result.content);
+        let content_for_model =
+            tool_result_content_for_model(&result.source_tool_name, &result.content);
         let (mut tool_msg, tr) = openai_tool_roundtrip_values(
             &result.call_id,
             "pre_resolved",
@@ -238,14 +247,7 @@ async fn prepare_headless_tool_round<'a, E: EdgeToolRoundRow>(
         .indices
         .iter()
         .map(|idx| {
-            let slot = resolve_headless_tool_slot(*idx, logical_tool_calls, |edge_idx| {
-                let edge = &edge_tool_round[edge_idx];
-                (
-                    edge.assistant_tool_call_id(edge_idx),
-                    edge.tool_name().to_string(),
-                    edge.tool_args().clone(),
-                )
-            });
+            let slot = resolve_headless_tool_slot(*idx, logical_tool_calls);
             ExecutionSlotSpec {
                 args_preview: make_args_preview(&slot.name, &slot.args),
                 tool_name: slot.name,
@@ -285,7 +287,6 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
     action_fence: Option<&dyn HeadlessActionFence>,
 ) -> HeadlessRoundOutcome {
     let HeadlessToolRoundCtx {
-        task_resolution_authority,
         turn_index,
         session_turn,
         quiet,
@@ -296,6 +297,7 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
         current_run_id,
         current_turn_chain_id,
         durable_dispatch_admission,
+        delegation_model_admissions,
         physical_tool_calls,
         logical_tool_calls,
         deferred_activations_by_call_id,
@@ -315,17 +317,16 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
         call_counts,
         max_identical_calls,
         max_tools_per_turn,
-        repeated_cache_hit_suppression,
         max_consecutive_empty_name,
         tool_call_records,
         tool_event_hooks,
+        client_skill_execution,
         term,
         mailbox,
         permission_context,
         progress_emitter,
         pre_resolved_results,
         runtime_tool_executor,
-        external_effect_recovery_paths,
         turn_start,
         llm_round,
         plan_mode_active,
@@ -397,15 +398,11 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
             ..Default::default()
         };
     }
-    if logical_tool_calls.is_empty()
-        && edge_tool_round.is_empty()
-        && pre_resolved_results.is_empty()
-    {
+    if logical_tool_calls.is_empty() {
         return HeadlessRoundOutcome {
             superseded_before_action: false,
             action_admission_error: Some(
-                "headless tool round requires at least one admitted, rejected, or edge carrier"
-                    .to_string(),
+                "headless tool round requires a provider request batch".to_string(),
             ),
             ..Default::default()
         };
@@ -443,7 +440,7 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
             current_run_id,
             current_turn_chain_id,
             durable_dispatch_admission,
-            task_resolution_authority,
+            delegation_model_admissions,
             tool_calls: logical_tool_calls,
             deferred_activations_by_call_id,
             runtime_control_calls_by_id,
@@ -461,17 +458,16 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
             call_counts,
             max_identical_calls,
             max_tools_per_turn,
-            repeated_cache_hit_suppression,
             max_consecutive_empty_name,
             tool_call_records,
             tool_event_hooks,
+            client_skill_execution,
             term,
             mailbox,
             permission_context,
             progress_emitter,
             effective_permission_timeout,
             runtime_tool_executor,
-            external_effect_recovery_paths,
             turn_start,
             llm_round,
             plan_mode_active,
@@ -550,9 +546,7 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
             }
         }
     }
-    let superseded_before_action = pipeline.action_fence_superseded();
-    let action_admission_error = pipeline.action_fence_error().map(ToString::to_string);
-    let shared_loop_terminal_call_ids = pipeline.into_shared_loop_terminal_call_ids();
+    let outcome = pipeline.into_round_outcome();
     for message in messages.iter_mut().skip(history_start) {
         if message.get("role").and_then(Value::as_str) != Some("tool") {
             continue;
@@ -567,31 +561,22 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
             );
         }
     }
-    HeadlessRoundOutcome {
-        superseded_before_action,
-        action_admission_error,
-        shared_loop_terminal_call_ids,
-    }
+    outcome
 }
 
-use astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx;
-
 pub(crate) enum ToolBatch {
-    Concurrent(Vec<HeadlessRoundToolIdx>),
-    Serial(HeadlessRoundToolIdx),
+    Concurrent(Vec<usize>),
+    Serial(usize),
 }
 
 #[cfg(test)]
-pub(crate) fn partition_tool_batches(
-    indices: &[HeadlessRoundToolIdx],
-    tool_calls: &[Value],
-) -> Vec<ToolBatch> {
+pub(crate) fn partition_tool_batches(indices: &[usize], tool_calls: &[Value]) -> Vec<ToolBatch> {
     partition_tool_batches_with_provider_policy(indices, tool_calls, |_| None)
 }
 
 #[cfg(test)]
 pub(crate) fn partition_tool_batches_with_provider_policy<F>(
-    indices: &[HeadlessRoundToolIdx],
+    indices: &[usize],
     tool_calls: &[Value],
     provider_parallelizable: F,
 ) -> Vec<ToolBatch>
@@ -607,7 +592,7 @@ where
 }
 
 pub(crate) fn partition_tool_batches_with_provider_policy_and_serial_gate<F, G>(
-    indices: &[HeadlessRoundToolIdx],
+    indices: &[usize],
     tool_calls: &[Value],
     provider_parallelizable: F,
     force_serial: G,
@@ -620,27 +605,19 @@ where
     use astra_turn_core::tool_policy::is_tool_concurrency_safe;
 
     let mut batches = Vec::new();
-    let mut concurrent_buf: Vec<HeadlessRoundToolIdx> = Vec::new();
+    let mut concurrent_buf: Vec<usize> = Vec::new();
 
     for &idx in indices {
-        let (tool_name, tool_args, serial_boundary) = match &idx {
-            HeadlessRoundToolIdx::ServerToolCall(i) => {
-                let call = tool_calls.get(*i);
-                (
-                    call.and_then(|tc| tc.get("function"))
-                        .and_then(|f| f.get("name"))
-                        .and_then(|n| n.as_str())
-                        .unwrap_or(""),
-                    call.and_then(astra_turn_core::parallel_tool_exec::parse_tool_args),
-                    call.is_some_and(|call| force_serial(call)),
-                )
-            }
-            HeadlessRoundToolIdx::SyntheticEdge(_) => ("synthetic_edge", None, false),
-        };
+        let call = tool_calls.get(idx);
+        let tool_name = call
+            .and_then(|call| call.get("function"))
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let tool_args = call.and_then(astra_turn_core::parallel_tool_exec::parse_tool_args);
+        let serial_boundary = call.is_some_and(|call| force_serial(call));
 
-        let is_readonly = if tool_name == "synthetic_edge" {
-            true
-        } else if let Some(parallelizable) = provider_parallelizable(tool_name) {
+        let is_readonly = if let Some(parallelizable) = provider_parallelizable(tool_name) {
             parallelizable
         } else {
             READ_ONLY_TOOLS.contains(&tool_name)
@@ -665,10 +642,37 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestration::{InheritedPermissions, PermissionMode, PermissionSyncContext};
     use serde_json::json;
 
-    fn server_idx(i: usize) -> HeadlessRoundToolIdx {
-        HeadlessRoundToolIdx::ServerToolCall(i)
+    fn server_idx(i: usize) -> usize {
+        i
+    }
+
+    #[tokio::test]
+    async fn permission_timeout_uses_the_shared_foreground_background_policy() {
+        let foreground = PermissionSyncContext::shared(InheritedPermissions {
+            mode: PermissionMode::Prompt,
+            ..Default::default()
+        });
+        let background = PermissionSyncContext::shared(InheritedPermissions {
+            mode: PermissionMode::Prompt,
+            is_background: true,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            effective_permission_timeout(Some(&foreground)).await,
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            effective_permission_timeout(Some(&background)).await,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            effective_permission_timeout(None).await,
+            Duration::from_secs(30)
+        );
     }
 
     #[test]
@@ -699,6 +703,93 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn pre_resolved_results_keep_source_tool_model_budgets() {
+        const SKILL_MARKER: &str = "AUTHORING_CONTEXT_MIDDLE";
+        const GENERIC_MARKER: &str = "GENERIC_RESULT_MIDDLE";
+
+        let long_result =
+            |marker: &str| format!("{}\n{marker}\n{}", "a".repeat(4_500), "z".repeat(4_500));
+        let skill_content = long_result(SKILL_MARKER);
+        let generic_content = long_result(GENERIC_MARKER);
+        assert!(
+            skill_content.chars().count()
+                > astra_turn_core::tool_result_sanitize::MAX_TOOL_RESULT_CHARS
+        );
+        assert!(
+            skill_content.chars().count()
+                < astra_turn_core::tool_result_sanitize::SKILL_MODEL_RESULT_CHARS
+        );
+
+        let tool_calls = vec![
+            json!({
+                "id": "skill-call",
+                "type": "function",
+                "function": {"name": "skill", "arguments": "{}"}
+            }),
+            json!({
+                "id": "agent-call",
+                "type": "function",
+                "function": {"name": "agent", "arguments": "{}"}
+            }),
+        ];
+        let pre_resolved = vec![
+            HeadlessPreResolvedToolResult::new(
+                "skill-call",
+                "skill",
+                skill_content.clone(),
+                astra_turn_core::tool_result_semantics::ToolResultStatus::Completed,
+            ),
+            HeadlessPreResolvedToolResult::new(
+                "agent-call",
+                "agent",
+                generic_content,
+                astra_turn_core::tool_result_semantics::ToolResultStatus::Completed,
+            ),
+        ];
+        let edge_tool_round: Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> = Vec::new();
+        let mut messages = Vec::new();
+        let mut tool_results = Vec::new();
+        let mut step_recorder = StepRecorder::new("test-user", "test-session", "source-budget");
+
+        let _prepared = prepare_headless_tool_round(
+            None,
+            &tool_calls,
+            &tool_calls,
+            &edge_tool_round,
+            "",
+            "",
+            &pre_resolved,
+            &mut messages,
+            &mut tool_results,
+            &mut step_recorder,
+            0,
+        )
+        .await;
+
+        assert_eq!(messages[1]["content"], skill_content);
+        assert!(
+            messages[1]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains(SKILL_MARKER)),
+            "skill instructions below the skill-specific budget must remain complete"
+        );
+        let generic_for_model = messages[2]["content"].as_str().unwrap();
+        assert!(
+            generic_for_model.chars().count()
+                <= astra_turn_core::tool_result_sanitize::MAX_TOOL_RESULT_CHARS
+        );
+        assert!(
+            !generic_for_model.contains(GENERIC_MARKER),
+            "ordinary pre-resolved results must retain the generic model budget"
+        );
+
+        assert_eq!(messages[1]["_tool_name"], "pre_resolved");
+        assert_eq!(messages[2]["_tool_name"], "pre_resolved");
+        assert_eq!(tool_results[0]["name"], "pre_resolved");
+        assert_eq!(tool_results[1]["name"], "pre_resolved");
     }
 
     #[test]

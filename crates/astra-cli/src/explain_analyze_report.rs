@@ -5,9 +5,12 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use crate::explain_analyze_format::{
+    alpha_label, decision_detail_line, diagnostic_label, format_ms, format_tokens,
+};
 use astra_turn_types::{
     ExplainAnalyzeEventV1, ExplainAnalyzeGraphV1, ExplainAnalyzeNodeKindV1,
-    ExplainAnalyzeOutcomeV1, ExplainAnalyzeProjectionDiagnosticCodeV1, ExplainAnalyzeUsageBasisV1,
+    ExplainAnalyzeOutcomeV1, ExplainAnalyzeUsageBasisV1,
 };
 
 const MAX_DIAGNOSTICS: usize = 5;
@@ -99,6 +102,16 @@ pub(crate) fn render(
         lines.push(format!("  {summary}"));
     }
 
+    lines.extend(
+        auxiliary_usage_lines_with_detail(&graph, verbose)
+            .into_iter()
+            .map(|line| format!("  {line}")),
+    );
+    lines.extend(
+        auxiliary_details_lines(&graph)
+            .into_iter()
+            .map(|line| format!("  {line}")),
+    );
     append_diagnostics(&graph, &mut lines);
     lines.join("\n")
 }
@@ -160,17 +173,25 @@ fn append_tree(
             let round = node
                 .round_index
                 .filter(|round| verbose || *round > 0)
-                .map(|round| format!(" · round {}", round + 1))
+                .map(|round| format!(" · round {}", u64::from(round).saturating_add(1)))
                 .unwrap_or_default();
             let attempt = node
                 .attempt_index
+                .filter(|_| node.kind != ExplainAnalyzeNodeKindV1::Admission)
                 .filter(|attempt| verbose || *attempt > 0)
-                .map(|attempt| format!(" · attempt {}", attempt + 1))
+                .map(|attempt| format!(" · attempt {}", u64::from(attempt).saturating_add(1)))
                 .unwrap_or_default();
             lines.push(format!(
                 "{tree}{} · {duration} · {state}{round}{attempt} · {offset}",
                 safe_label(&node.label),
             ));
+            if let Some(detail) = &node.decision_detail {
+                lines.push(format!(
+                    "{}{}",
+                    detail_prefix(&ancestor_has_sibling, last),
+                    decision_detail_line(detail)
+                ));
+            }
 
             if let Some(usage) = &node.usage {
                 lines.push(format!(
@@ -184,6 +205,24 @@ fn append_tree(
                         usage.output_tokens
                     ),
                 ));
+            }
+            for report in node
+                .context
+                .as_ref()
+                .and_then(|c| c.assembly.as_ref())
+                .into_iter()
+                .flat_map(|a| &a.edge_memory_selection)
+            {
+                let prefix = detail_prefix(&ancestor_has_sibling, last);
+                lines.push(format!("{prefix}{}", report.summary()));
+                if verbose {
+                    lines.extend(
+                        report
+                            .detail_lines()
+                            .into_iter()
+                            .map(|line| format!("{prefix}  {line}")),
+                    );
+                }
             }
             if verbose && let Some(context) = &node.context {
                 if let Some(budget) = &context.budget {
@@ -337,21 +376,6 @@ fn clock_labels(graph: &ExplainAnalyzeGraphV1) -> HashMap<String, String> {
     labels
 }
 
-fn alpha_label(mut ordinal: usize) -> String {
-    let mut label = String::new();
-    loop {
-        label.insert(
-            0,
-            char::from(b'A' + u8::try_from(ordinal % 26).unwrap_or(0)),
-        );
-        ordinal /= 26;
-        if ordinal == 0 {
-            return label;
-        }
-        ordinal -= 1;
-    }
-}
-
 fn tree_prefix(ancestors: &[bool], last: bool) -> String {
     let mut prefix = String::from("  ");
     for has_sibling in ancestors {
@@ -398,19 +422,6 @@ fn node_state(terminal: bool, outcome: Option<ExplainAnalyzeOutcomeV1>) -> &'sta
     }
 }
 
-fn diagnostic_label(code: ExplainAnalyzeProjectionDiagnosticCodeV1) -> &'static str {
-    use ExplainAnalyzeProjectionDiagnosticCodeV1::*;
-    match code {
-        ConflictingFact => "conflicting runtime facts",
-        DependencyCycle => "cyclic dependency",
-        InvalidEvent => "invalid runtime fact",
-        MissingDependency => "dependency was not observed",
-        MissingParent => "parent stage was not observed",
-        ParentCycle => "cyclic stage hierarchy",
-        UnresolvedTerminalNode => "stage did not reach a recorded end",
-    }
-}
-
 fn safe_label(label: &str) -> String {
     label
         .chars()
@@ -433,29 +444,6 @@ fn source_label(kind: astra_turn_types::ExplainAnalyzeContextSourceKindV1) -> &'
         Skills => "Skills",
         RuntimeIdentity => "Runtime identity",
         RuntimeVolatile => "Runtime state",
-        EmergentSkills => "Emergent skills",
-        EmergentMemory => "Emergent memory",
-        EmergentSummary => "Emergent summary",
-    }
-}
-
-fn format_ms(ms: u64) -> String {
-    if ms >= 1_000 {
-        format!("{:.1}s", ms as f64 / 1_000.0)
-    } else {
-        format!("{ms}ms")
-    }
-}
-
-fn format_tokens(tokens: u64) -> String {
-    if tokens >= 1_000_000 {
-        format!("{:.1}M", tokens as f64 / 1_000_000.0)
-    } else if tokens >= 10_000 {
-        format!("{:.1}k", tokens as f64 / 1_000.0)
-    } else if tokens >= 1_000 {
-        format!("{:.2}k", tokens as f64 / 1_000.0)
-    } else {
-        tokens.to_string()
     }
 }
 
@@ -482,6 +470,8 @@ mod tests {
         outcome: Option<ExplainAnalyzeOutcomeV1>,
     ) -> ExplainAnalyzeEventV1 {
         ExplainAnalyzeEventV1 {
+            auxiliary_usage: None,
+            auxiliary_details: None,
             schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: id.to_string(),
             run_id: "run-1".to_string(),
@@ -510,6 +500,7 @@ mod tests {
             start_elapsed_ms: (transition == ExplainAnalyzeTransitionV1::Finished).then_some(start),
             duration_ms: duration,
             outcome,
+            decision_detail: None,
             usage: None,
             context: None,
             coverage_gaps: Vec::new(),
@@ -524,6 +515,676 @@ mod tests {
         start.duration_ms = Some(duration);
         start.outcome = Some(ExplainAnalyzeOutcomeV1::Succeeded);
         start
+    }
+
+    #[test]
+    fn admission_purpose_slot_is_not_displayed_as_a_provider_retry() {
+        let turn = fact(
+            "turn-start",
+            "turn",
+            None,
+            ExplainAnalyzeNodeKindV1::Turn,
+            ExplainAnalyzeTransitionV1::Started,
+            0,
+            None,
+            None,
+        );
+        let mut observer = fact(
+            "observe-start",
+            "observe",
+            Some("turn"),
+            ExplainAnalyzeNodeKindV1::Admission,
+            ExplainAnalyzeTransitionV1::Started,
+            1,
+            None,
+            None,
+        );
+        observer.attempt_index = Some(1);
+        let mut retry = fact(
+            "retry-start",
+            "retry",
+            Some("turn"),
+            ExplainAnalyzeNodeKindV1::ProviderAttempt,
+            ExplainAnalyzeTransitionV1::Started,
+            3,
+            None,
+            None,
+        );
+        retry.attempt_index = Some(1);
+        let events = vec![
+            turn.clone(),
+            observer.clone(),
+            finished(observer, 2),
+            retry.clone(),
+            finished(retry, 3),
+            finished(turn, 8),
+        ];
+        let report = render(&events, true, false);
+        assert_eq!(
+            report.matches("attempt 2").count(),
+            1,
+            "only the physical provider retry has an attempt label"
+        );
+    }
+
+    #[test]
+    fn auxiliary_jev_usage_is_separate_and_missing_lanes_remain_unknown() {
+        use astra_turn_types::{
+            ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+            ExplainAnalyzeAuxiliaryUsageV1, ExplainAnalyzeUsageBasisV1,
+        };
+        let start = fact(
+            "turn-start",
+            "turn",
+            None,
+            ExplainAnalyzeNodeKindV1::Turn,
+            ExplainAnalyzeTransitionV1::Started,
+            0,
+            None,
+            None,
+        );
+        let mut end = finished(start.clone(), 100);
+        end.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
+            available: true,
+            truncated: false,
+            attempts: vec![ExplainAnalyzeAuxiliaryAttemptV1 {
+                attempt_id: "aux-1".into(),
+                provider: "typesafe".into(),
+                offering_id: "jev-1".into(),
+                model_name: "jev1".into(),
+                purpose: "memory_retrieval_rerank".into(),
+                operation_id: "relevance".into(),
+                usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderPartial,
+                usage: Some(ExplainAnalyzeTokenUsageV1 {
+                    basis: ExplainAnalyzeUsageBasisV1::ProviderPartial,
+                    fresh_input_tokens: Some(42),
+                    output_tokens: None,
+                    cache_read_tokens: None,
+                    cache_creation_tokens: None,
+                }),
+            }],
+        }));
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        graph.apply(start);
+        graph.apply(end);
+        let output = auxiliary_usage_lines(&graph).join("\n");
+        assert!(output.contains("Jev"), "{output}");
+        assert!(output.contains("in 42"), "{output}");
+        assert!(output.contains("out unknown"), "{output}");
+        assert!(output.contains("usage partial"), "{output}");
+        assert!(!output.contains("offering jev-1"), "{output}");
+        assert!(!output.contains("operation relevance"), "{output}");
+        let detailed = auxiliary_usage_lines_with_detail(&graph, true).join("\n");
+        assert!(detailed.contains("offering jev-1"), "{detailed}");
+        assert!(detailed.contains("operation relevance"), "{detailed}");
+    }
+
+    #[test]
+    fn auxiliary_details_explain_logical_timing_and_admission_settlement() {
+        use astra_turn_types::{
+            ExplainAnalyzeAdmissionSettlementReasonV1, ExplainAnalyzeAdmissionSettlementV1,
+            ExplainAnalyzeAuxiliaryCallV1, ExplainAnalyzeAuxiliaryDetailsV1,
+            RequestJudgmentClassificationV1, RequestJudgmentMutationV1, RequestJudgmentResultV1,
+            RequestJudgmentScopeV1,
+        };
+        let start = fact(
+            "turn-start",
+            "turn",
+            None,
+            ExplainAnalyzeNodeKindV1::Turn,
+            ExplainAnalyzeTransitionV1::Started,
+            0,
+            None,
+            None,
+        );
+        let mut end = finished(start.clone(), 100);
+        end.auxiliary_details = Some(Box::new(ExplainAnalyzeAuxiliaryDetailsV1 {
+            calls: vec![ExplainAnalyzeAuxiliaryCallV1 {
+                call_id: "request_judgment:initial:0".into(),
+                operation_id: "request_judgment".into(),
+                stage: "initial".into(),
+                start_elapsed_ms: 7,
+                duration_ms: 12,
+                outcome: ExplainAnalyzeOutcomeV1::Succeeded,
+            }],
+            truncated: false,
+            admission: Some(ExplainAnalyzeAdmissionSettlementV1 {
+                status: astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::Accepted,
+                reason: ExplainAnalyzeAdmissionSettlementReasonV1::Accepted,
+                classification: Some(RequestJudgmentResultV1::Decided {
+                    classification: RequestJudgmentClassificationV1 {
+                        work_required: false,
+                        activation_deferred: false,
+                        domain: None,
+                        mutation: RequestJudgmentMutationV1::ReadOnly,
+                        scope: RequestJudgmentScopeV1::Unknown,
+                        parallel_subruns: false,
+                        capabilities: Vec::new(),
+                    },
+                }),
+                decision: Some(RequestJudgmentResultV1::Decided {
+                    classification: RequestJudgmentClassificationV1 {
+                        work_required: false,
+                        activation_deferred: false,
+                        domain: None,
+                        mutation: RequestJudgmentMutationV1::ReadOnly,
+                        scope: RequestJudgmentScopeV1::Unknown,
+                        parallel_subruns: false,
+                        capabilities: Vec::new(),
+                    },
+                }),
+            }),
+        }));
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        graph.apply(start);
+        graph.apply(end);
+        let output = auxiliary_details_lines(&graph).join("\n");
+        assert!(output.contains("Auxiliary scope · turn"), "{output}");
+        assert!(
+            output.contains("Auxiliary timing · Request classification"),
+            "{output}"
+        );
+        assert!(
+            output.contains("stage initial · 12ms · client outcome succeeded · starts +7ms"),
+            "{output}"
+        );
+        assert!(
+            output.contains("logical client interval; overlapping intervals are not added"),
+            "{output}"
+        );
+        assert!(
+            output.contains("Admission settlement · status accepted · reason"),
+            "{output}"
+        );
+        assert!(output.contains("\"result\":\"decided\""), "{output}");
+        assert!(output.contains("\"work_required\":false"), "{output}");
+        assert!(output.contains("reconciled decision"), "{output}");
+
+        let mut second_start = fact(
+            "second-turn-start",
+            "second-turn",
+            None,
+            ExplainAnalyzeNodeKindV1::Turn,
+            ExplainAnalyzeTransitionV1::Started,
+            0,
+            None,
+            None,
+        );
+        second_start.turn_id = "turn-2".into();
+        second_start.clock_domain_id = "clock-2".into();
+        let mut second_end = finished(second_start, 80);
+        second_end.auxiliary_details = Some(Box::new(ExplainAnalyzeAuxiliaryDetailsV1 {
+            calls: vec![ExplainAnalyzeAuxiliaryCallV1 {
+                call_id: "work_plan:initial:0".into(),
+                operation_id: "work_plan".into(),
+                stage: "initial".into(),
+                start_elapsed_ms: 3,
+                duration_ms: 9,
+                outcome: ExplainAnalyzeOutcomeV1::Failed,
+            }],
+            truncated: false,
+            admission: None,
+        }));
+        graph.apply(second_end);
+        let output = auxiliary_details_lines(&graph).join("\n");
+        assert!(output.contains("Auxiliary scope · second-turn"), "{output}");
+        assert!(output.contains("work_plan:initial:0"), "{output}");
+    }
+
+    #[test]
+    fn auxiliary_known_tokens_are_lower_bounds_when_a_peer_attempt_is_unreported() {
+        use astra_turn_types::{
+            ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+            ExplainAnalyzeAuxiliaryUsageV1, ExplainAnalyzeUsageBasisV1,
+        };
+        let start = fact(
+            "turn-start",
+            "turn",
+            None,
+            ExplainAnalyzeNodeKindV1::Turn,
+            ExplainAnalyzeTransitionV1::Started,
+            0,
+            None,
+            None,
+        );
+        let mut end = finished(start.clone(), 100);
+        let exact = ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: "reported".into(),
+            provider: "typesafe".into(),
+            offering_id: "jev-1".into(),
+            model_name: "jev1".into(),
+            purpose: "introspection".into(),
+            operation_id: "request_judgment".into(),
+            usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+            usage: Some(ExplainAnalyzeTokenUsageV1 {
+                basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                fresh_input_tokens: Some(40),
+                output_tokens: Some(5),
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+            }),
+        };
+        end.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
+            available: true,
+            truncated: false,
+            attempts: vec![
+                exact.clone(),
+                ExplainAnalyzeAuxiliaryAttemptV1 {
+                    attempt_id: "missing".into(),
+                    usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::Unavailable,
+                    usage: None,
+                    ..exact
+                },
+            ],
+        }));
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        graph.apply(start);
+        graph.apply(end);
+        let output = auxiliary_usage_lines(&graph).join("\n");
+        assert!(output.contains("Request classification"), "{output}");
+        assert!(output.contains("in at least 40"), "{output}");
+        assert!(output.contains("out at least 5"), "{output}");
+        assert!(output.contains("usage 1/2 measured"), "{output}");
+    }
+
+    #[test]
+    fn auxiliary_capture_truncation_and_partial_turn_coverage_preserve_lower_bounds() {
+        use astra_turn_types::{
+            ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+            ExplainAnalyzeAuxiliaryUsageV1, ExplainAnalyzeUsageBasisV1,
+        };
+        let attempt = ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: "attempt".into(),
+            provider: "typesafe".into(),
+            offering_id: "offering".into(),
+            model_name: "model".into(),
+            purpose: "introspection".into(),
+            operation_id: "request_judgment".into(),
+            usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+            usage: Some(ExplainAnalyzeTokenUsageV1 {
+                basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                fresh_input_tokens: Some(2),
+                output_tokens: Some(3),
+                cache_read_tokens: Some(0),
+                cache_creation_tokens: Some(1),
+            }),
+        };
+        let ledger: Vec<_> = (0..129)
+            .map(|i| ExplainAnalyzeAuxiliaryAttemptV1 {
+                attempt_id: format!("attempt-{i}"),
+                ..attempt.clone()
+            })
+            .collect();
+        let captured = ExplainAnalyzeAuxiliaryUsageV1 {
+            available: true,
+            truncated: ledger.len() > 128,
+            attempts: ledger.into_iter().take(128).collect(),
+        };
+        let graph_for = |captures: Vec<ExplainAnalyzeAuxiliaryUsageV1>| {
+            let mut graph = ExplainAnalyzeGraphV1::default();
+            for (i, capture) in captures.into_iter().enumerate() {
+                let start = fact(
+                    &format!("start-{i}"),
+                    &format!("turn-{i}"),
+                    None,
+                    ExplainAnalyzeNodeKindV1::Turn,
+                    ExplainAnalyzeTransitionV1::Started,
+                    0,
+                    None,
+                    None,
+                );
+                let mut end = finished(start.clone(), 100);
+                end.auxiliary_usage = Some(Box::new(capture));
+                graph.apply(start);
+                graph.apply(end);
+            }
+            graph
+        };
+        let output = auxiliary_usage_lines(&graph_for(vec![captured])).join("\n");
+        for expected in [
+            "in at least 256",
+            "out at least 384",
+            "cache read at least 0",
+            "cache write at least 128",
+            "usage measured",
+            "capture truncated",
+        ] {
+            assert!(output.contains(expected), "missing {expected}: {output}");
+        }
+        assert!(!output.contains("capture unavailable"));
+        let complete = ExplainAnalyzeAuxiliaryUsageV1 {
+            available: true,
+            truncated: false,
+            attempts: vec![attempt],
+        };
+        let unavailable = ExplainAnalyzeAuxiliaryUsageV1 {
+            available: false,
+            truncated: false,
+            attempts: vec![],
+        };
+        let output = auxiliary_usage_lines(&graph_for(vec![complete.clone(), unavailable.clone()]))
+            .join("\n");
+        assert!(output.contains("in at least 2"), "{output}");
+        assert!(output.contains("out at least 3"));
+        assert!(output.contains("usage measured"));
+        assert!(output.contains("some call usage unavailable"));
+        assert!(!output.contains("capture truncated"));
+        let detailed =
+            auxiliary_usage_lines_with_detail(&graph_for(vec![complete, unavailable]), true)
+                .join("\n");
+        assert!(detailed.contains("capture unavailable"), "{detailed}");
+        let empty = ExplainAnalyzeAuxiliaryUsageV1 {
+            available: true,
+            truncated: true,
+            attempts: vec![],
+        };
+        let output = auxiliary_usage_lines(&graph_for(vec![empty.clone()])).join("\n");
+        assert!(output.contains("token counts are lower bounds"));
+        assert!(!output.contains("in 0"));
+        assert!(!output.contains("0/0"));
+        let detailed = auxiliary_usage_lines_with_detail(&graph_for(vec![empty]), true).join("\n");
+        assert!(detailed.contains("full usage unknown"), "{detailed}");
+    }
+
+    #[test]
+    fn conflicting_auxiliary_evidence_is_visible_without_token_totals() {
+        use astra_turn_types::{
+            ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+            ExplainAnalyzeAuxiliaryUsageV1, ExplainAnalyzeTokenUsageV1,
+        };
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        let mut events = Vec::new();
+        for (i, count) in [731, 947].into_iter().enumerate() {
+            let start = fact(
+                &format!("start-{i}"),
+                &format!("turn-{i}"),
+                None,
+                ExplainAnalyzeNodeKindV1::Turn,
+                ExplainAnalyzeTransitionV1::Started,
+                0,
+                None,
+                None,
+            );
+            let mut end = finished(start.clone(), 100);
+            end.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
+                available: true,
+                truncated: false,
+                attempts: vec![ExplainAnalyzeAuxiliaryAttemptV1 {
+                    attempt_id: "same-physical-attempt".into(),
+                    provider: "provider".into(),
+                    offering_id: "offering".into(),
+                    model_name: "model".into(),
+                    purpose: "verification_judge".into(),
+                    operation_id: "request_judgment".into(),
+                    usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+                    usage: Some(ExplainAnalyzeTokenUsageV1 {
+                        basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                        fresh_input_tokens: Some(count),
+                        output_tokens: Some(0),
+                        cache_read_tokens: None,
+                        cache_creation_tokens: None,
+                    }),
+                }],
+            }));
+            for event in [start, end] {
+                graph.apply(event.clone());
+                events.push(event);
+            }
+        }
+        // The default surfaces use the compact user-facing projection.
+        for output in [
+            auxiliary_usage_lines(&graph).join("\n"),
+            render(&events, false, false),
+            crate::explain_analyze_html::render(&events, false, false),
+        ] {
+            assert!(
+                output.contains(
+                    "Judgment usage · unavailable · 1 conflicting physical measurement(s); token total unknown"
+                ),
+                "{output}"
+            );
+            assert!(!output.contains("731") && !output.contains("947"));
+            assert!(!output.contains("capture truncated"));
+        }
+        // Detailed Explain/TUI/HTML views retain the forensic vocabulary.
+        for output in [
+            auxiliary_usage_lines_with_detail(&graph, true).join("\n"),
+            render(&events, true, false),
+            crate::explain_analyze_html::render(&events, true, false),
+        ] {
+            assert!(
+                output.contains("conflicting physical attempt evidence (1 identities)"),
+                "{output}"
+            );
+            assert!(output.contains("no token total inferred"));
+            assert!(!output.contains("731") && !output.contains("947"));
+            assert!(!output.contains("capture truncated"));
+        }
+        let mut no_usage = events[1].clone();
+        no_usage.auxiliary_usage = None;
+        for records in [
+            vec![no_usage.clone(), events[1].clone(), events[3].clone()],
+            vec![events[3].clone(), events[1].clone(), no_usage],
+        ] {
+            for output in [
+                render(&records, false, false),
+                crate::explain_analyze_html::render(&records, false, false),
+            ] {
+                assert!(
+                    output.contains(
+                        "Judgment usage · unavailable · conflicting turn/usage facts; token total unknown"
+                    ),
+                    "{output}"
+                );
+                assert!(!output.contains("731") && !output.contains("947"));
+                assert!(!output.contains("capture truncated"));
+            }
+            for output in [
+                render(&records, true, false),
+                crate::explain_analyze_html::render(&records, true, false),
+            ] {
+                assert!(output.contains("conflicting turn/usage facts"), "{output}");
+                assert!(output.contains("no token total inferred"));
+                assert!(!output.contains("731") && !output.contains("947"));
+                assert!(!output.contains("capture truncated"));
+            }
+        }
+    }
+
+    #[test]
+    fn auxiliary_usage_keeps_request_classification_skill_selection_and_work_planning_separate() {
+        use astra_turn_types::{
+            ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+            ExplainAnalyzeAuxiliaryUsageV1,
+        };
+        let start = fact(
+            "turn-start",
+            "turn",
+            None,
+            ExplainAnalyzeNodeKindV1::Turn,
+            ExplainAnalyzeTransitionV1::Started,
+            0,
+            None,
+            None,
+        );
+        let mut end = finished(start.clone(), 100);
+        let operations = [
+            ("request_judgment", "Request classification", 10),
+            ("skill_auto_route", "Skill selection", 20),
+            ("work_plan", "Work planning", 30),
+        ];
+        end.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
+            available: true,
+            truncated: false,
+            attempts: operations
+                .iter()
+                .map(|(operation, _, tokens)| ExplainAnalyzeAuxiliaryAttemptV1 {
+                    attempt_id: format!("aux-{operation}"),
+                    provider: "openai".into(),
+                    offering_id: "same-offering".into(),
+                    model_name: "same-model".into(),
+                    purpose: "introspection".into(),
+                    operation_id: (*operation).into(),
+                    usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+                    usage: Some(ExplainAnalyzeTokenUsageV1 {
+                        basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                        fresh_input_tokens: Some(*tokens),
+                        output_tokens: Some(1),
+                        cache_read_tokens: None,
+                        cache_creation_tokens: None,
+                    }),
+                })
+                .collect(),
+        }));
+        let output = render(&[start, end], false, false);
+        let lines = output
+            .lines()
+            .filter(|line| line.contains("Judgment ·"))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "{output}");
+        for (_, label, tokens) in operations {
+            let line = lines.iter().find(|line| line.contains(label)).unwrap();
+            assert!(line.contains(&format!("in {tokens} ·")), "{line}");
+            assert!(line.contains("usage measured"), "{line}");
+            assert!(line.contains("cache read unknown"), "{line}");
+        }
+        assert_eq!(
+            auxiliary_usage_label("completion_proxy:verification_judge", "verification_judge"),
+            "Verification"
+        );
+        assert_eq!(
+            auxiliary_usage_label("completion_proxy:introspection", "introspection"),
+            "Request analysis"
+        );
+        assert_eq!(
+            auxiliary_usage_label("unrecognized", "introspection"),
+            "Request analysis"
+        );
+        assert_eq!(
+            auxiliary_usage_label("completion_proxy:tool_result_rerank", "tool_result_rerank"),
+            "Tool result selection"
+        );
+        assert_eq!(
+            auxiliary_usage_label("unrecognized", "unrecognized"),
+            "Auxiliary inference"
+        );
+        assert_eq!(
+            auxiliary_usage_label("request_judgment", "introspection"),
+            "Request classification"
+        );
+    }
+
+    #[test]
+    fn mixed_jev_and_llm_usage_remains_isolated_across_repeated_capture_segments() {
+        use astra_turn_types::{
+            ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+            ExplainAnalyzeAuxiliaryUsageV1,
+        };
+        let attempts = [
+            (
+                "jev-decision",
+                "typesafe",
+                "jev-model",
+                "request_judgment",
+                100,
+                3,
+                None,
+                None,
+            ),
+            (
+                "llm-decision",
+                "openai",
+                "llm-model",
+                "request_judgment",
+                40,
+                5,
+                Some(60),
+                Some(0),
+            ),
+            (
+                "llm-plan",
+                "openai",
+                "llm-model",
+                "work_plan",
+                200,
+                20,
+                Some(10),
+                Some(7),
+            ),
+        ]
+        .into_iter()
+        .map(
+            |(id, provider, model, operation, input, output, read, write)| {
+                ExplainAnalyzeAuxiliaryAttemptV1 {
+                    attempt_id: id.into(),
+                    provider: provider.into(),
+                    offering_id: format!("offering-{provider}"),
+                    model_name: model.into(),
+                    purpose: "introspection".into(),
+                    operation_id: operation.into(),
+                    usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+                    usage: Some(ExplainAnalyzeTokenUsageV1 {
+                        basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                        fresh_input_tokens: Some(input),
+                        output_tokens: Some(output),
+                        cache_read_tokens: read,
+                        cache_creation_tokens: write,
+                    }),
+                }
+            },
+        )
+        .collect::<Vec<_>>();
+        let mut events = Vec::new();
+        for (segment, offset) in [("first", 0), ("second", 100)] {
+            let start = fact(
+                &format!("{segment}-start"),
+                segment,
+                None,
+                ExplainAnalyzeNodeKindV1::Turn,
+                ExplainAnalyzeTransitionV1::Started,
+                offset,
+                None,
+                None,
+            );
+            let mut end = finished(start.clone(), 100);
+            end.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
+                available: true,
+                truncated: false,
+                attempts: attempts.clone(),
+            }));
+            events.extend([start, end]);
+        }
+        let output = render(&events, false, false);
+        let lines = output
+            .lines()
+            .filter(|line| line.contains("Judgment ·"))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "{output}");
+        for (identity, label, counts) in [
+            (
+                "Jev (jev-model)",
+                "Request classification",
+                "in 100 · cache read unknown · cache write unknown · out 3",
+            ),
+            (
+                "openai (llm-model)",
+                "Request classification",
+                "in 40 · cache read 60 · cache write 0 · out 5",
+            ),
+            (
+                "openai (llm-model)",
+                "Work planning",
+                "in 200 · cache read 10 · cache write 7 · out 20",
+            ),
+        ] {
+            let line = lines
+                .iter()
+                .find(|line| line.contains(identity) && line.contains(label))
+                .unwrap();
+            assert!(line.contains(counts), "{line}");
+            assert!(line.contains("usage measured"), "{line}");
+            assert!(!line.contains("partial"), "{line}");
+        }
     }
 
     #[test]
@@ -581,14 +1242,24 @@ mod tests {
         let mut assembly_end = finished(assembly_start.clone(), 30);
         assembly_end.context = Some(ExplainAnalyzeContextMetricsV1 {
             budget: None,
-            assembly: Some(ExplainAnalyzeContextAssemblyV1 {
+            assembly: Some(Box::new(ExplainAnalyzeContextAssemblyV1 {
+                edge_memory_selection: vec![
+                    serde_json::from_value(serde_json::json!({
+                        "session_id":"s", "turn":1, "operation":"relevance", "method":"model",
+                        "reason":"completed", "model":"jev-test", "elapsed_ms":398,
+                        "selection_order":[0], "candidates":[{"index":0,"selected":true,"probability_bps":9000},
+                                      {"index":1,"selected":false,"probability_bps":1000}],
+                        "prompt_projection":{"selected_candidates":1,"included_candidates":1}
+                    }))
+                    .unwrap(),
+                ],
                 basis: ExplainAnalyzeContextAssemblyBasisV1::RuntimeTextEstimate,
                 sources: vec![ExplainAnalyzeContextSourceV1 {
                     kind: ExplainAnalyzeContextSourceKindV1::Memory,
                     section_count: 3,
                     estimated_tokens: 90,
                 }],
-            }),
+            })),
         });
 
         let model_start = fact(
@@ -657,6 +1328,16 @@ mod tests {
             "{output}"
         );
         assert!(!output.contains("trace"), "{output}");
+        assert!(output.contains("2 candidates → 1 selected"), "{output}");
+        assert!(output.contains("1/1 entered request"), "{output}");
+        assert!(
+            output.contains("Candidate 1 · selected · model score 90.00%"),
+            "{output}"
+        );
+        assert!(
+            output.contains("final request projection measured"),
+            "{output}"
+        );
     }
 
     #[test]
@@ -741,4 +1422,288 @@ mod tests {
             "{output}"
         );
     }
+}
+
+/// Same separately attributed auxiliary usage section for text, TUI and HTML.
+#[cfg(test)]
+pub(crate) fn auxiliary_usage_lines(graph: &ExplainAnalyzeGraphV1) -> Vec<String> {
+    auxiliary_usage_lines_with_detail(graph, false)
+}
+
+pub(crate) fn auxiliary_usage_lines_with_detail(
+    graph: &ExplainAnalyzeGraphV1,
+    detailed: bool,
+) -> Vec<String> {
+    use std::collections::BTreeMap;
+    if graph.auxiliary_capture_conflicted() {
+        return vec![if detailed {
+            "Auxiliary tokens · capture unavailable · conflicting turn/usage facts; no token total inferred; not a truncation claim".into()
+        } else {
+            "Judgment usage · unavailable · conflicting turn/usage facts; token total unknown"
+                .into()
+        }];
+    }
+    let conflicts = graph.auxiliary_usage_conflict_count();
+    if conflicts > 0 {
+        return vec![if detailed {
+            format!(
+                "Auxiliary tokens · capture unavailable · conflicting physical attempt evidence ({conflicts} identities); no token total inferred; not a truncation claim"
+            )
+        } else {
+            format!(
+                "Judgment usage · unavailable · {conflicts} conflicting physical measurement(s); token total unknown"
+            )
+        }];
+    }
+    type GroupKey<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str);
+    type Attempts<'a> = Vec<&'a astra_turn_types::ExplainAnalyzeAuxiliaryAttemptV1>;
+    let mut groups: BTreeMap<GroupKey<'_>, Attempts<'_>> = BTreeMap::new();
+    let truncated = graph.auxiliary_usage_truncated();
+    let incomplete_capture = truncated || graph.auxiliary_usage_unavailable();
+    for attempt in graph.auxiliary_attempts() {
+        groups
+            .entry((
+                &attempt.provider,
+                &attempt.offering_id,
+                &attempt.model_name,
+                &attempt.purpose,
+                &attempt.operation_id,
+            ))
+            .or_default()
+            .push(attempt);
+    }
+    let mut lines = Vec::new();
+    let render_group =
+        |provider: &str,
+         model: &str,
+         purpose: &str,
+         operation: &str,
+         offering: Option<&str>,
+         attempts: Vec<&astra_turn_types::ExplainAnalyzeAuxiliaryAttemptV1>| {
+            let reported = attempts
+                .iter()
+                .filter_map(|a| a.usage.as_ref())
+                .collect::<Vec<_>>();
+            let values = if reported.is_empty() {
+                "usage unavailable".into()
+            } else {
+                let lanes = [
+                    (
+                        "in",
+                        reported
+                            .iter()
+                            .map(|u| u.fresh_input_tokens)
+                            .collect::<Vec<_>>(),
+                    ),
+                    (
+                        "cache read",
+                        reported.iter().map(|u| u.cache_read_tokens).collect(),
+                    ),
+                    (
+                        "cache write",
+                        reported.iter().map(|u| u.cache_creation_tokens).collect(),
+                    ),
+                    ("out", reported.iter().map(|u| u.output_tokens).collect()),
+                ];
+                lanes
+                    .into_iter()
+                    .map(|(name, counts)| {
+                        let total = counts.len();
+                        let known = counts.into_iter().flatten().collect::<Vec<_>>();
+                        if known.is_empty() {
+                            format!("{name} unknown")
+                        } else {
+                            let qualifier = if !incomplete_capture
+                                && known.len() == total
+                                && reported.len() == attempts.len()
+                            {
+                                ""
+                            } else {
+                                "at least "
+                            };
+                            format!(
+                                "{name} {qualifier}{}",
+                                known.into_iter().map(u128::from).sum::<u128>()
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            };
+            let partial = if attempts.iter().any(|a| {
+                a.usage_status
+                    != astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact
+            }) {
+                " · usage partial"
+            } else {
+                ""
+            };
+            let calls = if attempts.len() == 1 {
+                "1 call".to_string()
+            } else {
+                format!("{} calls", attempts.len())
+            };
+            let measured = if reported.len() == attempts.len() {
+                "usage measured".to_string()
+            } else {
+                format!("usage {}/{} measured", reported.len(), attempts.len())
+            };
+            if detailed {
+                let scope = if incomplete_capture {
+                    " · captured scope incomplete"
+                } else {
+                    ""
+                };
+                format!(
+                    "Auxiliary tokens · {} ({model}) · {} · {calls} · {values} · {measured}{partial}{scope} · operation {operation} · offering {}",
+                    astra_services::judgment_presentation::provider_label(provider),
+                    astra_services::judgment_presentation::purpose_label(operation, purpose),
+                    offering.unwrap_or("offering unavailable"),
+                )
+            } else {
+                let coverage = if truncated {
+                    " · capture truncated; counts are lower bounds"
+                } else if graph.auxiliary_usage_unavailable() {
+                    " · capture incomplete"
+                } else {
+                    ""
+                };
+                format!(
+                    "Judgment · {} · {} ({model}) · {calls} · {values} · {measured}{partial}{coverage}",
+                    astra_services::judgment_presentation::purpose_label(operation, purpose),
+                    astra_services::judgment_presentation::provider_label(provider),
+                )
+            }
+        };
+    if detailed {
+        for ((provider, offering, model, purpose, operation), attempts) in groups {
+            lines.push(render_group(
+                provider,
+                model,
+                purpose,
+                operation,
+                Some(offering),
+                attempts,
+            ));
+        }
+    } else {
+        let mut display_groups: BTreeMap<(&str, &str, &str, &str), Attempts<'_>> = BTreeMap::new();
+        for ((provider, _offering, model, purpose, operation), attempts) in groups {
+            display_groups
+                .entry((provider, model, purpose, operation))
+                .or_default()
+                .extend(attempts);
+        }
+        for ((provider, model, purpose, operation), attempts) in display_groups {
+            lines.push(render_group(
+                provider, model, purpose, operation, None, attempts,
+            ));
+        }
+    }
+    if truncated {
+        lines.push(if detailed {
+            "Auxiliary tokens · capture truncated · counts cover captured requests only; all token sums are lower bounds; full usage unknown".into()
+        } else {
+            "Judgment usage · capture truncated · token counts are lower bounds".into()
+        });
+    }
+    if graph.auxiliary_usage_unavailable() {
+        lines.push(if detailed {
+            "Auxiliary tokens · capture unavailable".into()
+        } else {
+            "Judgment usage · some call usage unavailable".into()
+        });
+    }
+    lines
+}
+
+/// Render the logical auxiliary call intervals and the typed admission result.
+/// These facts are intentionally separate from physical token usage: the
+/// intervals are measured at the local client boundary, are allowed to
+/// overlap, and say nothing about provider-side compute time.
+pub(crate) fn auxiliary_details_lines(graph: &ExplainAnalyzeGraphV1) -> Vec<String> {
+    let details_by_scope = graph.auxiliary_details();
+    if details_by_scope.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    for (scope, details) in details_by_scope {
+        lines.push(format!("Auxiliary scope · {scope}"));
+        let mut calls = details.calls.iter().collect::<Vec<_>>();
+        calls.sort_unstable_by(|left, right| {
+            left.start_elapsed_ms
+                .cmp(&right.start_elapsed_ms)
+                .then_with(|| left.call_id.cmp(&right.call_id))
+        });
+        lines.extend(calls.into_iter().map(|call| {
+            format!(
+                "Auxiliary timing · {} · call {} · operation {} · stage {} · {} · client outcome {} · starts +{} · logical client interval; overlapping intervals are not added",
+                auxiliary_usage_label(&call.operation_id, ""),
+                call.call_id,
+                call.operation_id,
+                call.stage,
+                format_ms(call.duration_ms),
+                auxiliary_outcome_label(call.outcome),
+                format_ms(call.start_elapsed_ms),
+            )
+        }));
+        if details.truncated {
+            lines.push(
+                "Auxiliary timing · capture truncated · only the bounded set of logical calls is shown"
+                    .into(),
+            );
+        }
+        if let Some(admission) = &details.admission {
+            let status = match admission.status {
+                astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::Accepted => "accepted",
+                astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::Rejected => "rejected",
+                astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::Unavailable => {
+                    "unavailable"
+                }
+                astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::NotDispatched => {
+                    "not dispatched"
+                }
+            };
+            let reason = serde_json::to_string(&admission.reason)
+                .unwrap_or_else(|_| r#"{"kind":"unavailable"}"#.to_string());
+            let classification = admission
+                .classification
+                .as_ref()
+                .and_then(|result| serde_json::to_string(result).ok())
+                .unwrap_or_else(|| "unavailable".to_string());
+            let decision = admission
+                .decision
+                .as_ref()
+                .and_then(|result| serde_json::to_string(result).ok())
+                .unwrap_or_else(|| "unavailable".to_string());
+            lines.push(format!(
+                "Admission settlement · status {status} · reason {reason} · classifier result {classification} · reconciled decision {decision}"
+            ));
+        }
+    }
+    lines
+}
+
+fn auxiliary_outcome_label(outcome: ExplainAnalyzeOutcomeV1) -> &'static str {
+    match outcome {
+        ExplainAnalyzeOutcomeV1::Completed => "completed",
+        ExplainAnalyzeOutcomeV1::Succeeded => "succeeded",
+        ExplainAnalyzeOutcomeV1::Failed => "failed",
+        ExplainAnalyzeOutcomeV1::Cancelled => "cancelled",
+        ExplainAnalyzeOutcomeV1::Interrupted => "interrupted",
+        ExplainAnalyzeOutcomeV1::Blocked => "blocked",
+        ExplainAnalyzeOutcomeV1::Waiting => "waiting",
+        ExplainAnalyzeOutcomeV1::Rejected => "rejected",
+        ExplainAnalyzeOutcomeV1::Reused => "reused",
+        ExplainAnalyzeOutcomeV1::Suppressed => "suppressed",
+        ExplainAnalyzeOutcomeV1::Deferred => "deferred",
+        ExplainAnalyzeOutcomeV1::Resolved => "resolved",
+        ExplainAnalyzeOutcomeV1::Fallback => "fallback",
+        ExplainAnalyzeOutcomeV1::Unavailable => "unavailable",
+        ExplainAnalyzeOutcomeV1::Delegated => "delegated",
+    }
+}
+
+fn auxiliary_usage_label(operation: &str, purpose: &str) -> &'static str {
+    astra_services::judgment_presentation::purpose_label(operation, purpose)
 }

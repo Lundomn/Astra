@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import http.server
+import threading
 import json
 import os
 import sys
@@ -42,10 +44,79 @@ class _Opener:
 
     def open(self, request, timeout):
         self.requests.append((request, timeout))
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class BenchmarkModelSeedTests(unittest.TestCase):
+    def test_catalog_selection_requires_exact_server_admission(self):
+        catalog = {"items": [{"name": "selected", "offering_id": "offer-selected",
+                              "is_active": True, "thinking_capability": "both"}],
+                   "total": 1, "limit": 50, "catalog_revision": "revision", "next_cursor": None}
+        slot = {"model_name": "selected", "offering_id": "offer-selected",
+                "reasoning": {"mode": "model_default"}}
+        unsupported = seed.urllib.error.HTTPError("http://localhost", 400, "unsupported", {}, None)
+        cases = [(None, {"slots": [slot]}, True),
+                 ("high", {"slots": [{**slot, "reasoning": {"mode": "adaptive", "effort": "high"}}]}, True),
+                 ("high", unsupported, False), (None, OSError("unavailable"), False)]
+        cases.extend((None, response, False) for response in (
+            {}, {"slots": []}, {"slots": [slot, slot]},
+            {"slots": [{**slot, "model_name": "other"}]},
+            {"slots": [{**slot, "offering_id": "other"}]},
+            {"slots": [{**slot, "reasoning": {"mode": "disabled"}}]},
+        ))
+        for thinking, response, accepted in cases:
+            with self.subTest(thinking=thinking, response=response):
+                opener = _Opener([_Response(200, catalog),
+                                  response if isinstance(response, Exception) else _Response(200, response)])
+                with mock.patch.object(seed.preflight, "owned_api_opener", return_value=opener):
+                    ok, detail = seed.preflight.fetch_model_catalog(
+                        "http://localhost/models", "test-token", [("selected", thinking)])
+                self.assertEqual(ok, accepted, detail)
+                self.assertEqual(len(opener.requests), 2)
+                admission = opener.requests[-1][0]
+                self.assertEqual(admission.full_url, "http://localhost/model-access/admit")
+                self.assertEqual(json.loads(admission.data)["slots"][0]["selector"],
+                                 {"kind": "offering_id", "offering_id": "offer-selected"})
+
+    def test_owned_api_never_redirects_authorization(self):
+        received = []
+        class Target(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                received.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"{}")
+            do_POST = do_GET
+            def log_message(self, *_):
+                pass
+        target = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Target)
+        class Source(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{target.server_port}/target")
+                self.end_headers()
+            do_POST = do_GET
+            def log_message(self, *_):
+                pass
+        source = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Source)
+        threads = [threading.Thread(target=server.serve_forever, daemon=True) for server in (target, source)]
+        for thread in threads:
+            thread.start()
+        try:
+            for method in ("GET", "POST"):
+                with self.subTest(method=method), self.assertRaisesRegex(seed.SeedError, "HTTP 302"):
+                    seed._request_json(seed.owned_api_opener(), f"http://127.0.0.1:{source.server_port}/models/exact",
+                                       "test-secret-sentinel", None, 200, "model state", method=method, timeout=2)
+            self.assertEqual(received, [], "redirect target must receive no request or token")
+        finally:
+            for server, thread in zip((target, source), threads):
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def fixture(self, root: Path, selector: str = "selected(thinking:high)"):
         config = root / "config.json"
         config.write_text(
@@ -67,7 +138,17 @@ class BenchmarkModelSeedTests(unittest.TestCase):
   context_window: 100000
   max_completion_tokens: 20000
   supported_parameters: [tools]
+  input_modalities: [text, image]
+  output_modalities: [text]
+  fixed_temperature: 0.7
+  request_headers: {X-Provider-Option: enabled}
   wire_model_name: upstream-selected
+  pricing_currency: USD
+  pricing_unit: per_token
+  pricing_prompt: 0.000001
+  pricing_completion: 0
+  judgment_default: false
+  request_body_overrides: {custom_provider_option: {enabled: true}}
 """
         )
         return config, models
@@ -75,6 +156,8 @@ class BenchmarkModelSeedTests(unittest.TestCase):
     def test_registers_only_selected_model_then_checks_exact_route(self):
         with tempfile.TemporaryDirectory() as directory:
             config, models = self.fixture(Path(directory))
+            with models.open("a") as output:
+                output.write("- name: unselected\n  unrelated_field: private-value-sentinel\n")
             opener = _Opener(
                 [
                     _Response(201, {"name": "selected", "is_active": False}),
@@ -86,6 +169,8 @@ class BenchmarkModelSeedTests(unittest.TestCase):
                             "thinking_capability": "effort_only",
                         },
                     ),
+                    _Response(200, {"slots":[{"model_name":"selected", "offering_id":"offer-selected",
+                                             "reasoning":{"mode":"adaptive", "effort":"high"}}]}),
                 ]
             )
             result = seed.register_selected_model(
@@ -93,17 +178,47 @@ class BenchmarkModelSeedTests(unittest.TestCase):
             )
         self.assertTrue(result["checked"])
         self.assertEqual(result["thinking_mode"], "high")
-        self.assertEqual(len(opener.requests), 2)
-        create, check = [request for request, _ in opener.requests]
+        self.assertEqual(len(opener.requests), 3)
+        create, check, admission = [request for request, _ in opener.requests]
         self.assertEqual(create.full_url, "http://127.0.0.1:17012/models")
         self.assertEqual(
             check.full_url, "http://127.0.0.1:17012/models/selected/check"
         )
         self.assertEqual(create.get_header("Authorization"), "Bearer access-secret")
+        self.assertEqual(admission.full_url, "http://127.0.0.1:17012/model-access/admit")
+        self.assertEqual(json.loads(admission.data)["slots"][0], {
+            "selector":{"kind":"configured_name", "model_name":"selected"},
+            "reasoning":{"mode":"adaptive", "effort":"high"}
+        })
         payload = json.loads(create.data)
         self.assertEqual(payload["name"], "selected")
+        self.assertEqual(payload["input_modalities"], ["text", "image"])
+        self.assertEqual(payload["output_modalities"], ["text"])
+        self.assertEqual(payload["quirks"]["fixed_temperature"], 0.7)
+        self.assertEqual(payload["quirks"]["request_headers"], {"X-Provider-Option": "enabled"})
         self.assertEqual(payload["quirks"]["wire_model_name"], "upstream-selected")
+        self.assertEqual(payload["quirks"]["request_body_overrides"], {
+            "custom_provider_option": {"enabled": True},
+        })
+        self.assertNotIn("judgment_default", payload)
         self.assertNotIn("thinking:high", json.dumps(payload))
+        self.assertEqual(payload["pricing"], {
+            "currency": "USD", "unit": "per_token", "prompt": 0.000001, "completion": 0,
+        })
+
+    def test_plain_selection_uses_model_default_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, models = self.fixture(Path(directory), selector="selected")
+            opener = _Opener([
+                _Response(201, {"name": "selected"}),
+                _Response(200, {"name": "selected", "is_active": True}),
+                _Response(200, {"slots": [{"model_name": "selected", "offering_id": "offer-selected",
+                                          "reasoning": {"mode": "model_default"}}]}),
+            ])
+            result = seed.register_selected_model("http://localhost", config, models, "token", opener)
+        self.assertTrue(result["checked"])
+        self.assertEqual(json.loads(opener.requests[-1][0].data)["slots"][0]["reasoning"],
+                         {"mode": "model_default"})
 
     def test_missing_duplicate_or_empty_credentials_fail_before_api(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -120,6 +235,48 @@ class BenchmarkModelSeedTests(unittest.TestCase):
                 seed.register_selected_model("http://localhost", config, models, "token", opener)
             self.assertEqual(opener.requests, [])
 
+    def test_invalid_pricing_fails_before_api(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, models = self.fixture(Path(directory))
+            valid = models.read_text()
+            invalid_prices = (
+                valid.replace("pricing_currency: USD", "pricing_currency: EUR"),
+                valid.replace("pricing_unit: per_token", "pricing_unit: per_million_tokens"),
+                valid.replace("  pricing_unit: per_token\n", ""),
+                valid.replace("  pricing_prompt: 0.000001\n", ""),
+                valid.replace("  pricing_completion: 0\n", ""),
+                valid.replace("pricing_prompt: 0.000001", "pricing_prompt: -1"),
+                valid.replace("pricing_prompt: 0.000001", "pricing_prompt: .nan"),
+                valid.replace("pricing_prompt: 0.000001", "pricing_prompt: .inf"),
+                valid.replace("pricing_completion: 0", "pricing_completion: true"),
+                valid.replace("pricing_prompt: 0.000001", f"pricing_prompt: {10 ** 400}"),
+            )
+            for index, document in enumerate(invalid_prices):
+                with self.subTest(case=index):
+                    models.write_text(document)
+                    opener = _Opener([])
+                    with self.assertRaises(seed.SeedError):
+                        seed.register_selected_model(
+                            "http://localhost", config, models, "token", opener
+                        )
+                    self.assertEqual(opener.requests, [])
+
+    def test_unknown_selected_fields_fail_before_api_without_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, models = self.fixture(Path(directory))
+            valid = models.read_text()
+            for field in ("fallback_chain", "context_widnow"):
+                with self.subTest(field=field):
+                    models.write_text(valid + f"  {field}: private-value-sentinel\n")
+                    opener = _Opener([])
+                    with self.assertRaisesRegex(seed.SeedError, "unknown fields") as error:
+                        seed.register_selected_model(
+                            "http://localhost", config, models, "token", opener
+                        )
+                    self.assertIn(field, str(error.exception))
+                    self.assertNotIn("private-value-sentinel", str(error.exception))
+                    self.assertEqual(opener.requests, [])
+
     def test_check_must_activate_exact_high_thinking_model(self):
         with tempfile.TemporaryDirectory() as directory:
             config, models = self.fixture(Path(directory))
@@ -132,6 +289,7 @@ class BenchmarkModelSeedTests(unittest.TestCase):
                     [
                         _Response(201, {"name": "selected"}),
                         _Response(200, checked),
+                        seed.urllib.error.HTTPError("http://localhost", 400, "unsupported", {}, None),
                     ]
                 )
                 with self.assertRaises(seed.SeedError):

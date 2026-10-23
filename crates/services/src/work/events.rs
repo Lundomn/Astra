@@ -34,7 +34,6 @@ impl WorkEventSeq {
 #[serde(rename_all = "snake_case")]
 pub enum WorkEventKind {
     WorkCreated,
-    GoalRevised,
     CriteriaAccepted,
     BranchBasisAdopted,
     GraphReplaced,
@@ -52,6 +51,7 @@ pub enum WorkEventKind {
     RunDelegated,
     RunFailed,
     RunCancelled,
+    RecoveryPointCaptured,
     RuntimeEventsExpired,
 }
 
@@ -59,7 +59,6 @@ impl WorkEventKind {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::WorkCreated => "work_created",
-            Self::GoalRevised => "goal_revised",
             Self::CriteriaAccepted => "criteria_accepted",
             Self::BranchBasisAdopted => "branch_basis_adopted",
             Self::GraphReplaced => "graph_replaced",
@@ -77,6 +76,7 @@ impl WorkEventKind {
             Self::RunDelegated => "run_delegated",
             Self::RunFailed => "run_failed",
             Self::RunCancelled => "run_cancelled",
+            Self::RecoveryPointCaptured => "recovery_point_captured",
             Self::RuntimeEventsExpired => "runtime_events_expired",
         }
     }
@@ -84,7 +84,6 @@ impl WorkEventKind {
     pub(crate) fn from_persisted(value: &str) -> Option<Self> {
         match value {
             "work_created" => Some(Self::WorkCreated),
-            "goal_revised" => Some(Self::GoalRevised),
             "criteria_accepted" => Some(Self::CriteriaAccepted),
             "branch_basis_adopted" => Some(Self::BranchBasisAdopted),
             "graph_replaced" => Some(Self::GraphReplaced),
@@ -102,6 +101,7 @@ impl WorkEventKind {
             "run_delegated" => Some(Self::RunDelegated),
             "run_failed" => Some(Self::RunFailed),
             "run_cancelled" => Some(Self::RunCancelled),
+            "recovery_point_captured" => Some(Self::RecoveryPointCaptured),
             "runtime_events_expired" => Some(Self::RuntimeEventsExpired),
             _ => None,
         }

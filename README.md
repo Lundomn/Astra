@@ -1,8 +1,11 @@
 <div align="center">
 
-# Astra
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo/astra-lockup-dark.svg">
+  <img alt="Astra" src="docs/assets/logo/astra-lockup.svg" width="340">
+</picture>
 
-### An agent runtime with EXPLAIN ANALYZE for context
+### An agent runtime with native Jev judgments and EXPLAIN ANALYZE for context
 
 **Inspect context and state. Adjust and recover with evidence. Run in your environment.**
 
@@ -11,11 +14,12 @@
 [![VLDB ADS](https://img.shields.io/badge/VLDB_ADS-Accepted-6F42C1)](https://vldb-ads.top/)
 [![arXiv](https://img.shields.io/badge/arXiv-2609.00749-B31B1B?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2609.00749)
 [![Terminal-Bench](https://img.shields.io/badge/Terminal--Bench_2.1-67.4%25-0A7EA4)](#terminal-bench-21)
+[![Jev](https://img.shields.io/badge/Jev-Native_agent_integration-2563EB)](#jev-agent-integration)
 [![Rust 1.97](https://img.shields.io/badge/Rust-1.97-000000?logo=rust)](rust-toolchain.toml)
 [![TypeScript](https://img.shields.io/badge/SDK-TypeScript-3178C6?logo=typescript&logoColor=white)](packages/sdk)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-[Why Astra](#why-astra) · [Research](#research-and-benchmarks) · [Quick start](#quick-start) · [Architecture](#architecture) · [Runner](#runner-and-private-enterprise-it) · [Comparison](#how-astra-differs-from-coding-agents) · [Docs](#documentation)
+[Why Astra](#why-astra) · [Jev integration](#jev-agent-integration) · [Research](#research-and-benchmarks) · [Quick start](#quick-start) · [Architecture](#architecture) · [Runner](#runner-and-private-enterprise-it) · [Comparison](#how-astra-differs-from-coding-agents) · [Docs](#documentation)
 
 </div>
 
@@ -26,9 +30,38 @@ request is assembled by a budgeted pipeline you can EXPLAIN, every attempt
 leaves evidence you can inspect, diff, and roll back, and execution runs
 through a Runner inside your own environment.
 
+**[Current capability status](docs/reference/capabilities.md)** — supported profiles, defaults, dependencies, verification lanes and known limits for this source version.
+
+### Jev agent integration
+
+Astra integrates **Jev (TypeSafe AI's System One model)** at the agent-runtime
+level: an optional judgment layer for AI agents, configured separately from the
+main generation model. Its structured answers feed four existing decision points:
+
+- **Agent memory filtering:** select memories that contribute facts or constraints to the current task.
+- **Lesson dismissal:** distinguish an explicit correction from a one-time exception.
+- **Request classification:** identify request requirements before runtime admission.
+- **Skill selection:** select a workflow when the evidence clearly supports one.
+
+These callers share typed questions, validated responses, provider routing, and
+usage accounting. Native probabilities retain their meaning; uncertainty,
+timeouts, and unavailable models follow each caller's bounded fallback rules.
+The runtime retains execution authority. An ordinary LLM can serve the same
+judgment role through the shared contract—Jev is optional.
+
+**[Configure Jev or another judgment model](docs/guides/memory-judgment-pilot.md)** ·
+**[Reproduce the memory evaluation](expriment/jev-memory/SKILL.md)** ·
+**[Read the results and evidence](expriment/jev-memory/results/README.md)**
+
+The evaluation compares No JEV, native JEV, and Flash JEV-like judgments for
+accuracy, relevance, latency, and cache-aware cost. It includes failures and
+optimization tradeoffs; it does not establish whole-agent cost savings.
+
+### Inspect context and execution
+
 | What did the model receive? | What changed, and what next? | Where does it run? |
 | --- | --- | --- |
-| `EXPLAIN ANALYZE` shows context-source estimates, request-budget estimates, provider usage, execution timing, and which boundaries were not measured. `Self` exposes goals, budgets, and tool health. ContextPipe cut tokens 31% against append-only context. | Every attempt, config change, and checkpoint is versioned. Rewind a session, diff two runs, replay against the record, and continue durable Work with a new constraint. | A User Runner executes admitted tool calls in your repositories and networks. The Server coordinates; it never gets ambient access to your machine. |
+| `EXPLAIN ANALYZE` shows context-source estimates, request-budget estimates, provider usage, execution timing, and which boundaries were not measured. `Self` exposes goals, budgets, and tool health. ContextPipe cut tokens 31% against append-only context. | Every attempt, config change, and checkpoint is versioned. Inspect recorded turns, diff two runs, replay recorded run events, and continue durable Work with a new constraint. | A User Runner executes admitted tool calls in your repositories and networks. The Server coordinates; it never gets ambient access to your machine. |
 | **Understand what happened.** | **Know what changed and what still needs verification.** | **Keep code and credentials where they are.** |
 
 ```bash
@@ -62,6 +95,12 @@ TypeScript SDK sharing one agent backbone. Bring any model endpoint.
 </div>
 
 <sub>Illustrative recorded-event replay through the real Web component. Tree is the default; Timeline and Graph are optional. Missing failure explanations and unmeasured I/O time are explicitly identified.</sub>
+
+**Watch it on a real Work (90 seconds).** A long migration in the CLI: the
+context window Astra keeps for it, what it cut and why, and the Explain Analyze
+tree behind the answer.
+
+https://github.com/user-attachments/assets/c008be26-4320-413c-9ad6-100aefcfa728
 
 ### Pick the layer you need
 
@@ -500,8 +539,8 @@ astra chat -m "Run tests and fix failures" --permission-mode auto
 ```
 
 Inside the TUI, type `/` to discover commands. Common entries include
-`/model`, `/session`, `/skill`, `/memory`, `/plan`, `/checkpoint`, `/review`,
-`/team`, `/explain`, and `/help`.
+`/model`, `/session`, `/skill`, `/memory`, `/plan`, `/review`,
+`/explain`, and `/help`.
 
 ### Durable Work and inspection
 
@@ -515,12 +554,11 @@ astra audit list
 astra self snapshot
 ```
 
-### Skills, MCP, teams, and memory
+### Skills, MCP, and memory
 
 ```bash
 astra skill list
 astra mcp list
-astra team list
 astra memory search "deployment preferences"
 ```
 
@@ -532,7 +570,9 @@ astra serve stdio
 ```
 
 HTTP mode exposes the Axum API, SSE, and WebSocket transports. Stdio mode is a
-long-lived newline-delimited JSON-RPC app-server for parent processes. See the
+long-lived newline-delimited JSON-RPC app-server for parent processes. In stdio
+mode, `turn/start.threadId` must match the thread established by `thread/start`
+or `thread/resume`; use `thread/resume` to switch sessions. See the
 [CLI reference](docs/reference/cli-commands.md),
 [HTTP API](docs/reference/api-reference.md), and
 [TypeScript SDK](packages/sdk/README.md) for complete integration contracts.

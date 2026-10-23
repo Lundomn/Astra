@@ -1,5 +1,4 @@
 use astra_core::agent_warn;
-use astra_pipeline::step_protocol::ContextSignature;
 use sha2::{Digest, Sha256};
 
 use super::super::agentic::headless_round::HeadlessStderrStyle;
@@ -13,7 +12,7 @@ use astra_turn_core::headless_tool_assembly::{
 use astra_turn_core::headless_tool_body_preview::emit_headless_tool_body_preview;
 use astra_turn_core::headless_tool_journal::{
     journal_record_blocked_tool, journal_record_cancelled_tool,
-    journal_record_cross_turn_cache_hit, journal_record_duplicate_within_turn,
+    journal_record_duplicate_within_turn, journal_record_invocation_replay_with_evidence,
     journal_record_suppressed_tool_retry, journal_record_tool_not_admitted,
     journal_record_unknown_tool,
 };
@@ -33,135 +32,34 @@ const OUTCOME_MEMORY_FAILURE_BLOCK_WINDOW: usize = 2;
 const OUTCOME_MEMORY_FAILURE_BLOCK_MAX_AGE_SECS: u64 = 60 * 60;
 const NON_PROGRESS_BACKOFF_WINDOW: usize = 2;
 const NON_PROGRESS_BACKOFF_SECS: u64 = 15;
-const MAX_VALIDATION_ATTEMPTS_PER_WORKSPACE_EPOCH: u32 = 2;
-// `REPEATED_CACHE_HIT_SUPPRESSION_THRESHOLD` moved into `EffectiveToolPolicy`
-// as `repeated_cache_hit_suppression`; read from `ctx` on every call.
 const REASON_DUPLICATE_WITHIN_TURN: &str = "duplicate_within_turn";
-const REASON_REPEATED_CACHE_HIT_SUPPRESSED: &str = "repeated_cache_hit_suppressed";
-const REASON_REDUNDANT_VALIDATION_SUPPRESSED: &str = "redundant_validation_suppressed";
 
-fn workspace_context_signature(workspace_epoch: u64) -> ContextSignature {
-    ContextSignature {
-        workspace_version: Some(format!("workspace_epoch:{workspace_epoch}")),
-        memory_snapshot_id: None,
-    }
-}
-
-fn policy_idempotency_key(tool_name: &str, args: &Value, workspace_epoch: u64) -> IdempotencyKey {
-    let key = IdempotencyKey::semantic(tool_name, args);
-    if READ_ONLY_TOOLS.contains(&tool_name) {
-        key.with_context(workspace_context_signature(workspace_epoch))
-    } else {
-        key
-    }
-}
-
-fn observation_scoped_signature(
+fn policy_idempotency_key(
     tool_name: &str,
-    base_signature: &str,
-    workspace_epoch: u64,
-) -> String {
-    if READ_ONLY_TOOLS.contains(&tool_name) {
-        format!("{base_signature}@ws={workspace_epoch}")
-    } else {
-        base_signature.to_string()
-    }
-}
-
-fn bash_command_arg(args: &Value) -> Option<&str> {
-    args.get("command").and_then(Value::as_str)
-}
-
-fn split_shell_control_segments(command: &str) -> Vec<&str> {
-    command
-        .split(';')
-        .flat_map(|s| s.split("&&"))
-        .flat_map(|s| s.split("||"))
-        .collect()
-}
-
-fn simple_cd_target(segment: &str) -> Option<String> {
-    let mut parts = segment.split_whitespace();
-    if parts.next()? != "cd" {
+    args: &Value,
+    invocation_id: &str,
+    user_id: Option<&str>,
+    session_id: Option<&String>,
+    run_id: Option<&str>,
+    turn_chain_id: Option<&str>,
+) -> Option<IdempotencyKey> {
+    if !READ_ONLY_TOOLS.contains(&tool_name) {
         return None;
     }
-    let target = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(
-        target
-            .trim_matches(|ch| ch == '\'' || ch == '"')
-            .to_string(),
+    let identity = astra_turn_types::ToolInvocationIdentity::new(
+        user_id?,
+        session_id?.clone(),
+        run_id?,
+        turn_chain_id?,
+        invocation_id,
     )
-}
-
-fn is_validation_command_prefix(lower: &str) -> bool {
-    lower == "cargo check"
-        || lower.starts_with("cargo check ")
-        || lower == "cargo test"
-        || lower.starts_with("cargo test ")
-        || lower == "cargo clippy"
-        || lower.starts_with("cargo clippy ")
-        || lower == "cargo build"
-        || lower.starts_with("cargo build ")
-        || lower == "npx tsc --noemit"
-        || lower.starts_with("npx tsc --noemit ")
-        || lower == "tsc --noemit"
-        || lower.starts_with("tsc --noemit ")
-        || lower == "pytest"
-        || lower.starts_with("pytest ")
-        || lower == "python -m pytest"
-        || lower.starts_with("python -m pytest ")
-        || lower == "python3 -m pytest"
-        || lower.starts_with("python3 -m pytest ")
-        || lower == "python -m unittest"
-        || lower.starts_with("python -m unittest ")
-        || lower == "python3 -m unittest"
-        || lower.starts_with("python3 -m unittest ")
-        || lower == "npm test"
-        || lower.starts_with("npm test ")
-        || lower == "npm run build"
-        || lower.starts_with("npm run build ")
-        || lower == "go test"
-        || lower.starts_with("go test ")
-}
-
-fn normalize_validation_prefix(tool_name: &str, args: &Value) -> Option<String> {
-    if tool_name != "bash" {
-        return None;
-    }
-    let command = bash_command_arg(args)?.trim();
-    if command.is_empty() {
-        return None;
-    }
-
-    let mut cwd: Option<String> = None;
-    for raw_segment in split_shell_control_segments(command) {
-        let segment = raw_segment.trim();
-        if segment.is_empty() {
-            continue;
-        }
-        if let Some(target) = simple_cd_target(segment) {
-            cwd = Some(target);
-            continue;
-        }
-
-        let primary = segment.split('|').next().unwrap_or(segment).trim();
-        let stripped = astra_turn_core::cloud_approval_policy::strip_benign_fd_redirects(primary);
-        let normalized = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
-        if normalized.is_empty() {
-            continue;
-        }
-        let lower = normalized.to_ascii_lowercase();
-        if is_validation_command_prefix(&lower) {
-            return Some(match cwd {
-                Some(ref dir) => format!("cd {dir} && {normalized}"),
-                None => normalized,
-            });
-        }
-    }
-    None
+    .ok()?;
+    Some(IdempotencyKey::new(
+        &identity.storage_key(),
+        0,
+        tool_name,
+        args,
+    ))
 }
 
 fn edge_callback_conflict_message(
@@ -365,21 +263,16 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
     pub(super) fn handle_empty_tool_name(
         &mut self,
-        item: HeadlessRoundToolIdx,
+        item: usize,
         slot: &HeadlessResolvedToolSlot,
     ) -> HeadlessToolSlotControl {
         self.consecutive_empty_name = self.consecutive_empty_name.saturating_add(1);
-        let raw_tc = match item {
-            HeadlessRoundToolIdx::ServerToolCall(i) => {
-                self.ctx.tool_calls.get(i).map(|v| v.to_string())
-            }
-            _ => None,
-        };
+        let raw_tc = self.ctx.tool_calls.get(item).map(Value::to_string);
         agent_warn!(
             "step",
             "Empty tool name in slot {item:?} (id={}), raw tool_call: {}",
             slot.id,
-            raw_tc.as_deref().unwrap_or("(synthetic edge)")
+            raw_tc.as_deref().unwrap_or("(missing provider index)")
         );
         let err_msg = validator_denial_body(
             &slot.name,
@@ -437,17 +330,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
     pub(super) fn validate_slot(
         &mut self,
-        item: HeadlessRoundToolIdx,
+        item: usize,
     ) -> HeadlessPipelineStage<ValidatedExecution> {
-        let mut slot = self.resolve_slot(item);
-        if slot.synthetic_edge_index.is_none() {
-            super::inherit_external_effect_recovery_scope(
-                &slot.name,
-                &mut slot.args,
-                self.ctx.external_effect_recovery_paths,
-            );
-        }
-
+        let slot = self.resolve_slot(item);
         if self.ctx.pre_resolved_ids.contains(slot.id.as_str()) {
             return HeadlessPipelineStage::ShortCircuit;
         }
@@ -456,10 +341,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         // settled result is historical fact, so post-execution retry and
         // budget policy must not replace it with a synthetic skip.  A
         // signature-only match is intentionally insufficient authority.
-        let has_exact_edge_result = self.exact_edge_callback_index(&slot).is_some_and(|index| {
-            self.ctx.edge_tool_round[index].has_explicit_assistant_tool_call_id()
-                && !self.consumed_edge[index]
-        });
+        let has_exact_edge_result = self
+            .exact_edge_callback_index(&slot)
+            .is_some_and(|index| !self.consumed_edge[index]);
 
         if !has_exact_edge_result && self.executed_this_turn >= self.ctx.max_tools_per_turn {
             self.emit_turn_budget_stub(&slot);
@@ -477,9 +361,23 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let call_sig = tool_dedup_signature(&slot.name, &slot.args);
         let health_identity =
             astra_turn_core::tool_result_semantics::tool_health_identity(&slot.name, &slot.args);
-        let workspace_epoch = self.ctx.turn_guard.workspace_epoch();
-        let scoped_call_sig = observation_scoped_signature(&slot.name, &call_sig, workspace_epoch);
-        let idem_key = policy_idempotency_key(&slot.name, &slot.args, workspace_epoch);
+        // Scope only the within-batch duplicate limit across observed writes.
+        // This epoch is not a cache-freshness proof; replay keys below use the
+        // full invocation identity instead.
+        let scoped_call_sig = if READ_ONLY_TOOLS.contains(&slot.name.as_str()) {
+            format!("{call_sig}@ws={}", self.ctx.turn_guard.workspace_epoch())
+        } else {
+            call_sig
+        };
+        let idem_key = policy_idempotency_key(
+            &slot.name,
+            &slot.args,
+            &slot.id,
+            self.ctx.current_user_id,
+            self.ctx.current_session_id,
+            self.ctx.current_run_id,
+            self.ctx.current_turn_chain_id,
+        );
         let count = if has_exact_edge_result {
             0
         } else {
@@ -501,7 +399,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 &slot.id,
                 &slot.name,
                 REASON_DUPLICATE_WITHIN_TURN,
-                Some(&idem_key.cache_key()),
+                idem_key.as_ref().map(IdempotencyKey::cache_key).as_deref(),
                 args_preview.as_deref(),
                 None,
                 false,
@@ -525,11 +423,16 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         }
 
         if !has_exact_edge_result
+            && !(slot.name == "agent"
+                && self
+                    .ctx
+                    .runtime_tool_executor
+                    .is_some_and(|executor| executor.has_retained_agent_result(&slot.args)))
             && let Some((repeat_count, remaining_secs)) =
                 should_backoff_from_nonprogress(&self.ctx.turn_guard.health, &health_identity)
         {
             let (reason_code, err_msg, status_line) =
-                nonprogress_backoff_message(&slot.name, repeat_count, remaining_secs);
+                nonprogress_backoff_message(&slot.name, &slot.args, repeat_count, remaining_secs);
             emit_blocked_tool_result(
                 HeadlessBlockedTool {
                     id: &slot.id,
@@ -793,56 +696,12 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             return HeadlessPipelineStage::ShortCircuit;
         }
 
-        if !execution.is_edge_tool
-            && let Some(validation_prefix) =
-                normalize_validation_prefix(&execution.name, &execution.args)
-        {
-            let prior_attempts = self
-                .ctx
-                .turn_guard
-                .validation_attempts_since_workspace_mutation(&validation_prefix);
-            if prior_attempts >= MAX_VALIDATION_ATTEMPTS_PER_WORKSPACE_EPOCH {
-                let body = format!(
-                    "⛔ Redundant validation suppressed: `{validation_prefix}` has already run \
-                     {prior_attempts} time(s) since the last workspace mutation. Re-running the \
-                     same validation cannot produce new source-state evidence. Inspect the \
-                     reported files, make a change, or run a narrower diagnostic with different \
-                     arguments."
-                );
-                emit_blocked_tool_result(
-                    HeadlessBlockedTool {
-                        id: &execution.id,
-                        name: &execution.name,
-                        args: &execution.args,
-                        reason_code: REASON_REDUNDANT_VALIDATION_SUPPRESSED,
-                        journal_kind: HeadlessShortCircuitJournalKind::SuppressedRetry,
-                        err_msg: body.clone(),
-                        journal_reason: body,
-                        early_exit_ms: execution.early_exit_ms,
-                        status_line: Some(format!(
-                            "  ⛔ Redundant validation suppressed: {validation_prefix}"
-                        )),
-                    },
-                    self.ctx.step_recorder,
-                    self.ctx.quiet,
-                    self.ctx.term,
-                    self.ctx.messages,
-                    self.ctx.tool_results,
-                    self.ctx.tool_call_records,
-                );
-                return HeadlessPipelineStage::ShortCircuit;
-            }
-            self.ctx
-                .turn_guard
-                .record_validation_attempt(&validation_prefix);
-        }
-
         if execution.is_edge_tool {
             if let Some(snapshot) = execution.edge_replay_snapshot() {
                 self.slot_settlements.insert(
                     execution.id.clone(),
                     SlotSettlement::PendingEdgeValidated {
-                        execution: snapshot,
+                        execution: Box::new(snapshot),
                         idem_key: idem_key.clone(),
                     },
                 );
@@ -855,253 +714,128 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         })
     }
 
-    /// Reuse is an execution optimization, not an alternate authorization path.
-    /// Callers must run admission, runtime binding, permission, restriction, and
-    /// PreTool hook checks before reaching this method.
-    async fn try_reuse_authorized_read(
+    /// Replay only the completed result for this full invocation identity.
+    /// A new invocation id is a fresh observation, even when tool and args
+    /// match a previous call. Admission, permission, restriction, and PreTool
+    /// checks have already run before reaching this method.
+    async fn try_replay_same_invocation_read(
         &mut self,
         execution: &HeadlessResolvedExecution,
-        idem_key: &IdempotencyKey,
+        idem_key: Option<&IdempotencyKey>,
     ) -> bool {
-        // A settled edge result is already the execution outcome for this
-        // exact call id. Reusing an older observation here would overwrite
-        // executor truth and can make the ledger claim the call never ran.
-        if execution.is_edge_tool {
+        if execution.is_edge_tool || !READ_ONLY_TOOLS.contains(&execution.name.as_str()) {
             return false;
         }
-        if !READ_ONLY_TOOLS.contains(&execution.name.as_str()) {
+        let Some(idem_key) = idem_key else {
             return false;
-        }
+        };
 
-        let workspace_epoch = self.ctx.turn_guard.workspace_epoch();
-        let health_identity = astra_turn_core::tool_result_semantics::scoped_tool_health_identity(
-            &execution.name,
-            &execution.args,
-            READ_ONLY_TOOLS
-                .contains(&execution.name.as_str())
-                .then_some(workspace_epoch),
-        );
-
-        if let Some(mut cached) = self.ctx.idempotency_cache.check(idem_key).cloned() {
-            let cache_key = idem_key.cache_key();
-            let args_preview = safe_args_preview(&execution.name, &execution.args);
-            let prior_cache_hits = self
-                .ctx
-                .turn_guard
-                .health
-                .cache_hits_for_signature(&health_identity);
-            if prior_cache_hits >= self.ctx.repeated_cache_hit_suppression as usize {
-                let body = format!(
-                    "⛔ Repeated cached read suppressed: this exact {} request has already \
-                     been served from cache {} time(s). Use the earlier cached result in the \
-                     conversation instead of calling again; if you need different evidence, \
-                     change the arguments.",
-                    execution.name, prior_cache_hits
-                );
-                let (tool_msg, tr) = openai_tool_roundtrip_values(
-                    &execution.id,
-                    &execution.name,
-                    &body,
-                    astra_turn_core::tool_result_semantics::ToolResultStatus::Skipped,
-                );
-                self.ctx.messages.push(tool_msg);
-                self.ctx.tool_results.push(tr);
-                self.ctx.step_recorder.begin_tool_with_key_and_args_preview(
-                    &execution.name,
-                    &execution.id,
-                    Some(&cache_key),
-                    args_preview.as_deref(),
-                );
-                self.ctx.step_recorder.skip_tool_with_reason_and_metadata(
-                    &execution.name,
-                    Some(&execution.id),
-                    args_preview.as_deref(),
-                    REASON_REPEATED_CACHE_HIT_SUPPRESSED,
-                    true,
-                    Some(&body),
-                );
-                self.ctx
-                    .turn_guard
-                    .record_cache_hit_for_signature(&health_identity);
-                self.ctx
-                    .tool_call_records
-                    .push(journal_record_cross_turn_cache_hit(
-                        execution.id.clone(),
-                        execution.name.clone(),
-                        body.len() as u32,
-                        args_preview,
-                        Some(&body),
-                    ));
-                return true;
-            }
-            if !self.ctx.tool_event_hooks.is_empty()
-                && let Some(modified) = crate::skills::hooks::evaluate_post_tool_hooks(
-                    self.ctx.tool_event_hooks,
-                    &execution.name,
-                    &execution.args,
-                    &cached.output,
-                )
-                .await
+        let Some(mut cached) = self.ctx.idempotency_cache.check(idem_key).cloned() else {
+            return false;
+        };
+        let catalog_replay = execution.name == "model_catalog";
+        if catalog_replay {
+            let Ok(page) = serde_json::from_str::<astra_turn_core::model_catalog::ModelCatalogPage>(
+                &cached.output,
+            ) else {
+                return false;
+            };
+            if page.error.is_some()
+                || page.purpose != "chat"
+                || page.to_json() != cached.output
+                || cached.output.len() > astra_turn_core::model_catalog::MODEL_CATALOG_MAX_BYTES
+                || astra_turn_core::safety_middleware::sanitize_tool_output_for_llm(&cached.output)
+                    .content
+                    != cached.output
             {
-                cached.output = modified;
+                return false;
             }
-            if !self.ctx.quiet {
-                self.ctx.term.emit_line(
-                    HeadlessStderrStyle::Dim,
-                    headless_stderr_cache_hit_line(&execution.name),
-                );
-                emit_headless_tool_body_preview(
-                    self.ctx.term,
-                    self.ctx.quiet,
-                    &execution.name,
-                    &cached.output,
-                    false,
-                );
+        }
+        let cache_key = idem_key.cache_key();
+        let args_preview = safe_args_preview(&execution.name, &execution.args);
+        if !self.ctx.tool_event_hooks.is_empty()
+            && let Some(modified) = crate::skills::hooks::evaluate_post_tool_hooks(
+                self.ctx.tool_event_hooks,
+                &execution.name,
+                &execution.args,
+                &cached.output,
+            )
+            .await
+        {
+            // A catalog page is an authority-bearing observation. Re-execute
+            // through the normal governance path when a replay hook edits it.
+            if catalog_replay {
+                return false;
             }
-            let (mut tool_msg, tr) = headless_idempotency_hit_openai_pair(
+            cached.output = modified;
+        }
+        if !self.ctx.quiet {
+            self.ctx.term.emit_line(
+                HeadlessStderrStyle::Dim,
+                headless_stderr_cache_hit_line(&execution.name),
+            );
+            emit_headless_tool_body_preview(
+                self.ctx.term,
+                self.ctx.quiet,
+                &execution.name,
+                &cached.output,
+                false,
+            );
+        }
+        let (mut tool_msg, tr) = if catalog_replay {
+            openai_tool_roundtrip_values(
                 &execution.id,
                 &execution.name,
                 &cached.output,
                 astra_turn_core::tool_result_semantics::ToolResultStatus::Completed,
-            );
-            if let Some(obj) = tool_msg.as_object_mut() {
-                obj.insert(
-                    "_round_index".to_string(),
-                    serde_json::Value::Number(self.ctx.llm_round.into()),
-                );
-                obj.insert(
-                    "_tool_name".to_string(),
-                    serde_json::Value::String(execution.name.clone()),
-                );
-            }
-            self.ctx.messages.push(tool_msg);
-            self.ctx.tool_results.push(tr);
-            self.ctx.step_recorder.begin_tool_with_key_and_args_preview(
-                &execution.name,
-                &execution.id,
-                Some(&cache_key),
-                args_preview.as_deref(),
-            );
-            self.ctx
-                .step_recorder
-                .record_cache_hit_with_reason_and_metadata(
-                    &execution.name,
-                    Some(&execution.id),
-                    args_preview.as_deref(),
-                    cached.clone(),
-                    "cached_cross_turn",
-                );
-            self.ctx
-                .turn_guard
-                .record_cache_hit_for_signature(&health_identity);
-            self.ctx
-                .tool_call_records
-                .push(journal_record_cross_turn_cache_hit(
-                    execution.id.clone(),
-                    execution.name.clone(),
-                    cached.output.len() as u32,
-                    args_preview,
-                    Some(&cached.output),
-                ));
-            return true;
-        }
-
-        if let Some((prev_turn, cached_output)) =
-            self.ctx.semantic_dedup.pre_check_block_with_generation(
-                &execution.name,
-                &execution.args,
-                self.ctx.turn_index,
-                workspace_epoch,
             )
-        {
-            let args_preview = safe_args_preview(&execution.name, &execution.args);
-            let prior_cache_hits = self
-                .ctx
-                .turn_guard
-                .health
-                .cache_hits_for_signature(&health_identity);
-            let (body, reason_code) =
-                if prior_cache_hits >= self.ctx.repeated_cache_hit_suppression as usize {
-                    (
-                        format!(
-                            "⛔ Repeated cached read suppressed: this exact {} request has \
-                         already been served from cache {} time(s). Use the earlier cached \
-                         result in the conversation instead of calling again; if you need \
-                         different evidence, change the arguments.",
-                            execution.name, prior_cache_hits
-                        ),
-                        REASON_REPEATED_CACHE_HIT_SUPPRESSED,
-                    )
-                } else {
-                    let mut output = cached_output;
-                    if !self.ctx.tool_event_hooks.is_empty()
-                        && let Some(modified) = crate::skills::hooks::evaluate_post_tool_hooks(
-                            self.ctx.tool_event_hooks,
-                            &execution.name,
-                            &execution.args,
-                            &output,
-                        )
-                        .await
-                    {
-                        output = modified;
-                    }
-                    (output, "semantic_dedup_pre_check")
-                };
-            let (mut tool_msg, tr) = headless_idempotency_hit_openai_pair(
+        } else {
+            headless_idempotency_hit_openai_pair(
                 &execution.id,
                 &execution.name,
-                &body,
-                if reason_code == REASON_REPEATED_CACHE_HIT_SUPPRESSED {
-                    astra_turn_core::tool_result_semantics::ToolResultStatus::Skipped
-                } else {
-                    astra_turn_core::tool_result_semantics::ToolResultStatus::Completed
-                },
+                &cached.output,
+                astra_turn_core::tool_result_semantics::ToolResultStatus::Completed,
+            )
+        };
+        if let Some(obj) = tool_msg.as_object_mut() {
+            obj.insert(
+                "_round_index".to_string(),
+                serde_json::Value::Number(self.ctx.llm_round.into()),
             );
-            if let Some(obj) = tool_msg.as_object_mut() {
-                obj.insert(
-                    "_round_index".to_string(),
-                    serde_json::Value::Number(self.ctx.llm_round.into()),
-                );
-                obj.insert(
-                    "_tool_name".to_string(),
-                    serde_json::Value::String(execution.name.clone()),
-                );
-            }
-            self.ctx.messages.push(tool_msg);
-            self.ctx.tool_results.push(tr);
-            trace_short_circuit_tool_skip(
-                self.ctx.step_recorder,
-                &execution.id,
-                &execution.name,
-                reason_code,
-                Some(&idem_key.cache_key()),
-                args_preview.as_deref(),
-                Some(&body),
-                true,
+            obj.insert(
+                "_tool_name".to_string(),
+                serde_json::Value::String(execution.name.clone()),
             );
-            self.ctx
-                .turn_guard
-                .record_cache_hit_for_signature(&health_identity);
-            self.ctx
-                .tool_call_records
-                .push(journal_record_cross_turn_cache_hit(
-                    execution.id.clone(),
-                    execution.name.clone(),
-                    body.len() as u32,
-                    args_preview,
-                    Some(&body),
-                ));
-            agent_warn!(
-                "dedup",
-                "Semantic cache hit: tool '{}' (id={}) matches turn {} via param-aware dedup",
-                execution.name,
-                execution.id,
-                prev_turn + 1,
-            );
-            return true;
         }
-
-        false
+        self.ctx.messages.push(tool_msg);
+        self.ctx.tool_results.push(tr);
+        self.ctx.step_recorder.begin_tool_with_key_and_args_preview(
+            &execution.name,
+            &execution.id,
+            Some(&cache_key),
+            args_preview.as_deref(),
+        );
+        self.ctx
+            .step_recorder
+            .record_cache_hit_with_reason_and_metadata(
+                &execution.name,
+                Some(&execution.id),
+                args_preview.as_deref(),
+                cached.clone(),
+                "cached_same_invocation",
+            );
+        self.ctx
+            .tool_call_records
+            .push(journal_record_invocation_replay_with_evidence(
+                execution.id.clone(),
+                execution.name.clone(),
+                cached.output.len() as u32,
+                args_preview,
+                Some(&cached.output),
+                serde_json::to_string(&execution.args).ok(),
+                Some(&cached.output),
+            ));
+        true
     }
 
     pub(super) async fn permit_execution(
@@ -1231,6 +965,10 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 }
                 _ => None,
             };
+            let source_discovery_tool = self
+                .ctx
+                .runtime_tool_executor
+                .and_then(|executor| executor.source_selection_discovery_tool(&execution.name));
             resolved_provider_policy = provider_policy.cloned();
             let permission_result = match &provider_lookup {
                 crate::server::runtime_tool_executor::ProviderPolicyLookup::MissingPolicy {
@@ -1257,6 +995,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         effective_permission_timeout,
                         plan_mode_active,
                         provider_policy,
+                        source_discovery_tool.as_deref(),
                     )
                     .await
                 }
@@ -1386,7 +1125,11 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             }
         }
 
-        if cache_reuse_allowed && self.try_reuse_authorized_read(&execution, &idem_key).await {
+        if cache_reuse_allowed
+            && self
+                .try_replay_same_invocation_read(&execution, idem_key.as_ref())
+                .await
+        {
             return HeadlessPipelineStage::ShortCircuit;
         }
 
@@ -1499,9 +1242,20 @@ fn outcome_memory_block_message(
 
 fn nonprogress_backoff_message(
     tool_name: &str,
+    args: &Value,
     repeat_count: usize,
     remaining_secs: u64,
 ) -> (&'static str, String, String) {
+    if tool_name == "agent" && args.get("action").and_then(Value::as_str) == Some("get_result") {
+        return (
+            "nonprogress_retry_deferred",
+            format!(
+                "retry_deferred: agent.get_result was deferred because prior calls had no terminal result; current child status is unknown. If the result has since completed or was truncated, retrieve it with agent.get_result when the retry is available. {}",
+                astra_turn_core::orchestration::agent_result_wire::PENDING_CHILD_RUNTIME_WAIT_GUIDANCE
+            ),
+            format!("  ⚠ Busy-poll backoff: {tool_name} (~{remaining_secs}s)"),
+        );
+    }
     (
         "nonprogress_retry_deferred",
         format!(
@@ -1520,8 +1274,113 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    #[test]
+    fn ordinary_nonprogress_backoff_still_exposes_its_cooldown() {
+        let (_, message, _) =
+            nonprogress_backoff_message("read_file", &serde_json::json!({"path":"example"}), 2, 7);
+        assert!(message.contains("Wait about 7s"));
+    }
+
     fn names<const N: usize>(values: [&str; N]) -> HashSet<String> {
         values.into_iter().map(str::to_string).collect()
+    }
+
+    fn read_key(
+        user: Option<&str>,
+        session: Option<&str>,
+        run: Option<&str>,
+        chain: Option<&str>,
+        call: &str,
+        args: &Value,
+    ) -> Option<IdempotencyKey> {
+        let session = session.map(str::to_string);
+        policy_idempotency_key("read_file", args, call, user, session.as_ref(), run, chain)
+    }
+
+    #[test]
+    fn read_replay_key_requires_and_separates_full_invocation_identity() {
+        let args = serde_json::json!({"path": "shared.txt"});
+        let key = read_key(
+            Some("user-1"),
+            Some("session-1"),
+            Some("run-1"),
+            Some("chain-1"),
+            "call-1",
+            &args,
+        )
+        .expect("complete identity should permit exact replay");
+
+        for (user, session, run, chain, call) in [
+            ("user-2", "session-1", "run-1", "chain-1", "call-1"),
+            ("user-1", "session-2", "run-1", "chain-1", "call-1"),
+            ("user-1", "session-1", "run-2", "chain-1", "call-1"),
+            ("user-1", "session-1", "run-1", "chain-2", "call-1"),
+            ("user-1", "session-1", "run-1", "chain-1", "call-2"),
+        ] {
+            let other = read_key(
+                Some(user),
+                Some(session),
+                Some(run),
+                Some(chain),
+                call,
+                &args,
+            )
+            .expect("complete identity should permit exact replay");
+            assert_ne!(
+                key, other,
+                "each identity component must isolate cache entries"
+            );
+        }
+
+        for (user, session, run, chain, call) in [
+            (
+                None,
+                Some("session-1"),
+                Some("run-1"),
+                Some("chain-1"),
+                "call-1",
+            ),
+            (
+                Some("user-1"),
+                None,
+                Some("run-1"),
+                Some("chain-1"),
+                "call-1",
+            ),
+            (
+                Some("user-1"),
+                Some("session-1"),
+                None,
+                Some("chain-1"),
+                "call-1",
+            ),
+            (
+                Some("user-1"),
+                Some("session-1"),
+                Some("run-1"),
+                None,
+                "call-1",
+            ),
+            (
+                Some("user-1"),
+                Some("session-1"),
+                Some("run-1"),
+                Some("chain-1"),
+                "",
+            ),
+            (
+                Some(" "),
+                Some("session-1"),
+                Some("run-1"),
+                Some("chain-1"),
+                "call-1",
+            ),
+        ] {
+            assert!(
+                read_key(user, session, run, chain, call, &args).is_none(),
+                "incomplete or blank identity must not enable replay"
+            );
+        }
     }
 
     #[test]

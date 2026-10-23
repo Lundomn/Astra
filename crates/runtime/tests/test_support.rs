@@ -7,16 +7,19 @@ use std::{
 };
 
 use astra_core::ErrorResponse;
-use astra_runtime::{
-    AgenticRunLifecycleService, FernetTokenEncryptor, MatrixOneSettings, RunEngine,
-};
+#[cfg(feature = "e2e-hooks")]
+use astra_runtime::{AgenticRunLifecycleService, RunEngine};
+use astra_runtime::{FernetTokenEncryptor, MatrixOneSettings};
+#[cfg(feature = "e2e-hooks")]
+use astra_services::InMemoryRunStateStore;
 use astra_services::{
-    InMemoryRunStateStore, ModelCreateRequestData, ModelListItem, ModelRecord, ModelService,
-    ModelUpdateRequestData, ResolvedActiveLlmModel, ResolvedModelOffering,
+    ModelCreateRequestData, ModelListItem, ModelRecord, ModelService, ModelUpdateRequestData,
+    ResolvedActiveLlmModel, ResolvedModelOffering,
 };
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 pub type EdgeCallbackLedger = Arc<tokio::sync::Mutex<HashMap<String, Value>>>;
 
@@ -114,12 +117,12 @@ impl ModelService for StaticTestModelService {
         Ok(ResolvedModelOffering {
             offering_id,
             model: ResolvedActiveLlmModel {
+                price_snapshot: None,
                 model_name: self.model_name.clone(),
                 wire_model_name: None,
                 api_key: "test-key".to_string(),
                 base_url: "http://127.0.0.1:1".to_string(),
                 provider: "mock".to_string(),
-                fallback_chain: Vec::new(),
                 tags: Vec::new(),
                 request_body_overrides: None,
                 fixed_temperature: None,
@@ -172,12 +175,31 @@ pub fn test_matrixone_settings() -> MatrixOneSettings {
     }
 }
 
+pub fn require_db_it_env() -> MatrixOneSettings {
+    assert_eq!(
+        std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+        Ok("1"),
+        "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
+    );
+    MatrixOneSettings::from_env()
+}
+
+#[cfg(feature = "e2e-hooks")]
 pub fn test_run_lifecycle(
     encryptor: Arc<FernetTokenEncryptor>,
     ledger: EdgeCallbackLedger,
 ) -> AgenticRunLifecycleService {
     let run_engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
-    AgenticRunLifecycleService::new(test_matrixone_settings(), encryptor, ledger, run_engine)
+    astra_runtime::server::provider_test_support::configure_workspace_provider(
+        AgenticRunLifecycleService::new(test_matrixone_settings(), encryptor, ledger, run_engine),
+        Arc::new(
+            tempfile::Builder::new()
+                .prefix("astra-workspaces-fixture-")
+                .tempdir()
+                .expect("fixture workspace"),
+        ),
+        "web-fixture-executor",
+    )
 }
 
 pub fn tool_call(id: &str, name: &str, args: Value) -> Value {
@@ -210,4 +232,47 @@ pub fn parse_sse_events(body: &str) -> Vec<Value> {
         .filter_map(|line| line.strip_prefix("data: "))
         .filter_map(|data| serde_json::from_str(data).ok())
         .collect()
+}
+
+pub fn assert_contract_json(actual: &Value, expected: &Value, label: &str) {
+    if let Some(expected_obj) = expected.as_object()
+        && expected_obj.contains_key("detail")
+        && !expected_obj.contains_key("request_id")
+    {
+        let actual_obj = actual
+            .as_object()
+            .unwrap_or_else(|| panic!("{label}: actual response should be a JSON object"));
+        let request_id = actual_obj
+            .get("request_id")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("{label}: error response should include request_id"));
+        assert!(
+            Uuid::parse_str(request_id).is_ok(),
+            "{label}: request_id should be a UUID"
+        );
+
+        let mut normalized_actual = actual_obj.clone();
+        normalized_actual.remove("request_id");
+        assert_eq!(Value::Object(normalized_actual), *expected, "{label}");
+        return;
+    }
+
+    assert_eq!(actual, expected, "{label}");
+}
+
+pub fn call_id_for(events: &[Value], name: &str, matches: impl Fn(&Value) -> bool) -> String {
+    let calls: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "tool_call")
+        .filter(|event| {
+            let call = &event["tool_call"];
+            call["function"]["name"] == name
+                && serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap())
+                    .is_ok_and(|args| matches(&args))
+        })
+        .collect();
+    assert_eq!(calls.len(), 1, "one matching {name} invocation");
+    let id = calls[0]["tool_call"]["id"].as_str().unwrap();
+    assert_eq!(id.len(), 64, "accepted provider invocation ID");
+    id.to_owned()
 }

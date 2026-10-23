@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use astra_services::SessionArtifactStore;
+use astra_services::{SessionArtifactStore, session_journal::ToolCallDisposition};
 
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::execute::execution_error_kind;
@@ -14,7 +14,6 @@ use astra_turn_core::headless_tool_journal::journal_record_executed_tool_call;
 use astra_turn_core::headless_tool_postprocess::{
     HeadlessCacheableRecordCtx, format_headless_tool_duration,
     record_headless_cacheable_success_and_semantic_hint_if_ok,
-    try_write_light_headless_step_checkpoint,
 };
 use astra_turn_core::headless_tool_status_display::{
     tool_call_detail, tool_error_summary, tool_result_summary,
@@ -37,6 +36,84 @@ use astra_turn_core::tool_result_sanitize::{
 /// projection authoritative.
 pub(crate) const CANONICAL_WORK_TASK_BOARD_UPDATE_FIELD: &str =
     "_astra_canonical_work_task_board_update";
+
+/// Tool discovery is an authority-bearing round trip: a sanitized, hooked,
+/// or oversized selection is not the contract the producer issued. Fail the
+/// tool call instead of letting a partial model message authorize a carrier.
+fn tool_search_presentation_is_intact(
+    produced: &str,
+    presented: &str,
+    is_error: bool,
+    post_tool_modified: bool,
+    metadata: Option<&serde_json::Map<String, Value>>,
+) -> bool {
+    let budget = if astra_tools::model_result_presentation(metadata)
+        == astra_tools::ModelResultPresentation::SourceBounded
+    {
+        astra_tools::tool_search::MAX_SELECTION_RESULT_BYTES
+    } else {
+        astra_turn_core::tool_result_sanitize::MAX_TOOL_RESULT_CHARS
+    };
+    if produced != presented || post_tool_modified || presented.len() > budget {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(presented) else {
+        return false;
+    };
+    if is_error {
+        value["mode"] == "error" && value["status"] == "failed"
+    } else {
+        value["mode"] == "select" && value["status"] == "completed"
+    }
+}
+
+/// A catalog page is a complete, revision-bound JSON document. Hooks and
+/// governance may reject it but must not turn a modified page into a success.
+fn model_catalog_presentation_is_intact(
+    produced: &str,
+    presented: &str,
+    is_error: bool,
+    post_tool_modified: bool,
+    metadata: Option<&serde_json::Map<String, Value>>,
+) -> bool {
+    !is_error
+        && !post_tool_modified
+        && produced == presented
+        && presented.len() <= astra_turn_core::model_catalog::MODEL_CATALOG_MAX_BYTES
+        && astra_tools::model_result_presentation(metadata)
+            == astra_tools::ModelResultPresentation::SourceBounded
+        && serde_json::from_str::<Value>(presented)
+            .ok()
+            .is_some_and(|value| value["purpose"] == "chat" && value["error"].is_null())
+}
+
+fn model_catalog_presentation_failure() -> astra_tools::ToolResult {
+    use astra_turn_core::model_catalog::{CatalogError, unavailable_page};
+    astra_tools::ToolResult::error(
+        unavailable_page(CatalogError::InvalidCatalog, "unknown").to_json(),
+    )
+}
+
+fn projected_writer_applied_bound(
+    execution: &HeadlessResolvedExecution,
+    record: &ToolCallRecord,
+    owner: TerminalProjectionOwner,
+) -> Option<bool> {
+    (record.was_executed()
+        && record.ok
+        && matches!(
+            owner,
+            TerminalProjectionOwner::RuntimeRoute | TerminalProjectionOwner::EdgeCallback
+        )
+        && execution.tool_result_fields.as_ref().is_some_and(|fields| {
+            fields
+                .get(astra_tools::workspace_observation::WRITER_APPLIED_BOUND_FIELD)
+                .and_then(Value::as_bool)
+                == Some(true)
+        })
+        && astra_tools::executor::is_workspace_mutation_tool(&execution.name, &execution.args))
+    .then_some(true)
+}
 
 fn tool_call_disposition_from_result_fields(
     fields: &serde_json::Map<String, Value>,
@@ -103,6 +180,7 @@ fn emit_tool_display_feedback(
 struct PersistedRecordResult {
     content: String,
     artifact: Option<astra_services::session_journal::ToolResultArtifactDescriptor>,
+    delivery_unavailable: bool,
 }
 
 fn persist_tool_result_for_record_with_authority(
@@ -152,6 +230,7 @@ fn persist_tool_document_for_record_with_authority(
     } = document;
     let Some(sid) = current_session_id else {
         return Ok(PersistedRecordResult {
+            delivery_unavailable: full_model_result_str != inline_model_result_str,
             content: if kind.is_result() {
                 inline_model_result_str
             } else {
@@ -162,6 +241,7 @@ fn persist_tool_document_for_record_with_authority(
     };
     let Some(run_id) = current_run_id else {
         return Ok(PersistedRecordResult {
+            delivery_unavailable: full_model_result_str != inline_model_result_str,
             // Without a run identity there is no immutable artifact identity.
             // Preserve the complete sanitized evidence inline instead of
             // emitting a handle that introspect cannot safely resolve.
@@ -199,6 +279,7 @@ fn persist_tool_document_for_record_with_authority(
                 "tool-result artifact unavailable; retaining full sanitized journal result"
             );
             return Ok(PersistedRecordResult {
+                delivery_unavailable: full_model_result_str != inline_model_result_str,
                 content: full_model_result_str.to_string(),
                 artifact: None,
             });
@@ -207,10 +288,12 @@ fn persist_tool_document_for_record_with_authority(
     };
     Ok(match persisted {
         Some(persisted) => PersistedRecordResult {
+            delivery_unavailable: false,
             content: persisted.replacement,
             artifact: Some(persisted.descriptor),
         },
         None => PersistedRecordResult {
+            delivery_unavailable: false,
             content: inline_model_result_str,
             artifact: None,
         },
@@ -276,6 +359,15 @@ fn model_tool_result_for_followup(
     inline_model_result_str: String,
     journal_result: &PersistedRecordResult,
 ) -> String {
+    if presentation == astra_tools::ModelResultPresentation::Generic
+        && journal_result.delivery_unavailable
+    {
+        return serde_json::json!({
+            "result_delivery_complete": false,
+            "error": {"code": "result_delivery_unavailable",
+                "message": "The complete result could not be delivered. This does not change the execution outcome. Do not repeat an executed action merely to recover its output; report the delivery gap or retrieve the retained result."},
+        }).to_string();
+    }
     if presentation == astra_tools::ModelResultPresentation::Generic
         && journal_result.artifact.is_some()
     {
@@ -353,10 +445,10 @@ pub(crate) fn safe_tool_arguments_for_record(
     args: &Value,
 ) -> (Option<String>, Option<String>, Option<String>) {
     let mut safe_args = args.clone();
-    astra_tools::credential_redaction::redact_credentials_in_json(&mut safe_args);
+    astra_text_utils::credential_redaction::redact_credentials_in_json(&mut safe_args);
     let args_full = serde_json::to_string(&safe_args).ok();
     let args_preview = make_args_preview(tool_name, &safe_args).map(|preview| {
-        astra_tools::credential_redaction::redact_credentials_for_display(&preview).0
+        astra_text_utils::credential_redaction::redact_credentials_for_display(&preview).0
     });
     let file_path = safe_args
         .get("path")
@@ -503,6 +595,39 @@ fn work_receipt_for_model(tool_name: &str, content: &str) -> Option<String> {
     serde_json::to_string(&Value::Object(projected)).ok()
 }
 
+fn work_establishment_receipt(
+    tool_name: &str,
+    content: &str,
+) -> Option<astra_services::session_journal::RuntimeWorkEstablishmentReceipt> {
+    if tool_name != "start_work" {
+        return None;
+    }
+    let result = serde_json::from_str::<Value>(content).ok()?;
+    match result.get("status")?.as_str()? {
+        "started" => {
+            Some(astra_services::session_journal::RuntimeWorkEstablishmentReceipt::Started)
+        }
+        "continued" => {
+            Some(astra_services::session_journal::RuntimeWorkEstablishmentReceipt::Continued)
+        }
+        "deferred"
+            if result.get("operation_state").and_then(Value::as_str) == Some("cancelled")
+                && result.get("assignment_created").and_then(Value::as_bool) == Some(false) =>
+        {
+            let operation_id = result
+                .get("operation_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())?;
+            Some(
+                astra_services::session_journal::RuntimeWorkEstablishmentReceipt::Deferred {
+                    operation_id: operation_id.to_string(),
+                },
+            )
+        }
+        _ => None,
+    }
+}
+
 fn model_tool_result_session_dir(
     current_user_id: Option<&str>,
     session_id: &str,
@@ -529,8 +654,11 @@ fn truncate_tool_error(result_str: &str) -> String {
 }
 
 impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
-    pub(super) async fn record_execution(&mut self, executed: ExecutedExecution) {
-        self.observe_execution_terminal_owner(&executed.execution);
+    pub(super) async fn record_execution(&mut self, mut executed: ExecutedExecution) {
+        // Preserve the accepted transport fact before presentation/governance
+        // can rewrite or fail this tool's displayed result.
+        self.observe_execution_terminal_owner(&mut executed.execution);
+        let terminal_owner = executed.execution.terminal_projection_owner();
         let ExecutedExecution {
             mut execution,
             idem_key,
@@ -539,12 +667,21 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             error_kind: source_error_kind,
             executed_ms,
         } = executed;
+        let tool_search_produced =
+            (execution.name == "tool_search").then(|| execution.result_str.clone());
+        let model_catalog_produced =
+            (execution.name == "model_catalog" && !is_err).then(|| execution.result_str.clone());
         // The executor may briefly hold a raw result, but no downstream
         // ledger, hook, event, journal, step recorder, or model message may.
         // Redact before any persistence or presentation so a failed edit or
         // failed tool cannot leak the very credential the model could not see.
         let initial_sanitized =
             astra_turn_core::safety_middleware::sanitize_tool_output_for_llm(&execution.result_str);
+        let runtime_work_establishment_receipt = if !is_err {
+            work_establishment_receipt(&execution.name, &initial_sanitized.content)
+        } else {
+            None
+        };
         execution.result_str = initial_sanitized.content;
         if let Some(metadata) = execution.tool_result_fields.take() {
             let sanitized =
@@ -587,6 +724,39 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         execution.result_str =
             astra_turn_core::safety_middleware::sanitize_tool_output_for_llm(&execution.result_str)
                 .content;
+        let mut selection_presentation_rejected = false;
+        if let Some(produced) = tool_search_produced.as_deref()
+            && !tool_search_presentation_is_intact(
+                produced,
+                &execution.result_str,
+                is_err,
+                post_tool_modified,
+                execution.tool_result_fields.as_ref(),
+            )
+        {
+            let failure = astra_tools::tool_search::selection_presentation_failure();
+            execution.result_str = failure.output;
+            execution.tool_result_fields = failure.metadata;
+            is_err = true;
+            selection_presentation_rejected = true;
+        }
+        let mut catalog_presentation_rejected = false;
+        if let Some(produced) = model_catalog_produced.as_deref()
+            && (execution.is_edge_tool
+                || !model_catalog_presentation_is_intact(
+                    produced,
+                    &execution.result_str,
+                    is_err,
+                    post_tool_modified,
+                    execution.tool_result_fields.as_ref(),
+                ))
+        {
+            let failure = model_catalog_presentation_failure();
+            execution.result_str = failure.output;
+            execution.tool_result_fields = failure.metadata;
+            is_err = true;
+            catalog_presentation_rejected = true;
+        }
         let exit_semantics = execution
             .tool_result_fields
             .as_ref()
@@ -602,6 +772,40 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             },
             post_tool_modified,
         );
+        // Capture before completion persistence: a failed commit must not erase
+        // the scope of a provider execution that already crossed dispatch.
+        let invocation_identity = execution
+            .pending_runtime_completion
+            .as_ref()
+            .and_then(|pending| pending.invocation_identity())
+            .or_else(|| {
+                execution
+                    .confirmed_invocation
+                    .as_ref()
+                    .map(|record| record.identity.clone())
+            })
+            .or_else(|| {
+                astra_turn_types::ToolInvocationIdentity::new(
+                    self.ctx.current_user_id?,
+                    self.ctx.current_session_id?,
+                    self.ctx.current_run_id?,
+                    self.ctx.current_turn_chain_id?,
+                    &execution.id,
+                )
+                .ok()
+            });
+        let work_attribution = execution.pending_runtime_completion.as_ref()
+            .map(|pending| pending.work_attribution().clone())
+            .or_else(|| execution.confirmed_invocation.as_ref().and_then(|record| {
+                crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::from_durable(&record.decision)
+                    .ok().map(|decision| decision.work_attribution)
+            }))
+            .or_else(|| execution.edge_terminal_authority.then(|| {
+                self.ctx.edge_tool_round.iter().find(|edge|
+                    edge.tool_call_id() == Some(execution.id.as_str()) && edge.tool_name() == execution.name
+                ).and_then(|edge| edge.work_attribution()).cloned()
+            }).flatten())
+            .unwrap_or_default();
         let finalized = if let Some(pending) = execution.pending_runtime_completion.take() {
             let executor = self
                 .ctx
@@ -626,10 +830,10 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             }
         }).or_else(|| {
             execution.edge_terminal_authority.then(|| {
-                self.ctx.edge_tool_round.iter().enumerate()
-                    .find(|(index, edge)| edge.assistant_tool_call_id(*index) == execution.id
+                self.ctx.edge_tool_round.iter()
+                    .find(|edge| edge.tool_call_id() == Some(execution.id.as_str())
                         && edge.tool_name() == execution.name)
-                    .and_then(|(_, edge)| edge.execution_completion()).cloned()
+                    .and_then(|edge| edge.execution_completion()).cloned()
             }).flatten()
         });
         let finalized = finalized.result;
@@ -641,13 +845,70 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             astra_turn_core::safety_middleware::sanitize_tool_metadata_for_persistence(metadata)
                 .metadata
         });
+        if !selection_presentation_rejected
+            && let Some(produced) = tool_search_produced.as_deref()
+            && !tool_search_presentation_is_intact(
+                produced,
+                &execution.result_str,
+                is_err,
+                post_tool_modified,
+                execution.tool_result_fields.as_ref(),
+            )
+        {
+            let failure = astra_tools::tool_search::selection_presentation_failure();
+            execution.result_str = failure.output;
+            execution.tool_result_fields = failure.metadata;
+            is_err = true;
+            selection_presentation_rejected = true;
+        }
+        if !catalog_presentation_rejected
+            && let Some(produced) = model_catalog_produced.as_deref()
+            && !model_catalog_presentation_is_intact(
+                produced,
+                &execution.result_str,
+                is_err,
+                post_tool_modified,
+                execution.tool_result_fields.as_ref(),
+            )
+        {
+            let failure = model_catalog_presentation_failure();
+            execution.result_str = failure.output;
+            execution.tool_result_fields = failure.metadata;
+            is_err = true;
+            catalog_presentation_rejected = true;
+        }
         let mut error_kind =
             execution_error_kind(execution.tool_result_fields.as_ref()).or(source_error_kind);
+        if selection_presentation_rejected || catalog_presentation_rejected {
+            error_kind = Some(astra_core::ErrorKind::ContractViolation);
+        }
 
-        let journal_result_source =
+        let mut journal_result_source =
             tool_result_content_for_model_unbounded(&execution.name, &execution.result_str);
-        let journal_result_inline =
-            truncate_tool_result_for_model(&execution.name, &journal_result_source);
+        if execution.name == "tool_search" && journal_result_source != execution.result_str {
+            let failure = astra_tools::tool_search::selection_presentation_failure();
+            execution.result_str = failure.output.clone();
+            execution.tool_result_fields = failure.metadata;
+            journal_result_source = failure.output;
+            is_err = true;
+            error_kind = Some(astra_core::ErrorKind::ContractViolation);
+        }
+        if !catalog_presentation_rejected
+            && let Some(produced) = model_catalog_produced.as_deref()
+            && journal_result_source != produced
+        {
+            let failure = model_catalog_presentation_failure();
+            execution.result_str = failure.output.clone();
+            execution.tool_result_fields = failure.metadata;
+            journal_result_source = failure.output;
+            is_err = true;
+            error_kind = Some(astra_core::ErrorKind::ContractViolation);
+        }
+        let journal_result_inline = model_projection_before_artifact_replacement(
+            &execution.name,
+            &journal_result_source,
+            astra_tools::model_result_presentation(execution.tool_result_fields.as_ref()),
+        );
         let full_guidance = runtime_advisories.join("\n");
         let inline_guidance = truncate_tool_result_for_model(&execution.name, &full_guidance);
         let (journal_result, guidance_artifact) =
@@ -697,6 +958,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     error_kind = Some(astra_core::ErrorKind::ContractViolation);
                     (
                         PersistedRecordResult {
+                            delivery_unavailable: false,
                             content: failure,
                             artifact: None,
                         },
@@ -704,6 +966,32 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     )
                 }
             };
+
+        // The final governed source is still complete here, even if persistence
+        // replaced its presentation with an artifact or bounded inline result.
+        // Admit instructions only after hooks, finalization and persistence have
+        // succeeded; the original callback supplies provenance, never content.
+        if !is_err
+            && execution.edge_terminal_authority
+            && execution.name == crate::turn::skill_tool::SKILL_TOOL_NAME
+            && let Some((catalog, skill_execution)) = self.ctx.client_skill_execution.as_mut()
+            && let Some(call) =
+                self.ctx.tool_calls.iter().find(|call| {
+                    call.get("id").and_then(Value::as_str) == Some(execution.id.as_str())
+                })
+            && let Some(edge) = self.ctx.edge_tool_round.iter().find(|edge| {
+                edge.tool_call_id() == Some(execution.id.as_str())
+                    && edge.tool_name() == execution.name
+            })
+        {
+            skill_execution.record_client_pipeline_skill(
+                catalog,
+                call,
+                edge,
+                &journal_result_source,
+                self.ctx.session_turn,
+            );
+        }
 
         if !runtime_advisories.is_empty() || execution.tool_result_fields.is_some() {
             astra_turn_core::tool::result::advisory::set_advisories(
@@ -735,7 +1023,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             ));
         // Fill observability fields on the just-pushed record.
         if let Some(rec) = self.ctx.tool_call_records.last_mut() {
+            rec.invocation_identity = invocation_identity;
             rec.execution_completion = execution_completion;
+            rec.work_attribution = Some(work_attribution);
             rec.runtime_args_full = raw_args_full;
             rec.tool_call_id = Some(execution.id.clone());
             rec.result_artifact = journal_result.artifact.clone();
@@ -782,16 +1072,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         fields.get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
                     })
                     .cloned();
-                rec.external_effect_observed = fields
-                    .get(astra_tools::workspace_observation::EXTERNAL_EFFECT_OBSERVED_FIELD)
-                    .and_then(serde_json::Value::as_bool);
-                rec.external_effect_scope = fields
-                    .get(astra_tools::workspace_observation::EXTERNAL_EFFECT_SCOPE_FIELD)
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToString::to_string);
-                rec.external_effect_receipt = fields
-                    .get(astra_tools::workspace_observation::EXTERNAL_EFFECT_RECEIPT_FIELD)
-                    .cloned();
+                rec.workspace_writer_applied_bound =
+                    projected_writer_applied_bound(&execution, rec, terminal_owner);
                 rec.workspace_mutation_partial = fields
                     .get("workspace_mutation_partial")
                     .and_then(serde_json::Value::as_bool);
@@ -832,7 +1114,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         &execution.name,
                         &error_msg,
                         rec.clone(),
-                    );
+                    )
+                    .with_producer_scope(self.ctx.current_run_id);
                     let writer = match self.ctx.current_user_id {
                         Some(user_id) => {
                             astra_services::session_journal::JournalWriter::for_user(user_id, sid)
@@ -856,23 +1139,37 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             }
         }
 
-        self.ctx
-            .step_recorder
-            .complete_tool_with_result_and_metadata(
+        let disposition = self
+            .ctx
+            .tool_call_records
+            .last()
+            .map(|record| record.effective_disposition());
+        if matches!(
+            disposition,
+            Some(ToolCallDisposition::Rejected | ToolCallDisposition::Deferred)
+        ) {
+            self.ctx.step_recorder.skip_tool_with_reason_and_metadata(
                 &execution.name,
-                &execution.id,
+                Some(&execution.id),
                 args_preview.as_deref(),
-                is_err,
-                executed_ms,
+                "not_executed",
                 false,
-                &execution.result_str,
+                Some(&execution.result_str),
             );
-        self.executed_this_turn += 1;
-
-        if let (Some(user_id), Some(sid)) = (self.ctx.current_user_id, self.ctx.current_session_id)
-        {
-            try_write_light_headless_step_checkpoint(user_id, sid, self.ctx.step_recorder);
+        } else {
+            self.ctx
+                .step_recorder
+                .complete_tool_with_result_and_metadata(
+                    &execution.name,
+                    &execution.id,
+                    args_preview.as_deref(),
+                    is_err,
+                    executed_ms,
+                    false,
+                    &execution.result_str,
+                );
         }
+        self.executed_this_turn += 1;
 
         let observed_workspace_mutation = self.ctx.tool_call_records.last().is_some_and(|record| {
             record.name == "bash"
@@ -892,7 +1189,6 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 ))
         {
             self.ctx.turn_guard.record_workspace_mutation();
-            self.ctx.idempotency_cache.evict_tools(&READ_ONLY_TOOLS);
             self.ctx.semantic_dedup.clear_observation_cache();
         }
 
@@ -900,13 +1196,18 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             let mut advisories = astra_turn_core::tool::result::advisory::advisories(
                 execution.tool_result_fields.as_ref(),
             );
-            // Cache and compare the provider observation, not presentation
-            // transforms from the current Pre/PostTool hook set. Reuse applies
-            // the then-current hooks again after authorization.
+            // Only the same Server invocation may reuse its result. Edge
+            // observations and calls without a complete identity remain
+            // useful semantic evidence but cannot become replay state.
+            let replay_key = if execution.is_edge_tool {
+                None
+            } else {
+                idem_key.as_ref()
+            };
             record_headless_cacheable_success_and_semantic_hint_if_ok(
                 &execution.name,
                 &execution.args,
-                &idem_key,
+                replay_key,
                 HeadlessCacheableRecordCtx {
                     observation: &cache_observation,
                     advisories: &mut advisories,
@@ -982,6 +1283,28 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             model_tool_result_for_followup(result_presentation, model_result_str, &journal_result)
         };
 
+        // Online feedback must evaluate the exact sanitized projection that
+        // crossed the model boundary. `result_full` may intentionally point
+        // at an out-of-line artifact, so do not make the evaluator recover a
+        // model-visible identity from storage presentation. Generic artifact
+        // replacements are not evidence: the model received only a pointer
+        // and can request a native recovery window if needed.
+        if let Some(record) = self.ctx.tool_call_records.last_mut() {
+            record.runtime_model_result_full = if !is_err
+                && (journal_result.artifact.is_none()
+                    || result_presentation != astra_tools::ModelResultPresentation::Generic)
+            {
+                (!model_result_str.is_empty()).then_some(model_result_str.clone())
+            } else {
+                None
+            };
+            record.runtime_work_establishment_receipt = if !is_err && record.was_executed() {
+                runtime_work_establishment_receipt
+            } else {
+                None
+            };
+        }
+
         let (mut tool_msg, tr) = openai_tool_roundtrip_values_with_result_fields(
             &execution.id,
             &execution.name,
@@ -999,7 +1322,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 serde_json::Value::Number(self.ctx.llm_round.into()),
             );
             obj.insert(
-                "_tool_name".to_string(),
+                astra_turn_core::tool_result_storage::TOOL_RESULT_TOOL_NAME_FIELD.to_string(),
                 serde_json::Value::String(execution.name.clone()),
             );
             if let Err(error) = astra_turn_core::tool_result_storage::mark_tool_result_run_id(
@@ -1044,7 +1367,132 @@ mod tests {
     use super::*;
     use astra_services::session_journal::JournalDirGuard;
     use astra_services::session_journal::ToolCallDisposition;
+
+    #[test]
+    fn tool_search_presentation_requires_the_complete_producer_result() {
+        let result = astra_tools::tool_search::tool_search_result(
+            &astra_tools::schemas::all_tool_schemas(),
+            &serde_json::json!({"query":"select:agent,agent_fanout"}),
+        );
+        assert!(!result.is_error);
+        assert!(result.output.len() > astra_turn_core::tool_result_sanitize::MAX_TOOL_RESULT_CHARS);
+        assert!(tool_search_presentation_is_intact(
+            &result.output,
+            &result.output,
+            false,
+            false,
+            result.metadata.as_ref(),
+        ));
+        assert!(!tool_search_presentation_is_intact(
+            &result.output,
+            &result.output.replace("agent_fanout", "other_tool"),
+            false,
+            false,
+            result.metadata.as_ref(),
+        ));
+        assert!(!tool_search_presentation_is_intact(
+            &result.output,
+            &result.output,
+            false,
+            true,
+            result.metadata.as_ref(),
+        ));
+        assert!(!tool_search_presentation_is_intact(
+            &result.output,
+            &result.output,
+            false,
+            false,
+            None,
+        ));
+    }
     use serde_json::json;
+
+    #[test]
+    fn applied_bound_projection_requires_a_trusted_executed_typed_writer() {
+        let mut execution = HeadlessResolvedExecution {
+            confirmed_invocation: None,
+            id: "call-a".into(),
+            name: "str_replace".into(),
+            args: json!({"path":"target.txt","old_str":"before","new_str":"after"}),
+            result_str: "Replaced successfully".into(),
+            tool_result_fields: Some(serde_json::Map::from_iter([(
+                astra_tools::workspace_observation::WRITER_APPLIED_BOUND_FIELD.into(),
+                json!(true),
+            )])),
+            authoritative_is_error: Some(false),
+            pending_runtime_completion: None,
+            accepted_send: None,
+            edge_duration_ms: 1,
+            is_edge_tool: true,
+            edge_result_missing: false,
+            edge_terminal_authority: true,
+            early_exit_ms: 0,
+        };
+        let mut record = ToolCallRecord {
+            name: "str_replace".into(),
+            ok: true,
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        };
+        assert_eq!(
+            projected_writer_applied_bound(
+                &execution,
+                &record,
+                execution.terminal_projection_owner()
+            ),
+            Some(true)
+        );
+        let mut retained = record.clone();
+        retained.workspace_writer_applied_bound = Some(true);
+        assert_eq!(
+            serde_json::to_vec(&retained).unwrap().len()
+                - serde_json::to_vec(&record).unwrap().len(),
+            38,
+            "journal record adds one bounded applied fact"
+        );
+        let restored: ToolCallRecord =
+            serde_json::from_slice(&serde_json::to_vec(&retained).unwrap()).unwrap();
+        assert_eq!(restored.workspace_writer_applied_bound, Some(true));
+        assert!(restored.runtime_args_full.is_none());
+
+        execution.edge_terminal_authority = false;
+        assert_eq!(
+            projected_writer_applied_bound(
+                &execution,
+                &record,
+                execution.terminal_projection_owner()
+            ),
+            None
+        );
+        execution.edge_terminal_authority = true;
+        for (disposition, ok) in [
+            (ToolCallDisposition::Rejected, true),
+            (ToolCallDisposition::Reused, true),
+            (ToolCallDisposition::Executed, false),
+        ] {
+            record.disposition = Some(disposition);
+            record.ok = ok;
+            assert_eq!(
+                projected_writer_applied_bound(
+                    &execution,
+                    &record,
+                    execution.terminal_projection_owner()
+                ),
+                None
+            );
+        }
+        record.disposition = Some(ToolCallDisposition::Executed);
+        record.ok = true;
+        execution.name = "bash".into();
+        assert_eq!(
+            projected_writer_applied_bound(
+                &execution,
+                &record,
+                execution.terminal_projection_owner()
+            ),
+            None
+        );
+    }
 
     #[test]
     fn guidance_persistence_failure_keeps_evidence_without_fabricating_a_handle() {
@@ -1249,15 +1697,40 @@ mod tests {
         );
     }
 
-    #[test]
-    fn durable_record_io_failure_retains_sanitized_inline_result_without_descriptor() {
+    #[tokio::test]
+    async fn durable_record_io_failure_retains_result_but_reports_incomplete_model_delivery() {
         let temp = tempfile::tempdir().expect("tempdir");
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = format!("persisted-io-{}", uuid::Uuid::new_v4());
         let dir = model_tool_result_session_dir(Some("reviewer-a"), &session_id).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("tool-results"), "not a directory").unwrap();
-        let sanitized = "complete sanitized result retained for degraded audit";
+        let spawner = crate::orchestration::agent_tool::tests::test_spawner_without_executor();
+        let ctx = crate::orchestration::agent_tool::tests::test_spawn_context(spawner, None);
+        ctx.fanout_admission.set_direct_child_for_test(
+            crate::orchestration::spawner::DirectChildCompletion {
+                agent_id: "child".into(),
+                run_id: "child-run".into(),
+                parent_agent_id: ctx.agent_id.clone(),
+                status: crate::orchestration::AgentStatus::Completed {
+                    result: "delivery ".repeat(10_000),
+                    finish_reason: None,
+                },
+                applied_user_intents: Vec::new(),
+            },
+        );
+        ctx.fanout_admission.take_completed_direct_children();
+        let sanitized = crate::orchestration::agent_tool::handle_agent_tool(
+            &json!({"action":"get_result", "agent_id":"child"}),
+            Some(&ctx),
+        )
+        .await;
+        let inline = model_projection_before_artifact_replacement(
+            "agent",
+            &sanitized,
+            astra_tools::ModelResultPresentation::Generic,
+        );
+        assert_ne!(sanitized, inline);
 
         let persisted = persist_tool_result_for_record_with_authority(
             Some("reviewer-a"),
@@ -1265,13 +1738,26 @@ mod tests {
             Some("run-io"),
             "call-io",
             "agent",
-            sanitized,
-            "bounded preview".to_string(),
+            &sanitized,
+            inline.clone(),
         )
         .expect("ordinary IO degradation must preserve the original tool outcome");
 
         assert_eq!(persisted.content, sanitized);
         assert!(persisted.artifact.is_none());
+        let delivery: Value = serde_json::from_str(&model_tool_result_for_followup(
+            astra_tools::ModelResultPresentation::Generic,
+            inline,
+            &persisted,
+        ))
+        .unwrap();
+        assert_eq!(delivery["result_delivery_complete"], false);
+        assert_eq!(delivery["error"]["code"], "result_delivery_unavailable");
+        assert!(
+            ctx.fanout_admission
+                .retained_direct_child_result("child")
+                .is_some()
+        );
     }
 
     #[test]
@@ -1532,6 +2018,38 @@ mod tests {
     }
 
     #[test]
+    fn work_establishment_receipt_is_typed_and_requires_completed_defer_semantics() {
+        use astra_services::session_journal::RuntimeWorkEstablishmentReceipt as Receipt;
+
+        assert_eq!(
+            work_establishment_receipt("start_work", r#"{"status":"started"}"#),
+            Some(Receipt::Started)
+        );
+        assert_eq!(
+            work_establishment_receipt("start_work", r#"{"status":"continued"}"#),
+            Some(Receipt::Continued)
+        );
+        assert_eq!(
+            work_establishment_receipt(
+                "start_work",
+                r#"{"status":"deferred","operation_id":"op-1","operation_state":"cancelled","assignment_created":false}"#
+            ),
+            Some(Receipt::Deferred {
+                operation_id: "op-1".to_string(),
+            })
+        );
+        for incomplete in [
+            r#"{"status":"deferred","operation_id":"op-1","operation_state":"running","assignment_created":false}"#,
+            r#"{"status":"deferred","operation_id":"op-1","operation_state":"cancelled","assignment_created":true}"#,
+            r#"{"status":"deferred","operation_state":"cancelled","assignment_created":false}"#,
+        ] {
+            assert!(work_establishment_receipt("start_work", incomplete).is_none());
+        }
+        assert!(work_establishment_receipt("read_file", r#"{"status":"started"}"#).is_none());
+        assert!(work_establishment_receipt("start_work", "not json").is_none());
+    }
+
+    #[test]
     fn lossy_model_bound_persists_evidence_below_large_result_threshold() {
         let temp = tempfile::tempdir().expect("tempdir");
         let _guard = JournalDirGuard::new(temp.path());
@@ -1675,7 +2193,17 @@ mod tests {
         assert_eq!(model_result, inline);
         let projected: serde_json::Value = serde_json::from_str(&model_result).unwrap();
         assert_eq!(projected["schema"], "astra-introspect-model-projection-v1");
-        assert_eq!(projected["summary"], report.summary);
+        let summary_shortened = report.summary.chars().count() > 360;
+        let expected_summary = if summary_shortened {
+            format!("{}…", report.summary.chars().take(360).collect::<String>())
+        } else {
+            report.summary.clone()
+        };
+        assert_eq!(projected["summary"], expected_summary);
+        assert_eq!(
+            projected["projection_budget"]["summary_shortened"],
+            summary_shortened
+        );
         assert!(
             !model_result.contains("introspect(artifact="),
             "introspect should use typed facet requests rather than recursively paging its own snapshot"
@@ -1735,6 +2263,82 @@ mod tests {
             native_recovery.len() < window.len(),
             "native recovery must retain the generic model boundary"
         );
+    }
+
+    #[test]
+    fn models_catalog_page_survives_recording_and_followup_without_artifact_substitution() {
+        use astra_services::models::{ModelAccessKind, ModelExecutionPlacement, ModelListItem};
+        use astra_turn_core::model_catalog::{ModelCatalogRequest, catalog_page};
+        let items = (0..20)
+            .map(|i| ModelListItem {
+                thinking_protocol: None,
+                offering_id: format!("offering-{i:02}"),
+                name: format!("model-{i:02}"),
+                provider: "openai".into(),
+                access_id: "access".into(),
+                access_kind: ModelAccessKind::CloudByok,
+                access_label: "Personal".repeat(40),
+                execution_placement: ModelExecutionPlacement::Server,
+                description: None,
+                is_active: true,
+                context_window: 32768,
+                max_completion_tokens: None,
+                architecture: None,
+                thinking_capability: None,
+                pricing: None,
+            })
+            .collect();
+        let content = catalog_page(items, &ModelCatalogRequest::default(), "user")
+            .unwrap()
+            .to_json();
+        assert!(
+            content.len() > astra_turn_core::tool_result_sanitize::MAX_TOOL_RESULT_CHARS,
+            "exercise the actual generic artifact replacement boundary"
+        );
+        let produced =
+            astra_tools::ToolResult::text(content.clone()).with_source_bounded_model_projection();
+        let presentation = astra_tools::model_result_presentation(produced.metadata.as_ref());
+        assert!(model_catalog_presentation_is_intact(
+            &content,
+            &content,
+            false,
+            false,
+            produced.metadata.as_ref(),
+        ));
+        assert!(!model_catalog_presentation_is_intact(
+            &content,
+            &content.replace("offering-00", "redacted"),
+            false,
+            false,
+            produced.metadata.as_ref(),
+        ));
+        let sanitized = tool_result_content_for_model_unbounded("model_catalog", &produced.output);
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = format!("models-projection-{}", uuid::Uuid::new_v4());
+        let journal = persist_tool_result_for_record_with_authority(
+            Some("owner"),
+            Some(&session_id),
+            Some("run-models"),
+            "call-models",
+            "model_catalog",
+            &sanitized,
+            truncate_tool_result_for_model("model_catalog", &sanitized),
+        )
+        .unwrap();
+        assert!(
+            journal.artifact.is_some(),
+            "exercise generic lossy persistence boundary"
+        );
+        let inline =
+            model_projection_before_artifact_replacement("model_catalog", &sanitized, presentation);
+        let delivered = model_tool_result_for_followup(presentation, inline, &journal);
+        let before: Value = serde_json::from_str(&content).unwrap();
+        let after: Value = serde_json::from_str(&delivered).unwrap();
+        assert_eq!(after, before);
+        assert_eq!(after["items"].as_array().unwrap().len(), 16);
+        assert!(after["next_cursor"].is_string());
+        assert!(!delivered.contains("<persisted-output>"));
     }
 
     #[test]

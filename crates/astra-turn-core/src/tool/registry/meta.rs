@@ -286,8 +286,24 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         schema_tokens: 25,
     },
     ToolMeta {
+        name: "model_catalog",
+        description: "Compare the authenticated user's active Chat models, capabilities and prices; an explicit user-named model is resolved by runtime, so do not call this merely to spawn it",
+        triggers: &[
+            "models",
+            "model catalog",
+            "available models",
+            "模型列表",
+            "可用模型",
+        ],
+        intents: &[IntentType::Introspect],
+        scope: Scope::Local,
+        requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
+        schema_tokens: 24,
+    },
+    ToolMeta {
         name: "introspect",
-        description: "Query own runtime state: pressure, cache, tool health, alerts",
+        description: "Read runtime state or server Explain snapshots: explain={target:previous} excludes the current root; target=run selects run_id. Returns a bounded window and fixed handle for pagination.",
         triggers: &[
             "introspect",
             "self-check",
@@ -746,6 +762,16 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         schema_tokens: 30,
     },
     ToolMeta {
+        name: "discover_skills",
+        description: "Search the current skill catalog for matching workflows.",
+        triggers: &["skill", "workflow", "discover", "技能"],
+        intents: &[IntentType::CodeRead],
+        scope: Scope::Local,
+        requires: &[Capability::SkillsCatalog],
+        binding_validation: RuntimeBindingValidation::None,
+        schema_tokens: 30,
+    },
+    ToolMeta {
         name: "enter_plan_mode",
         description: "Switch the runtime into plan-authoring mode. Server-owned state machine.",
         triggers: &["plan", "enter plan mode"],
@@ -998,6 +1024,7 @@ mod tests {
             ("rollback_database_snapshots", Capability::Database),
             ("lsp", Capability::LSPServer),
             ("skill", Capability::SkillsCatalog),
+            ("discover_skills", Capability::SkillsCatalog),
             ("enter_plan_mode", Capability::PlanLifecycle),
             ("exit_plan_mode", Capability::PlanLifecycle),
         ];

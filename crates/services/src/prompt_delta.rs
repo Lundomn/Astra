@@ -1,3 +1,4 @@
+use crate::CancellationSafePoolConnection;
 use crate::db_row::RowExt as PromptDeltaDbRow;
 use astra_core::{
     SharedPool, matrixone_null_shape_comment, matrixone_statement_with_null_shape,
@@ -6,6 +7,7 @@ use astra_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use sqlx::Acquire;
 
 pub(crate) const PROMPT_DIAGNOSTIC_RETENTION_DAYS: u32 = 90;
 const EXPIRED_PROMPT_REQUESTS_SQL: &str =
@@ -63,9 +65,9 @@ pub(crate) struct PromptDiagnosticExpiry {
     pub prompt_deltas: u64,
 }
 
-fn push_prompt_request_key_predicates<'a>(
-    query: &mut sqlx::QueryBuilder<'a, sqlx::MySql>,
-    request_keys: &'a [(String, String, String)],
+fn push_prompt_request_key_predicates(
+    query: &mut sqlx::QueryBuilder<sqlx::MySql>,
+    request_keys: &[(String, String, String)],
 ) {
     for (index, (user_id, session_id, request_id)) in request_keys.iter().enumerate() {
         if index > 0 {
@@ -84,7 +86,7 @@ fn push_prompt_request_key_predicates<'a>(
 
 fn delete_prompt_deltas_query(
     request_keys: &[(String, String, String)],
-) -> sqlx::QueryBuilder<'_, sqlx::MySql> {
+) -> sqlx::QueryBuilder<sqlx::MySql> {
     let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new("DELETE FROM prompt_deltas WHERE ");
     push_prompt_request_key_predicates(&mut query, request_keys);
     query.push(" ORDER BY user_id ASC, session_id ASC, request_id ASC, delta_seq ASC");
@@ -93,7 +95,7 @@ fn delete_prompt_deltas_query(
 
 fn delete_prompt_requests_query(
     request_keys: &[(String, String, String)],
-) -> sqlx::QueryBuilder<'_, sqlx::MySql> {
+) -> sqlx::QueryBuilder<sqlx::MySql> {
     let mut query =
         sqlx::QueryBuilder::<sqlx::MySql>::new("DELETE FROM prompt_request_records WHERE ");
     push_prompt_request_key_predicates(&mut query, request_keys);
@@ -214,11 +216,17 @@ mod retention_tests {
         )];
         let delete_deltas = delete_prompt_deltas_query(&keys);
         let delete_requests = delete_prompt_requests_query(&keys);
-        assert!(delete_deltas.sql().starts_with("DELETE FROM prompt_deltas"));
-        assert!(delete_deltas.sql().contains("delta_seq ASC"));
+        assert!(
+            delete_deltas
+                .sql()
+                .as_str()
+                .starts_with("DELETE FROM prompt_deltas")
+        );
+        assert!(delete_deltas.sql().as_str().contains("delta_seq ASC"));
         assert!(
             delete_requests
                 .sql()
+                .as_str()
                 .starts_with("DELETE FROM prompt_request_records")
         );
     }
@@ -305,10 +313,14 @@ pub struct PromptRequestObservability {
     pub delta_counts: PromptDeltaCounts,
 }
 
-async fn rollback_prompt_delta_tx(tx: sqlx::Transaction<'_, sqlx::MySql>, context: &'static str) {
-    if let Err(error) = tx.rollback().await {
+async fn rollback_prompt_delta_tx(
+    tx: sqlx::Transaction<'_, sqlx::MySql>,
+    context: &'static str,
+) -> Result<(), String> {
+    tx.rollback().await.map_err(|error| {
         tracing::warn!(target: "astra_services::prompt_delta", context, %error, "prompt delta transaction rollback failed");
-    }
+        format!("{context}: transaction rollback failed: {error}")
+    })
 }
 
 fn prompt_delta_row_string(row: &impl PromptDeltaDbRow, column: &str) -> Result<String, String> {
@@ -484,6 +496,8 @@ fn decode_stored_prompt_delta(
 pub struct PromptRequestPlanInput<'a> {
     pub user_id: &'a str,
     pub session_id: &'a str,
+    /// None denotes a session-scoped diagnostic without an execution run.
+    pub run_id: Option<&'a str>,
     pub turn: u32,
     pub round: u32,
     pub attempt: u32,
@@ -494,6 +508,9 @@ pub struct PromptRequestPlanInput<'a> {
 }
 
 pub fn plan_prompt_request(input: PromptRequestPlanInput<'_>) -> Result<PromptRequestPlan, String> {
+    if input.run_id.is_some_and(|run_id| run_id.trim().is_empty()) {
+        return Err("prompt request run identity must not be blank".into());
+    }
     let mut chunks = Vec::with_capacity(input.messages.len() + input.tools.len());
     for (index, message) in input.messages.iter().enumerate() {
         let logical_key = format!(
@@ -536,6 +553,7 @@ pub fn plan_prompt_request(input: PromptRequestPlanInput<'_>) -> Result<PromptRe
         request_id: prompt_request_id(
             input.user_id,
             input.session_id,
+            input.run_id,
             input.turn,
             input.round,
             input.attempt,
@@ -555,14 +573,41 @@ pub async fn persist_prompt_request(
     input: &PromptRequestPersistInput,
     plan: &PromptRequestPlan,
 ) -> Result<PromptRequestPersistResult, String> {
+    if input
+        .run_id
+        .as_deref()
+        .is_some_and(|run_id| run_id.trim().is_empty())
+        || plan.request_id
+            != prompt_request_id(
+                &input.user_id,
+                &input.session_id,
+                input.run_id.as_deref(),
+                input.turn,
+                input.round,
+                input.attempt,
+                &input.source,
+            )
+    {
+        return Err("prompt request plan does not match persistence identity".into());
+    }
     let db = pool.get();
-    let mut tx = db.begin().await.map_err(|error| error.to_string())?;
+    let mut connection = CancellationSafePoolConnection::acquire(db)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut tx = connection
+        .connection_mut()
+        .begin()
+        .await
+        .map_err(|error| error.to_string())?;
     crate::storage::lock_agent_session_write_fence(&mut tx, &input.session_id, &input.user_id)
         .await
         .map_err(|error| format!("lock prompt diagnostic session fence: {error}"))?;
     ensure_session_owner(&mut tx, &input.session_id, &input.user_id).await?;
     if let Some(existing) = load_existing_request(&mut tx, input, &plan.request_id).await? {
-        return existing_prompt_request_or_conflict(input, plan, existing);
+        let persisted = existing_prompt_request_or_conflict(input, plan, existing)?;
+        rollback_prompt_delta_tx(tx, "persist_prompt_request replay").await?;
+        connection.release();
+        return Ok(persisted);
     }
 
     let previous_request = load_previous_request(&mut tx, input).await?;
@@ -734,7 +779,7 @@ pub async fn persist_prompt_request(
                 previous_request_id.is_some(),
             ],
         );
-        sqlx::query(&request_insert_sql)
+        sqlx::query(request_insert_sql)
         .bind(&plan.request_id)
         .bind(&input.session_id)
         .bind(&input.user_id)
@@ -763,17 +808,22 @@ pub async fn persist_prompt_request(
     .await;
 
     if let Err(error) = write_result {
-        rollback_prompt_delta_tx(tx, "persist_prompt_request write failure").await;
-        let mut recovery = db.acquire().await.map_err(|source| source.to_string())?;
-        if let Some(existing) =
-            load_existing_request(&mut recovery, input, &plan.request_id).await?
+        if let Err(rollback_error) =
+            rollback_prompt_delta_tx(tx, "persist_prompt_request write failure").await
         {
+            return Err(format!("{error}; {rollback_error}"));
+        }
+        let recovered =
+            load_existing_request(connection.connection_mut(), input, &plan.request_id).await?;
+        connection.release();
+        if let Some(existing) = recovered {
             return existing_prompt_request_or_conflict(input, plan, existing);
         }
         return Err(error);
     }
 
     tx.commit().await.map_err(|error| error.to_string())?;
+    connection.release();
     if astra_core::history_work::instrumentation_enabled() {
         astra_core::history_work::record_rows(
             astra_core::history_work::HistoryWorkSite::PromptDeltaRows,
@@ -864,7 +914,7 @@ pub async fn count_prompt_requests_for_session(
 
 async fn count_prompt_requests(
     pool: &SharedPool,
-    sql: &str,
+    sql: &'static str,
     user_id: &str,
     bind_value: &str,
 ) -> Result<u32, String> {
@@ -879,7 +929,7 @@ async fn count_prompt_requests(
 
 async fn load_latest_prompt_observability(
     pool: &SharedPool,
-    sql: &str,
+    sql: &'static str,
     user_id: &str,
     bind_value: &str,
 ) -> Result<Option<PromptRequestObservability>, String> {
@@ -1390,13 +1440,24 @@ fn hash_prompt_plan(chunks: &[PromptChunkPlan], max_output_tokens: Option<u32>) 
 fn prompt_request_id(
     user_id: &str,
     session_id: &str,
+    run_id: Option<&str>,
     turn: u32,
     round: u32,
     attempt: u32,
     source: &str,
 ) -> String {
-    let digest =
-        sha256_hex(format!("{user_id}|{session_id}|{turn}|{round}|{attempt}|{source}").as_bytes());
+    let identity = serde_json::to_vec(&(
+        "astra.prompt-request",
+        user_id,
+        session_id,
+        run_id,
+        turn,
+        round,
+        attempt,
+        source,
+    ))
+    .expect("prompt request identity contains only JSON primitives");
+    let digest = sha256_hex(&identity);
     format!("promptreq-{}", &digest[..24])
 }
 
@@ -1550,6 +1611,7 @@ mod tests {
         let plan_a = plan_prompt_request(PromptRequestPlanInput {
             user_id: "user-1",
             session_id: "session-1",
+            run_id: None,
             turn: 1,
             round: 0,
             attempt: 0,
@@ -1563,6 +1625,7 @@ mod tests {
         let plan_b = plan_prompt_request(PromptRequestPlanInput {
             user_id: "user-1",
             session_id: "session-1",
+            run_id: None,
             turn: 1,
             round: 0,
             attempt: 0,
@@ -1583,6 +1646,7 @@ mod tests {
             plan_prompt_request(PromptRequestPlanInput {
                 user_id: "owner-a",
                 session_id: "session-a",
+                run_id: None,
                 turn: 1,
                 round: 0,
                 attempt: 0,
@@ -1610,6 +1674,7 @@ mod tests {
         let first = plan_prompt_request(PromptRequestPlanInput {
             user_id: "owner-a",
             session_id: "long-session",
+            run_id: None,
             turn: 1_024,
             round: 0,
             attempt: 0,
@@ -1623,6 +1688,7 @@ mod tests {
         let second = plan_prompt_request(PromptRequestPlanInput {
             user_id: "owner-a",
             session_id: "long-session",
+            run_id: None,
             turn: 1_025,
             round: 0,
             attempt: 0,
@@ -1665,6 +1731,7 @@ mod tests {
         let plan = plan_prompt_request(PromptRequestPlanInput {
             user_id: "owner",
             session_id: "session",
+            run_id: None,
             turn: 1,
             round: 0,
             attempt: 0,
@@ -1818,6 +1885,7 @@ mod tests {
         let plan = plan_prompt_request(PromptRequestPlanInput {
             user_id: "user-1",
             session_id: "session-1",
+            run_id: None,
             turn: 2,
             round: 1,
             attempt: 0,
@@ -1842,6 +1910,7 @@ mod tests {
         let owner_a = plan_prompt_request(PromptRequestPlanInput {
             user_id: "owner-a",
             session_id: "shared-session",
+            run_id: None,
             turn: 2,
             round: 1,
             attempt: 0,
@@ -1854,6 +1923,7 @@ mod tests {
         let owner_b = plan_prompt_request(PromptRequestPlanInput {
             user_id: "owner-b",
             session_id: "shared-session",
+            run_id: None,
             turn: 2,
             round: 1,
             attempt: 0,
@@ -1875,11 +1945,42 @@ mod tests {
     }
 
     #[test]
+    fn prompt_plan_separates_runs_without_changing_content_hash() {
+        let messages = [json!({"role": "user", "content": "shared content"})];
+        let plan = |run_id| {
+            plan_prompt_request(PromptRequestPlanInput {
+                user_id: "owner",
+                session_id: "session",
+                run_id,
+                turn: 1,
+                round: 0,
+                attempt: 0,
+                source: "server_loop_host",
+                messages: &messages,
+                tools: &[],
+                max_output_tokens: None,
+            })
+        };
+        let parent = plan(Some("parent")).unwrap();
+        for run_id in [Some("child"), Some("sibling"), None] {
+            let other = plan(run_id).unwrap();
+            assert_ne!(parent.request_id, other.request_id);
+            assert_eq!(parent.request_hash, other.request_hash);
+            assert_eq!(other.request_id, plan(run_id).unwrap().request_id);
+        }
+        assert_eq!(parent.request_id, plan(Some("parent")).unwrap().request_id);
+        for run_id in ["", " ", "\t"] {
+            assert!(plan(Some(run_id)).is_err());
+        }
+    }
+
+    #[test]
     fn existing_prompt_request_accepts_only_matching_hash() {
         let messages = [json!({"role": "user", "content": "same prompt"})];
         let plan = plan_prompt_request(PromptRequestPlanInput {
             user_id: "owner-a",
             session_id: "session-a",
+            run_id: None,
             turn: 2,
             round: 1,
             attempt: 0,

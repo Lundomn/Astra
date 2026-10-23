@@ -22,6 +22,9 @@ import sys
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+import urllib.parse
+
+import benchmark_model_seed
 
 
 SCHEMA_VERSION = 2
@@ -49,11 +52,9 @@ BOOT_METADATA_TABLES = frozenset(
         "astra_schema_table_contracts",
         "infra_llm_models",
         "maintenance_sweep_cursors",
-        "preview_template_registry",
-        "raw_ref_scheme_registry",
-        # The distributed weighted-admission coordinator owns one durable
-        # scope gate. It is created during core-schema bootstrap and is not
-        # user/session/work state; its exact scope is validated below.
+        # The distributed weighted-admission coordinator owns partition gates.
+        # They are created during core-schema bootstrap and are not
+        # user/session/work state; their exact source scopes are validated below.
         "session_weighted_admission_gates",
         "sweeper_leases",
         # A fresh scored database is seeded through the production admin API.
@@ -158,7 +159,6 @@ def _mysql_rows(sql: str, database: str | None = None) -> list[list[str]]:
         f"-h{host}",
         f"-P{port}",
         f"-u{user}",
-        "--skip-ssl",
         "--batch",
         "--skip-column-names",
     ]
@@ -279,6 +279,7 @@ def _validate_closed_schema_counts(
     counts: dict[str, int],
     *,
     optional_absent: set[str] | frozenset[str] = frozenset(),
+    repo: Path | None = None,
 ) -> None:
     _validate_closed_schema_presence(canonical, actual, optional_absent)
     if set(counts) != actual:
@@ -304,7 +305,11 @@ def _validate_closed_schema_counts(
         "astra_schema_contracts": 1,
         "infra_llm_models": 1,
         "maintenance_sweep_cursors": 1,
-        "session_weighted_admission_gates": 1,
+        "session_weighted_admission_gates": len(
+            _distributed_admission_scopes(
+                Path(__file__).resolve().parents[2] if repo is None else repo
+            )
+        ),
         "sweeper_leases": 1,
     }
     for table, expected in expected_boot_counts.items():
@@ -367,128 +372,38 @@ def _core_schema_contract_version(repo: Path) -> str:
     return match.group(1)
 
 
-def _distributed_admission_scope(repo: Path) -> str:
+def _distributed_admission_scopes(repo: Path) -> list[str]:
     source = (
         repo / "crates" / "services" / "src" / "weighted_admission.rs"
     ).read_text(encoding="utf-8")
-    match = re.search(
-        r'pub\(crate\) const DISTRIBUTED_ADMISSION_SCOPE: &str = "([^"]+)";',
+    partitions = re.findall(
+        r'^pub\(crate\) const DISTRIBUTED_ADMISSION_PARTITIONS: usize = ([1-9][0-9]*);$',
         source,
+        re.MULTILINE,
     )
-    if match is None:
+    # Recognize only the source-owned literal formatter. Unsupported changes
+    # must fail closed rather than accept a guessed scope or arbitrary rows.
+    formats = re.findall(
+        r'^pub\(crate\) fn distributed_admission_scope\(partition: usize\) -> String \{\s*'
+        r'format!\("([a-zA-Z0-9_]+)\{partition:02\}([a-zA-Z0-9_]*)"\)\s*^\}',
+        source,
+        re.MULTILINE,
+    )
+    if len(partitions) != 1 or len(formats) != 1:
         raise ContractError(
-            "cannot resolve the source-owned distributed admission scope"
+            "cannot resolve the source-owned distributed admission scopes"
         )
-    return match.group(1)
+    prefix, suffix = formats[0]
+    return sorted(
+        f"{prefix}{partition:02}{suffix}" for partition in range(int(partitions[0]))
+    )
 
 
-def _canonical_baseline_registry_rows(repo: Path) -> dict[str, list[list[str]]]:
-    """Derive exact startup seeds from the same checked-in Rust constants.
-
-    Timestamps are deliberately excluded.  Every semantic column, including
-    the JSON strings written by startup, is compared byte-for-byte.
-    """
-    storage = (repo / "crates" / "services" / "src" / "storage.rs").read_text(
-        encoding="utf-8"
-    )
-    context = (repo / "crates" / "services" / "src" / "context_manifest.rs").read_text(
-        encoding="utf-8"
-    )
-    raw_block = re.search(
-        r"for \(scheme, resolver, backing, access_check, example\) in \[(.*?)\n\s*\] \{",
-        storage,
-        re.DOTALL,
-    )
-    if raw_block is None:
-        raise ContractError("cannot resolve raw-ref startup seed inventory")
-    raw_rows = [
-        [*values, "1"]
-        for values in re.findall(
-            r'\(\s*"([^"]+)",\s*"([^"]+)",\s*"([^"]+)",\s*"([^"]+)",\s*"([^"]+)"\s*,?\s*\)',
-            raw_block.group(1),
-            re.DOTALL,
+def _validate_admission_gates(rows: list[list[str]], repo: Path) -> None:
+    if rows != [[scope] for scope in _distributed_admission_scopes(repo)]:
+        raise ContractError(
+            "session_weighted_admission_gates does not match the exact source scopes"
         )
-    ]
-    if len(raw_rows) != 9 or len({row[0] for row in raw_rows}) != len(raw_rows):
-        raise ContractError("raw-ref startup seed inventory is not canonical")
-
-    template_block = re.search(
-        r"pub const BASELINE_PREVIEW_TEMPLATES:.*?= &\[(.*?)\n\];",
-        context,
-        re.DOTALL,
-    )
-    weights_block = re.search(
-        r"pub fn preview_template_fts_field_weights.*?match normalize_version \{(.*?)\n\s*\}\n\}\n\n#\[",
-        context,
-        re.DOTALL,
-    )
-    if template_block is None or weights_block is None:
-        raise ContractError("cannot resolve preview-template startup seed inventory")
-    templates = re.findall(
-        r'\("([^"]+)",\s*([0-9]+),\s*"([^"]+)"\)',
-        template_block.group(1),
-    )
-    weights = dict(
-        re.findall(
-            r'"([^"]+)"\s*=>\s*(?:\{\s*)?r#"([^\n]+)"#',
-            weights_block.group(1),
-        )
-    )
-    default_match = re.search(r'_\s*=>\s*r#"([^\n]+)"#', weights_block.group(1))
-    if not templates or default_match is None:
-        raise ContractError("preview-template startup seed inventory is empty")
-    default_weights = default_match.group(1)
-    preview_rows = [
-        [
-            tool_name,
-            "v1",
-            "active",
-            max_preview_bytes,
-            "tool_output_preview",
-            "[]",
-            weights.get(normalize_version, default_weights),
-            normalize_version,
-            "{}",
-        ]
-        for tool_name, max_preview_bytes, normalize_version in templates
-    ]
-    if len({row[0] for row in preview_rows}) != len(preview_rows):
-        raise ContractError("preview-template startup seed inventory has duplicates")
-    return {
-        "raw_ref_scheme_registry": sorted(raw_rows),
-        "preview_template_registry": sorted(preview_rows),
-    }
-
-
-def _validate_baseline_registry_rows(database: str, repo: Path) -> dict[str, object]:
-    expected = _canonical_baseline_registry_rows(repo)
-    observed = {
-        "raw_ref_scheme_registry": _mysql_rows(
-            "SELECT scheme, resolver_name, backing_store, access_check, "
-            "canonical_example, CAST(is_active AS CHAR) "
-            "FROM raw_ref_scheme_registry ORDER BY scheme",
-            database,
-        ),
-        "preview_template_registry": _mysql_rows(
-            "SELECT tool_name, version, status, CAST(max_preview_bytes AS CHAR), "
-            "default_chunk_type, first_class_columns_json, fts_field_weights_json, "
-            "normalize_version, schema_json "
-            "FROM preview_template_registry ORDER BY tool_name, version",
-            database,
-        ),
-    }
-    result: dict[str, object] = {}
-    for table in sorted(expected):
-        if observed[table] != expected[table]:
-            raise ContractError(
-                f"bootstrap table {table} differs from its exact source-owned baseline"
-            )
-        serialized = json.dumps(
-            observed[table], sort_keys=True, separators=(",", ":")
-        ).encode()
-        result[f"{table}_count"] = len(observed[table])
-        result[f"{table}_sha256"] = hashlib.sha256(serialized).hexdigest()
-    return result
 
 
 def _canonical_runtime_system_baseline(repo: Path) -> dict[str, object]:
@@ -501,7 +416,9 @@ def _canonical_runtime_system_baseline(repo: Path) -> dict[str, object]:
     cursor_source = sources[source_paths[1]]
     lease = re.search(
         r"pub\(crate\) fn spawn_runtime_sweepers\(.*?"
-        r'lease_name:\s*"([^"]+)"\.to_string\(\),',
+        r"SweeperLease::new\(\s*"
+        r"shared_pool\.clone\(\),\s*pod_id,\s*"
+        r'"([^"]+)"\.to_string\(\),',
         sweeper_source,
         re.DOTALL,
     )
@@ -685,10 +602,7 @@ def _validate_boot_metadata(database: str, repo: Path, counts: dict[str, int]) -
         "SELECT scope_name FROM session_weighted_admission_gates ORDER BY scope_name",
         database,
     )
-    if admission_gates != [[_distributed_admission_scope(repo)]]:
-        raise ContractError(
-            "session_weighted_admission_gates does not match the exact source scope"
-        )
+    _validate_admission_gates(admission_gates, repo)
     digest = hashlib.sha256(
         json.dumps(table_contracts, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -697,7 +611,6 @@ def _validate_boot_metadata(database: str, repo: Path, counts: dict[str, int]) -
         "core_contract_version": version,
         "table_contract_count": len(table_contracts),
         "table_contract_sha256": digest,
-        **_validate_baseline_registry_rows(database, repo),
         **_validate_runtime_system_baseline(database, repo),
     }
 
@@ -724,7 +637,7 @@ def _runtime_state(database: str, repo: Path | None = None) -> dict[str, object]
             "database count inventory returned a non-integer"
         ) from error
     _validate_closed_schema_counts(
-        canonical, actual, counts, optional_absent=conditional_tables
+        canonical, actual, counts, optional_absent=conditional_tables, repo=repo
     )
     boot_metadata = _validate_boot_metadata(database, repo, counts)
     return {
@@ -745,17 +658,42 @@ def _model_state(database: str) -> dict[str, str | int | None]:
         raise ContractError(
             "ASTRA_HARNESS_MODEL_THINKING must be exactly 'none' or 'high'"
         )
-    rows = _mysql_rows(
-        "SELECT model_name, is_active, COALESCE(thinking_capability,''), "
-        "COALESCE(thinking_probe_error,''), CAST(updated_at AS CHAR) "
-        "FROM infra_llm_models",
-        database,
-    )
-    if len(rows) != 1 or len(rows[0]) != 5:
+    query = "SELECT model_id, model_name, is_active, CAST(updated_at AS CHAR) FROM infra_llm_models"
+    rows = _mysql_rows(query, database)
+    if len(rows) != 1 or len(rows[0]) != 4:
         raise ContractError(f"expected exactly one model offering, found {len(rows)}")
-    name, active, capability, probe_error, updated_at = rows[0]
+    model_id, name, active, updated_at = rows[0]
     if name != EXPECTED_MODEL or active != "1":
         raise ContractError("the exact selected model offering is not uniquely active")
+    api_url = _required_env("ASTRA_HARNESS_CONTROL_API_URL").rstrip("/")
+    parsed = urllib.parse.urlsplit(api_url)
+    if (parsed.scheme != "http" or parsed.hostname != "127.0.0.1"
+        or parsed.username is not None or parsed.password is not None
+        or parsed.path or parsed.query or parsed.fragment):
+        raise ContractError("model state requires the owned loopback Astra API origin")
+    try:
+        model = benchmark_model_seed._request_json(
+            benchmark_model_seed.owned_api_opener(),
+            api_url + "/models/" + urllib.parse.quote(name, safe=""),
+            _required_env("ASTRA_ACCESS_TOKEN"), None, 200, "selected model state",
+            method="GET", timeout=8,
+        )
+    except benchmark_model_seed.SeedError as error:
+        raise ContractError(str(error)) from None
+    if (model.get("model_id") != model_id or model.get("name") != name
+        or model.get("is_active") is not True):
+        raise ContractError("the owned API does not match the exact database offering")
+    if _mysql_rows(query, database) != rows:
+        raise ContractError("selected model changed while reading its bound observation")
+    capability = model.get("thinking_capability")
+    if capability not in (None, "both", "effort_only", "native_only", "none"):
+        raise ContractError("the selected offering returned an invalid thinking capability")
+    probe = model.get("thinking_probe")
+    if probe is not None and not isinstance(probe, dict):
+        raise ContractError("the selected offering returned an invalid thinking observation")
+    probe_error = probe.get("error") if probe is not None else None
+    if probe_error is not None and not isinstance(probe_error, str):
+        raise ContractError("the selected offering returned an invalid thinking probe error")
     if (
         EXPECTED_THINKING_MODE == "high"
         and capability not in {"both", "effort_only"}
@@ -766,7 +704,7 @@ def _model_state(database: str) -> dict[str, str | int | None]:
     return {
         "model_name": name,
         "is_active": 1,
-        "thinking_capability": capability,
+        "thinking_capability": capability or "",
         "thinking_probe_error": probe_error or None,
         "requested_thinking_mode": EXPECTED_THINKING_MODE,
         "checked_updated_at": updated_at,

@@ -396,19 +396,23 @@ pub fn evaluate_permission(
     args: &Value,
     ctx: &PermissionSyncContext,
 ) -> DecisionEnvelope {
-    evaluate_permission_with_provider_policy(tool_name, args, ctx, None)
+    evaluate_permission_with_provider_policy(tool_name, args, ctx, None, None)
 }
 
 /// Evaluate permission using the exact provider policy that was selected for
 /// this invocation. Static tools pass `None` and retain their args-aware
 /// registry behavior; dynamic tools must pass the descriptor-keyed policy used
-/// by batching and execution.
+/// by batching and execution. `source_discovery_tool` is supplied only for an
+/// exact materialized selection whose descriptor is indexed by the runtime;
+/// it grants the selection the discovery tool's allowlist scope, not its other
+/// permission rules or approval policy.
 #[must_use]
 pub fn evaluate_permission_with_provider_policy(
     tool_name: &str,
     args: &Value,
     ctx: &PermissionSyncContext,
     provider_policy: Option<&crate::provider_resolution::ResolvedInvocationPolicy>,
+    source_discovery_tool: Option<&str>,
 ) -> DecisionEnvelope {
     let mut trace = Vec::with_capacity(EVALUATION_ORDER.len());
     let mut risk_tags = risk_tags_for_request(tool_name, args);
@@ -475,6 +479,51 @@ pub fn evaluate_permission_with_provider_policy(
         EvaluationStep::DenyRules,
         "no deny rule matched",
     );
+
+    let provably_read_only = provider_policy.map_or_else(
+        || is_read_only_tool_with_args(tool_name, Some(args)),
+        |policy| policy.is_read_only(),
+    );
+    let collaborator_stage = provider_policy.is_some_and(|policy| policy.is_collaborator_stage());
+    let inherited_collaborator_stage = ctx.inherited.read_only_execution && collaborator_stage;
+    // Work lifecycle transitions are control-plane capabilities. Their
+    // durable state changes are validated by the Work executor, so they must
+    // remain usable in a read-only child even though they are not ordinary
+    // read tools. Keep this classification in the canonical runtime tool
+    // contract instead of extending a permission-name allowlist here.
+    let contract_read_only = provider_policy.is_none()
+        && astra_runtime_env::builtin_tool_is_read_only_execution_capability(tool_name);
+    let coordination_or_consultation = (provider_policy.is_none()
+        && (is_internal_orchestration_control(tool_name, args)
+            || crate::tool::categories::classify(tool_name, Some(args)).category
+                == crate::tool::categories::ToolCategory::Consultative
+            || contract_read_only))
+        || collaborator_stage;
+    if ctx.inherited.read_only_execution
+        && (tool_name == "bash"
+            || tool_name == "lsp"
+            || (tool_name != "bash" && !provably_read_only && !coordination_or_consultation))
+    {
+        let reason = "read-only agent cannot execute a shell, LSP, or non-read-only tool";
+        let decision = HardDecision::Deny {
+            reason: reason.to_string(),
+        };
+        push_matched(
+            &mut trace,
+            EvaluationStep::SafetyMiddleware,
+            &decision,
+            reason,
+        );
+        return envelope(
+            decision,
+            DecisionSource::SafetyMiddleware {
+                reason: reason.to_string(),
+            },
+            trace,
+            will_save,
+            risk_tags,
+        );
+    }
 
     match evaluate_tool_safety_request(tool_name, args) {
         SafetyMiddlewareDecision::Allow => {
@@ -738,7 +787,11 @@ pub fn evaluate_permission_with_provider_policy(
     );
 
     if ctx.inherited.allowed_tools.is_some() {
-        if !ctx.inherited.is_tool_allowed_by_allowlist(tool_name) {
+        if !ctx.inherited.is_tool_allowed_by_allowlist(tool_name)
+            && !(provider_policy.is_some()
+                && source_discovery_tool
+                    .is_some_and(|source| ctx.inherited.is_tool_allowed_by_allowlist(source)))
+        {
             let decision = HardDecision::Deny {
                 reason: format!("Tool '{tool_name}' not in allowed tools list"),
             };
@@ -802,8 +855,8 @@ pub fn evaluate_permission_with_provider_policy(
         push_skipped(&mut trace, EvaluationStep::AskRules, "no ask rule matched");
     }
 
-    let provider_requires_approval =
-        provider_policy.is_some_and(|policy| policy.requires_approval());
+    let provider_requires_approval = provider_policy
+        .is_some_and(|policy| policy.requires_approval() && !inherited_collaborator_stage);
     let static_explicit_reason = if provider_policy.is_none() {
         explicit_approval_reason(tool_name, args)
     } else {
@@ -860,13 +913,19 @@ pub fn evaluate_permission_with_provider_policy(
         // This keeps admission and execution aligned: read-only invocations,
         // plan-control tools, and plan-internal authoring pass; external
         // implementation side effects are denied.
-        if !crate::plan_mode_policy::is_plan_mode_blocked_tool(tool_name, args) {
+        if collaborator_stage
+            || !crate::plan_mode_policy::is_plan_mode_blocked_tool(tool_name, args)
+        {
             let decision = HardDecision::Allow;
             push_matched(
                 &mut trace,
                 EvaluationStep::Mode,
                 &decision,
-                "allowed by plan-mode policy",
+                if collaborator_stage {
+                    "collaborator stage admitted; its adapter applies the plan-mode ceiling"
+                } else {
+                    "allowed by plan-mode policy"
+                },
             );
             return envelope(
                 decision,
@@ -1062,6 +1121,23 @@ pub fn evaluate_permission_with_provider_policy(
         EvaluationStep::AllowRules,
         "no allow rule matched",
     );
+
+    if inherited_collaborator_stage && ctx.mode() != PermissionMode::Deny {
+        let decision = HardDecision::Allow;
+        push_matched(
+            &mut trace,
+            EvaluationStep::Mode,
+            &decision,
+            "collaborator stage admitted by the read-only execution ceiling; workspace effects remain grant-bound",
+        );
+        return envelope(
+            decision,
+            DecisionSource::InternalOrchestration,
+            trace,
+            will_save,
+            risk_tags,
+        );
+    }
 
     if ctx.mode() != PermissionMode::Deny && is_internal_orchestration_control(tool_name, args) {
         let decision = HardDecision::Allow;
@@ -1548,9 +1624,13 @@ fn accept_edits_auto_allows(tool_name: &str, args: &Value) -> bool {
 
 fn is_internal_orchestration_control(tool_name: &str, args: &Value) -> bool {
     match tool_name {
+        "send_message" => true,
         "agent" => matches!(
             agent_action_from_args(args),
-            Ok(AgentAction::Spawn | AgentAction::GetResult | AgentAction::SendMessage)
+            Ok(AgentAction::Spawn
+                | AgentAction::GetResult
+                | AgentAction::Wait
+                | AgentAction::SendMessage)
         ),
         "agent_fanout" => matches!(
             agent_fanout_action_from_args(args),
@@ -2705,6 +2785,35 @@ mod tests {
     }
 
     #[test]
+    fn auto_mode_reads_workspace_bash_output_without_weakening_astra_state_guard() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let command = "jq -r '.items[]' /sandbox/.moi/astra-bash-outputs/one.stdout";
+        assert!(!crate::cloud::approval_policy::bash_command_is_read_only(
+            command
+        ));
+        let workspace_output =
+            evaluate_permission("bash", &serde_json::json!({"command": command}), &ctx);
+        assert!(
+            matches!(workspace_output.decision, HardDecision::Allow),
+            "ordinary workspace output should follow existing Auto mode: {workspace_output:?}"
+        );
+
+        let private_state = evaluate_permission(
+            "bash",
+            &serde_json::json!({
+                "command": "jq -r '.items[]' /sandbox/.moi/.astra/bash-outputs/one.stdout"
+            }),
+            &ctx,
+        );
+        assert!(
+            matches!(private_state.decision, HardDecision::NeedExternal { .. }),
+            "Astra private state must remain protected: {private_state:?}"
+        );
+    }
+
+    #[test]
     fn evaluate_reading_hidden_home_secret_requires_approval_in_auto_mode() {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,
@@ -3178,6 +3287,8 @@ mod tests {
         approval: crate::provider_resolution::ProviderApprovalBaseline,
     ) -> crate::provider_resolution::ResolvedInvocationPolicy {
         crate::provider_resolution::ResolvedInvocationPolicy {
+            runtime_requirements: None,
+            native_collaborator_protocol: None,
             descriptor: astra_turn_types::ResolvedToolDescriptorRef::new(
                 astra_turn_types::ToolIdentity::new(
                     astra_turn_types::ProviderBindingRef::new("binding").unwrap(),
@@ -3199,6 +3310,17 @@ mod tests {
         }
     }
 
+    fn collaborator_policy(
+        effect: astra_turn_types::ResolvedToolEffect,
+        parallelizable: bool,
+        approval: crate::provider_resolution::ProviderApprovalBaseline,
+    ) -> crate::provider_resolution::ResolvedInvocationPolicy {
+        let mut policy = provider_policy(effect, parallelizable, approval);
+        policy.native_collaborator_protocol =
+            Some(crate::provider_resolution::NativeCollaboratorProtocol::CodexAppServer);
+        policy
+    }
+
     #[test]
     fn provider_read_policy_drives_the_same_permission_short_circuit_as_batching() {
         let ctx = crate::permission::types::PermissionSyncContext::root(
@@ -3214,6 +3336,7 @@ mod tests {
             &serde_json::json!({}),
             &ctx,
             Some(&policy),
+            None,
         );
 
         assert_eq!(envelope.decision, HardDecision::Allow);
@@ -3251,6 +3374,7 @@ mod tests {
                 &serde_json::json!({}),
                 &ctx,
                 Some(&policy),
+                None,
             );
 
             assert!(matches!(
@@ -3289,10 +3413,77 @@ mod tests {
             &serde_json::json!({}),
             &ctx,
             Some(&policy),
+            None,
         );
 
         assert!(matches!(envelope.decision, HardDecision::Deny { .. }));
         assert!(matches!(envelope.source, DecisionSource::DenyRule { .. }));
+    }
+
+    #[test]
+    fn collaborator_stage_uses_the_child_ceiling_without_becoming_a_global_read_only_tool() {
+        let child = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::Prompt,
+                read_only_execution: true,
+                ..Default::default()
+            },
+        );
+        let collaborator = collaborator_policy(
+            astra_turn_types::ResolvedToolEffect::Mutating,
+            false,
+            crate::provider_resolution::ProviderApprovalBaseline::RequiresApproval,
+        );
+        let admitted = evaluate_permission_with_provider_policy(
+            "provider_stage_alias",
+            &serde_json::json!({"task":"inspect"}),
+            &child,
+            Some(&collaborator),
+            None,
+        );
+        assert_eq!(admitted.decision, HardDecision::Allow);
+        assert_eq!(admitted.source, DecisionSource::InternalOrchestration);
+
+        let ordinary_mutating = provider_policy(
+            astra_turn_types::ResolvedToolEffect::Mutating,
+            false,
+            crate::provider_resolution::ProviderApprovalBaseline::RequiresApproval,
+        );
+        let denied = evaluate_permission_with_provider_policy(
+            "provider_stage_alias",
+            &serde_json::json!({"task":"inspect"}),
+            &child,
+            Some(&ordinary_mutating),
+            None,
+        );
+        assert!(matches!(denied.decision, HardDecision::Deny { .. }));
+
+        let root = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Prompt,
+        );
+        let root_decision = evaluate_permission_with_provider_policy(
+            "provider_stage_alias",
+            &serde_json::json!({"task":"inspect"}),
+            &root,
+            Some(&collaborator),
+            None,
+        );
+        assert!(matches!(
+            root_decision.decision,
+            HardDecision::NeedExternal { .. }
+        ));
+
+        let plan = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Plan,
+        );
+        let plan_decision = evaluate_permission_with_provider_policy(
+            "provider_stage_alias",
+            &serde_json::json!({"task":"inspect"}),
+            &plan,
+            Some(&collaborator),
+            None,
+        );
+        assert_eq!(plan_decision.decision, HardDecision::Allow);
     }
 
     // ── Issue #326 P5 / R2 Major 5: MCP capability metadata ──
@@ -3452,5 +3643,103 @@ mod tests {
                 DecisionSource::InternalOrchestration
             ));
         }
+    }
+
+    #[test]
+    fn read_only_child_ceiling_precedes_auto_mode_and_allow_rules() {
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::Auto,
+                read_only_execution: true,
+                allow_rules: vec![crate::permission::types::PermissionRule::tool("bash")],
+                ..Default::default()
+            },
+        );
+
+        for command in [
+            "git checkout -q HEAD~1 && cargo test; git checkout -q main",
+            "git checkout HEAD~1",
+            "touch changed.txt",
+            "unknown-helper changed.txt",
+            "git show HEAD",
+            "git diff HEAD~1 HEAD",
+            "git status --short",
+            "test -v 'BASH_VERSINFO[$(touch ./marker)0]'",
+        ] {
+            let decision =
+                evaluate_permission("bash", &serde_json::json!({"command": command}), &ctx);
+            assert!(
+                matches!(decision.decision, HardDecision::Deny { .. }),
+                "{command}"
+            );
+        }
+        let coordination = evaluate_permission(
+            "agent",
+            &serde_json::json!({"action": "send_message", "agent_id": "child", "message": "status?"}),
+            &ctx,
+        );
+        assert!(matches!(coordination.decision, HardDecision::Allow));
+        for tool in ["start_work", "run_next_work_item", "settle_work_item"] {
+            let decision = evaluate_permission(tool, &serde_json::json!({}), &ctx);
+            assert!(
+                matches!(decision.decision, HardDecision::Allow),
+                "read-only Work lifecycle must remain executable: {tool}: {decision:?}"
+            );
+        }
+        let lsp = evaluate_permission(
+            "lsp",
+            &serde_json::json!({"operation": "rename", "dry_run": true}),
+            &ctx,
+        );
+        assert!(matches!(lsp.decision, HardDecision::Deny { .. }));
+        let script = evaluate_permission(
+            "run_script",
+            &serde_json::json!({"script": "open('changed.txt', 'w').write('x')"}),
+            &ctx,
+        );
+        assert!(matches!(script.decision, HardDecision::Deny { .. }));
+        for (tool, args) in [
+            ("read_file", serde_json::json!({"path": "README.md"})),
+            ("grep", serde_json::json!({"pattern": "agent", "path": "."})),
+            ("glob", serde_json::json!({"pattern": "**/*.rs"})),
+        ] {
+            let decision = evaluate_permission(tool, &args, &ctx);
+            assert!(
+                matches!(decision.decision, HardDecision::Allow),
+                "read-only child should retain typed {tool} access: {decision:?}"
+            );
+        }
+        let dynamic_read = provider_policy(
+            astra_turn_types::ResolvedToolEffect::ReadOnly,
+            true,
+            crate::provider_resolution::ProviderApprovalBaseline::NoAdditionalApproval,
+        );
+        assert!(matches!(
+            evaluate_permission_with_provider_policy(
+                "mcp__provider__read",
+                &serde_json::json!({}),
+                &ctx,
+                Some(&dynamic_read),
+                None,
+            )
+            .decision,
+            HardDecision::Allow
+        ));
+        let disguised_write = provider_policy(
+            astra_turn_types::ResolvedToolEffect::Mutating,
+            false,
+            crate::provider_resolution::ProviderApprovalBaseline::NoAdditionalApproval,
+        );
+        assert!(matches!(
+            evaluate_permission_with_provider_policy(
+                "read_file",
+                &serde_json::json!({"path": "x"}),
+                &ctx,
+                Some(&disguised_write),
+                None,
+            )
+            .decision,
+            HardDecision::Deny { .. }
+        ));
     }
 }

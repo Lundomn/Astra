@@ -39,11 +39,11 @@ jobs:
           - os: macos-15-intel
             target: x86_64-apple-darwin
             suffix: darwin-amd64
-            features: ""
+            features: astra-cli/release-vendored-openssl
           - os: macos-15
             target: aarch64-apple-darwin
             suffix: darwin-arm64
-            features: ""
+            features: astra-cli/release-vendored-openssl
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -98,6 +98,23 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: |
           set -euo pipefail
+          # Refresh the canonical source declaration for this candidate build.
+          # Ordinary Cargo builds intentionally cannot claim clean identity.
+          source_sha="$(git rev-parse --verify 'HEAD^{commit}')"
+          if [ "$source_sha" != "$RELEASE_SOURCE_SHA" ]; then
+            echo "Release checkout does not match the selected source" >&2
+            exit 1
+          fi
+          source_status="$(GIT_OPTIONAL_LOCKS=0 git status --porcelain=v1 --untracked-files=no)"
+          if [ -n "$source_status" ]; then
+            echo "Release checkout has tracked source changes" >&2
+            exit 1
+          fi
+          export ASTRA_BUILD_SOURCE_GIT_SHA="$source_sha"
+          export ASTRA_BUILD_SOURCE_GIT_DIRTY=false
+          # Keep the same declaration for subsequent Cargo tests in this job.
+          printf 'ASTRA_BUILD_SOURCE_GIT_SHA=%s\nASTRA_BUILD_SOURCE_GIT_DIRTY=false\n' \
+            "$source_sha" >> "$GITHUB_ENV"
           set --
           if [ -n "${RELEASE_FEATURES}" ]; then
             set -- --features "${RELEASE_FEATURES}"
@@ -106,6 +123,12 @@ jobs:
             --manifest-path Cargo.toml --target "${{ matrix.target }}" \
             -p astra-cli --bin astra \
             -p astra-edge --bin astra-edge
+
+      - name: Probe Edge TLS from the joint build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/probe_edge_tls.py "target/${{ matrix.target }}/release/astra-edge"
 
       - name: Execute client candidates
         shell: bash
@@ -120,6 +143,17 @@ jobs:
               exit 1
             fi
             "${candidate}" --help >/dev/null
+            if [ "$(uname -s)" = Darwin ]; then
+              deps="$(otool -L "${candidate}" | awk 'NR > 1 { print $1 }')"
+              for dep in ${deps}; do
+                case "${dep}" in
+                  *libssl*|*libcrypto*)
+                    echo "${binary} links non-portable OpenSSL: ${dep}" >&2
+                    exit 1
+                    ;;
+                esac
+              done
+            fi
           done
 
       - name: Verify Darwin session execution lease contract

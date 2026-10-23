@@ -145,6 +145,7 @@ pub(super) async fn resolve_or_create_chat_session_id(
 pub(super) struct ResolvedChatSession {
     pub(super) session_id: Option<String>,
     pub(super) full_llm_capture: bool,
+    pub(super) session_admission_facts: Option<astra_services::SessionAdmissionFacts>,
 }
 
 pub(super) async fn resolve_or_create_chat_session(
@@ -164,24 +165,27 @@ pub(super) async fn resolve_or_create_chat_session(
                     .session_service
                     .get_session_for_provider_request(session_id.clone(), user.user_id.clone())
                     .await
+                    .map(|session| (session, None))
             } else {
                 state
                     .session_service
-                    .get_session(session_id.clone(), user.user_id.clone())
+                    .get_session_with_admission_facts(session_id.clone(), user.user_id.clone())
                     .await
             };
             match session {
-                Ok(session) => Ok(ResolvedChatSession {
+                Ok((session, session_admission_facts)) => Ok(ResolvedChatSession {
                     session_id: Some(session_id),
                     full_llm_capture:
                         crate::turn::llm::exchange_capture::session_full_llm_capture_enabled(Some(
                             &session.metadata,
                         )),
+                    session_admission_facts,
                 }),
                 Err(error) if is_session_service_unconfigured_error(&error) => {
                     Ok(ResolvedChatSession {
                         session_id: session_id_is_trusted.then_some(session_id),
                         full_llm_capture: false,
+                        session_admission_facts: None,
                     })
                 }
                 Err(error) => Err(normalize_chat_session_error(error)),
@@ -206,17 +210,19 @@ pub(super) async fn resolve_or_create_chat_session(
             )
             .await
             {
-                Ok(session) => Ok(ResolvedChatSession {
+                Ok((session, session_admission_facts)) => Ok(ResolvedChatSession {
                     session_id: Some(session.session_id),
                     full_llm_capture:
                         crate::turn::llm::exchange_capture::session_full_llm_capture_enabled(Some(
                             &session.metadata,
                         )),
+                    session_admission_facts,
                 }),
                 Err(error) if is_session_service_unconfigured_error(&error) => {
                     Ok(ResolvedChatSession {
                         session_id: None,
                         full_llm_capture: false,
+                        session_admission_facts: None,
                     })
                 }
                 Err(error) => Err(error),
@@ -300,6 +306,7 @@ pub(super) async fn chat_handler(
     .await?;
     chat_data.session_id = resolved.session_id;
     chat_data.full_llm_capture = resolved.full_llm_capture;
+    chat_data.session_admission_facts = resolved.session_admission_facts;
     validate_conversation_authority(
         &state,
         &user.user_id,
@@ -399,6 +406,7 @@ pub(super) async fn chat_stream_handler(
     };
     chat_data.session_id = resolved.session_id;
     chat_data.full_llm_capture = resolved.full_llm_capture;
+    chat_data.session_admission_facts = resolved.session_admission_facts;
     if let Err((status, error)) = validate_conversation_authority(
         &state,
         &user.user_id,
@@ -442,7 +450,7 @@ pub(super) async fn chat_stream_handler(
                 let run_id = stream.run_id.clone();
                 sse_streaming_response(session_id, run_id, request_id.clone(), event_rx)
             } else {
-                // Batch fallback (test stubs, etc.)
+                // Replay retained events for an already-settled durable run.
                 let mut events = vec![serde_json::json!({
                     "type": "session_info",
                     "session_id": stream.session_id,
@@ -532,6 +540,7 @@ mod session_resolution_tests {
         created: Arc<Mutex<Vec<(String, SessionCreateRequestData)>>>,
         missing_sessions: Arc<Mutex<Vec<String>>>,
         looked_up_session_ids: Arc<Mutex<Vec<String>>>,
+        fail_creation: bool,
     }
 
     impl RecordingSessionService {
@@ -562,6 +571,13 @@ mod session_resolution_tests {
                 .lock()
                 .await
                 .push((user_id.clone(), request.clone()));
+            if self.fail_creation {
+                tokio::task::yield_now().await;
+                return Err(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "creation failed",
+                ));
+            }
             Ok(SessionRecord {
                 session_id: "s-created".to_string(),
                 user_id,
@@ -688,22 +704,45 @@ mod session_resolution_tests {
     }
 
     #[tokio::test]
+    async fn failed_chat_session_creation_does_not_consume_quota() {
+        use astra_services::resource_governor::{InMemoryResourceGovernor, ResourceGovernor};
+
+        let governor = Arc::new(InMemoryResourceGovernor::new());
+        let mut state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_session_service(Arc::new(RecordingSessionService {
+                fail_creation: true,
+                ..Default::default()
+            }));
+        state.resource_governor = governor.clone();
+        let result =
+            resolve_or_create_chat_session(&state, &test_user(), None, None, false, false).await;
+        assert!(result.is_err());
+        assert_eq!(result.err().unwrap().0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(governor.get_usage("u1").await.sessions_created, 0);
+    }
+
+    #[tokio::test]
     async fn resolve_or_create_chat_session_id_creates_session_for_new_lifecycle_turn() {
         let session_service = RecordingSessionService::default();
         let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
             .with_session_service(Arc::new(session_service.clone()));
 
-        let session_id = resolve_or_create_chat_session_id(
+        let resolved = resolve_or_create_chat_session(
             &state,
             &test_user(),
             None,
             Some("agent-1".to_string()),
             false,
+            false,
         )
         .await
         .expect("session resolution should succeed");
 
-        assert_eq!(session_id.as_deref(), Some("s-created"));
+        assert_eq!(resolved.session_id.as_deref(), Some("s-created"));
+        assert!(
+            resolved.session_admission_facts.is_none(),
+            "a custom session creator without admission facts must retain the lifecycle fallback"
+        );
 
         let created = session_service.created_requests().await;
         assert_eq!(created.len(), 1);
@@ -741,6 +780,30 @@ mod session_resolution_tests {
         assert_eq!(error.0, StatusCode::NOT_FOUND);
         assert_eq!(error.1.0.detail, "Session not found");
         assert_eq!(error.1.0.error_code, None);
+    }
+
+    #[tokio::test]
+    async fn custom_session_service_keeps_authoritative_plan_fallback_available() {
+        let session_service = RecordingSessionService::default();
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_session_service(Arc::new(session_service));
+
+        let resolved = resolve_or_create_chat_session(
+            &state,
+            &test_user(),
+            Some("existing-session".to_string()),
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect("custom session service should resolve an existing session");
+
+        assert_eq!(resolved.session_id.as_deref(), Some("existing-session"));
+        assert!(
+            resolved.session_admission_facts.is_none(),
+            "implementations without the optimized admission read must let the lifecycle perform its authoritative plan lookup"
+        );
     }
 
     #[tokio::test]
@@ -1190,7 +1253,8 @@ mod chat_stream_lifecycle_tests {
             _run_id: String,
             _user_id: String,
             _last_index: u32,
-        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+        ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>
+        {
             unreachable!()
         }
 
@@ -1257,7 +1321,8 @@ mod chat_stream_lifecycle_tests {
             _run_id: String,
             _user_id: String,
             _last_index: u32,
-        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+        ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>
+        {
             unreachable!()
         }
 
@@ -1335,7 +1400,8 @@ mod chat_stream_lifecycle_tests {
             _run_id: String,
             _user_id: String,
             _last_index: u32,
-        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+        ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>
+        {
             unreachable!()
         }
 
@@ -1394,7 +1460,8 @@ mod chat_stream_lifecycle_tests {
             _run_id: String,
             _user_id: String,
             _last_index: u32,
-        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+        ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>
+        {
             unreachable!()
         }
 
@@ -1456,7 +1523,8 @@ mod chat_stream_lifecycle_tests {
             _run_id: String,
             _user_id: String,
             _last_index: u32,
-        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+        ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>
+        {
             unreachable!()
         }
 
@@ -1531,7 +1599,8 @@ mod chat_stream_lifecycle_tests {
             _run_id: String,
             _user_id: String,
             _last_index: u32,
-        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+        ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>
+        {
             unreachable!()
         }
 
@@ -1598,7 +1667,8 @@ mod chat_stream_lifecycle_tests {
             _run_id: String,
             _user_id: String,
             _last_index: u32,
-        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+        ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>
+        {
             unreachable!()
         }
 

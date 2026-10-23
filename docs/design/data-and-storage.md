@@ -16,6 +16,30 @@ Data and storage owns platform state layering, MatrixOne usage, retention, archi
 | C4 debug bundle | short-lived raw diagnostics and manifests. |
 | C5 learning artifacts | redacted, consent-gated derived data. |
 
+Delegation topology, status, retry lineage, usage, and terminal evidence are owned
+by `agent_runs` and `agent_run_events`. Run admission and owner-fenced transitions
+persist these canonical facts; there is no separate delegation table or
+delegation-state mirror. The run display projection and bounded terminal-receipt
+repair remain derived from canonical run facts.
+
+Session state projections remain owned by personal-skill activation and
+user-anchor memory. The unused general state-item upsert API and generic mutation
+validator are retired. Session lifecycle fencing, projection reads, artifact
+reference accounting, and retention remain owned by the existing storage
+boundaries.
+
+The unused general authority-event query source API is retired; canonical
+Session authority still persists owner-scoped audit facts. Handoff fencing
+verification reads the exact rejected reservation, including its old lease and
+expected root, rather than accepting an unrelated rejection event.
+
+Execution bindings are initialized once as Ready at generation 1. Subsequent
+provider switches use the controller-authorized durable begin/complete/retry
+receipt contract; the unused general binding CAS source API is retired.
+Generation fencing, quiescence checks, and owner-scoped binding reads remain
+part of the canonical coordinator. Edge handoff requires verifiable source
+and target materializations; it does not convert a Server binding into Edge.
+
 ## MatrixOne role
 
 MatrixOne is the platform state store and analytic substrate. It should support:
@@ -26,6 +50,82 @@ MatrixOne is the platform state store and analytic substrate. It should support:
 - retention and purge jobs;
 - analytic/evaluation workloads;
 - optional MatrixOne-native value such as time travel or hybrid search when appropriate.
+
+## Schema bootstrap
+
+Bootstrap supports a fresh database or the current schema contract. Canonical
+CREATE declarations define the complete table shape; startup validates it
+without ALTER-based upgrades, historical backfills, or retired-table cleanup.
+An older completion marker is rejected and requires a new database. Interrupted
+fresh bootstrap can retry under the existing database lease, with readiness
+published only after schema validation succeeds.
+
+Agent metadata is persisted by the database service. Its unused alternative
+in-memory CRUD implementation and self-tests are retired; the unconfigured
+service remains explicit. The owner/name unique constraint is enforced by the
+database, and create or rename conflicts now return HTTP 409 rather than 500.
+Other SQL and malformed persisted-data errors retain their 500 behavior.
+
+## Session-memory recovery journal
+
+Fresh schema contract `2026-10-16-v104` includes `agent_session_memory_work`, keyed
+by canonical Astra owner and Session. It checkpoints the existing extraction
+and governance algorithms: frozen request/write inputs, stage receipts, a
+worker lease and bounded retry timing. Canonical Session status, execution
+settlement and context heads remain authoritative; the journal does not grant
+memory access or create another context lifecycle. Session deletion removes
+its queued inputs through the existing deletion catalog.
+
+Completed extraction drops its input transcript; publication coordinates and
+facts survive independently. Only fully successful governance retires replay
+inventories and receipts. Fenced inspections do not persist state, and finishing
+commits state and lease release together. Uncertain/failed work keeps its exact
+replay data. There remains one row per retained Session, not a global byte bound.
+
+The startup shape guard requires all journal columns. An existing v102 database
+is rejected under the repository's fresh-schema policy; deployment requires a
+new/current-contract database rather than only changing the image. Bootstrap
+does not silently add the journal to an old completion marker. Database
+replacement and preservation of existing data require an operator-owned rollout;
+this memory change performs no automatic reset or migration.
+
+## Transcript persistence
+
+Fresh schema contract `2026-10-08-v101` stores transcript items and their
+committed projection head. Physical page metadata and the unused source event
+position column are removed. The run lookup index is `(user_id, run_id)`.
+Context snapshot anchor, request, and response IDs share the canonical event ID
+capacity, and the schema guard checks all three columns.
+Model thinking observations use only the configuration-bound snapshot; obsolete
+capability and error mirror columns are absent.
+The retired tool-result projection decision/receipt tables and special event
+field are absent. Current provider-wire and accepted-to-terminal recovery
+contracts remain unchanged.
+The retired session-level physical-workspace claim, unexecuted workflow-trigger
+and plan-step attempt tables are not part of this contract. The unused cloud
+configuration-body mirror is also absent; configuration version changes retain
+their canonical journal audit and local content-addressed bodies. Plans retain their
+owner-scoped authoring state and session binding; execution and attempt evidence
+remain with Work and Run. There is no migration, replacement table, page cache, or rebuild job;
+an older database must be recreated from the current schema.
+
+One append implementation requires canonical session admission in the same
+transaction. Canonical/core event writers reuse their admission; standalone
+append and evidence materialization acquire `admit_session_event_write(false)`,
+including reasoning-only and cursor-only materialization. Empty append executes
+no SQL; all-replay append does not allocate a sequence. New identities use one
+lazy `MAX(item_seq)` under the owner/session lock. Membership and insert batches
+are limited by bind count and payload bytes; an indivisible oversized item is
+sent alone. Database column equality determines duplicate identities within
+and across batches. First occurrence wins; equal content under distinct IDs
+remains distinct. All chunks and enclosing event capture roll back together.
+
+Item content hashes, per-item canonical commitment fields, contiguous committed
+projection heads, and authoritative terminal replay verification remain
+required. Accepted event replay can repair missing display material and enrich
+reasoning; it cannot reconstruct arbitrary original item sequences/timestamps
+or synthesize a committed head from the newest item. The bounded root-only
+transcript restore fallback remains available when canonical history is absent.
 
 ## Retention
 
@@ -42,10 +142,70 @@ Retention is a product contract:
 
 - Event ids should be stable and collision-resistant.
 - Ingestion should be idempotent.
+- Session event counters commit in the same transaction as their inserted event
+  rows, including terminal settlement and trace repair. Replay contributes no
+  insertion delta; a lost commit acknowledgement must not trigger a separate
+  counter update.
+- Terminal capture batches core conversation events and LLM/tool trace events
+  through the same writer, sharing session admission and insertion readback.
+- The existing asynchronous ingestion worker combines eligible session heads
+  into count- and charged-byte-bounded transactions. The aggregate event bound
+  or earliest absolute flush deadline triggers dispatch; owner round-robin and
+  one in-flight head per session preserve fairness and ordering. One transaction
+  uses one shared ingestion permit and connection, retaining foreground pool
+  headroom. It inserts event rows together and applies inserted-only counter,
+  session-end and causal-edge effects through set-based writes. Session admission
+  returns stored row identities; input spelling is not a second equality rule.
+  The shared causal-edge writer bounds each statement to 10,922 six-parameter
+  rows, preserving parent order across chunks within the caller's transaction.
+  All facts and effects commit before durable delivery is acknowledged.
+- Cross-session batching couples locks for one bounded database attempt. A
+  failed/uncertain batch retains each session's exact retry head; retries use the
+  same executor one group at a time. An authoritative session rejection rolls
+  back the shared transaction, rejects only that session and retries its peers,
+  including during drain. Database failure is not success, and ambiguous commit
+  replay still requires canonical payload-hash classification. A batch bound of
+  one retains independent-session execution. This writer does not batch the
+  synchronous event API or control-plane admission transactions, and fewer SQL
+  statements do not imply fewer stored rows or unlimited concurrent executions.
 - Poison records should be isolated.
 - Invalid records should not block later independent facts.
 - Slot/lease semantics must avoid permanent deadlock through expiry or repair.
+- Run-event append checks persisted idempotency identities in bounded windows
+  (64 keys, 16 KiB of key bytes; an indivisible key is queried alone), under
+  the existing owner/session/run transaction. Database column equality maps
+  matches to input ordinals; Rust does not normalize persisted identities.
+  Conflicting immutable payloads abort the entire batch, including across
+  windows. Unkeyed events remain distinct. This reduces preflight round trips,
+  not retained event rows or payload bytes; commit reconciliation and display
+  projection repair retain their existing owners.
+- Run mutations retain the deletion-fence → session → execution-slot → run
+  lock order. A caller's exact-owner/session/run locking read also establishes
+  existence; it does not need a separate existence query in that transaction.
+  Canonical owner-backed appends use their exact-session generation/lease
+  UPDATE as the run fence; appends without execution authority still require
+  explicit run-existence admission. Generic event appends retain the same
+  locked metadata reader but omit the unused checkpoint body. These changes
+  reduce SQL exchanges and returned bytes, not retained data or durability.
+- Run status snapshots omit checkpoint bodies and read their canonical binding
+  and accounting facts in one bounded event query after the metadata lookup.
+  A narrow type/index aggregate selects the earliest event of each binding type
+  and the latest finalized fact, or latest finished fact only when none exists;
+  the selected positions then join back to their owner-scoped payloads.
+  At most four payloads are returned. Selection precedes decoding, so corruption
+  of a selected fact remains an error rather than authorizing fallback. This is
+  a read optimization, not a cache, new authority, retention change, or atomic
+  snapshot across the two reads.
 - Data deletion must propagate to derived artifacts.
+- Decision audits and skill selections acquire canonical non-lazy session
+  admission in the same transaction as INSERT. Decision reference checks and
+  receipt decoding complete before commit; a receipt failure rolls back the
+  insert. Skill catalog resolution precedes BEGIN and the first selected
+  skill's resolved version is bound in INSERT, retaining the supplied version
+  when unresolved. Neither path allocates sequences or changes event counters;
+  an empty skill hook performs no database I/O. Their checked-out connection is
+  released only after completed commit or rollback; cancellation closes that
+  checkout. A lost commit acknowledgement still has an unknown outcome.
 
 ## Versioning
 
@@ -104,3 +264,27 @@ Archival should preserve allowed metadata while removing or redacting payloads a
 - debug bundles;
 - artifact manifests;
 - eval cases that include private payloads.
+
+## Router deployment state
+
+Fresh schema contract `2026-09-27-v90` adds `model_router_deployments`, keyed by
+owner, with a compare-and-swap revision and typed deployment/revocation JSON. This
+is C0 tuning control state. Mutations and existing `auth_audit_logs` entries share
+one transaction. Routing decisions and reviewed outcomes continue to use
+`agent_run_events`; dashboard queries are bounded projections of that ledger.
+As with the canonical bootstrap policy above, older schema markers are rejected;
+this change does not implement an in-place migration or backfill.
+
+Compressed conversation history is an immutable `context_history_v1` session
+artifact, referenced by `session_transcript` with the owning session ID. It
+remains reachable until the existing owned-session deletion releases its
+references. Server introspect reads bounded UTF-8 windows from the authenticated
+artifact store; client-local file paths are not recovery authority.
+
+The unused `storage::delete_agent_event_edges_for_owned_event_ids` source API
+is retired. Event deletion keeps edge removal in the existing owner-scoped
+transaction, and session deletion retains bounded owner/session cleanup.
+
+The durable run retry counter is retired from the fresh schema and Rust record.
+Verification retries retain their `retry_of` and `retry_scope` lineage; recovery
+generations and provider-attempt retry accounting remain separate authorities.

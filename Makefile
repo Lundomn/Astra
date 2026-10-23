@@ -49,7 +49,7 @@ help:
 	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
 	@echo "  make test-offline       - Rust workspace + e2e-hooks + @astra/sdk (30s per case; default 2 nextest threads, override: NEXTEST_OFFLINE_THREADS=<n> / NEXTEST_OFFLINE_PROFILE=<profile>)"
 	@echo "  make validate-capability-matrix - Verify capability system-test references resolve"
-	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (30s per case via profile=strict-online; see .config/nextest.toml)"
+	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (60s per case via profile=strict-online; see .config/nextest.toml)"
 	@echo "  make test-memoria-databases - Verify Memoria database bootstrap contract"
 	@echo "  make test-stack-bootstrap - Verify stack startup bootstraps Memoria before API"
 	@echo "  make test-memoria-online-contract - Real Memoria missing-ID/circuit-recovery contract (explicit)"
@@ -63,7 +63,7 @@ help:
 	@echo "  make test-durable-event-pressure - Live MatrixOne durable event pressure probe (explicit, not part of test-online)"
 	@echo "  make test-saas          - SaaS platform E2E (docs/testing/saas-test-plan.md §5; MatrixOne + optional SDK)"
 	@echo "  make test-saas-coverage - SaaS E2E + llvm line coverage report (needs: cargo install cargo-llvm-cov)"
-	@echo "  make test-live-llm      - Live LLM suite (real provider APIs from .models.yaml; one model per provider)"
+	@echo "  make harness-live-llm   - Live LLM suite (real provider APIs from .models.yaml; one model per provider)"
 	@echo "  make test-contract      - Run contract tests (http/admin/config)"
 	@echo "  (also: test-sdk-offline, test-web-offline, test-sdk-online — @astra/sdk + web offline; remote E2E opt-in on test-online)"
 	@echo ""
@@ -252,7 +252,14 @@ dev-deps-up:
 		exit 1; \
 	fi
 	@mkdir -p deployment/all-in-one/data/matrixone deployment/all-in-one/data/matrixone/logs deployment/all-in-one/data/logs/memoria
-	@$(DEPS_COMPOSE) up -d matrixone
+	@attempt=1; \
+	while ! ( $(DEPS_COMPOSE) up -d matrixone ); do \
+		if [ "$$attempt" -ge 3 ]; then exit 1; fi; \
+		delay=$$((attempt * 5)); \
+		echo "MatrixOne startup failed; retrying in $${delay}s ($$attempt/3)..."; \
+		sleep "$$delay"; \
+		attempt=$$((attempt + 1)); \
+	done
 	@$(MAKE) dev-deps-wait-matrixone
 	@$(MAKE) dev-deps-ensure-memoria
 	@echo "✅ Dependency services started (MatrixOne :6001, Memoria :8100)"
@@ -266,7 +273,7 @@ dev-deps-down:
 .PHONY: dev-deps-clean
 dev-deps-clean:
 	@echo "⚠️  WARNING: This will delete all dependency data!"
-	@printf "Are you sure? [y/N] " && read REPLY && \
+	@set -e; printf "Are you sure? [y/N] " && read REPLY && \
 	if [ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ]; then \
 		($(DEPS_COMPOSE) down -v); \
 		if [ -d deployment/all-in-one/data ]; then \
@@ -382,15 +389,25 @@ dev-api-stop:
 dev-api-start-debug:
 	@BUILD_MODE=debug ./scripts/dev/start-api.sh
 
-.PHONY: dev-api-restart
-dev-api-restart: dev-api-stop
-	@sleep 1
-	@$(MAKE) dev-api-start
+.PHONY: dev-api-restart dev-api-restart-locked
+dev-api-restart:
+	@./scripts/dev/with-api-lifecycle-lock.sh $(MAKE) --no-print-directory dev-api-restart-locked
 
-.PHONY: dev-api-restart-debug
-dev-api-restart-debug: dev-api-stop
+dev-api-restart-locked:
+	@./scripts/dev/require-api-lifecycle-lock.sh
+	@$(MAKE) --no-print-directory dev-api-stop
 	@sleep 1
-	@$(MAKE) dev-api-start-debug
+	@$(MAKE) --no-print-directory dev-api-start
+
+.PHONY: dev-api-restart-debug dev-api-restart-debug-locked
+dev-api-restart-debug:
+	@./scripts/dev/with-api-lifecycle-lock.sh $(MAKE) --no-print-directory dev-api-restart-debug-locked
+
+dev-api-restart-debug-locked:
+	@./scripts/dev/require-api-lifecycle-lock.sh
+	@$(MAKE) --no-print-directory dev-api-stop
+	@sleep 1
+	@$(MAKE) --no-print-directory dev-api-start-debug
 
 .PHONY: dev-api-logs
 dev-api-logs:
@@ -428,7 +445,12 @@ dev-sdk-deps:
 	else \
 		echo "✅ Local @astra/sdk dependencies ready"; \
 	fi
-	@if [ ! -f packages/sdk/dist/index.js ] || [ ! -f packages/sdk/dist/index.d.ts ]; then \
+# The Web app consumes the package's dist entrypoint. Rebuild when source or
+# package configuration changed so a restarted Web server cannot silently load
+# an older decoder.
+	@if [ ! -f packages/sdk/dist/index.js ] || [ ! -f packages/sdk/dist/index.d.ts ] || \
+		[ -n "$$(find packages/sdk/src packages/sdk/package.json packages/sdk/tsconfig.json packages/sdk/tsup.config.ts \
+			-type f -newer packages/sdk/dist/index.js -print -quit 2>/dev/null)" ]; then \
 		echo "Building local @astra/sdk package..."; \
 		cd packages/sdk && npm run build; \
 	else \
@@ -437,7 +459,8 @@ dev-sdk-deps:
 
 .PHONY: dev-web-deps
 dev-web-deps: dev-sdk-deps
-	@if [ ! -f web/node_modules/next/dist/bin/next ]; then \
+	@if [ ! -f web/node_modules/next/dist/bin/next ] || \
+		[ ! -f web/node_modules/@astra/sdk/package.json ]; then \
 		echo "Installing web UI dependencies..."; \
 		cd web && npm ci --no-audit --no-fund; \
 	else \
@@ -883,11 +906,15 @@ dev-setup-demo:
 # /health can answer. MatrixOne can take several minutes on a cold schema;
 # keep the ordinary API-start timeout unchanged and give only this destructive
 # reseed flow the longer readiness window.
-.PHONY: dev-seed
+.PHONY: dev-seed dev-seed-locked
 dev-seed:
 	@echo "⚠️  This will reset the database and reseed admin + models."
 	@printf "Are you sure? [y/N] "; read REPLY; \
 	[ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ] || { echo "Cancelled"; exit 1; }
+	@./scripts/dev/with-api-lifecycle-lock.sh $(MAKE) --no-print-directory dev-seed-locked
+
+dev-seed-locked:
+	@./scripts/dev/require-api-lifecycle-lock.sh
 	@echo "Stopping API server before dropping the database..."
 	@$(MAKE) dev-api-stop
 	@$(MAKE) dev-deps-wait
@@ -896,7 +923,7 @@ dev-seed:
 	DB_NAME=$${ASTRA_DATABASE:-astra_runtime}; \
 	SQL="DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
 	scripts/dev/mysql-client.sh -e "$$SQL"
-	@API_START_TIMEOUT_SECONDS=$${API_START_TIMEOUT_SECONDS:-600} $(MAKE) dev-api-restart-debug build-cli-debug
+	@API_START_TIMEOUT_SECONDS=$${API_START_TIMEOUT_SECONDS:-600} $(MAKE) dev-api-restart-debug-locked build-cli-debug
 	@sleep 2
 	@echo "Registering admin (admin@mo.com)..."
 	@NO_PROXY=localhost ./target/debug/astra admin register \
@@ -1080,7 +1107,7 @@ test-dashboard: ## Build astra-test and launch live dashboard
 .PHONY: test-offline
 # Run the focused runtime profile gate first so provider/surface regressions fail
 # before the broader workspace, server E2E-hook, SDK, and web offline suites.
-test-offline: sweep validate-capability-matrix test-runtime-profiles test-workspace test-runtime-e2e-hooks test-sdk-offline test-web-offline
+test-offline: sweep validate-capability-matrix test-runtime-profiles test-workspace test-history-work test-runtime-e2e-hooks test-sdk-offline test-web-offline
 
 .PHONY: validate-capability-matrix
 validate-capability-matrix:
@@ -1157,7 +1184,7 @@ test-managed-runtime:
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::builder_runtime_surface_follows_orchestrator_read_only_binding
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::tool_call_start_projects_request_scoped_mcp_route_metadata
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_transport_metadata::tests::server_sandbox_reports_sandbox_ready
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib orchestrator_managed_executes_through_sandbox_resident_agent_transport
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib sandbox_resident_agent_route_is_explicitly_unavailable
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib orchestrator_managed_without_sandbox_resident_agent_transport_does_not_reroute_to_local
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib request_scoped_mcp_tools_bypass_edge_transport
 
@@ -1182,11 +1209,19 @@ test-mcp-fixture:
 	@CARGO_INCREMENTAL=0 $(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli --bin mock_mcp_server
 
 .PHONY: test-workspace
+# Feature unification includes the deep futures exercised by the e2e-hooks lane.
 test-workspace: sweep test-mcp-fixture
 	@echo "Running Rust workspace tests (nextest profile=$(NEXTEST_OFFLINE_PROFILE))..."
-	@CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) --workspace $(NEXTEST_OFFLINE_FLAGS)
+	@RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) --workspace $(NEXTEST_OFFLINE_FLAGS)
 	@echo "Running workspace doctests (cargo test --doc; not covered by nextest)..."
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) --workspace --doc
+
+.PHONY: test-history-work
+# Copy accounting is process-scoped and deliberately disabled in ordinary tests.
+# These deterministic measurements need neither MatrixOne nor a live provider.
+test-history-work:
+	@ASTRA_HISTORY_WORK_TRACE=1 CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
+		-p astra-runtime --test compaction_work --run-ignored only $(NEXTEST_OFFLINE_FLAGS)
 
 # Compiles deterministic model/edge hooks used by runtime system journeys.
 .PHONY: test-runtime-e2e-hooks
@@ -1201,7 +1236,9 @@ test-runtime-e2e-hooks: sweep
 # This helper owns the astra-runtime / astra-plan integration binaries.
 # astra-services integration binaries run in test-online's core lane, beside
 # the astra-services ignored lib tests, so their test-binary linking and live-DB
-# time are charged to core. `make test-online` remains the complete online suite.
+# time are charged to core. CI splits core into isolated core-runtime,
+# core-turn-core, and core-services jobs. `make test-online` remains the complete
+# online suite; ASTRA_ONLINE_LANE=core retains the combined core lane.
 #
 # Optional serial mode: ASTRA_TEST_DB_IT_TEST_THREADS=1 -> -j 1
 .PHONY: test-ignored-integration
@@ -1226,7 +1263,7 @@ test-ignored-integration:
 				--features astra-runtime/e2e-hooks \
 				--tests --run-ignored only \
 				$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
-				-E '$(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
+				-E 'not binary(compaction_work) and $(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
 					|| FAILED="$$FAILED runtime-plan-perf"; \
 		else \
 			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_RUNTIME_ROOT_SECRET=$${ASTRA_RUNTIME_ROOT_SECRET:-test-runtime-root-secret} ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
@@ -1234,7 +1271,7 @@ test-ignored-integration:
 				--features astra-runtime/e2e-hooks \
 				--tests --run-ignored only \
 				$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
-				-E 'not binary(perf_benchmarks) and $(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
+				-E 'not binary(perf_benchmarks) and not binary(compaction_work) and $(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
 					|| FAILED="$$FAILED integration"; \
 			echo "Running online performance benchmarks in an isolated serial lane (blocking unless ASTRA_STRICT_ONLINE_PERF=0)..."; \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
@@ -1278,8 +1315,11 @@ test-online:
 	case "$$ONLINE_LANE" in \
 		all) DB_NAMES="$$RUNTIME_IGNORED_DB $$INTEGRATION_DB" ;; \
 		core) DB_NAMES="$$RUNTIME_IGNORED_DB" ;; \
+		core-runtime|core-turn-core|core-services) \
+			RUNTIME_IGNORED_DB="$${TEST_DB_BASE}_$$(printf '%s' "$$ONLINE_LANE" | tr '-' '_')"; \
+			DB_NAMES="$$RUNTIME_IGNORED_DB" ;; \
 		integration) DB_NAMES="$$INTEGRATION_DB" ;; \
-		*) echo "❌ invalid ASTRA_ONLINE_LANE=$$ONLINE_LANE (expected all, core, or integration)"; exit 2 ;; \
+		*) echo "❌ invalid ASTRA_ONLINE_LANE=$$ONLINE_LANE (expected all, core, core-runtime, core-turn-core, core-services, or integration)"; exit 2 ;; \
 	esac; \
 	echo "Running online lane=$$ONLINE_LANE; recreating test databases: $$DB_NAMES ..."; \
 	for DB_NAME in $$DB_NAMES; do \
@@ -1287,31 +1327,39 @@ test-online:
 		scripts/dev/mysql-client.sh -e "$$SQL" 2>/dev/null || true; \
 	done; \
 	FAILED=""; \
-	if [ "$$ONLINE_LANE" != "integration" ]; then \
-		echo "Running astra-runtime ignored unit/bin tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE); live-LLM suite gated by ASTRA_LIVE_LLM)..."; \
-		ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+	if [ "$$ONLINE_LANE" = "all" ] || [ "$$ONLINE_LANE" = "core" ] || [ "$$ONLINE_LANE" = "core-runtime" ]; then \
+		echo "Running astra-runtime ignored unit/bin tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE); real provider calls disabled)..."; \
+		RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+			ASTRA_TEST_DATABASE=$$RUNTIME_IGNORED_DB \
 			ASTRA_TEST_DB_IT=1 \
+			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
 				--lib --bins --run-ignored only $(NEXTEST_ONLINE_FLAGS) $$ONLINE_JOBS_FLAG \
 				-E 'not test(/durable_run_event_pressure_probe/) and $(NEXTEST_CLEANUP_PRESSURE_EXCLUSION)' \
 				|| FAILED="$$FAILED astra-runtime-ignored"; \
+	fi; \
+	if [ "$$ONLINE_LANE" = "all" ] || [ "$$ONLINE_LANE" = "core" ] || [ "$$ONLINE_LANE" = "core-turn-core" ]; then \
 		echo "Running astra-turn-core db-store ignored tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
-		ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+		RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 			ASTRA_TEST_DB_IT=1 \
+			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-turn-core \
 				--features db-store --lib --run-ignored only $(NEXTEST_ONLINE_FLAGS) $$ONLINE_JOBS_FLAG \
 				-E '$(NEXTEST_CLEANUP_PRESSURE_EXCLUSION)' \
 				|| FAILED="$$FAILED astra-turn-core-db-store"; \
+	fi; \
+	if [ "$$ONLINE_LANE" = "all" ] || [ "$$ONLINE_LANE" = "core" ] || [ "$$ONLINE_LANE" = "core-services" ]; then \
 		echo "Running astra-services ignored lib/integration tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
-		ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+		RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 			ASTRA_TEST_DATABASE=$$RUNTIME_IGNORED_DB \
 			ASTRA_TEST_DB_IT=1 \
+			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services \
 				--lib --tests --run-ignored only $(NEXTEST_ONLINE_FLAGS) $$ONLINE_JOBS_FLAG \
 				-E '$(NEXTEST_CLEANUP_PRESSURE_EXCLUSION)' \
 				|| FAILED="$$FAILED astra-services-online"; \
 	fi; \
-	if [ "$$ONLINE_LANE" != "core" ]; then \
+	if [ "$$ONLINE_LANE" = "all" ] || [ "$$ONLINE_LANE" = "integration" ]; then \
 		echo "Running ignored integration suites (live DB=$$INTEGRATION_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
 		ASTRA_DATABASE=$$INTEGRATION_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 			ASTRA_TEST_DATABASE=$$INTEGRATION_DB \
@@ -1329,21 +1377,21 @@ test-online:
 		echo "❌ test-online: failed suites:$$FAILED"; \
 		exit 1; \
 	fi
-	@if [ "$${ASTRA_ONLINE_LANE:-all}" = "core" ]; then \
-		echo "Skipping @astra/sdk remote E2E in the core online lane"; \
-	elif [ "$${ASTRA_SDK_ONLINE_E2E:-}" = "1" ]; then \
+	@case "$${ASTRA_ONLINE_LANE:-all}" in core|core-*) \
+		echo "Skipping @astra/sdk remote E2E in the core online lane" ;; \
+	*) if [ "$${ASTRA_SDK_ONLINE_E2E:-}" = "1" ]; then \
 		$(MAKE) test-sdk-online; \
 	else \
 		echo "Skipping @astra/sdk remote E2E (set ASTRA_SDK_ONLINE_E2E=1 with API running, or: make test-sdk-online)"; \
-	fi
+	fi ;; esac
 	@if [ "$${ASTRA_MEMORIA_ONLINE:-}" = "1" ]; then \
 		$(MAKE) test-memoria-online-contract; \
 	else \
 		echo "Skipping real Memoria contract (set ASTRA_MEMORIA_ONLINE=1, or: make test-memoria-online-contract)"; \
 	fi
 	@echo ""
-	@echo "NOTE: live-LLM suite (real provider APIs, reads .models.yaml) auto-skips unless"
-	@echo "      ASTRA_LIVE_LLM=1 is set. Run it explicitly with: make test-live-llm"
+	@echo "NOTE: normal offline/online tests exclude real-provider harness code."
+	@echo "      Real-provider harness is separate and explicit: make harness-live-llm"
 
 # Explicit cleanup pressure probes. This is intentionally not part of
 # test-online because pressure timings are operational evidence, not a normal
@@ -1506,11 +1554,11 @@ test-saas-coverage:
 # Live-LLM suite: hits real provider APIs listed in .models.yaml.
 # Picks ONE model per distinct provider at runtime — what's in the yaml gets
 # tested, nothing is hard-coded. Bypasses MatrixOne / DB fixtures entirely.
-.PHONY: test-live-llm
-test-live-llm:
+.PHONY: harness-live-llm
+harness-live-llm:
 	@echo "Running live-LLM token usage tests (reads .models.yaml; one model per provider)..."
-	@ASTRA_LIVE_LLM=1 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
-		--test live_token_usage_e2e -- --ignored --nocapture
+	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
+		--features live-provider-tests --test live_token_usage_e2e -- --ignored --nocapture
 
 # @astra/sdk — no real HTTP API (Mode A in-process runs via ASTRA_SDK_E2E=1 in test:coverage)
 .PHONY: test-sdk-offline
@@ -1614,6 +1662,38 @@ test-harness-capabilities: validate-capability-matrix ## Audit typed anchors, th
 		--eval-file target/astra-test-harness/capabilities/eval.json \
 		--parallel "$${PARALLEL:-1}" --runs "$${RUNS:-1}"
 
+# ----------------------------------------------------------------------------
+# Opt-in cross-surface Work journey.
+#
+# This is intentionally outside test-offline and the mocked Web E2E lane. It
+# needs a disposable owner token and an already-running candidate Server whose
+# /health build_git_sha exactly matches this checkout. The runner starts only
+# its own Web and TUI processes, so it cannot restart or stop a developer's
+# shared API process.
+#
+# Variables:
+#   ASTRA_HARNESS_ACCESS_TOKEN — required, never printed or put on argv
+#   ASTRA_API_URL              — candidate Server (default: 127.0.0.1:17001)
+#   ASTRA_WORK_LIVE_MODEL      — TUI bootstrap model selector (the Work turn
+#                                  uses the candidate Server's canonical default)
+#   ASTRA_WORK_LIVE_WEB_PORT   — isolated Web port (default: 3537)
+#   ASTRA_WORK_LIVE_TIMEOUT    — bounded journey deadline in seconds
+#   ASTRA_WORK_LIVE_RUN_DIR    — retain state, PTY, Web, and Playwright evidence
+# ----------------------------------------------------------------------------
+.PHONY: test-work-live
+test-work-live: dev-web-deps ## Run the real TUI → Web Work journey (Linux opt-in; not offline/CI)
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli --bin astra
+	@run_dir="$${ASTRA_WORK_LIVE_RUN_DIR:-$$(mktemp -d -t astra-work-live.XXXXXX)}"; \
+	ASTRA_HARNESS_ACCESS_TOKEN="$${ASTRA_HARNESS_ACCESS_TOKEN:-}" \
+	python3 scripts/harness/work_surface_live.py \
+		--api-url "$${ASTRA_API_URL:-http://127.0.0.1:17001}" \
+		--model "$${ASTRA_WORK_LIVE_MODEL:-deepseek-v4-flash}" \
+		--profile "$${ASTRA_WORK_LIVE_PROFILE:-harness-auto}" \
+		--web-port "$${ASTRA_WORK_LIVE_WEB_PORT:-3537}" \
+		--timeout "$${ASTRA_WORK_LIVE_TIMEOUT:-240}" \
+		--astra-bin "$(CURDIR)/target/debug/astra" \
+		--run-dir "$$run_dir" --keep-artifacts
+
 # ============================================================================
 # Code Quality
 # ============================================================================
@@ -1636,7 +1716,9 @@ toolchain-check:
 	fi
 
 .PHONY: lint
-lint: toolchain-check sweep
+# Cache retention is independent of correctness. CI restores reusable artifacts;
+# age-based cleanup belongs to an explicit `make sweep`, not this gate.
+lint: toolchain-check
 	@echo "Running clippy..."
 	@$(CARGO) clippy $(CARGO_MANIFEST_FLAG) --all-targets -- -D warnings
 

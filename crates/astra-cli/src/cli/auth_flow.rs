@@ -8,6 +8,139 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod browser_code;
+mod browser_launcher;
+#[cfg(test)]
+mod login_discovery_tests;
+pub(crate) mod uc;
+
+#[derive(Clone, Debug)]
+pub(crate) enum LoginMethod {
+    Uc(astra_services::auth::uc::UcDiscovery),
+    Memoria(String),
+    Password,
+}
+
+/// One discovery decision for both terminal and workbench entrypoints.
+pub(crate) async fn discover_login_method(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+) -> Result<LoginMethod, String> {
+    let methods = match api.get_auth_methods().await {
+        Ok(methods) => methods,
+        Err(astra_thin_client::ThinClientError::Api { status, .. }) if status.as_u16() == 404 => {
+            reject_native_login_downgrade(profile)?;
+            return Ok(LoginMethod::Password);
+        }
+        Err(error) => return Err(map_thin_err(error)),
+    };
+    if profile.is_none()
+        && let Some(uc) = methods.get("uc").filter(|value| !value.is_null())
+    {
+        return serde_json::from_value(uc.clone())
+            .map(LoginMethod::Uc)
+            .map_err(|_| "invalid UC login discovery".into());
+    }
+    reject_native_login_downgrade(profile)?;
+    parse_legacy_login_method(methods)
+}
+
+fn reject_native_login_downgrade(profile: Option<&str>) -> Result<(), String> {
+    // `astra login` deliberately has no in-memory bearer binding: it must
+    // work after logout and expired/interrupted credentials. The persisted
+    // environment selection still requires UC, just as the live TUI does.
+    if profile.is_none()
+        && (crate::cli::native_auth::active().is_some()
+            || astra_credentials::native::NativeStore::new()?.configured()?)
+    {
+        return Err(
+            "The selected MOI session requires UC login, but this server no longer advertises UC"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) enum LoginProgress {
+    OpenBrowser(String),
+    BrowserLaunchFailed(String),
+    Completing,
+}
+
+pub(crate) type LoginObserver =
+    std::sync::Arc<dyn Fn(LoginProgress) -> Result<(), String> + Send + Sync>;
+
+pub(crate) fn terminal_login_observer() -> LoginObserver {
+    std::sync::Arc::new(|progress| {
+        match progress {
+            LoginProgress::OpenBrowser(url) => eprintln!("Open this page to sign in:\n{url}"),
+            LoginProgress::BrowserLaunchFailed(reason) => eprintln!("{reason}"),
+            LoginProgress::Completing => {}
+        }
+        Ok(())
+    })
+}
+
+pub(crate) async fn browser_login(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    method: LoginMethod,
+    observer: LoginObserver,
+    terminal_workspace_prompt: bool,
+) -> Result<(), String> {
+    browser_login_with_launcher(
+        api,
+        profile,
+        method,
+        observer,
+        terminal_workspace_prompt,
+        browser_launcher::launch_login_url,
+    )
+    .await
+}
+
+pub(crate) async fn browser_login_with_launcher(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    method: LoginMethod,
+    observer: LoginObserver,
+    terminal_workspace_prompt: bool,
+    launch: impl AsyncFnOnce(String) -> Result<(), String>,
+) -> Result<(), String> {
+    match method {
+        LoginMethod::Uc(discovery) => {
+            uc::login_with_observer(api, discovery, observer, terminal_workspace_prompt, launch)
+                .await
+        }
+        LoginMethod::Memoria(website) => {
+            do_memoria_browser_login_impl(
+                api,
+                profile,
+                &website,
+                async |url| present_login_url(url, &observer, launch).await,
+                || observer(LoginProgress::Completing),
+            )
+            .await?;
+            Ok(())
+        }
+        LoginMethod::Password => Err("Password authentication requires the account form".into()),
+    }
+}
+
+async fn present_login_url(
+    url: String,
+    observer: &LoginObserver,
+    launch: impl AsyncFnOnce(String) -> Result<(), String>,
+) -> Result<(), String> {
+    observer(LoginProgress::OpenBrowser(url.clone()))?;
+    if let Err(reason) = launch(url).await {
+        // Opening is advisory. The displayed manual URL and callback remain
+        // valid even if automatic opening or warning delivery fails.
+        let _ = observer(LoginProgress::BrowserLaunchFailed(format!(
+            "Could not open a browser automatically: {reason}. Use the sign-in link shown above."
+        )));
+    }
+    Ok(())
+}
 
 /// Session authentication failure that can be repaired by `/login`.
 ///
@@ -28,16 +161,20 @@ pub(crate) fn is_llm_provider_auth_error(error: &str) -> bool {
 }
 
 pub(crate) fn clear_profile_auth(profile: Option<&str>) -> Result<(), String> {
-    credential_store()
-        .mutate(|creds| {
-            let name = profile_name(profile, creds);
-            if let Some(entry) = creds.profiles.get_mut(&name) {
-                entry.access_token = None;
-                entry.refresh_token = None;
-                entry.last_session_id = None;
-            }
-        })
-        .map_err(|e| e.to_string())
+    crate::cli::cli_config::cli_utils::replace_profile_auth(|| {
+        credential_store()
+            .mutate(|creds| {
+                let name = profile_name(profile, creds);
+                if let Some(entry) = creds.profiles.get_mut(&name) {
+                    entry.access_token = None;
+                    entry.refresh_token = None;
+                    entry.last_session_id = None;
+                }
+                name
+            })
+            .map_err(|e| e.to_string())
+    })
+    .map(|_| ())
 }
 
 #[derive(Deserialize)]
@@ -69,29 +206,34 @@ pub(crate) fn save_profile_auth_tokens(
     let username = username.to_string();
     let access = tokens.access_token.clone();
     let refresh = tokens.refresh_token.clone();
-    let name = credential_store()
-        .mutate(|creds| {
-            let name =
-                CredentialStore::resolve_profile_name(profile, creds.current_profile.as_deref());
-            let existing = creds.profiles.get(&name).cloned().unwrap_or_default();
-            let prev_session = if existing.account_id.as_deref() == Some(tokens.user_id.as_str()) {
-                existing.last_session_id
-            } else {
-                None
-            };
-            let updated = Profile {
-                username: Some(username.clone()),
-                account_id: Some(tokens.user_id.clone()),
-                access_token: Some(access.clone()),
-                refresh_token: Some(refresh.clone()),
-                last_session_id: prev_session,
-                memoria_api_key: existing.memoria_api_key,
-            };
-            creds.current_profile = Some(name.clone());
-            creds.profiles.insert(name.clone(), updated);
-            name
-        })
-        .map_err(|e| e.to_string())?;
+    let name = crate::cli::cli_config::cli_utils::replace_profile_auth(|| {
+        credential_store()
+            .mutate(|creds| {
+                let name = CredentialStore::resolve_profile_name(
+                    profile,
+                    creds.current_profile.as_deref(),
+                );
+                let existing = creds.profiles.get(&name).cloned().unwrap_or_default();
+                let prev_session =
+                    if existing.account_id.as_deref() == Some(tokens.user_id.as_str()) {
+                        existing.last_session_id
+                    } else {
+                        None
+                    };
+                let updated = Profile {
+                    username: Some(username.clone()),
+                    account_id: Some(tokens.user_id.clone()),
+                    access_token: Some(access.clone()),
+                    refresh_token: Some(refresh.clone()),
+                    last_session_id: prev_session,
+                    memoria_api_key: existing.memoria_api_key,
+                };
+                creds.current_profile = Some(name.clone());
+                creds.profiles.insert(name.clone(), updated);
+                name
+            })
+            .map_err(|e| e.to_string())
+    })?;
     crate::cli::cli_config::cli_utils::install_cli_profile_identity(
         name,
         Some(tokens.user_id.clone()),
@@ -99,17 +241,23 @@ pub(crate) fn save_profile_auth_tokens(
 }
 
 pub(crate) fn save_refreshed_profile_tokens(
-    profile: Option<&str>,
+    profile: &str,
+    expected: &Profile,
     tokens: &AuthTokenPayload,
+    binding: &crate::cli::cli_config::cli_utils::LegacyAuthBinding,
+    pair: &mut (Option<String>, Option<String>),
 ) -> Result<(), String> {
+    if !binding.matches_profile(profile) {
+        return Err("refresh login binding was replaced".into());
+    }
     let user_id = tokens.user_id.clone();
     let access = tokens.access_token.clone();
     let refresh = tokens.refresh_token.clone();
-    credential_store()
+    binding.commit_rotation(expected, pair, (Some(access.clone()), Some(refresh.clone())), || credential_store()
         .mutate(|creds| {
-            let name =
-                CredentialStore::resolve_profile_name(profile, creds.current_profile.as_deref());
-            let entry = creds.profiles.entry(name.clone()).or_default();
+            let name = profile;
+            let entry = creds.profiles.get_mut(name)
+                .ok_or_else(|| "refresh credential source was removed".to_string())?;
             match entry.account_id.as_deref() {
                 Some(existing_account_id) if existing_account_id == user_id => {}
                 Some(existing_account_id) => {
@@ -123,11 +271,19 @@ pub(crate) fn save_refreshed_profile_tokens(
                     ));
                 }
             }
+            // Account labels alone cannot distinguish a replacement login from
+            // the credential pair that authorized this refresh.
+            if entry.account_id != expected.account_id
+                || entry.access_token != expected.access_token
+                || entry.refresh_token != expected.refresh_token
+            {
+                return Err("refresh credential source was replaced".to_string());
+            }
             entry.access_token = Some(access.clone());
             entry.refresh_token = Some(refresh.clone());
             Ok(())
         })
-        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?)
 }
 
 pub(crate) async fn do_login(
@@ -180,19 +336,32 @@ struct MemoriaConnectionCallback {
     memoria_connection_key: String,
 }
 
-pub(crate) async fn do_memoria_browser_login(
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    website_base: &str,
-) -> Result<String, String> {
-    do_memoria_browser_login_with_opener(api, profile, website_base, open_login_url).await
-}
-
+#[cfg(test)]
 async fn do_memoria_browser_login_with_opener(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     website_base: &str,
     open: impl FnOnce(&str),
+) -> Result<String, String> {
+    do_memoria_browser_login_impl(
+        api,
+        profile,
+        website_base,
+        async |url| {
+            open(&url);
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .await
+}
+
+async fn do_memoria_browser_login_impl(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    website_base: &str,
+    open: impl AsyncFnOnce(String) -> Result<(), String>,
+    completing: impl Fn() -> Result<(), String>,
 ) -> Result<String, String> {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
@@ -216,10 +385,8 @@ async fn do_memoria_browser_login_with_opener(
         env!("CARGO_PKG_VERSION")
     );
     let connect_url = browser_code::append_capability(&connect_url, &verifier)?;
-    eprintln!("Open this page to connect Astra:\n{connect_url}");
-    open(&connect_url);
-
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    open(connect_url).await?;
     let mut rejected = 0_u8;
     let mut requests = 0_u8;
     loop {
@@ -295,6 +462,7 @@ async fn do_memoria_browser_login_with_opener(
                     continue;
                 }
             };
+            completing()?;
             let result = tokio::time::timeout_at(deadline, async {
                 let key =
                     browser_code::redeem(website_base, &code, &verifier, port, &expected_state)
@@ -367,6 +535,7 @@ async fn do_memoria_browser_login_with_opener(
             }
             continue;
         }
+        completing()?;
         match tokio::time::timeout_at(
             deadline,
             do_memoria_login_with_key(api, profile, &callback.memoria_connection_key),
@@ -587,35 +756,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
-fn open_login_url(url: &str) {
-    #[cfg(target_os = "macos")]
-    let result = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(target_os = "linux")]
-    let result = std::process::Command::new("xdg-open").arg(url).spawn();
-    #[cfg(target_os = "windows")]
-    let result = windows_browser_command(url).spawn();
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    let result: std::io::Result<std::process::Child> = Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "browser launch is unsupported",
-    ));
-    if let Err(error) = result {
-        eprintln!("Could not open a browser automatically: {error}");
-    }
-}
-
-pub(crate) async fn discover_login_website(
-    api: &astra_thin_client::ThinClient,
-) -> Result<Option<String>, String> {
-    let methods = match api.get_auth_methods().await {
-        Ok(value) => value,
-        // Old/self-hosted servers keep the original password journey. Do not
-        // silently downgrade on network errors, denied access or malformed JSON.
-        Err(astra_thin_client::ThinClientError::Api { status, .. }) if status.as_u16() == 404 => {
-            return Ok(None);
-        }
-        Err(error) => return Err(map_thin_err(error)),
-    };
+fn parse_legacy_login_method(methods: serde_json::Value) -> Result<LoginMethod, String> {
     #[derive(Deserialize)]
     struct Methods {
         password: bool,
@@ -633,10 +774,10 @@ pub(crate) async fn discover_login_website(
             return Err("Server login issuer is missing".into());
         }
         validate_login_website(&provider.authorization_url)?;
-        return Ok(Some(provider.authorization_url));
+        return Ok(LoginMethod::Memoria(provider.authorization_url));
     }
     if methods.password {
-        Ok(None)
+        Ok(LoginMethod::Password)
     } else {
         Err("Server has no available login method".into())
     }
@@ -664,22 +805,6 @@ fn validate_login_website(value: &str) -> Result<url::Url, String> {
         return Err("Server login URL requires HTTPS (HTTP is allowed only on loopback)".into());
     }
     Ok(url)
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn windows_browser_command(url: &str) -> std::process::Command {
-    let mut command = std::process::Command::new("powershell.exe");
-    // The URL is data in the child environment, never shell source. In
-    // particular the callback's &state= cannot become another command.
-    command
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Start-Process -FilePath $env:ASTRA_LOGIN_URL",
-        ])
-        .env("ASTRA_LOGIN_URL", url);
-    command
 }
 
 async fn request_login_tokens(
@@ -732,14 +857,13 @@ async fn retire_auth_runtime(state: &mut SessionState) {
             .shutdown_and_wait_with_reason(AUTH_RUNTIME_SHUTDOWN_WAIT, AUTH_RUNTIME_REPLACED_REASON)
             .await;
     }
-    state.delegation_engine = None;
-    state.unregister_root_mailbox().await;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 struct PreparedAuthTransition {
     owner_changed: bool,
     runtime_needs_initialization: bool,
+    runtime_config: Option<(astra_config::RuntimeConfig, String)>,
 }
 
 async fn prepare_session_auth_transition(
@@ -751,37 +875,124 @@ async fn prepare_session_auth_transition(
     let profile_name = profile_name(profile, &credentials);
     let target_owner = cli_profile_owner_scope(&profile_name, Some(account_id))?;
     let owner_changed = target_owner != astra_services::local_owner_scope();
-    let runtime_needs_initialization =
-        state.agent_spawner.is_none() || state.delegation_engine.is_none();
+    let runtime_needs_initialization = state.agent_spawner.is_none();
 
-    if owner_changed {
+    let runtime_config = if owner_changed {
+        let prepared =
+            crate::cli::session::session_startup::prepare_session_runtime_config(state, None)?;
         // The old session must reach its durable boundary while the old owner
         // scope and credentials are still installed. Only then may local
         // ownerless APIs be rebound to the authenticated account.
         retire_auth_runtime(state).await;
-        crate::cli::session::session_cleanup::finalize_session(state).await;
-        state.reset_for_new_session();
-        state.clear_session_id();
-    } else if runtime_needs_initialization {
-        // A same-owner login after `/logout`, or a partially initialized
-        // runtime, is not a session boundary. Retire any incomplete half and
-        // rebuild it after the new credentials have been saved.
-        retire_auth_runtime(state).await;
-    }
+        crate::cli::session::session_cleanup::finalize_session(state).await?;
+        Some(prepared)
+    } else {
+        if runtime_needs_initialization {
+            // A same-owner login after `/logout`, or a partially initialized
+            // runtime, is not a session boundary. Retire any incomplete half and
+            // rebuild it after the new credentials have been saved.
+            retire_auth_runtime(state).await;
+        }
+        None
+    };
     Ok(PreparedAuthTransition {
         owner_changed,
         runtime_needs_initialization: owner_changed || runtime_needs_initialization,
+        runtime_config,
     })
 }
 
-async fn initialize_authenticated_runtime(
+fn commit_session_auth_transition(
+    prepared: PreparedAuthTransition,
+    account_id: &str,
+    state: &mut SessionState,
+) -> bool {
+    if let Some((config, version)) = prepared.runtime_config {
+        // Publish the new local conversation only after credentials changed.
+        // Model preference may cross accounts; Offering and pricing may not.
+        state.model = state.model.as_deref().map(|name| name.to_string().into());
+        state.reset_for_new_session();
+        state.clear_session_id();
+        state.ingestion_user_id = Some(account_id.to_owned());
+        crate::cli::session::session_startup::apply_session_runtime_config(state, config, version);
+    }
+    prepared.runtime_needs_initialization
+}
+
+/// End the old owner's runtime before browser login can publish new credentials.
+/// Cancellation retains credentials, but starts a fresh local conversation.
+pub(crate) async fn begin_browser_session_login(state: &mut SessionState) -> Result<(), String> {
+    let (config, version) =
+        crate::cli::session::session_startup::prepare_session_runtime_config(state, None)?;
+    retire_auth_runtime(state).await;
+    if state.session_id.is_some() {
+        crate::cli::session::session_cleanup::finalize_session(state).await?;
+    }
+    state.session_memory_port = None;
+    state.reset_for_new_session();
+    state.clear_session_id();
+    state.model = None;
+    crate::cli::session::session_startup::apply_session_runtime_config(state, config, version);
+    Ok(())
+}
+
+pub(crate) async fn finish_browser_session_login(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-    access_token: String,
+    uc: bool,
     state: &mut SessionState,
-) {
-    crate::cli::agent_runtime::initialize_multi_agent_runtime(state, api, access_token, profile)
-        .await;
+) -> Result<
+    (
+        astra_thin_client::ThinClient,
+        String,
+        crate::cli::session::session_runtime::PipelineModules,
+    ),
+    String,
+> {
+    let api = if uc {
+        crate::cli::native_auth::bind_after_login(api)?
+    } else {
+        api.clone()
+    };
+    let token = crate::cli::session::session_runtime::fresh_access_token(&api, profile)
+        .await
+        .ok_or("Login completed but no usable session credential is available")?;
+    let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
+    let (config, version) =
+        crate::cli::session::session_startup::prepare_session_runtime_config(state, None)?;
+    state.ingestion_user_id = Some(user_id);
+    crate::cli::session::session_startup::apply_session_runtime_config(state, config, version);
+    // A workbench started while signed out skipped startup registration. Publish
+    // its stable checkout binding under the new identity before admitting chat.
+    crate::cli::edge_lifecycle::register_edge_once(&api, &token)
+        .await
+        .map_err(|_| {
+            "Signed in, but local execution registration failed. Retry /login before chatting."
+                .to_string()
+        })?;
+    let modules = rebuild_browser_identity_services(&api, profile, state).await;
+    crate::cli::agent_runtime::initialize_agent_projection(state);
+    Ok((api, token, modules))
+}
+
+async fn rebuild_browser_identity_services(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    state: &mut SessionState,
+) -> crate::cli::session::session_runtime::PipelineModules {
+    // A new identity/generation must not inherit cached private skills or a
+    // provider pinned to the preceding login. Reuse the startup composition.
+    let modules = crate::cli::session::session_runtime::create_tui_pipeline_modules(
+        api,
+        profile,
+        crate::cli::session::session_runtime::resolved_session_project_root().as_deref(),
+    )
+    .await;
+    state.unified_skill_registry = modules.unified_skill_registry.clone();
+    state.mcp_manager = modules.mcp_manager.clone();
+    state.session_memory_port =
+        crate::cli::session::session_startup::build_cli_session_memory_port(api, profile).await;
+    modules
 }
 
 pub(crate) async fn do_login_for_session(
@@ -800,8 +1011,8 @@ pub(crate) async fn do_login_for_session(
     );
     save_profile_auth_tokens(profile, username, &tokens)?;
     let access_token = tokens.access_token.clone();
-    if transition.runtime_needs_initialization {
-        initialize_authenticated_runtime(api, profile, access_token.clone(), state).await;
+    if commit_session_auth_transition(transition, &tokens.user_id, state) {
+        crate::cli::agent_runtime::initialize_agent_projection(state);
     }
     Ok(access_token)
 }
@@ -823,8 +1034,8 @@ pub(crate) async fn do_register_for_session(
     );
     save_profile_auth_tokens(profile, username, &tokens)?;
     let access_token = tokens.access_token;
-    if transition.runtime_needs_initialization {
-        initialize_authenticated_runtime(api, profile, access_token.clone(), state).await;
+    if commit_session_auth_transition(transition, &tokens.user_id, state) {
+        crate::cli::agent_runtime::initialize_agent_projection(state);
     }
     Ok(access_token)
 }
@@ -833,6 +1044,118 @@ pub(crate) async fn do_register_for_session(
 mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Debug)]
+    struct GenerationBearer(&'static str);
+
+    impl astra_thin_client::client::BearerProvider for GenerationBearer {
+        fn token(
+            &self,
+        ) -> futures_util::future::BoxFuture<'_, Result<String, astra_thin_client::ThinClientError>>
+        {
+            Box::pin(async move { Ok(self.0.to_owned()) })
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn browser_identity_services_replace_generation_and_private_skill_cache() {
+        use std::sync::Arc;
+        use wiremock::matchers::header;
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _creds = crate::tests::isolate_credentials();
+        let _env_token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let server = MockServer::start().await;
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        assert!(state.session_memory_port.is_none());
+        let mut previous_registry = None;
+        // First login, same-account re-login, then account switch.
+        for (generation, owner) in [("g1", "alice"), ("g2", "alice"), ("g3", "bob")] {
+            let mut credentials = load_credentials();
+            credentials.profiles.insert(
+                "default".into(),
+                Profile {
+                    access_token: Some("explicit-token-must-not-override-provider".into()),
+                    ..Default::default()
+                },
+            );
+            save_credentials(&credentials).unwrap();
+            let bearer = format!("Bearer {generation}");
+            Mock::given(method("GET"))
+                .and(path("/auth/me"))
+                .and(header("authorization", bearer.as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"user_id": owner})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let name = format!("private-{generation}");
+            let record = json!({"skill_id": name, "skill_name": name, "version": "1.0.0",
+                "metadata": {"instructions": format!("Private instructions for {generation}")}});
+            Mock::given(method("GET"))
+                .and(path("/skills"))
+                .and(header("authorization", bearer.as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "skills": [record.clone()], "limit": 100, "total": 1, "next_cursor": null
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/skills/{name}")))
+                .and(header("authorization", bearer.as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(record))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None)
+                .unwrap()
+                .with_bearer_provider(Arc::new(GenerationBearer(generation)));
+            state.runtime_config.memory.retrieval_top_k = 42;
+            super::begin_browser_session_login(&mut state)
+                .await
+                .unwrap();
+            assert!(state.session_memory_port.is_none());
+            assert_eq!(
+                state.runtime_config.memory.retrieval_top_k,
+                astra_config::RuntimeConfig::load().memory.retrieval_top_k
+            );
+            assert!(state.config_version_id.is_some());
+            let _modules = super::rebuild_browser_identity_services(&api, None, &mut state).await;
+            let memory = state.session_memory_port.as_ref().unwrap();
+            Mock::given(method("POST"))
+                .and(path("/sessions/identity-test-session/memory/finalize"))
+                .and(header("authorization", bearer.as_str()))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(
+                        json!({"accepted":true,"session_id":"identity-test-session"}),
+                    ),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            astra_runtime::turn::cloud::session_end_governance::run_session_end_governance(
+                &Default::default(),
+                "identity-test-session",
+                memory.as_ref(),
+            )
+            .await
+            .unwrap();
+            let registry = state.unified_skill_registry.clone();
+            if let Some(old) = previous_registry.take() {
+                assert!(!Arc::ptr_eq(&old, &registry));
+            }
+            let report = registry.discover_all_report().await.unwrap();
+            assert!(report.failures.is_empty(), "{:?}", report.failures);
+            registry.load(&name).await.unwrap();
+            if generation != "g1" {
+                assert!(
+                    registry.load("private-g1").await.is_err(),
+                    "old private cache leaked"
+                );
+            }
+            previous_registry = Some(registry);
+        }
+    }
 
     #[serial_test::serial]
     #[tokio::test]
@@ -851,10 +1174,31 @@ mod tests {
             let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
             let (sender, receiver) = tokio::sync::oneshot::channel();
             let website_url = website.uri();
-            let login =
-                super::do_memoria_browser_login_with_opener(&api, None, &website_url, |url| {
-                    sender.send(url.to_string()).unwrap();
-                });
+            let sender = std::sync::Mutex::new(Some(sender));
+            let warnings = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed_warnings = warnings.clone();
+            let observer: super::LoginObserver = std::sync::Arc::new(move |progress| {
+                match progress {
+                    super::LoginProgress::OpenBrowser(url) => {
+                        sender.lock().unwrap().take().unwrap().send(url).unwrap();
+                    }
+                    super::LoginProgress::BrowserLaunchFailed(reason) => {
+                        assert!(reason.contains("Use the sign-in link"));
+                        observed_warnings.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        return Err("warning view already closed".into());
+                    }
+                    super::LoginProgress::Completing => {}
+                }
+                Ok(())
+            });
+            let login = super::browser_login_with_launcher(
+                &api,
+                None,
+                super::LoginMethod::Memoria(website_url),
+                observer,
+                false,
+                async |_| Err("test launcher unavailable".into()),
+            );
             let browser = async {
                 let url = url::Url::parse(&receiver.await.unwrap()).unwrap();
                 let fields: std::collections::HashMap<_, _> = url
@@ -999,7 +1343,8 @@ mod tests {
                 );
             };
             let (result, ()) = tokio::join!(login, browser);
-            assert_eq!(result.unwrap(), "test-access");
+            result.unwrap();
+            assert_eq!(warnings.load(std::sync::atomic::Ordering::SeqCst), 1);
             let profile = load_credentials().profiles.remove("default").unwrap();
             assert_eq!(profile.account_id.as_deref(), Some("browser-user"));
             assert_eq!(profile.access_token.as_deref(), Some("test-access"));
@@ -1305,28 +1650,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn windows_browser_launch_keeps_callback_url_out_of_shell_source() {
-        let url = "https://thememoria.ai/connect/astra?port=1234&state=abc&cli_version=0.2.1";
-        let command = super::windows_browser_command(url);
-        let args: Vec<_> = command
-            .get_args()
-            .map(|v| v.to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            args.iter()
-                .all(|arg| !arg.contains(url) && !arg.contains("&state"))
-        );
-        assert!(
-            command
-                .get_envs()
-                .any(|(name, value)| name == "ASTRA_LOGIN_URL"
-                    && value == Some(std::ffi::OsStr::new(url)))
-        );
-    }
-
     #[tokio::test]
+    #[serial_test::serial]
     async fn login_discovery_preserves_local_servers_and_rejects_bad_cloud_urls() {
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _native_directory = crate::test_utils::ProcessEnvGuard::remove("MOI_AUTH_DIR");
         use wiremock::{
             Mock, MockServer, ResponseTemplate,
             matchers::{method, path},
@@ -1357,10 +1685,12 @@ mod tests {
                 .mount(&server)
                 .await;
             let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-            let result = super::discover_login_website(&api).await;
+            let result = super::discover_login_method(&api, None).await;
             match expected {
-                "password" => assert_eq!(result.unwrap(), None),
-                "browser" => assert_eq!(result.unwrap().as_deref(), Some("https://thememoria.ai")),
+                "password" => assert!(matches!(result.unwrap(), super::LoginMethod::Password)),
+                "browser" => assert!(
+                    matches!(result.unwrap(), super::LoginMethod::Memoria(url) if url == "https://thememoria.ai")
+                ),
                 _ => assert!(result.is_err()),
             }
         }
@@ -1439,13 +1769,20 @@ mod tests {
         );
         save_credentials(&creds).unwrap();
 
+        let binding =
+            crate::cli::cli_config::cli_utils::legacy_auth_binding("default", Some("account-a"))
+                .unwrap();
+        let mut pair = binding.pair.try_lock().unwrap();
         let error = save_refreshed_profile_tokens(
-            None,
+            "default",
+            &creds.profiles["default"],
             &AuthTokenPayload {
                 user_id: "account-b".to_string(),
                 access_token: "access-b".to_string(),
                 refresh_token: "refresh-b".to_string(),
             },
+            &binding,
+            &mut pair,
         )
         .expect_err("refresh must not move a profile to another account");
         assert!(error.contains("does not match"), "{error}");
@@ -1459,8 +1796,11 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn login_account_change_closes_old_owner_session_before_rebinding() {
-        let _creds_guard = crate::tests::isolate_credentials();
         let (_sessions_dir, _journal_guard) = crate::tests::isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let _token_guard = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _state_root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
         let _identity_guard =
             crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
                 "default", None,
@@ -1481,6 +1821,33 @@ mod tests {
         state.set_session_id(session_id);
         state.journal = Some(writer);
         state.turn = 1;
+        state.ingestion_user_id = Some("account-a".into());
+        let hub = std::sync::Arc::new(
+            astra_runtime::observability::ObservabilityHub::with_storage(
+                astra_runtime_env::local_state_root().join("observability"),
+            ),
+        );
+        for (account, total_queries) in [
+            ("anonymous", 11111),
+            ("account-a", 11111),
+            ("account-b", 22222),
+        ] {
+            let mut profile = hub.profiles().get_profile(account);
+            profile.stats.total_queries = total_queries;
+            hub.profiles().update_profile(profile);
+        }
+        state.observability_hub = Some(hub);
+        state.runtime_config.memory.retrieval_top_k = 42;
+        state.model = Some(
+            crate::cli::session::session_state::SessionModelChoice::Selected(
+                crate::cli::session::session_runtime::ServerModelSelection {
+                    name: "model-a(thinking:high)".into(),
+                    offering_id: "owner-a-offering".into(),
+                    context_window: Some(8192),
+                    pricing: Some(astra_services::models::PricingData::default()),
+                },
+            ),
+        );
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1500,6 +1867,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(token, "access-b");
+        assert_eq!(state.ingestion_user_id.as_deref(), Some("account-b"));
+        assert_eq!(
+            serde_json::to_value(&state.runtime_config).unwrap(),
+            serde_json::to_value(astra_config::RuntimeConfig::load()).unwrap()
+        );
+        assert_eq!(state.model.as_deref(), Some("model-a(thinking:high)"));
+        assert!(state.model.as_ref().unwrap().offering_id().is_none());
+        assert!(state.model.as_ref().unwrap().pricing().is_none());
         assert!(state.session_id.is_none());
         assert_ne!(astra_services::local_owner_scope(), old_owner);
         let old_events =
@@ -1512,8 +1887,151 @@ mod tests {
             load_credentials().profiles["default"].account_id.as_deref(),
             Some("account-b")
         );
-        assert!(state.delegation_engine.is_some());
         assert!(state.agent_spawner.is_some());
+
+        // Preserve actual credentials and disk profiles, but discard process/session state.
+        let fresh_id = format!("cold-profile-{}", uuid::Uuid::new_v4());
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"session_id":fresh_id})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        crate::cli::slash::slash_state::start_fresh_session(&api, None, &token, &mut state)
+            .await
+            .unwrap();
+        let expected = serde_json::to_value(&state.runtime_config).unwrap();
+        let expected_version = state.config_version_id.clone();
+        assert_eq!(
+            serde_json::to_value(&state.runtime_config).unwrap(),
+            serde_json::to_value(astra_config::RuntimeConfig::load()).unwrap()
+        );
+        assert!(
+            astra_services::session_workspace::read_workspace(&fresh_id)
+                .unwrap()
+                .tuned_config_json
+                .is_none()
+        );
+        let active = astra_turn_core::active_conversation::ActiveConversation::empty(
+            &crate::cli::cli_config::cli_utils::cli_user_id(),
+            &fresh_id,
+        )
+        .unwrap();
+        let commit = active
+            .prepare_commit(
+                1,
+                state.config_version_id.clone(),
+                vec![
+                    json!({"role":"user","content":"question"}),
+                    json!({"role":"assistant","content":"answer"}),
+                ],
+            )
+            .unwrap();
+        assert_eq!(commit.next.cursor().owner_id, "account-b");
+        Mock::given(method("POST"))
+            .and(path(format!("/sessions/{fresh_id}/resume")))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer access-b",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                astra_services::session_restore::RestoredSession {
+                    session_id: fresh_id.clone(),
+                    turn_count: 1,
+                    restored_from_cloud: true,
+                    resume_bundle: Some(astra_turn_types::ResumeBundleV1 {
+                        schema_version: astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION,
+                        cursor: commit.next.cursor().clone(),
+                        source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
+                        conversation_messages: commit.next.messages().to_vec(),
+                        materialized_conversation_root_hash: None,
+                        degraded_reasons: Vec::new(),
+                        repair_actions: Vec::new(),
+                        projections: Default::default(),
+                    }),
+                    ..Default::default()
+                },
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        state
+            .journal
+            .as_ref()
+            .unwrap()
+            .append(
+                &astra_services::session_journal::JournalEvent::turn(
+                    Some(&fresh_id),
+                    1,
+                    state.model.as_deref(),
+                    "question",
+                    "answer",
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                .with_conversation_commit(commit.commit),
+            )
+            .unwrap();
+        state.prepare_for_session_rebind().await;
+        drop(state);
+        crate::cli::cli_config::cli_utils::install_cli_profile_identity("default", None).unwrap();
+        crate::cli::cli_config::cli_utils::configure_cli_profile_identity(
+            None,
+            crate::cli::cli_config::cli_utils::CliProfileIdentityAdmission::RequireBoundAccount,
+        )
+        .unwrap();
+        let mut restarted = crate::cli::session::session_runtime::initialize_session_state(
+            None,
+            None,
+            &crate::cli::cli_config::cli_context::CliContext::default(),
+        );
+        assert_eq!(
+            serde_json::to_value(&restarted.runtime_config).unwrap(),
+            expected
+        );
+        assert_eq!(restarted.ingestion_user_id.as_deref(), Some("account-b"));
+        {
+            let obs = restarted
+                .observability_session
+                .as_ref()
+                .unwrap()
+                .read()
+                .unwrap();
+            assert_eq!(obs.user_id, "account-b");
+            assert_eq!(obs.profile.user_id, "account-b");
+            assert_eq!(obs.profile.stats.total_queries, 22222);
+            assert_eq!(serde_json::to_value(&obs.config).unwrap(), expected);
+        }
+        // Missing ingestion metadata must not change the installed account authority.
+        restarted.ingestion_user_id = None;
+        crate::cli::slash::slash_session::restore_session_into_state(
+            &fresh_id,
+            None,
+            &api,
+            &mut restarted,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&restarted.runtime_config).unwrap(),
+            expected
+        );
+        assert_eq!(restarted.config_version_id, expected_version);
+        {
+            let obs = restarted
+                .observability_session
+                .as_ref()
+                .unwrap()
+                .read()
+                .unwrap();
+            assert_eq!(obs.user_id, "account-b");
+            assert_eq!(obs.profile.user_id, "account-b");
+            assert_eq!(obs.profile.stats.total_queries, 22222);
+            assert_eq!(serde_json::to_value(&obs.config).unwrap(), expected);
+        }
+        server.verify().await;
     }
 
     #[serial_test::serial]
@@ -1529,8 +2047,10 @@ mod tests {
         let owner = astra_services::local_owner_scope();
         let mut state = crate::cli::session::session_state::SessionState::default();
         state.set_session_id("same-owner-session");
+        state.runtime_config.memory.retrieval_top_k = 42;
+        state.config_version_id = Some("same-owner-config".into());
+        let saved = serde_json::to_value(&state.runtime_config).unwrap();
         assert!(state.agent_spawner.is_none());
-        assert!(state.delegation_engine.is_none());
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1550,9 +2070,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(token, "access-new");
+        assert_eq!(serde_json::to_value(&state.runtime_config).unwrap(), saved);
+        assert_eq!(
+            state.config_version_id.as_deref(),
+            Some("same-owner-config")
+        );
         assert_eq!(astra_services::local_owner_scope(), owner);
         assert_eq!(state.session_id.as_deref(), Some("same-owner-session"));
-        assert!(state.delegation_engine.is_some());
         assert!(state.agent_spawner.is_some());
     }
 

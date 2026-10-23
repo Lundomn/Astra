@@ -85,8 +85,6 @@ async fn load_dashboard_model_catalog(
         std::time::Duration::from_secs(30),
         tokio::process::Command::new(admin_bin)
             .args(["admin", "model", "list"])
-            .env("NO_PROXY", "localhost,127.0.0.1")
-            .env("no_proxy", "localhost,127.0.0.1")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -482,7 +480,7 @@ fn apply_dashboard_event_to_snapshot(snapshot: &mut DashboardSnapshot, event: &D
 
 static DASHBOARD_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) fn next_dashboard_event_sequence() -> u64 {
+pub fn next_dashboard_event_sequence() -> u64 {
     DASHBOARD_EVENT_SEQUENCE.fetch_add(1, Ordering::AcqRel) + 1
 }
 
@@ -971,8 +969,6 @@ async fn login_handler(
             "--password",
             &req.password,
         ])
-        .env("NO_PROXY", "localhost,127.0.0.1")
-        .env("no_proxy", "localhost,127.0.0.1")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
@@ -1311,6 +1307,7 @@ async fn execute_run(
     astra_services::configure_local_owner_scope(runner_identity.local_owner_scope.clone());
     runner_cfg.profile = Some(runner_identity.profile_name);
     runner_cfg.artifact_owner_scopes = runner_identity.artifact_owner_scopes.clone();
+    runner_cfg.cancel_flag = Some(cancel_flag.clone());
 
     let judger_model = req.judger_model.as_deref().unwrap_or(&config.judger_model);
     let judger_cfg = JudgerConfig::new(config.astra_bin.clone(), judger_model);

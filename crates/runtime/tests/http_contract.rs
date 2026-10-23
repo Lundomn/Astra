@@ -8,7 +8,8 @@ use axum::{
 };
 use serde::Deserialize;
 use tower::util::ServiceExt;
-use uuid::Uuid;
+
+mod test_support;
 
 #[derive(Deserialize)]
 struct ResponseContract {
@@ -86,36 +87,6 @@ async fn read_json_with_headers(
     (status, json)
 }
 
-fn assert_contract_json(actual: &serde_json::Value, expected: &serde_json::Value, label: &str) {
-    if let Some(expected_obj) = expected.as_object()
-        && expected_obj.contains_key("detail")
-        && !expected_obj.contains_key("request_id")
-    {
-        let actual_obj = actual
-            .as_object()
-            .unwrap_or_else(|| panic!("{label}: actual response should be a JSON object"));
-        let request_id = actual_obj
-            .get("request_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_else(|| panic!("{label}: error response should include request_id"));
-        assert!(
-            Uuid::parse_str(request_id).is_ok(),
-            "{label}: request_id should be a UUID"
-        );
-
-        let mut normalized_actual = actual_obj.clone();
-        normalized_actual.remove("request_id");
-        assert_eq!(
-            serde_json::Value::Object(normalized_actual),
-            *expected,
-            "{label}"
-        );
-        return;
-    }
-
-    assert_eq!(actual, expected, "{label}");
-}
-
 fn assert_health_contract_json(
     actual: &serde_json::Value,
     expected: &serde_json::Value,
@@ -130,6 +101,15 @@ fn assert_health_contract_json(
         Some("<dynamic-build-git-sha>"),
         "{label}: health contract must use the dynamic build SHA sentinel"
     );
+    let expected_dirty = expected
+        .as_object()
+        .and_then(|object| object.get("build_git_dirty"))
+        .and_then(serde_json::Value::as_str);
+    assert_eq!(
+        expected_dirty,
+        Some("<dynamic-build-git-dirty>"),
+        "{label}: health contract must use the dynamic build dirty sentinel"
+    );
 
     let mut resolved_expected = expected.clone();
     resolved_expected
@@ -139,7 +119,14 @@ fn assert_health_contract_json(
             "build_git_sha".to_string(),
             serde_json::Value::String(astra_core::history_work_baseline::BUILD_GIT_SHA.to_string()),
         );
-    assert_contract_json(actual, &resolved_expected, label);
+    resolved_expected
+        .as_object_mut()
+        .expect("health contract should be a JSON object")
+        .insert(
+            "build_git_dirty".to_string(),
+            serde_json::Value::Bool(astra_core::history_work_baseline::BUILD_GIT_DIRTY == "true"),
+        );
+    test_support::assert_contract_json(actual, &resolved_expected, label);
 }
 
 fn assert_root_contract_json(actual: &serde_json::Value, expected: &serde_json::Value) {
@@ -161,7 +148,7 @@ fn assert_root_contract_json(actual: &serde_json::Value, expected: &serde_json::
             "version".to_string(),
             serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
         );
-    assert_contract_json(actual, &resolved_expected, "root");
+    test_support::assert_contract_json(actual, &resolved_expected, "root");
 }
 
 fn build_request(
@@ -227,5 +214,73 @@ async fn removed_learning_routes_are_not_public_contracts() {
             StatusCode::NOT_FOUND,
             "{method} {path} must stay removed instead of returning a stub"
         );
+    }
+}
+
+#[tokio::test]
+async fn retired_database_mutation_routes_cannot_execute_through_http() {
+    let app = build_test_app(true);
+    let payload = serde_json::json!({"name":"fixture_branch","source":"fixture_source","target":"fixture_target","operation":"merge","model":"fixture_model","session_count":2,"checkpoint_name":"fixture_checkpoint"});
+    for (method, path) in [
+        ("POST", "/branches"),
+        ("DELETE", "/branches"),
+        ("POST", "/branches/diff"),
+        ("POST", "/branches/merge"),
+        ("POST", "/branches/cost-estimate"),
+        ("POST", "/data-versioning/sandbox/fixture/restore"),
+    ] {
+        for authenticated in [false, true] {
+            let headers = if authenticated {
+                vec![
+                    ("authorization", "Bearer fixture-user"),
+                    ("content-type", "application/json"),
+                ]
+            } else {
+                vec![("content-type", "application/json")]
+            };
+            let response = app
+                .clone()
+                .oneshot(build_request(
+                    method,
+                    path,
+                    &headers,
+                    body::Body::from(payload.to_string()),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "retired {method} {path}, authenticated={authenticated}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn retired_unimplemented_routes_cannot_claim_execution() {
+    let app = build_test_app(true);
+    for (method, path) in [
+        ("POST", "/triggers"),
+        ("GET", "/triggers"),
+        ("DELETE", "/triggers/fixture"),
+        ("POST", "/triggers/fixture/fire"),
+        ("POST", "/sessions/fixture/replay"),
+        ("GET", "/sessions/fixture/replay/compare"),
+    ] {
+        for authenticated in [false, true] {
+            let mut headers = vec![("content-type", "application/json")];
+            if authenticated {
+                headers.push(("authorization", "Bearer fixture-user"));
+            }
+            let response = app.clone().oneshot(build_request(method, path, &headers,
+                body::Body::from(r#"{"trigger_type":"schedule","cron_expr":"* * * * *","secret":"fixture-secret","user_input":"fixture"}"#)))
+                .await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "retired {method} {path}, authenticated={authenticated}"
+            );
+        }
     }
 }

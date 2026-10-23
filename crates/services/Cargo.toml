@@ -12,6 +12,16 @@ e2e-hooks = []
 external-contract-tests = []
 # Requires explicit feature + --ignored + private provider configuration.
 live-provider-tests = []
+# Long-running opt-in load profiles are excluded from ordinary database lanes.
+capacity-probes = []
+
+[[test]]
+name = "ingestion_capacity_db_it"
+required-features = ["capacity-probes"]
+
+[[test]]
+name = "ingestion_batch_tradeoff_db_it"
+required-features = ["capacity-probes"]
 
 [[test]]
 name = "memoria_live_contract_it"
@@ -47,19 +57,19 @@ reqwest.workspace = true
 hickory-resolver = { version = "0.26.1", default-features = false, features = ["system-config", "tokio"] }
 rustls.workspace = true
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-webpki-roots = "1"
+
 percent-encoding = "2"
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 sha2.workspace = true
-sqlx = { workspace = true, features = ["chrono"] }
+sqlx = { workspace = true, features = ["chrono", "json"] }
+sqlx-core.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-unicode-segmentation = "1.12"
 dirs = "6.0.0"
 fastrand = "2"
 fs2 = "0.4.3"
@@ -79,5 +89,6 @@ sqlx = { workspace = true, features = ["chrono"] }
 tempfile = "3"
 # `test-util` enables virtual-time `start_paused` so timeout/retry tests
 # don't wait real seconds.
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "test-util"] }
+tokio = { workspace = true, features = ["io-std", "macros", "rt-multi-thread", "sync", "test-util"] }
+tracing-subscriber.workspace = true
 uuid.workspace = true

@@ -15,9 +15,10 @@
 //!
 //! **Server → Edge** (JSON text frames):
 //! ```text
-//! {"type": "edge_auth_ok", "user_id": "...", "interaction_api_major": "3"}
+//! {"type": "edge_auth_ok", "user_id": "...", "edge_id": "ws-...", "interaction_api_major": "3"}
 //! {"type": "edge_auth_error", "message": "..."}
 //! {"type": "edge_tool_request", "request_id": "...", "tool": "...", "args": {...}}
+//! {"type": "edge_tool_input", "request_id": "...", "delivery_generation": 1, "input": {...}}
 //! {"type": "edge_pong"}
 //! {"type": "edge_closing", "reason": "..."}
 //! ```
@@ -25,7 +26,61 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+pub const MAX_SEALED_CAPACITY_BYTES: usize = 128 * 1024;
+pub const MAX_CAPACITY_RPC_TIMEOUT_SECS: u64 = 130;
+pub const MAX_CAPACITY_RPC_INFLIGHT: usize = 64;
+
+pub fn valid_capacity_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeCapacityProvider {
+    pub id: String,
+    /// Public recipient key only; local endpoint and bearer key stay on Edge.
+    pub public_key: String,
+}
+
+// The payload is sealed by the capacity owner, not interpreted by Astra.
+// These wire types are available to both server and Edge feature profiles.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SealedCapacityPayload(pub String);
+
+impl std::fmt::Debug for SealedCapacityPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[sealed capacity payload]")
+    }
+}
+
+impl SealedCapacityPayload {
+    pub fn is_valid(&self) -> bool {
+        !self.0.is_empty()
+            && self.0.len() <= MAX_SEALED_CAPACITY_BYTES
+            && self
+                .0
+                .bytes()
+                .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'-' | b'_'))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityRpcFailure {
+    Invalid,
+    Offline,
+    BindingChanged,
+    Unsupported,
+    Busy,
+    OutcomeUnknown,
+}
+
 pub use astra_turn_types::ToolInvocationIdentity;
+use astra_turn_types::{ProviderStageInput, ProviderStageInputAck};
 
 /// Edge can inject request-scoped provider authorization into one bash
 /// subprocess without receiving file-transfer metadata or bytes.
@@ -68,6 +123,10 @@ impl std::fmt::Debug for RuntimeProcessAuthorizationContext {
             .finish()
     }
 }
+
+/// Maximum UTF-8 bytes of a complete serialized Edge WebSocket message,
+/// including identity, delivery generation, metadata and JSON escaping.
+pub const MAX_EDGE_MESSAGE_BYTES: usize = 256 * 1024;
 
 /// Default timeout for tool execution on the edge agent.
 pub const EDGE_TOOL_TIMEOUT_SECS: u64 = 300; // 5 minutes
@@ -130,9 +189,49 @@ pub enum EdgeClientMessage {
         tool_result_fields: Option<Map<String, Value>>,
     },
 
+    /// Acknowledgement that an input sent to an active provider stage was
+    /// accepted or rejected by the provider adapter. A missing acknowledgement
+    /// is a transport failure; this message does not claim model output was
+    /// produced.
+    #[serde(rename = "edge_tool_input_ack")]
+    ToolInputAck {
+        request_id: String,
+        delivery_generation: u64,
+        ack: ProviderStageInputAck,
+    },
+
+    /// Edge heartbeat.
+    #[serde(rename = "edge_capacity_result")]
+    CapacityResult {
+        request_id: String,
+        connection_generation: u64,
+        result: Result<SealedCapacityPayload, CapacityRpcFailure>,
+    },
+
     /// Edge heartbeat.
     #[serde(rename = "edge_ping")]
     Ping {},
+}
+
+/// Concrete execution grant, frozen by admission rather than inferred from
+/// tool arguments. Workspace authority is confined to the exact selected
+/// materialization; it does not authorize reading arbitrary host files or
+/// provider credentials. Consumers intersect it with local authority and
+/// mandatory sensitive-path restrictions, never expand it via approval.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeExecutionCeiling {
+    pub workspace_root: String,
+    pub workspace_id: Option<String>,
+    pub materialization_id: Option<String>,
+    pub execution_binding_generation: u64,
+    /// Locally approved provider executable/bootstrap paths, frozen by
+    /// admission. Files grant only that file; directories grant descendants
+    /// subject to mandatory sensitive-path denial. Not arbitrary data roots.
+    /// An empty list is explicit; consumers must never add fallback paths.
+    pub runtime_read_paths: Vec<String>,
+    pub workspace_write_allowed: bool,
+    pub network_allowed: bool,
 }
 
 /// Messages sent from server to edge agent.
@@ -143,6 +242,10 @@ pub enum EdgeServerMessage {
     #[serde(rename = "edge_auth_ok")]
     AuthOk {
         user_id: String,
+        /// Server-issued identity of this authenticated WebSocket registry
+        /// generation. REST callbacks must echo this exact value; an
+        /// edge-local agent label is not a transport identity.
+        edge_id: String,
         interaction_api_major: String,
     },
 
@@ -160,6 +263,9 @@ pub enum EdgeServerMessage {
         delivery_generation: u64,
         tool: String,
         args: Value,
+        /// Frozen per-invocation authority. Native executors require it;
+        /// ordinary command execution still uses its existing local boundary.
+        execution_ceiling: Option<Box<EdgeExecutionCeiling>>,
         /// Opaque provider authorization injected only for this bash call.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         runtime_process_authorization: Option<Box<RuntimeProcessAuthorizationContext>>,
@@ -167,8 +273,34 @@ pub enum EdgeServerMessage {
         /// authorization must never execute without its live credential.
         #[serde(default, skip_serializing_if = "is_false")]
         runtime_process_authorization_required: bool,
-        /// Maximum execution time in seconds.
-        #[serde(default = "default_tool_timeout_secs")]
+        /// Finite command limit; an authenticated task may have no cutoff.
+        timeout_secs: Option<u64>,
+        /// Immutable server-admitted work cutoff, excluding settlement grace.
+        execution_deadline_unix_ms: Option<u64>,
+        /// Work remaining when this dispatch was produced. Replay must also
+        /// enforce the absolute cutoff; this value never renews authority.
+        execution_timeout_ms: Option<u64>,
+        /// Independent command policy ceiling, not the native job budget.
+        command_timeout_cap_ms: Option<u64>,
+    },
+
+    /// Deliver one already-admitted semantic input to the active provider
+    /// stage for this invocation. The request identity and delivery
+    /// generation fence it to the exact in-flight execution.
+    #[serde(rename = "edge_tool_input")]
+    ToolInput {
+        request_id: String,
+        delivery_generation: u64,
+        input: ProviderStageInput,
+    },
+
+    /// Server heartbeat response.
+    #[serde(rename = "edge_capacity_request")]
+    CapacityRequest {
+        request_id: String,
+        connection_generation: u64,
+        provider_id: String,
+        payload: SealedCapacityPayload,
         timeout_secs: u64,
     },
 
@@ -206,16 +338,14 @@ impl EdgeServerMessage {
             EdgeServerMessage::AuthOk { .. } => "auth_ok",
             EdgeServerMessage::AuthError { .. } => "auth_error",
             EdgeServerMessage::ToolRequest { .. } => "tool_request",
+            EdgeServerMessage::ToolInput { .. } => "tool_input",
             EdgeServerMessage::Pong {} => "pong",
             EdgeServerMessage::Closing { .. } => "closing",
             EdgeServerMessage::ToolCancel { .. } => "tool_cancel",
             EdgeServerMessage::ToolResultAck { .. } => "tool_result_ack",
+            EdgeServerMessage::CapacityRequest { .. } => "capacity_request",
         }
     }
-}
-
-fn default_tool_timeout_secs() -> u64 {
-    EDGE_TOOL_TIMEOUT_SECS
 }
 
 #[cfg(test)]
@@ -329,6 +459,7 @@ mod tests {
     #[test]
     fn edge_tool_request_serializes() {
         let msg = EdgeServerMessage::ToolRequest {
+            execution_ceiling: None,
             request_id: "req-456".into(),
             identity: Box::new(identity()),
             delivery_generation: 1,
@@ -336,7 +467,10 @@ mod tests {
             args: json!({"command": "echo hello"}),
             runtime_process_authorization: None,
             runtime_process_authorization_required: false,
-            timeout_secs: 120,
+            timeout_secs: Some(120),
+            execution_deadline_unix_ms: None,
+            execution_timeout_ms: None,
+            command_timeout_cap_ms: None,
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "edge_tool_request");
@@ -347,6 +481,7 @@ mod tests {
     #[test]
     fn edge_tool_request_round_trips_hidden_process_authorization() {
         let msg = EdgeServerMessage::ToolRequest {
+            execution_ceiling: None,
             request_id: "req-process-auth".into(),
             identity: Box::new(identity()),
             delivery_generation: 1,
@@ -356,7 +491,10 @@ mod tests {
                 authorization: "Bearer runtime-grant".into(),
             })),
             runtime_process_authorization_required: true,
-            timeout_secs: 120,
+            timeout_secs: Some(120),
+            execution_deadline_unix_ms: None,
+            execution_timeout_ms: None,
+            command_timeout_cap_ms: None,
         };
 
         assert!(!format!("{msg:?}").contains("runtime-grant"));
@@ -407,11 +545,13 @@ mod tests {
     fn edge_auth_ok_serializes() {
         let msg = EdgeServerMessage::AuthOk {
             user_id: "u-123".into(),
+            edge_id: "ws-test".into(),
             interaction_api_major: crate::AGENT_INTERACTION_API_MAJOR.into(),
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "edge_auth_ok");
         assert_eq!(v["user_id"], "u-123");
+        assert_eq!(v["edge_id"], "ws-test");
         assert_eq!(
             v["interaction_api_major"],
             crate::AGENT_INTERACTION_API_MAJOR
@@ -478,6 +618,49 @@ mod tests {
     }
 
     #[test]
+    fn provider_stage_input_round_trips_with_exact_turn_fence() {
+        let input = ProviderStageInput::Text {
+            input_id: "message-1".into(),
+            content: "continue".into(),
+            correlation_id: Some("parent-turn".into()),
+            expected_turn_id: Some("turn-7".into()),
+        };
+        let message = EdgeServerMessage::ToolInput {
+            request_id: "run/session/call".into(),
+            delivery_generation: 9,
+            input: input.clone(),
+        };
+        let decoded: EdgeServerMessage =
+            serde_json::from_value(serde_json::to_value(message).unwrap()).unwrap();
+        assert!(matches!(
+            decoded,
+            EdgeServerMessage::ToolInput {
+                request_id,
+                delivery_generation: 9,
+                input: decoded_input,
+            } if request_id == "run/session/call" && decoded_input == input
+        ));
+
+        let ack = EdgeClientMessage::ToolInputAck {
+            request_id: "run/session/call".into(),
+            delivery_generation: 9,
+            ack: ProviderStageInputAck::accepted(&input, Some("turn-7".into())),
+        };
+        let decoded: EdgeClientMessage =
+            serde_json::from_value(serde_json::to_value(ack).unwrap()).unwrap();
+        assert!(matches!(
+            decoded,
+            EdgeClientMessage::ToolInputAck {
+                request_id,
+                delivery_generation: 9,
+                ack,
+            } if request_id == "run/session/call"
+                && ack.input_id == "message-1"
+                && ack.provider_turn_id.as_deref() == Some("turn-7")
+        ));
+    }
+
+    #[test]
     fn edge_client_ping_serializes() {
         let v = serde_json::to_value(&EdgeClientMessage::Ping {}).unwrap();
         assert_eq!(v["type"], "edge_ping");
@@ -500,7 +683,7 @@ mod tests {
                 tool, timeout_secs, ..
             } => {
                 assert_eq!(tool, "bash");
-                assert_eq!(timeout_secs, 120);
+                assert_eq!(timeout_secs, Some(120));
             }
             _ => panic!("expected ToolRequest"),
         }
@@ -522,6 +705,7 @@ mod tests {
         let msg: EdgeServerMessage = serde_json::from_value(json!({
             "type": "edge_auth_ok",
             "user_id": "u1",
+            "edge_id": "ws-u1",
             "interaction_api_major": crate::AGENT_INTERACTION_API_MAJOR,
         }))
         .unwrap();

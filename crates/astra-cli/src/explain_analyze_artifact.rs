@@ -7,11 +7,12 @@
 use std::{
     collections::HashMap,
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{IsTerminal, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
 
+use astra_config::runtime_config::ExplainReportFormat;
 use astra_services::SessionArtifactStore;
 use astra_turn_types::{EXPLAIN_ANALYZE_SCHEMA_VERSION, ExplainAnalyzeEventV1};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -136,11 +137,11 @@ impl Default for LatestRecordUpdate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExplainAnalyzeArtifactV1 {
     artifact_schema_version: u16,
-    artifact_kind: &'static str,
-    artifact_type: &'static str,
-    content_type: &'static str,
-    storage: &'static str,
-    representation: &'static str,
+    artifact_kind: String,
+    artifact_type: String,
+    content_type: String,
+    storage: String,
+    representation: String,
     schema_version: u16,
     session_id: String,
     run_id: String,
@@ -156,29 +157,57 @@ struct ExplainAnalyzeArtifactV1 {
 #[derive(Debug, Clone)]
 pub(crate) struct PublishedArtifact {
     pub(crate) handle: String,
+    pub(crate) format: ExplainReportFormat,
     pub(crate) rendered_path: Option<PathBuf>,
     pub(crate) render_error: Option<String>,
 }
 
 impl PublishedArtifact {
     pub(crate) fn user_notice(&self) -> String {
-        match &self.rendered_path {
-            Some(path) => format!(
-                "Explain Analyze report saved locally · Markdown\n  Path: {}",
-                compact_local_path(path)
-            ),
-            None if self.render_error.is_some() => format!(
-                "Explain Analyze data saved locally · Markdown unavailable\n  Artifact: {}\n  Reason: {}",
-                self.handle,
-                self.render_error
-                    .as_deref()
-                    .unwrap_or("unknown rendering error")
-            ),
-            None => format!(
-                "Explain Analyze data saved locally · canonical JSON\n  Artifact: {}",
-                self.handle
-            ),
+        let format = self.format.display_name();
+        match (&self.rendered_path, self.render_error.as_deref()) {
+            (Some(_), None) => format!("Explain Analyze {format} report ready"),
+            (Some(_), Some(error)) => {
+                format!("Explain Analyze {format} report ready · rendering warning: {error}")
+            }
+            (None, Some(error)) => {
+                format!("Explain Analyze data saved · {format} report unavailable: {error}")
+            }
+            (None, None) => "Explain Analyze data saved · no local report is available".to_string(),
         }
+    }
+
+    /// Return the one actionable local link for a human-facing notice. The
+    /// opaque session handle remains an internal/model-facing identity and is
+    /// deliberately absent from this presentation path.
+    pub(crate) fn user_link(&self) -> Option<crate::tui::turn_event::SystemLink> {
+        let path = self.rendered_path.as_deref()?;
+        let uri =
+            crate::cli::terminal_hyperlinks::file_uri_for_path(&path.display().to_string(), None)?;
+        Some(crate::tui::turn_event::SystemLink {
+            uri,
+            label: "Open report".to_string(),
+            fallback: compact_local_path(path),
+        })
+    }
+
+    /// Compact one-line output for non-TUI callers such as the streaming CLI.
+    pub(crate) fn terminal_notice(&self) -> String {
+        self.terminal_notice_with_links(std::io::stderr().is_terminal())
+    }
+
+    fn terminal_notice_with_links(&self, allow_osc8: bool) -> String {
+        let notice = self.user_notice();
+        let Some(link) = self.user_link() else {
+            return notice;
+        };
+        let target = if allow_osc8 && crate::cli::terminal_hyperlinks::terminal_hyperlinks_enabled()
+        {
+            crate::cli::terminal_hyperlinks::osc8_link(&link.uri, &link.label)
+        } else {
+            link.fallback
+        };
+        format!("{notice} · {target}")
     }
 }
 
@@ -382,11 +411,11 @@ pub(crate) fn persist(
     let result = (|| {
         let payload = ExplainAnalyzeArtifactV1 {
             artifact_schema_version: ARTIFACT_SCHEMA_VERSION,
-            artifact_kind: "explain_analyze",
-            artifact_type: ARTIFACT_TYPE,
-            content_type: ARTIFACT_CONTENT_TYPE,
-            storage: ARTIFACT_STORAGE,
-            representation: "canonical",
+            artifact_kind: "explain_analyze".into(),
+            artifact_type: ARTIFACT_TYPE.into(),
+            content_type: ARTIFACT_CONTENT_TYPE.into(),
+            storage: ARTIFACT_STORAGE.into(),
+            representation: "canonical".into(),
             schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
             session_id: session_id.to_string(),
             run_id: first.run_id.clone(),
@@ -451,14 +480,15 @@ pub(crate) fn persist(
     }
 }
 
-/// Publish the canonical JSON snapshot and a bounded Markdown/plain-text
-/// rendering for the local user interface. The canonical handle remains
+/// Publish the canonical JSON snapshot and a bounded human-readable rendering
+/// in the selected format for the local user interface. The canonical handle remains
 /// readable even if the derived report cannot be written, so a rendering
 /// failure is returned as metadata instead of hiding the usable artifact.
 pub(crate) fn persist_rendered_report(
     session_id: &str,
     events: &[ExplainAnalyzeEventV1],
     delivery_degraded: bool,
+    format: ExplainReportFormat,
     verbose: bool,
 ) -> Result<Option<PublishedArtifact>, String> {
     let Some(handle) = persist(session_id, events, delivery_degraded)? else {
@@ -467,16 +497,26 @@ pub(crate) fn persist_rendered_report(
     let token = token_from_handle(&handle)
         .map(str::to_owned)
         .ok_or_else(|| "invalid Explain artifact handle after publication".to_string())?;
-    let report = crate::explain_analyze_report::render(events, verbose, delivery_degraded);
     let directory = artifact_directory(session_id)?;
-    let path = directory.join(format!("{token}.md"));
-    // Keep tree prefixes and aligned timing columns intact in Markdown
-    // previews. The report itself is deliberately plain text; a fenced block
-    // prevents proportional-font rendering from destroying its graph shape.
-    let rendered = markdown_report(&report);
+    let (extension, rendered) = match format {
+        ExplainReportFormat::Html => (
+            "html",
+            crate::explain_analyze_html::render(events, verbose, delivery_degraded),
+        ),
+        ExplainReportFormat::Markdown => {
+            let report = crate::explain_analyze_report::render(events, verbose, delivery_degraded);
+            ("md", markdown_report(&report))
+        }
+        ExplainReportFormat::Text => (
+            "txt",
+            crate::explain_analyze_report::render(events, verbose, delivery_degraded),
+        ),
+    };
+    let path = directory.join(format!("{token}.{extension}"));
     if rendered.len() > RENDERED_REPORT_MAX_BYTES {
         return Ok(Some(PublishedArtifact {
             handle,
+            format,
             rendered_path: None,
             render_error: Some(format!(
                 "rendered report exceeds the {} byte bound",
@@ -487,21 +527,30 @@ pub(crate) fn persist_rendered_report(
     let render_result = (|| {
         std::fs::create_dir_all(&directory)
             .map_err(|error| format!("create Explain Analyze report directory: {error}"))?;
-        let temporary = path.with_extension("md.tmp");
-        std::fs::write(&temporary, rendered.as_bytes())
+        // Keep the temporary file owned by `NamedTempFile` until the atomic
+        // publish succeeds. A failed write or rename therefore removes its
+        // partial bytes immediately instead of accumulating one bounded file
+        // per failed turn.
+        let mut temporary = tempfile::NamedTempFile::new_in(&directory)
+            .map_err(|error| format!("create Explain Analyze rendered report: {error}"))?;
+        temporary
+            .write_all(rendered.as_bytes())
             .map_err(|error| format!("write Explain Analyze rendered report: {error}"))?;
-        std::fs::rename(&temporary, &path)
-            .map_err(|error| format!("publish Explain Analyze rendered report: {error}"))?;
+        temporary
+            .persist(&path)
+            .map_err(|error| format!("publish Explain Analyze rendered report: {}", error.error))?;
         Ok::<(), String>(())
     })();
     match render_result {
         Ok(()) => Ok(Some(PublishedArtifact {
             handle,
+            format,
             rendered_path: Some(path),
             render_error: None,
         })),
         Err(error) => Ok(Some(PublishedArtifact {
             handle,
+            format,
             rendered_path: None,
             render_error: Some(error),
         })),
@@ -526,8 +575,7 @@ fn latest_capture(session_dir: &Path) -> Result<Option<LatestExplainAnalyzeCaptu
     if metadata.len() > 16 * 1024 {
         return Err("Explain Analyze artifact index exceeds the read bound".to_string());
     }
-    let bytes = std::fs::read(path)
-        .map_err(|error| format!("read Explain Analyze artifact index: {error}"))?;
+    let bytes = read_bounded_bytes(&path, 16 * 1024)?;
     let capture: LatestExplainAnalyzeCapture = serde_json::from_slice(&bytes)
         .map_err(|error| format!("decode Explain Analyze artifact index: {error}"))?;
     if capture.artifact_schema_version != ARTIFACT_SCHEMA_VERSION
@@ -629,45 +677,6 @@ fn latest_notice_for_capture(capture: &LatestExplainAnalyzeCapture) -> Option<St
     }
 }
 
-fn context_notice_for_capture(capture: &LatestExplainAnalyzeCapture) -> String {
-    let notice = latest_notice_for_capture(capture).unwrap_or_else(|| {
-        "Explain Analyze artifact is not currently readable; report that limitation instead of inferring runtime facts."
-            .to_string()
-    });
-    let read_instruction = capture
-        .handle
-        .as_deref()
-        .map(|handle| {
-            format!(
-                "If the user asks about the previous/latest Explain Analyze run, call introspect(artifact=\"{handle}\", offset=0, max_bytes=65536) before drawing conclusions. The handle is readable only through the host that owns this session artifact store; a remote Server may report it unavailable rather than reading a client path. If introspect is unavailable in the visible tool set, report that artifact recovery is unavailable instead of guessing."
-            )
-        })
-        .unwrap_or_else(|| {
-            "The latest Explain Analyze capture is not currently readable; report that limitation instead of inferring runtime facts."
-                .to_string()
-        });
-    format!(
-        "[Explain Analyze artifact discovery]\n{notice}\n{read_instruction}\nThe CLI may also show a local rendered report path to the user; that path is a presentation affordance, while the opaque artifact handle is the model-facing source. Treat the artifact as the runtime source of truth; do not infer timing from renderer text or source code."
-    )
-}
-
-/// Compact prompt-facing discovery notice for the next model turn. It names
-/// the typed artifact capability and the bounded reader without copying the
-/// report into the prompt or exposing a host filesystem path.
-pub(crate) fn latest_context_notice(session_dir: &Path) -> Result<Option<String>, String> {
-    let artifact_directory = session_dir.join(ARTIFACT_DIR);
-    if let Some(failure) = publication_failure(&artifact_directory) {
-        return Ok(Some(format!(
-            "[Explain Analyze artifact discovery]\n{}\nThe CLI may show a rendered report path to the user when available, but the local path is not a model authority. The latest Explain Analyze capture is not currently readable; report that limitation instead of inferring runtime facts.",
-            publication_failure_notice(&failure)
-        )));
-    }
-    let Some(capture) = latest_capture(session_dir)? else {
-        return Ok(None);
-    };
-    Ok(Some(context_notice_for_capture(&capture)))
-}
-
 fn read_artifact_window(
     path: &Path,
     offset: usize,
@@ -730,6 +739,146 @@ fn read_artifact_window(
         );
     }
     Ok((content[..end].to_string(), total_bytes, offset + end))
+}
+
+fn read_bounded_bytes(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
+    let file = File::open(path).map_err(|_| "local Explain capture unavailable".to_string())?;
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "local Explain capture unreadable".to_string())?;
+    if bytes.len() > limit {
+        return Err("local Explain capture exceeds read bound".into());
+    }
+    Ok(bytes)
+}
+
+pub(crate) struct LocalCapturedJudgmentUsage {
+    pub(crate) scope: astra_services::reflect::JudgmentUsageScope,
+    pub(crate) facts: astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1,
+}
+
+impl LocalCapturedJudgmentUsage {
+    pub(crate) fn summary(&self) -> astra_services::reflect::JudgmentUsageSummary {
+        let mut summary =
+            astra_services::reflect::JudgmentUsageSummary::from_physical_attempts(&self.facts);
+        summary.scope = self.scope.clone();
+        summary.capture_incomplete = true;
+        for group in &mut summary.groups {
+            group.input_incomplete = true;
+            group.output_incomplete = true;
+        }
+        summary.omitted_groups += summary.groups.len().saturating_sub(32);
+        summary.groups.truncate(32);
+        summary
+    }
+}
+
+/// One owner-local typed reader shared by Reflect and introspect. Never falls
+/// back to an older handle and never interprets journal LLM-round counters.
+pub(crate) fn local_judgment_usage(session_id: &str) -> LocalCapturedJudgmentUsage {
+    read_local_judgment_usage(session_id).unwrap_or_else(|_| LocalCapturedJudgmentUsage {
+        scope: astra_services::reflect::JudgmentUsageScope::LocalCaptureUnavailable,
+        facts: astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
+            available: false,
+            truncated: false,
+            attempts: vec![],
+        },
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn persist_test_judgment_usage(session_id: &str) {
+    let mut events = tests::complete_events();
+    events[1].auxiliary_usage = Some(Box::new(astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
+        available: true,
+        truncated: false,
+        attempts: vec![astra_turn_types::ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: "physical-1".into(),
+            provider: "typesafe".into(),
+            offering_id: "jev-test".into(),
+            model_name: "jev".into(),
+            purpose: "verification_judge".into(),
+            operation_id: "request_judgment".into(),
+            usage_status: astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+            usage: Some(astra_turn_types::ExplainAnalyzeTokenUsageV1 {
+                basis: astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderExact,
+                fresh_input_tokens: Some(123),
+                output_tokens: Some(7),
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+            }),
+        }],
+    }));
+    events.push(events[1].clone());
+    persist(session_id, &events, false).unwrap();
+}
+
+fn read_local_judgment_usage(session_id: &str) -> Result<LocalCapturedJudgmentUsage, String> {
+    let session_dir = astra_services::local_session_artifact_store().session_dir(session_id)?;
+    if publication_failure(&session_dir.join(ARTIFACT_DIR)).is_some() {
+        return Err("local Explain publication unavailable".into());
+    }
+    let capture = latest_capture(&session_dir)?.ok_or("no local Explain capture")?;
+    let handle = capture
+        .handle
+        .as_deref()
+        .ok_or("local Explain capture not readable")?;
+    let run_id = capture.run_id.as_deref().ok_or("missing capture run")?;
+    let turn_id = capture.turn_id.as_deref().ok_or("missing capture turn")?;
+    if [run_id, turn_id]
+        .iter()
+        .any(|id| id.is_empty() || id.len() > 512 || id.chars().any(char::is_control))
+    {
+        return Err("invalid capture identity".into());
+    }
+    if handle != artifact_handle(run_id, turn_id) {
+        return Err("capture handle mismatch".into());
+    }
+    let token = token_from_handle(handle).ok_or("invalid capture handle")?;
+    let bytes = read_bounded_bytes(&artifact_path(&session_dir, token), ARTIFACT_MAX_BYTES)?;
+    if capture.size_bytes != Some(bytes.len())
+        || capture.checksum_sha256.as_deref()
+            != Some(format!("{:x}", Sha256::digest(&bytes)).as_str())
+    {
+        return Err("capture integrity mismatch".into());
+    }
+    let artifact: ExplainAnalyzeArtifactV1 =
+        serde_json::from_slice(&bytes).map_err(|_| "invalid typed Explain capture".to_string())?;
+    if artifact.artifact_schema_version != ARTIFACT_SCHEMA_VERSION
+        || artifact.schema_version != EXPLAIN_ANALYZE_SCHEMA_VERSION
+        || artifact.artifact_kind != "explain_analyze"
+        || artifact.artifact_type != ARTIFACT_TYPE
+        || artifact.content_type != ARTIFACT_CONTENT_TYPE
+        || artifact.storage != ARTIFACT_STORAGE
+        || artifact.representation != "canonical"
+        || artifact.session_id != session_id
+        || artifact.run_id != run_id
+        || artifact.turn_id != turn_id
+        || artifact.capture_status != capture.status
+        || artifact
+            .events
+            .iter()
+            .any(|e| e.run_id != run_id || e.turn_id != turn_id)
+    {
+        return Err("capture scope or contract mismatch".into());
+    }
+    let mut graph = astra_turn_types::ExplainAnalyzeGraphV1::default();
+    for event in artifact.events {
+        graph.apply(event);
+    }
+    let facts = astra_services::reflect::JudgmentUsageSummary::supported_attempts(
+        &graph.auxiliary_usage_snapshot(),
+    );
+    // Graph::apply validates every event and auxiliary identity before retaining
+    // it. Historical coverage is separate from the producer's truncation flag.
+    Ok(LocalCapturedJudgmentUsage {
+        scope: astra_services::reflect::JudgmentUsageScope::LocalCapturedRunTurn {
+            run_id: artifact.run_id,
+            turn_id: artifact.turn_id,
+        },
+        facts,
+    })
 }
 
 pub(crate) fn resolve_request(session_dir: &Path, args: &Value) -> Option<Result<String, String>> {
@@ -811,8 +960,10 @@ mod tests {
         }
     }
 
-    fn complete_events() -> Vec<ExplainAnalyzeEventV1> {
+    pub(super) fn complete_events() -> Vec<ExplainAnalyzeEventV1> {
         let common = ExplainAnalyzeEventV1 {
+            auxiliary_usage: None,
+            auxiliary_details: None,
             schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: "clock-1:0".to_string(),
             run_id: "run-1".to_string(),
@@ -831,6 +982,7 @@ mod tests {
             start_elapsed_ms: None,
             duration_ms: None,
             outcome: None,
+            decision_detail: None,
             usage: None,
             context: None,
             coverage_gaps: Vec::new(),
@@ -843,6 +995,150 @@ mod tests {
         finished.duration_ms = Some(5);
         finished.outcome = Some(ExplainAnalyzeOutcomeV1::Completed);
         vec![common, finished]
+    }
+
+    #[test]
+    fn local_usage_conflicting_node_cannot_be_revived_by_independent_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session = "local-usage-conflict";
+        persist_test_judgment_usage(session);
+        let directory = astra_services::local_session_artifact_store()
+            .session_dir(session)
+            .unwrap();
+        let index = latest_capture(&directory).unwrap().unwrap();
+        let path = artifact_path(
+            &directory,
+            token_from_handle(index.handle.as_deref().unwrap()).unwrap(),
+        );
+        let artifact: ExplainAnalyzeArtifactV1 =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let first = artifact.events[1].clone();
+        let mut conflicting = first.clone();
+        conflicting.auxiliary_usage.as_mut().unwrap().attempts[0]
+            .usage
+            .as_mut()
+            .unwrap()
+            .fresh_input_tokens = Some(947);
+        let mut independent = conflicting.clone();
+        independent.event_id = "independent-terminal".into();
+        independent.node_id = "independent-segment".into();
+        let records = [first, conflicting, independent];
+        for order in [[0, 1, 2], [2, 1, 0], [0, 2, 1]] {
+            let mut events = vec![artifact.events[0].clone()];
+            events.extend(order.map(|index| records[index].clone()));
+            assert!(events.iter().all(ExplainAnalyzeEventV1::is_valid));
+            persist(session, &events, false).unwrap();
+            let captured = local_judgment_usage(session);
+            assert!(matches!(
+                captured.scope,
+                astra_services::reflect::JudgmentUsageScope::LocalCapturedRunTurn { .. }
+            ));
+            assert!(!captured.facts.available);
+            assert!(!captured.facts.truncated);
+            assert!(captured.facts.attempts.is_empty());
+            let summary = captured.summary();
+            assert_eq!(summary.coverage, "unavailable");
+            assert!(summary.groups.is_empty());
+            assert!(!summary.render().contains("947"));
+            assert!(!summary.render().contains("123"));
+        }
+    }
+
+    #[test]
+    fn local_usage_validates_scope_checksum_bounds_and_missing_coverage() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session = "local-usage-test";
+        assert!(!local_judgment_usage(session).facts.available);
+        persist(session, &complete_events(), false).unwrap();
+        assert!(
+            !local_judgment_usage(session).facts.available,
+            "no snapshot is not zero usage"
+        );
+        persist_test_judgment_usage(session);
+        let captured = local_judgment_usage(session);
+        assert_eq!(captured.facts.attempts.len(), 1);
+        assert!(!captured.facts.truncated);
+        let summary = captured.summary();
+        assert!(summary.capture_incomplete);
+        assert_eq!(summary.coverage, "available");
+        assert!(!summary.render().contains("capture truncated"));
+        assert_eq!(summary.groups[0].known_input_tokens, 123);
+        assert!(summary.groups[0].input_incomplete);
+        assert!(matches!(
+            summary.scope,
+            astra_services::reflect::JudgmentUsageScope::LocalCapturedRunTurn {
+                ref run_id,
+                ref turn_id,
+            } if run_id == "run-1" && turn_id == "turn-2"
+        ));
+        let dir = astra_services::local_session_artifact_store()
+            .session_dir(session)
+            .unwrap();
+        let index = latest_capture(&dir).unwrap().unwrap();
+        let path = artifact_path(
+            &dir,
+            token_from_handle(index.handle.as_deref().unwrap()).unwrap(),
+        );
+        let original = std::fs::read(&path).unwrap();
+        for field in [
+            "attempt_id",
+            "provider",
+            "offering_id",
+            "operation_id",
+            "purpose",
+            "model_name",
+        ] {
+            let mut payload: Value = serde_json::from_slice(&original).unwrap();
+            for event in payload["events"].as_array_mut().unwrap() {
+                if let Some(attempts) = event
+                    .get_mut("auxiliary_usage")
+                    .and_then(|usage| usage.get_mut("attempts"))
+                    .and_then(Value::as_array_mut)
+                {
+                    attempts[0][field] = Value::String("x".repeat(1024));
+                }
+            }
+            let bytes = serde_json::to_vec(&payload).unwrap();
+            assert!(
+                serde_json::from_slice::<ExplainAnalyzeArtifactV1>(&bytes).is_ok(),
+                "{field}: fixture must reach canonical identity validation"
+            );
+            std::fs::write(&path, &bytes).unwrap();
+            let mut changed = index.clone();
+            changed.size_bytes = Some(bytes.len());
+            changed.checksum_sha256 = Some(format!("{:x}", Sha256::digest(&bytes)));
+            write_latest(&dir, changed);
+            let invalid = local_judgment_usage(session);
+            assert!(!invalid.facts.available, "{field}");
+            assert!(matches!(
+                invalid.scope,
+                astra_services::reflect::JudgmentUsageScope::LocalCapturedRunTurn { .. }
+            ));
+            assert!(!invalid.summary().render().contains(&"x".repeat(1024)));
+        }
+        std::fs::write(&path, b"{}").unwrap();
+        assert!(!local_judgment_usage(session).facts.available);
+        for field in ["session_id", "run_id", "turn_id"] {
+            let mut payload: Value = serde_json::from_slice(&original).unwrap();
+            payload[field] = Value::String("foreign".into());
+            let bytes = serde_json::to_vec(&payload).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let mut changed = index.clone();
+            changed.size_bytes = Some(bytes.len());
+            changed.checksum_sha256 = Some(format!("{:x}", Sha256::digest(&bytes)));
+            write_latest(&dir, changed);
+            assert!(!local_judgment_usage(session).facts.available, "{field}");
+        }
+        std::fs::write(&path, vec![b'x'; ARTIFACT_MAX_BYTES + 1]).unwrap();
+        assert!(!local_judgment_usage(session).facts.available);
+        persist_test_judgment_usage(session);
+        mark_unavailable(session, None, None, "not captured").unwrap();
+        assert!(
+            !local_judgment_usage(session).facts.available,
+            "must not reuse older success"
+        );
     }
 
     #[test]
@@ -863,31 +1159,86 @@ mod tests {
     }
 
     #[test]
-    fn published_artifact_notice_labels_the_local_copy_and_model_handle() {
+    fn published_artifact_notice_keeps_human_copy_compact_and_separates_the_link() {
         let local = PublishedArtifact {
             handle: artifact_handle("run-1", "turn-1"),
-            rendered_path: Some(PathBuf::from("/tmp/explain-analyze.md")),
+            format: ExplainReportFormat::Html,
+            rendered_path: Some(PathBuf::from("/tmp/report with spaces.html")),
             render_error: None,
         };
         let notice = local.user_notice();
-        assert!(notice.starts_with("Explain Analyze report saved locally · Markdown"));
-        assert!(notice.contains("Path: /tmp/explain-analyze.md"));
-        assert!(!notice.contains("Local Explain report\n/tmp"));
+        assert_eq!(notice, "Explain Analyze HTML report ready");
+        let link = local
+            .user_link()
+            .expect("local report should be actionable");
+        assert_eq!(link.label, "Open report");
+        assert!(
+            link.uri
+                .starts_with("file:///tmp/report%20with%20spaces.html")
+        );
+        assert_eq!(link.fallback, "/tmp/report with spaces.html");
+        assert!(!notice.contains("artifact://"));
 
         let server = PublishedArtifact {
             rendered_path: None,
             ..local
         };
         let notice = server.user_notice();
-        assert!(notice.contains("Artifact: artifact://session/explain-analyze/"));
+        assert_eq!(
+            notice,
+            "Explain Analyze data saved · no local report is available"
+        );
+        assert!(server.user_link().is_none());
 
         let failed_render = PublishedArtifact {
             render_error: Some("rendered report exceeds the bound".into()),
             ..server
         };
         let notice = failed_render.user_notice();
-        assert!(notice.contains("Markdown unavailable"));
-        assert!(notice.contains("Reason: rendered report exceeds the bound"));
+        assert!(notice.contains("HTML report unavailable"));
+        assert!(notice.contains("rendered report exceeds the bound"));
+        assert_eq!(
+            notice.matches("rendered report exceeds the bound").count(),
+            1
+        );
+
+        let rendered_with_warning = PublishedArtifact {
+            rendered_path: Some(PathBuf::from("/tmp/report with spaces.html")),
+            ..failed_render.clone()
+        };
+        let notice = rendered_with_warning.user_notice();
+        assert!(notice.starts_with("Explain Analyze HTML report ready · rendering warning:"));
+        assert!(rendered_with_warning.user_link().is_some());
+        assert_eq!(
+            notice.matches("rendered report exceeds the bound").count(),
+            1
+        );
+
+        let no_local_copy = PublishedArtifact {
+            rendered_path: None,
+            render_error: None,
+            ..failed_render
+        };
+        let notice = no_local_copy.user_notice();
+        assert_eq!(
+            notice,
+            "Explain Analyze data saved · no local report is available"
+        );
+        assert!(no_local_copy.user_link().is_none());
+    }
+
+    #[test]
+    fn redirected_artifact_notice_uses_plain_path_without_osc8() {
+        let publication = PublishedArtifact {
+            handle: artifact_handle("run-redirected", "turn-1"),
+            format: ExplainReportFormat::Html,
+            rendered_path: Some(PathBuf::from("/tmp/report.md")),
+            render_error: None,
+        };
+
+        let notice = publication.terminal_notice_with_links(false);
+        assert_eq!(notice, "Explain Analyze HTML report ready · /tmp/report.md");
+        assert!(!notice.contains('\x1b'));
     }
 
     #[test]
@@ -896,9 +1247,15 @@ mod tests {
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "9a5c2f6e-0f88-44db-a7a4-5e89c1d2f304";
         let events = complete_events();
-        let publication = persist_rendered_report(session_id, &events, false, false)
-            .expect("publication should succeed")
-            .expect("non-empty capture should publish");
+        let publication = persist_rendered_report(
+            session_id,
+            &events,
+            false,
+            ExplainReportFormat::Markdown,
+            false,
+        )
+        .expect("publication should succeed")
+        .expect("non-empty capture should publish");
         let rendered_path = publication
             .rendered_path
             .as_ref()
@@ -919,6 +1276,34 @@ mod tests {
     }
 
     #[test]
+    fn persist_rendered_report_writes_selected_html_companion_by_default() {
+        let temp = tempfile::tempdir().expect("temporary sessions directory");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "9a5c2f6e-0f88-44db-a7a4-5e89c1d2f305";
+        let publication = persist_rendered_report(
+            session_id,
+            &complete_events(),
+            false,
+            ExplainReportFormat::Html,
+            false,
+        )
+        .expect("publication should succeed")
+        .expect("non-empty capture should publish");
+        assert_eq!(publication.format, ExplainReportFormat::Html);
+        let path = publication
+            .rendered_path
+            .as_ref()
+            .expect("HTML companion should be written");
+        assert_eq!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("html")
+        );
+        let html = std::fs::read_to_string(path).expect("HTML report");
+        assert!(html.starts_with("<!doctype html>"), "{html}");
+        assert!(html.contains("Execution workspace"), "{html}");
+    }
+
+    #[test]
     fn rendered_report_failure_does_not_hide_the_canonical_artifact() {
         let temp = tempfile::tempdir().expect("temporary sessions directory");
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
@@ -929,16 +1314,13 @@ mod tests {
         let session_dir = astra_services::local_session_artifact_store()
             .session_dir(session_id)
             .expect("session directory");
-        std::fs::create_dir_all(
-            session_dir
-                .join(ARTIFACT_DIR)
-                .join(format!("{token}.md.tmp")),
-        )
-        .expect("block Markdown temporary path");
+        std::fs::create_dir_all(session_dir.join(ARTIFACT_DIR).join(format!("{token}.html")))
+            .expect("block HTML temporary path");
 
-        let publication = persist_rendered_report(session_id, &events, false, false)
-            .expect("canonical publication should succeed")
-            .expect("non-empty capture should publish");
+        let publication =
+            persist_rendered_report(session_id, &events, false, ExplainReportFormat::Html, false)
+                .expect("canonical publication should succeed")
+                .expect("non-empty capture should publish");
         assert!(publication.rendered_path.is_none());
         assert!(publication.render_error.is_some());
         let resolved = resolve_request(
@@ -948,6 +1330,51 @@ mod tests {
         .expect("canonical handle should be recognized")
         .expect("canonical artifact must remain readable when rendering fails");
         assert!(resolved.contains("Artifact handle:"), "{resolved}");
+    }
+
+    #[test]
+    fn repeated_render_failures_clean_up_temporary_reports() {
+        let temp = tempfile::tempdir().expect("temporary sessions directory");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "a5c2f6e9-0f88-44db-a7a4-5e89c1d2f306";
+        let events = complete_events();
+        let handle = artifact_handle("run-1", "turn-2");
+        let token = token_from_handle(&handle).expect("encoded handle token");
+        let session_dir = astra_services::local_session_artifact_store()
+            .session_dir(session_id)
+            .expect("session directory");
+        let artifact_dir = session_dir.join(ARTIFACT_DIR);
+        std::fs::create_dir_all(artifact_dir.join(format!("{token}.html")))
+            .expect("block HTML publication target");
+
+        for _ in 0..3 {
+            let publication = persist_rendered_report(
+                session_id,
+                &events,
+                false,
+                ExplainReportFormat::Html,
+                false,
+            )
+            .expect("canonical publication should succeed")
+            .expect("non-empty capture should publish");
+            assert!(publication.rendered_path.is_none());
+            assert!(publication.render_error.is_some());
+        }
+
+        let mut entries = std::fs::read_dir(&artifact_dir)
+            .expect("artifact directory")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect::<Vec<_>>();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![
+                std::ffi::OsString::from(format!("{token}.html")),
+                std::ffi::OsString::from(format!("{token}.json")),
+                std::ffi::OsString::from("latest.json"),
+            ],
+            "failed derived publications must not leave temporary files"
+        );
     }
 
     #[test]
@@ -974,11 +1401,6 @@ mod tests {
             .expect("latest notice")
             .expect("completed notice");
         assert!(notice.contains(&handle), "{notice}");
-        let context = latest_context_notice(temp.path())
-            .expect("latest context notice")
-            .expect("completed context notice");
-        assert!(context.contains("introspect(artifact="), "{context}");
-        assert!(context.contains("runtime source of truth"), "{context}");
     }
 
     #[test]

@@ -58,6 +58,14 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
             get(session::session_handlers::session_device_events_handler),
         )
         .route(
+            "/sessions/{session_id}/memory/status",
+            get(session::session_handlers::session_memory_status_handler),
+        )
+        .route(
+            "/sessions/{session_id}/memory/finalize",
+            post(session::session_handlers::finalize_session_memory_handler),
+        )
+        .route(
             "/sessions/{session_id}/close",
             post(session::session_handlers::close_session_handler),
         )
@@ -145,14 +153,6 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
         .nest(
             "/sessions/{session_id}/harness",
             harness_routes(state.clone()),
-        )
-        .route(
-            "/sessions/{session_id}/replay",
-            post(crate::service_handlers::replay::replay_session_handler),
-        )
-        .route(
-            "/sessions/{session_id}/replay/compare",
-            get(crate::service_handlers::replay::compare_replay_handler),
         )
         .route(
             "/sessions/{session_id}/audit/summary",

@@ -33,6 +33,77 @@ impl MetricTarget for MetricsRegistryBridge {
     }
 }
 
+fn scrape_database_pool_metrics(state: &AppState) {
+    let registry = state.metrics_registry();
+    registry.register_counter(
+        "astra_db_pool_hot_checkouts_total",
+        "MatrixOne checkouts that reused a recently active connection without an extra PING.",
+    );
+    registry.register_counter(
+        "astra_db_pool_health_checks_total",
+        "Completed or cancelled MatrixOne idle-connection PING health checks by outcome.",
+    );
+    registry.register_counter(
+        "astra_db_pool_health_check_microseconds_total",
+        "Cumulative time spent in MatrixOne idle-connection PING health checks.",
+    );
+    registry.register_counter(
+        "astra_db_pool_health_check_slow_total",
+        "MatrixOne idle-connection PING health checks exceeding the configured slow threshold.",
+    );
+    registry.register_gauge(
+        "astra_db_pool_connections",
+        "Current MatrixOne pool connections by state.",
+    );
+
+    let pool = astra_core::matrixone_pool_telemetry_snapshot();
+    registry.set_counter_absolute("astra_db_pool_hot_checkouts_total", &[], pool.hot_checkouts);
+    registry.set_counter_absolute(
+        "astra_db_pool_health_checks_total",
+        &[("outcome", "success")],
+        pool.health_check_successes,
+    );
+    registry.set_counter_absolute(
+        "astra_db_pool_health_checks_total",
+        &[("outcome", "failure")],
+        pool.health_check_failures,
+    );
+    registry.set_counter_absolute(
+        "astra_db_pool_health_checks_total",
+        &[("outcome", "cancelled")],
+        pool.health_check_cancelled,
+    );
+    registry.set_counter_absolute(
+        "astra_db_pool_health_check_microseconds_total",
+        &[],
+        pool.health_check_micros,
+    );
+    registry.set_counter_absolute(
+        "astra_db_pool_health_check_slow_total",
+        &[],
+        pool.health_check_slow,
+    );
+
+    if let Some(shared_pool) = state.shared_pool.as_ref() {
+        let stats = shared_pool.stats();
+        registry.set_gauge(
+            "astra_db_pool_connections",
+            &[("state", "open")],
+            f64::from(stats.size),
+        );
+        registry.set_gauge(
+            "astra_db_pool_connections",
+            &[("state", "idle")],
+            stats.num_idle as f64,
+        );
+        registry.set_gauge(
+            "astra_db_pool_connections",
+            &[("state", "max")],
+            f64::from(stats.max_connections),
+        );
+    }
+}
+
 fn register_event_ingestion_metrics(registry: &astra_turn_core::pipeline_metrics::MetricsRegistry) {
     registry.register_gauge(
         "astra_event_ingestion_config_batch_size",
@@ -50,6 +121,50 @@ fn register_event_ingestion_metrics(registry: &astra_turn_core::pipeline_metrics
         "astra_event_ingestion_config_max_retries",
         "Configured event ingestion max retries for this runtime process.",
     );
+    registry.register_gauge(
+        "astra_event_ingestion_config_max_resident_bytes",
+        "Configured global serialized-byte admission budget for event ingestion.",
+    );
+    registry.register_gauge(
+        "astra_event_ingestion_config_max_event_bytes",
+        "Configured maximum serialized size of one ingestion event.",
+    );
+    registry.register_gauge(
+        "astra_event_ingestion_config_max_concurrent_session_flushes",
+        "Configured per-worker ceiling for concurrent session flush attempts.",
+    );
+    registry.register_gauge(
+        "astra_event_ingestion_config_db_attempt_timeout_secs",
+        "Configured whole-attempt ingestion database deadline in seconds.",
+    );
+    for (name, help) in [
+        (
+            "astra_event_ingestion_resident_events",
+            "Accepted ingestion events currently retained across all process-local states.",
+        ),
+        (
+            "astra_event_ingestion_resident_events_peak",
+            "Process peak of accepted ingestion events retained concurrently.",
+        ),
+        (
+            "astra_event_ingestion_resident_bytes",
+            "Serialized bytes currently retained by accepted ingestion events.",
+        ),
+        (
+            "astra_event_ingestion_resident_bytes_peak",
+            "Process peak serialized bytes retained by accepted ingestion events.",
+        ),
+        (
+            "astra_event_ingestion_db_attempts",
+            "Ingestion database attempts currently active.",
+        ),
+        (
+            "astra_event_ingestion_db_attempts_peak",
+            "Process peak concurrent ingestion database attempts.",
+        ),
+    ] {
+        registry.register_gauge(name, help);
+    }
     registry.register_counter(
         "astra_event_ingestion_events_received_total",
         "Events accepted by the event ingestion worker.",
@@ -61,6 +176,14 @@ fn register_event_ingestion_metrics(registry: &astra_turn_core::pipeline_metrics
     registry.register_counter(
         "astra_event_ingestion_events_dropped_permanent_total",
         "Events permanently dropped by the ingestion worker after acceptance.",
+    );
+    registry.register_counter(
+        "astra_event_ingestion_events_abandoned_shutdown_total",
+        "Accepted events explicitly abandoned by a failed graceful shutdown flush.",
+    );
+    registry.register_counter(
+        "astra_event_ingestion_events_unresolved_shutdown_total",
+        "Accepted events whose durable outcome is unknown after shutdown.",
     );
     registry.register_counter(
         "astra_event_ingestion_flushes_total",
@@ -112,6 +235,26 @@ fn scrape_event_ingestion_metrics(state: &AppState) {
         &[],
         config.max_retries as f64,
     );
+    registry.set_gauge(
+        "astra_event_ingestion_config_max_resident_bytes",
+        &[],
+        config.max_resident_bytes as f64,
+    );
+    registry.set_gauge(
+        "astra_event_ingestion_config_max_event_bytes",
+        &[],
+        config.max_event_bytes as f64,
+    );
+    registry.set_gauge(
+        "astra_event_ingestion_config_max_concurrent_session_flushes",
+        &[],
+        config.max_concurrent_session_flushes as f64,
+    );
+    registry.set_gauge(
+        "astra_event_ingestion_config_db_attempt_timeout_secs",
+        &[],
+        config.db_attempt_timeout_secs as f64,
+    );
     registry.set_counter_absolute(
         "astra_event_ingestion_enqueue_overflows_total",
         &[],
@@ -152,11 +295,49 @@ fn scrape_event_ingestion_metrics(state: &AppState) {
         stats.events_dropped_permanent,
     );
     registry.set_counter_absolute(
+        "astra_event_ingestion_events_abandoned_shutdown_total",
+        &[],
+        stats.events_abandoned_shutdown,
+    );
+    registry.set_counter_absolute(
+        "astra_event_ingestion_events_unresolved_shutdown_total",
+        &[],
+        stats.events_unresolved_shutdown,
+    );
+    registry.set_counter_absolute(
         "astra_event_ingestion_flushes_total",
         &[],
         stats.flush_count,
     );
     registry.set_counter_absolute("astra_event_ingestion_errors_total", &[], stats.errors);
+    for (name, value) in [
+        (
+            "astra_event_ingestion_resident_events",
+            stats.resident_events_current,
+        ),
+        (
+            "astra_event_ingestion_resident_events_peak",
+            stats.resident_events_peak,
+        ),
+        (
+            "astra_event_ingestion_resident_bytes",
+            stats.resident_bytes_current,
+        ),
+        (
+            "astra_event_ingestion_resident_bytes_peak",
+            stats.resident_bytes_peak,
+        ),
+        (
+            "astra_event_ingestion_db_attempts",
+            stats.db_attempts_current,
+        ),
+        (
+            "astra_event_ingestion_db_attempts_peak",
+            stats.db_attempts_peak,
+        ),
+    ] {
+        registry.set_gauge(name, &[], value as f64);
+    }
 }
 
 fn scrape_history_work_metrics(state: &AppState) {
@@ -393,6 +574,7 @@ pub(super) async fn current_health(state: &AppState) -> HealthResponse {
         memoria: memoria_health.label().to_string(),
         interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.to_string(),
         build_git_sha: astra_core::history_work_baseline::BUILD_GIT_SHA.to_string(),
+        build_git_dirty: astra_core::history_work_baseline::BUILD_GIT_DIRTY == "true",
     }
 }
 
@@ -453,6 +635,7 @@ pub(super) async fn metrics_handler(State(state): State<AppState>) -> impl IntoR
     crate::capacity_model::scrape_capacity_metrics_from_env(&state.metrics_registry());
     scrape_event_ingestion_metrics(&state);
     scrape_history_work_metrics(&state);
+    scrape_database_pool_metrics(&state);
     crate::turn::model_cooldown::rate_limit_cooldown().scrape_metrics(&state.metrics_registry());
     let body = state.metrics_registry().render_prometheus();
     (
@@ -605,7 +788,7 @@ mod tests {
         let cooldown = crate::turn::model_cooldown::rate_limit_cooldown();
         cooldown.reset_for_tests();
         cooldown.with("metrics-model", |rl| {
-            rl.record_429(None, false);
+            rl.record_429(None);
         });
 
         let response = metrics_handler(State(state)).await.into_response();
@@ -637,10 +820,6 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("# TYPE astra_interaction_ask_user_wait_total counter"),
-            "{text}"
-        );
-        assert!(
             text.contains("# TYPE astra_interaction_approval_lookup_total counter"),
             "{text}"
         );
@@ -650,6 +829,18 @@ mod tests {
         );
         assert!(
             text.contains("# TYPE astra_ws_run_stream_poll_attempts_total counter"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE astra_db_pool_health_checks_total counter"),
+            "{text}"
+        );
+        assert!(
+            text.contains("astra_db_pool_health_checks_total{outcome=\"cancelled\"}"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE astra_db_pool_connections gauge"),
             "{text}"
         );
         assert!(

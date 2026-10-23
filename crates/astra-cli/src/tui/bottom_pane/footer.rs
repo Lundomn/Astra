@@ -15,6 +15,9 @@ pub(crate) struct Footer {
     pub cwd: Option<String>,
     pub is_turn_active: bool,
     pub permission_mode: Option<PermissionMode>,
+    /// A pending selection, cleared when execution acknowledges application.
+    /// The policy owner supplies the current mode through its read-only mirror.
+    pending_permission_mode: Option<PermissionMode>,
     pub git_branch: Option<String>,
     /// Current request's usable context-window occupancy. This deliberately
     /// does not use cumulative session/billing token totals.
@@ -50,6 +53,7 @@ impl Footer {
             cwd: current_cwd_display(),
             is_turn_active: false,
             permission_mode: None,
+            pending_permission_mode: None,
             git_branch: detect_git_branch(),
             context_window: None,
             raw_context_window_tokens: None,
@@ -81,6 +85,19 @@ impl Footer {
         self.mode_mirror = Some(mirror);
     }
 
+    pub(crate) fn set_pending_permission_mode(&mut self, mode: PermissionMode) {
+        self.pending_permission_mode = Some(mode);
+    }
+
+    pub(crate) fn clear_pending_permission_mode(&mut self) {
+        self.pending_permission_mode = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_permission_mode(&self) -> Option<PermissionMode> {
+        self.pending_permission_mode
+    }
+
     /// Resolve the live permission mode: prefer the lock-free mirror
     /// when available; otherwise fall back to the cached field (for
     /// tests and early-init renders before the mirror is wired).
@@ -96,6 +113,7 @@ impl Footer {
             model: self.model.clone(),
             cwd: self.cwd.clone(),
             permission_mode: self.live_mode(),
+            pending_permission_mode: self.pending_permission_mode,
             // Prefer the cached field refreshed by `refresh_env()`,
             // but fall back to a direct probe if the footer has not
             // been initialized yet (useful for early renders/tests).
@@ -136,8 +154,8 @@ impl Footer {
         self.pending_context_window_policy = Some((raw_tokens, usable_tokens));
     }
 
-    pub fn set_request_token_usage(&mut self, usage: astra_turn_types::RequestTokenUsage) {
-        self.request_token_usage = Some(usage);
+    pub fn set_request_token_usage(&mut self, usage: Option<astra_turn_types::RequestTokenUsage>) {
+        self.request_token_usage = usage;
     }
 
     /// A new model request has started. Retain the preceding request as
@@ -168,7 +186,20 @@ impl Footer {
     }
 
     /// Replace an estimate with the provider-confirmed request input count.
-    pub fn set_context_window_measured(&mut self, used_tokens: u64) {
+    pub fn set_context_window_measured(&mut self, used_tokens: Option<u64>) {
+        let Some(used_tokens) = used_tokens else {
+            if let Some((non_system_tokens, limit_tokens)) = self.context_window_non_system_tokens {
+                self.context_window = Some(ContextWindowUsage::estimated(
+                    non_system_tokens
+                        .saturating_add(u64::from(self.last_system_prompt_tokens.unwrap_or(0))),
+                    limit_tokens,
+                ));
+                self.context_window_is_previous = false;
+            } else if !self.context_window_is_previous {
+                self.context_window = None;
+            }
+            return;
+        };
         let Some(current) = self.context_window else {
             return;
         };
@@ -254,7 +285,7 @@ mod tests {
             Some(ContextWindowUsage::estimated(14_000, 160_000))
         );
 
-        footer.set_context_window_measured(17_250);
+        footer.set_context_window_measured(Some(17_250));
         assert_eq!(
             footer.context_window,
             Some(ContextWindowUsage::provider_reported(17_250, 160_000))
@@ -278,16 +309,47 @@ mod tests {
     }
 
     #[test]
+    fn withdrawn_measurement_restores_only_current_assembly_estimate() {
+        let mut footer = Footer::new();
+        footer.begin_context_window_estimate(ContextWindowUsage::estimated(500, 10_000));
+        footer.set_context_system_prompt_tokens(100);
+        footer.set_context_window_measured(Some(900));
+        footer.set_request_token_usage(Some(astra_turn_types::RequestTokenUsage::default()));
+        footer.set_context_window_measured(None);
+        footer.set_request_token_usage(None);
+        assert_eq!(
+            footer.context_window,
+            Some(ContextWindowUsage::estimated(600, 10_000))
+        );
+        assert!(footer.request_token_usage.is_none());
+        assert!(!footer.context_window_is_previous());
+
+        footer.set_context_window_measured(Some(0));
+        assert_eq!(
+            footer.context_window,
+            Some(ContextWindowUsage::provider_reported(0, 10_000))
+        );
+        footer.clear_context_window_for_new_request();
+        footer.set_context_window_measured(None);
+        assert!(footer.context_window_is_previous());
+
+        let mut restored = Footer::new();
+        restored.restore_context_window(ContextWindowUsage::provider_reported(900, 10_000));
+        restored.set_context_window_measured(None);
+        assert!(restored.context_window.is_none());
+    }
+
+    #[test]
     fn context_policy_and_request_lanes_remain_separate_from_session_totals() {
         let mut footer = Footer::new();
         footer.set_context_window_policy(1_000_000, 910_000);
         footer.begin_context_window_estimate(ContextWindowUsage::estimated(700_000, 910_000));
-        footer.set_request_token_usage(astra_turn_types::RequestTokenUsage {
+        footer.set_request_token_usage(Some(astra_turn_types::RequestTokenUsage {
             fresh_input_tokens: 100_000,
             cache_read_tokens: 590_000,
             cache_creation_tokens: 10_000,
             output_tokens: 4_000,
-        });
+        }));
 
         assert_eq!(footer.raw_context_window_tokens, Some(1_000_000));
         assert_eq!(
@@ -322,5 +384,79 @@ mod tests {
             Some(ContextWindowUsage::estimated(12_000, 180_000))
         );
         assert_eq!(footer.raw_context_window_tokens, Some(200_000));
+    }
+
+    #[test]
+    fn pending_permission_mode_is_ui_only_and_clears_when_consumed() {
+        let mut footer = Footer::new();
+        assert_eq!(footer.pending_permission_mode(), None);
+
+        footer.set_pending_permission_mode(crate::cli::permission_manager::PermissionMode::Auto);
+        assert_eq!(
+            footer.pending_permission_mode(),
+            Some(crate::cli::permission_manager::PermissionMode::Auto)
+        );
+
+        footer.clear_pending_permission_mode();
+        assert_eq!(footer.pending_permission_mode(), None);
+    }
+
+    #[test]
+    fn pending_permission_mode_reaches_the_rendered_bottom_status() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+
+        let mut footer = Footer::new();
+        footer.permission_mode = Some(crate::cli::permission_manager::PermissionMode::Prompt);
+        footer.set_pending_permission_mode(crate::cli::permission_manager::PermissionMode::Auto);
+        let area = Rect::new(0, 0, 80, 1);
+        let mut buf = Buffer::empty(area);
+        footer.render(area, &mut buf);
+        let rendered: String = (0..area.width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+
+        assert!(rendered.contains("Ask"), "current mode must remain visible");
+        assert!(
+            rendered.contains("next: Auto"),
+            "staged mode must be visible while the turn runs; got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn pending_permission_mode_does_not_override_the_live_mode_mirror() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state
+            .perm_manager
+            .set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
+        let mirror = state.perm_manager.mode_mirror_handle();
+        let mut footer = Footer::new();
+        footer.set_mode_mirror(mirror);
+        footer.set_pending_permission_mode(crate::cli::permission_manager::PermissionMode::Auto);
+
+        let area = Rect::new(0, 0, 80, 1);
+        let mut buf = Buffer::empty(area);
+        footer.render(area, &mut buf);
+        let rendered: String = (0..area.width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(rendered.contains("Ask"));
+        assert!(rendered.contains("next: Auto"));
+
+        state
+            .perm_manager
+            .set_mode(crate::cli::permission_manager::PermissionMode::Plan);
+        let mut buf = Buffer::empty(area);
+        footer.render(area, &mut buf);
+        let rendered: String = (0..area.width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(rendered.contains("Read-only"));
+        assert!(rendered.contains("next: Auto"));
+        assert!(
+            !rendered.contains("Ask"),
+            "pending intent must not replace the live mirror; got {rendered:?}"
+        );
     }
 }

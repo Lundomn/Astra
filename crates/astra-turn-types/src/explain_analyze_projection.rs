@@ -37,12 +37,34 @@ pub struct ExplainAnalyzeProjectedNodeV1 {
     pub end_elapsed_ms: Option<u64>,
     pub duration_ms: Option<u64>,
     pub outcome: Option<ExplainAnalyzeOutcomeV1>,
+    pub decision_detail: Option<crate::ExplainAnalyzeDecisionDetailV1>,
     pub usage: Option<ExplainAnalyzeTokenUsageV1>,
     pub context: Option<ExplainAnalyzeContextMetricsV1>,
+    pub auxiliary_usage: Option<Box<crate::ExplainAnalyzeAuxiliaryUsageV1>>,
+    pub auxiliary_details: Option<Box<crate::ExplainAnalyzeAuxiliaryDetailsV1>>,
     pub coverage_gaps: Vec<crate::ExplainAnalyzeCoverageGapV1>,
     pub start_observed: bool,
     pub terminal_observed: bool,
     pub conflicted: bool,
+}
+
+/// Capture coverage for one physical Explain Analyze execution scope.
+///
+/// A logical turn can contain more than one scope when execution is retried,
+/// resumed, or otherwise creates a new clock domain. A terminal node in one
+/// scope therefore cannot establish coverage for another scope. Consumers
+/// should use this projection instead of aggregating terminal/snapshot facts
+/// with global `any`/`all` checks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExplainAnalyzeScopeCoverageV1 {
+    pub run_id: String,
+    pub turn_id: String,
+    pub clock_domain_id: String,
+    pub provider_attempt_observed: bool,
+    pub turn_observed: bool,
+    pub terminal_turn_observed: bool,
+    pub turn_conflicted: bool,
+    pub auxiliary_snapshot_observed: bool,
 }
 
 /// Whether all known facts are internally consistent. `Unknown` also covers a
@@ -239,6 +261,8 @@ pub struct ExplainAnalyzeGraphV1 {
     node_indices: HashMap<String, usize>,
     seen_events: HashMap<String, SeenEvent>,
     conflicted_node_ids: BTreeSet<String>,
+    // Retain conflict provenance even when the incoming usage fact is discarded.
+    auxiliary_capture_conflicted: bool,
     duplicate_event_count: usize,
     diagnostics: ExplainAnalyzeProjectionDiagnosticsV1,
     root_indices: BTreeSet<usize>,
@@ -251,8 +275,420 @@ pub struct ExplainAnalyzeGraphV1 {
 }
 
 impl ExplainAnalyzeGraphV1 {
+    /// Captured terminal usage only. Missing snapshots are not an empty ledger.
+    pub fn auxiliary_usage_snapshot(&self) -> crate::ExplainAnalyzeAuxiliaryUsageV1 {
+        let (attempts, conflicts) = self.reconcile_auxiliary_attempts();
+        if conflicts > 0 || self.auxiliary_capture_conflicted() {
+            // The wire has no conflict-coverage field. Do not turn rejected
+            // evidence into either zero usage or producer truncation.
+            return crate::ExplainAnalyzeAuxiliaryUsageV1 {
+                available: false,
+                truncated: false,
+                attempts: Vec::new(),
+            };
+        }
+        let available = self.nodes.iter().any(|node| {
+            node.terminal_observed
+                && !node.conflicted
+                && node
+                    .auxiliary_usage
+                    .as_ref()
+                    .is_some_and(|usage| usage.available)
+        });
+        crate::ExplainAnalyzeAuxiliaryUsageV1 {
+            available,
+            truncated: available && self.auxiliary_usage_truncated(),
+            attempts: attempts.into_iter().cloned().collect(),
+        }
+    }
+
+    /// Deduplicate physical attempts across repeated turn segments.
+    pub fn auxiliary_attempts(&self) -> Vec<&crate::ExplainAnalyzeAuxiliaryAttemptV1> {
+        self.reconcile_auxiliary_attempts().0
+    }
+
+    /// Conflicting physical identities/measurements, not omitted capture rows.
+    pub fn auxiliary_usage_conflict_count(&self) -> usize {
+        self.reconcile_auxiliary_attempts().1
+    }
+
+    /// A conflicted Turn cannot establish capture coverage, even if its
+    /// retained version lacks usage. This is not an attempt-identity count.
+    pub fn auxiliary_capture_conflicted(&self) -> bool {
+        self.auxiliary_capture_conflicted
+            || self.nodes.iter().any(|node| {
+                node.conflicted
+                    && (node.kind == ExplainAnalyzeNodeKindV1::Turn
+                        || node.auxiliary_usage.is_some())
+            })
+    }
+
+    fn reconcile_auxiliary_attempts(
+        &self,
+    ) -> (Vec<&crate::ExplainAnalyzeAuxiliaryAttemptV1>, usize) {
+        use crate::{
+            ExplainAnalyzeAuxiliaryAttemptV1 as Attempt,
+            ExplainAnalyzeAuxiliaryUsageStatusV1 as Status,
+        };
+        let buckets = |attempt: &Attempt| {
+            attempt.usage.as_ref().map_or([None; 4], |usage| {
+                [
+                    usage.fresh_input_tokens,
+                    usage.output_tokens,
+                    usage.cache_read_tokens,
+                    usage.cache_creation_tokens,
+                ]
+            })
+        };
+        fn identity(attempt: &Attempt) -> [&str; 5] {
+            // Compare below without allocating or minting a replacement fact.
+            [
+                attempt.provider.as_str(),
+                attempt.offering_id.as_str(),
+                attempt.model_name.as_str(),
+                attempt.purpose.as_str(),
+                attempt.operation_id.as_str(),
+            ]
+        }
+        let rank = |status| match status {
+            Status::Unavailable => 0,
+            Status::ProviderPartial => 1,
+            Status::ProviderExact => 2,
+        };
+        // Consensus buckets are comparison evidence only, never merged into
+        // the selected record. Remember weaker observations even when a later
+        // exact record omits that bucket, so contradictions cannot disappear.
+        let mut attempts = BTreeMap::new();
+        for attempt in self
+            .nodes
+            .iter()
+            .filter(|n| n.terminal_observed && !n.conflicted)
+            .filter_map(|n| n.auxiliary_usage.as_ref())
+            .flat_map(|u| &u.attempts)
+        {
+            let (selected, known, conflicted) =
+                attempts
+                    .entry(&attempt.attempt_id)
+                    .or_insert((attempt, buckets(attempt), false));
+            *conflicted |= identity(selected) != identity(attempt);
+            for (previous, current) in known.iter_mut().zip(buckets(attempt)) {
+                if let Some(current) = current {
+                    if let Some(previous) = previous {
+                        *conflicted |= *previous != current;
+                    } else {
+                        *previous = Some(current);
+                    }
+                }
+            }
+            // Stable tie-break between compatible original records. Never
+            // add buckets or promote a partial-only value to exact evidence.
+            let key = |a: &Attempt| (rank(a.usage_status), a.usage.is_some(), buckets(a));
+            if key(attempt) > key(selected) {
+                *selected = attempt;
+            }
+        }
+        let conflicts = attempts
+            .values()
+            .filter(|(_, _, conflict)| *conflict)
+            .count();
+        let retained = attempts
+            .into_values()
+            .filter_map(|(attempt, _, conflict)| (!conflict).then_some(attempt))
+            .collect();
+        (retained, conflicts)
+    }
+    pub fn auxiliary_usage_unavailable(&self) -> bool {
+        self.nodes
+            .iter()
+            .any(|n| n.auxiliary_usage.as_ref().is_some_and(|u| !u.available))
+    }
+
+    pub fn auxiliary_usage_truncated(&self) -> bool {
+        self.nodes
+            .iter()
+            .any(|n| n.auxiliary_usage.as_ref().is_some_and(|u| u.truncated))
+    }
+
+    /// Semantic settlement and logical auxiliary-call timing for every
+    /// terminal scope. Unlike physical usage, this is not reconstructed from
+    /// the inference ledger or database timestamps.
+    pub fn auxiliary_details(&self) -> Vec<(&str, &crate::ExplainAnalyzeAuxiliaryDetailsV1)> {
+        let mut details = self
+            .nodes
+            .iter()
+            .filter(|node| node.terminal_observed && !node.conflicted)
+            .filter_map(|node| {
+                node.auxiliary_details
+                    .as_deref()
+                    .map(|details| (node.node_id.as_str(), details))
+            })
+            .collect::<Vec<_>>();
+        details.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        details
+    }
+
     pub fn nodes(&self) -> &[ExplainAnalyzeProjectedNodeV1] {
         &self.nodes
+    }
+
+    /// Exact primary input buckets across all observed execution scopes.
+    /// Output and timing coverage do not determine prompt-cache coverage.
+    /// Callers must separately reject transport loss or unverified identity.
+    /// Missing lanes remain unknown; auxiliary and stage totals are excluded.
+    pub fn primary_prompt_cache_usage(&self) -> Option<crate::NormalizedPromptCacheUsage> {
+        let mut total = crate::NormalizedPromptCacheUsage::default();
+        for (_, usage) in self.primary_prompt_cache_inputs()? {
+            total.fresh_input_tokens = total
+                .fresh_input_tokens
+                .checked_add(usage.fresh_input_tokens)?;
+            total.cache_read_tokens = total
+                .cache_read_tokens
+                .checked_add(usage.cache_read_tokens)?;
+            total.cache_creation_tokens = total
+                .cache_creation_tokens
+                .checked_add(usage.cache_creation_tokens)?;
+        }
+        total.checked_total_input_tokens()?;
+        Some(total)
+    }
+
+    /// Provider-observed cache reads remain usable when another input lane is
+    /// unknown. This proves only a read count, never a total-input share.
+    pub fn primary_prompt_cache_read_tokens(&self) -> Option<u64> {
+        self.primary_prompt_cache_read_inputs()?
+            .try_fold(0_u64, |total, (_, read)| total.checked_add(read))
+    }
+
+    fn primary_attempt_nodes(
+        &self,
+    ) -> Option<impl Iterator<Item = &ExplainAnalyzeProjectedNodeV1> + Clone + '_> {
+        if self.integrity() != ExplainAnalyzeGraphIntegrityV1::Consistent
+            || self
+                .execution_scope_coverage()
+                .iter()
+                .any(|scope| !scope.terminal_turn_observed || scope.turn_conflicted)
+        {
+            return None;
+        }
+        let nodes = self
+            .nodes
+            .iter()
+            .filter(|node| node.kind == ExplainAnalyzeNodeKindV1::ProviderAttempt);
+        nodes.clone().next()?;
+        Some(nodes)
+    }
+
+    /// Validated physical primary input records, without allocating another
+    /// graph or inventing ordering between clock domains. Consumers can use
+    /// the existing typed node/parent identity for grouping.
+    pub fn primary_prompt_cache_inputs(
+        &self,
+    ) -> Option<
+        impl Iterator<
+            Item = (
+                &ExplainAnalyzeProjectedNodeV1,
+                crate::NormalizedPromptCacheUsage,
+            ),
+        > + '_,
+    > {
+        let nodes = self.primary_attempt_nodes()?;
+        for node in nodes.clone() {
+            Self::exact_primary_input(node)?;
+        }
+        Some(nodes.map(|node| {
+            (
+                node,
+                Self::exact_primary_input(node).expect("immutable validated primary input"),
+            )
+        }))
+    }
+
+    fn primary_prompt_cache_read_inputs(
+        &self,
+    ) -> Option<impl Iterator<Item = (&ExplainAnalyzeProjectedNodeV1, u64)> + '_> {
+        let nodes = self.primary_attempt_nodes()?;
+        for node in nodes.clone() {
+            Self::known_primary_cache_read(node)?;
+        }
+        Some(nodes.map(|node| {
+            (
+                node,
+                Self::known_primary_cache_read(node).expect("immutable validated cache read"),
+            )
+        }))
+    }
+
+    fn known_primary_cache_read(node: &ExplainAnalyzeProjectedNodeV1) -> Option<u64> {
+        if !node.start_observed || !node.terminal_observed || node.conflicted {
+            return None;
+        }
+        let usage = node.usage.as_ref()?;
+        if !matches!(
+            usage.basis,
+            crate::ExplainAnalyzeUsageBasisV1::ProviderExact
+                | crate::ExplainAnalyzeUsageBasisV1::ProviderPartial
+        ) {
+            return None;
+        }
+        usage.cache_read_tokens
+    }
+
+    /// Ordered request groups within one physical scope. Physical retries
+    /// share their typed ModelRound parent; phase attempts remain distinct.
+    /// Multiple clocks have no shared ordering evidence and are not guessed.
+    pub fn primary_prompt_cache_request_groups(
+        &self,
+    ) -> Option<Vec<crate::NormalizedPromptCacheUsage>> {
+        self.primary_prompt_cache_request_groups_from(
+            self.primary_prompt_cache_inputs()?,
+            |total, usage| {
+                total.fresh_input_tokens = total
+                    .fresh_input_tokens
+                    .checked_add(usage.fresh_input_tokens)?;
+                total.cache_read_tokens = total
+                    .cache_read_tokens
+                    .checked_add(usage.cache_read_tokens)?;
+                total.cache_creation_tokens = total
+                    .cache_creation_tokens
+                    .checked_add(usage.cache_creation_tokens)?;
+                total.checked_total_input_tokens()?;
+                Some(())
+            },
+        )
+    }
+
+    /// Ordered cache-read counts, with unknown creation/fresh lanes still
+    /// unknown. Exact input-share consumers use the method above instead.
+    pub fn primary_prompt_cache_read_request_groups(&self) -> Option<Vec<u64>> {
+        self.primary_prompt_cache_request_groups_from(
+            self.primary_prompt_cache_read_inputs()?,
+            |total, read| {
+                *total = total.checked_add(read)?;
+                Some(())
+            },
+        )
+    }
+
+    fn primary_prompt_cache_request_groups_from<'a, T: Copy + Default>(
+        &self,
+        inputs: impl Iterator<Item = (&'a ExplainAnalyzeProjectedNodeV1, T)>,
+        mut add: impl FnMut(&mut T, T) -> Option<()>,
+    ) -> Option<Vec<T>> {
+        if self.execution_scope_coverage().len() != 1 {
+            return None;
+        }
+        let mut groups = BTreeMap::<(u32, u32), (&str, T)>::new();
+        let mut physical_attempts = HashSet::new();
+        for (node, usage) in inputs {
+            let parent = self.nodes.get(node.parent_index?)?;
+            if parent.kind != ExplainAnalyzeNodeKindV1::ModelRound
+                || !parent.start_observed
+                || !parent.terminal_observed
+                || parent.conflicted
+                || parent.run_id != node.run_id
+                || parent.turn_id != node.turn_id
+                || parent.clock_domain_id != node.clock_domain_id
+                || parent.round_index != node.round_index
+            {
+                return None;
+            }
+            let key = (parent.round_index?, parent.attempt_index?);
+            if !physical_attempts.insert((parent.node_id.as_str(), node.attempt_index?)) {
+                return None;
+            }
+            let (id, total) = groups
+                .entry(key)
+                .or_insert((parent.node_id.as_str(), T::default()));
+            if *id != parent.node_id {
+                return None;
+            }
+            add(total, usage)?;
+        }
+        // A model-request boundary without any physical input evidence must
+        // not disappear before a caller applies its warmup count.
+        for parent in self
+            .nodes
+            .iter()
+            .filter(|node| node.kind == ExplainAnalyzeNodeKindV1::ModelRound)
+        {
+            let (id, _) = groups.get(&(parent.round_index?, parent.attempt_index?))?;
+            if *id != parent.node_id {
+                return None;
+            }
+        }
+        Some(groups.into_values().map(|(_, usage)| usage).collect())
+    }
+
+    fn exact_primary_input(
+        node: &ExplainAnalyzeProjectedNodeV1,
+    ) -> Option<crate::NormalizedPromptCacheUsage> {
+        if !node.start_observed || !node.terminal_observed || node.conflicted {
+            return None;
+        }
+        let usage = node.usage.as_ref()?;
+        if !matches!(
+            usage.basis,
+            crate::ExplainAnalyzeUsageBasisV1::ProviderExact
+                | crate::ExplainAnalyzeUsageBasisV1::ProviderPartial
+        ) {
+            return None;
+        }
+        let input = crate::NormalizedPromptCacheUsage::new(
+            usage.fresh_input_tokens?,
+            usage.cache_read_tokens?,
+            usage.cache_creation_tokens?,
+        );
+        input.checked_total_input_tokens()?;
+        Some(input)
+    }
+
+    /// Return capture coverage grouped by the producer's physical execution
+    /// scope. The grouping identity is the complete `(run, turn, clock)`
+    /// tuple; a prior scope must never satisfy a later scope's terminal or
+    /// auxiliary snapshot requirement.
+    pub fn execution_scope_coverage(&self) -> Vec<ExplainAnalyzeScopeCoverageV1> {
+        let mut coverage =
+            BTreeMap::<(String, String, String), ExplainAnalyzeScopeCoverageV1>::new();
+        for node in &self.nodes {
+            if !matches!(
+                node.kind,
+                ExplainAnalyzeNodeKindV1::Turn | ExplainAnalyzeNodeKindV1::ProviderAttempt
+            ) {
+                continue;
+            }
+            let key = (
+                node.run_id.clone(),
+                node.turn_id.clone(),
+                node.clock_domain_id.clone(),
+            );
+            let entry = coverage
+                .entry(key)
+                .or_insert_with(|| ExplainAnalyzeScopeCoverageV1 {
+                    run_id: node.run_id.clone(),
+                    turn_id: node.turn_id.clone(),
+                    clock_domain_id: node.clock_domain_id.clone(),
+                    provider_attempt_observed: false,
+                    turn_observed: false,
+                    terminal_turn_observed: false,
+                    turn_conflicted: false,
+                    auxiliary_snapshot_observed: false,
+                });
+            match node.kind {
+                ExplainAnalyzeNodeKindV1::ProviderAttempt => {
+                    entry.provider_attempt_observed = true;
+                }
+                ExplainAnalyzeNodeKindV1::Turn => {
+                    entry.turn_observed = true;
+                    entry.terminal_turn_observed |= node.terminal_observed;
+                    entry.turn_conflicted |= node.conflicted;
+                    entry.auxiliary_snapshot_observed |= node.terminal_observed
+                        && !node.conflicted
+                        && node.auxiliary_usage.is_some();
+                }
+                _ => unreachable!("scope coverage only admits turn/provider nodes"),
+            }
+        }
+        coverage.into_values().collect()
     }
 
     /// Return roots in first-seen order. Nodes with unresolved parents are
@@ -331,6 +767,8 @@ impl ExplainAnalyzeGraphV1 {
                 };
             }
 
+            self.auxiliary_capture_conflicted |=
+                event.kind == ExplainAnalyzeNodeKindV1::Turn || event.auxiliary_usage.is_some();
             let mut node_ids = BTreeSet::new();
             node_ids.insert(seen.node_id);
             node_ids.insert(event.node_id.clone());
@@ -364,6 +802,8 @@ impl ExplainAnalyzeGraphV1 {
             conflict |= self.merge_event(node_index, &event);
         }
         if conflict {
+            self.auxiliary_capture_conflicted |=
+                event.kind == ExplainAnalyzeNodeKindV1::Turn || event.auxiliary_usage.is_some();
             self.mark_conflicted_node_id(&event.node_id);
         }
 
@@ -513,8 +953,11 @@ impl ExplainAnalyzeGraphV1 {
             end_elapsed_ms: terminal.then_some(event.elapsed_ms),
             duration_ms: event.duration_ms,
             outcome: event.outcome,
+            decision_detail: event.decision_detail.clone(),
             usage: event.usage.clone(),
             context: event.context.clone(),
+            auxiliary_usage: event.auxiliary_usage.clone(),
+            auxiliary_details: event.auxiliary_details.clone(),
             coverage_gaps: event.coverage_gaps.clone(),
             start_observed: event.transition == ExplainAnalyzeTransitionV1::Started,
             terminal_observed: terminal,
@@ -657,7 +1100,10 @@ impl ExplainAnalyzeGraphV1 {
                     || node.end_elapsed_ms != Some(event.elapsed_ms)
                     || node.duration_ms != event.duration_ms
                     || node.outcome != event.outcome
+                    || node.decision_detail != event.decision_detail
                     || node.usage != event.usage
+                    || node.auxiliary_usage != event.auxiliary_usage
+                    || node.auxiliary_details != event.auxiliary_details
                     || node.context != event.context
                     || node.coverage_gaps != event.coverage_gaps
                 {
@@ -674,8 +1120,11 @@ impl ExplainAnalyzeGraphV1 {
                 node.end_elapsed_ms = Some(event.elapsed_ms);
                 node.duration_ms = event.duration_ms;
                 node.outcome = event.outcome;
+                node.decision_detail = event.decision_detail.clone();
                 node.usage = event.usage.clone();
                 node.context = event.context.clone();
+                node.auxiliary_usage = event.auxiliary_usage.clone();
+                node.auxiliary_details = event.auxiliary_details.clone();
                 node.coverage_gaps = event.coverage_gaps.clone();
                 node.terminal_observed = true;
             }
@@ -892,6 +1341,8 @@ mod tests {
         elapsed_ms: u64,
     ) -> ExplainAnalyzeEventV1 {
         ExplainAnalyzeEventV1 {
+            auxiliary_usage: None,
+            auxiliary_details: None,
             schema_version: crate::EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: format!("{node_id}/started"),
             run_id: "run-1".to_owned(),
@@ -912,6 +1363,7 @@ mod tests {
             start_elapsed_ms: None,
             duration_ms: None,
             outcome: None,
+            decision_detail: None,
             usage: None,
             context: None,
             coverage_gaps: Vec::new(),
@@ -930,6 +1382,608 @@ mod tests {
         event.duration_ms = Some(end_elapsed_ms - start_elapsed_ms);
         event.outcome = Some(ExplainAnalyzeOutcomeV1::Succeeded);
         event
+    }
+
+    #[test]
+    fn primary_cache_request_groups_preserve_phase_attempts_and_physical_retries() {
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        let turn = started("turn", ExplainAnalyzeNodeKindV1::Turn, None, "c", 0);
+        graph.apply(turn.clone());
+        // Arrival order is not request order, and zero-input groups still
+        // consume a warmup position.
+        for (phase, reads) in [(2, vec![0]), (0, vec![10, 20]), (1, vec![50])] {
+            let parent_id = format!("phase-{phase}");
+            let mut parent = started(
+                &parent_id,
+                ExplainAnalyzeNodeKindV1::ModelRound,
+                Some("turn"),
+                "c",
+                0,
+            );
+            parent.round_index = Some(7); // Gaps and nonzero starts are legitimate.
+            parent.attempt_index = Some(phase);
+            graph.apply(parent.clone());
+            for (attempt, read) in reads.into_iter().enumerate() {
+                let mut child = started(
+                    &format!("{parent_id}-{attempt}"),
+                    ExplainAnalyzeNodeKindV1::ProviderAttempt,
+                    Some(&parent_id),
+                    "c",
+                    0,
+                );
+                child.round_index = Some(7);
+                child.attempt_index = Some(attempt as u32);
+                graph.apply(child.clone());
+                let mut terminal = finished(child, 0, 1);
+                terminal.usage = Some(ExplainAnalyzeTokenUsageV1 {
+                    basis: crate::ExplainAnalyzeUsageBasisV1::ProviderExact,
+                    fresh_input_tokens: Some(0),
+                    cache_read_tokens: Some(read),
+                    cache_creation_tokens: Some(0),
+                    output_tokens: None,
+                });
+                graph.apply(terminal);
+            }
+            graph.apply(finished(parent, 0, 2));
+        }
+        graph.apply(finished(turn, 0, 3));
+        graph.finish_ingest();
+        let groups = graph.primary_prompt_cache_request_groups().unwrap();
+        assert_eq!(
+            groups
+                .iter()
+                .map(|usage| usage.cache_read_tokens)
+                .collect::<Vec<_>>(),
+            vec![30, 50, 0]
+        );
+        let mut duplicate_physical = graph.clone();
+        let mut duplicate = started(
+            "duplicate-physical",
+            ExplainAnalyzeNodeKindV1::ProviderAttempt,
+            Some("phase-0"),
+            "c",
+            0,
+        );
+        duplicate.round_index = Some(7);
+        duplicate.attempt_index = Some(0);
+        duplicate_physical.apply(duplicate.clone());
+        let mut duplicate = finished(duplicate, 0, 1);
+        duplicate.usage = Some(ExplainAnalyzeTokenUsageV1 {
+            basis: crate::ExplainAnalyzeUsageBasisV1::ProviderExact,
+            fresh_input_tokens: Some(0),
+            cache_read_tokens: Some(10),
+            cache_creation_tokens: Some(0),
+            output_tokens: None,
+        });
+        duplicate_physical.apply(duplicate);
+        duplicate_physical.finish_ingest();
+        assert_eq!(
+            duplicate_physical.integrity(),
+            ExplainAnalyzeGraphIntegrityV1::Consistent
+        );
+        assert!(
+            duplicate_physical
+                .primary_prompt_cache_request_groups()
+                .is_none()
+        );
+
+        let mut undispatched = graph.clone();
+        let mut parent = started(
+            "no-physical-evidence",
+            ExplainAnalyzeNodeKindV1::ModelRound,
+            Some("turn"),
+            "c",
+            0,
+        );
+        parent.round_index = Some(8);
+        parent.attempt_index = Some(0);
+        undispatched.apply(parent.clone());
+        undispatched.apply(finished(parent, 0, 1));
+        undispatched.finish_ingest();
+        assert_eq!(
+            undispatched.integrity(),
+            ExplainAnalyzeGraphIntegrityV1::Consistent
+        );
+        assert!(undispatched.primary_prompt_cache_request_groups().is_none());
+        let mut multiscoped = graph.clone();
+        multiscoped.apply(finished(
+            started(
+                "next",
+                ExplainAnalyzeNodeKindV1::Turn,
+                None,
+                "other-clock",
+                0,
+            ),
+            0,
+            1,
+        ));
+        multiscoped.finish_ingest();
+        assert_eq!(
+            multiscoped.integrity(),
+            ExplainAnalyzeGraphIntegrityV1::Consistent
+        );
+        assert!(multiscoped.primary_prompt_cache_request_groups().is_none());
+        let mut colliding = started(
+            "collision",
+            ExplainAnalyzeNodeKindV1::ModelRound,
+            Some("turn"),
+            "c",
+            0,
+        );
+        colliding.round_index = Some(7);
+        colliding.attempt_index = Some(1);
+        graph.apply(colliding.clone());
+        graph.apply(finished(colliding, 0, 1));
+        graph.finish_ingest();
+        assert_eq!(
+            graph.integrity(),
+            ExplainAnalyzeGraphIntegrityV1::Consistent
+        );
+        assert!(graph.primary_prompt_cache_request_groups().is_none());
+    }
+
+    #[test]
+    fn primary_cache_input_requires_coverage_not_output() {
+        let turn = started("turn", ExplainAnalyzeNodeKindV1::Turn, None, "c", 0);
+        let request = started(
+            "request",
+            ExplainAnalyzeNodeKindV1::ProviderAttempt,
+            Some("turn"),
+            "c",
+            0,
+        );
+        let mut terminal = finished(request.clone(), 0, 1);
+        terminal.usage = Some(ExplainAnalyzeTokenUsageV1 {
+            // The real producer marks usage partial when output is absent,
+            // even though every input lane is provider-observed.
+            basis: crate::ExplainAnalyzeUsageBasisV1::ProviderPartial,
+            fresh_input_tokens: Some(100),
+            cache_read_tokens: Some(900),
+            cache_creation_tokens: Some(0),
+            output_tokens: None,
+        });
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        for event in [
+            turn.clone(),
+            request.clone(),
+            terminal.clone(),
+            terminal.clone(),
+            finished(turn.clone(), 0, 2),
+        ] {
+            graph.apply(event);
+        }
+        graph.finish_ingest();
+        assert_eq!(
+            graph.primary_prompt_cache_usage(),
+            Some(crate::NormalizedPromptCacheUsage::new(100, 900, 0))
+        );
+        for invalid in 0..5 {
+            let mut partial = ExplainAnalyzeGraphV1::default();
+            let mut partial_terminal = terminal.clone();
+            let usage = partial_terminal.usage.as_mut().unwrap();
+            match invalid {
+                0 => usage.fresh_input_tokens = None,
+                1 => usage.cache_read_tokens = None,
+                2 => usage.cache_creation_tokens = None,
+                3 => usage.basis = crate::ExplainAnalyzeUsageBasisV1::RuntimeEstimated,
+                _ => usage.fresh_input_tokens = Some(u64::MAX),
+            }
+            for event in [
+                turn.clone(),
+                request.clone(),
+                partial_terminal,
+                finished(turn.clone(), 0, 2),
+            ] {
+                partial.apply(event);
+            }
+            partial.finish_ingest();
+            assert_eq!(partial.primary_prompt_cache_usage(), None);
+        }
+        let mut resumed = graph.clone();
+        resumed.apply(started(
+            "next",
+            ExplainAnalyzeNodeKindV1::Turn,
+            None,
+            "next-clock",
+            0,
+        ));
+        resumed.finish_ingest();
+        assert_eq!(resumed.primary_prompt_cache_usage(), None);
+        terminal.usage.as_mut().unwrap().cache_read_tokens = Some(800);
+        graph.apply(terminal);
+        graph.finish_ingest();
+        assert_eq!(graph.primary_prompt_cache_usage(), None);
+    }
+
+    #[test]
+    fn partial_provider_read_proves_only_read_count() {
+        let turn = started("turn", ExplainAnalyzeNodeKindV1::Turn, None, "c", 0);
+        let mut round = started(
+            "round",
+            ExplainAnalyzeNodeKindV1::ModelRound,
+            Some("turn"),
+            "c",
+            0,
+        );
+        round.attempt_index = Some(0);
+        let attempt = started(
+            "attempt",
+            ExplainAnalyzeNodeKindV1::ProviderAttempt,
+            Some("round"),
+            "c",
+            0,
+        );
+        let mut terminal = finished(attempt.clone(), 0, 1);
+        terminal.usage = Some(ExplainAnalyzeTokenUsageV1 {
+            basis: crate::ExplainAnalyzeUsageBasisV1::ProviderPartial,
+            fresh_input_tokens: Some(315),
+            cache_read_tokens: Some(8_192),
+            cache_creation_tokens: None,
+            output_tokens: Some(1),
+        });
+        let build = |terminal: ExplainAnalyzeEventV1| {
+            let mut graph = ExplainAnalyzeGraphV1::default();
+            for event in [
+                turn.clone(),
+                round.clone(),
+                attempt.clone(),
+                terminal,
+                finished(round.clone(), 0, 2),
+                finished(turn.clone(), 0, 3),
+            ] {
+                graph.apply(event);
+            }
+            graph.finish_ingest();
+            graph
+        };
+        let graph = build(terminal.clone());
+        assert_eq!(graph.primary_prompt_cache_read_tokens(), Some(8_192));
+        assert_eq!(
+            graph.primary_prompt_cache_read_request_groups(),
+            Some(vec![8_192])
+        );
+        assert_eq!(graph.primary_prompt_cache_usage(), None);
+        assert_eq!(graph.primary_prompt_cache_request_groups(), None);
+
+        let mut missing = terminal.clone();
+        missing.usage.as_mut().unwrap().cache_read_tokens = None;
+        assert_eq!(build(missing).primary_prompt_cache_read_tokens(), None);
+        let mut estimated = terminal;
+        estimated.usage.as_mut().unwrap().basis =
+            crate::ExplainAnalyzeUsageBasisV1::RuntimeEstimated;
+        assert_eq!(build(estimated).primary_prompt_cache_read_tokens(), None);
+    }
+
+    #[test]
+    fn decision_detail_is_retained_and_conflicting_terminal_evidence_is_detected() {
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        let start = started(
+            "admission-agent",
+            ExplainAnalyzeNodeKindV1::Admission,
+            Some("turn-1"),
+            "clock-1",
+            4,
+        );
+        let mut terminal = finished(start, 4, 9);
+        terminal.outcome = Some(ExplainAnalyzeOutcomeV1::Blocked);
+        terminal.decision_detail = Some(
+            crate::ExplainAnalyzeDecisionDetailV1::DelegationCatalogResolution {
+                requirement_index: 1,
+                match_count: 0,
+            },
+        );
+        graph.apply(terminal.clone());
+        graph.apply(terminal.clone());
+        assert_eq!(graph.duplicate_event_count(), 1);
+        assert_eq!(graph.nodes()[0].decision_detail, terminal.decision_detail);
+
+        terminal.event_id.push_str("-conflict");
+        terminal.decision_detail = Some(
+            crate::ExplainAnalyzeDecisionDetailV1::DelegationCatalogResolution {
+                requirement_index: 1,
+                match_count: 3,
+            },
+        );
+        graph.apply(terminal);
+        assert!(graph.nodes()[0].conflicted);
+        assert_eq!(
+            graph.conflicted_node_ids().collect::<Vec<_>>(),
+            ["admission-agent"]
+        );
+    }
+
+    #[test]
+    fn auxiliary_snapshots_upgrade_status_without_double_counting_attempts() {
+        use crate::{
+            ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+            ExplainAnalyzeAuxiliaryUsageV1, ExplainAnalyzeTokenUsageV1, ExplainAnalyzeUsageBasisV1,
+        };
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        for (index, status) in [
+            ExplainAnalyzeAuxiliaryUsageStatusV1::Unavailable,
+            ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderPartial,
+            ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut event = finished(
+                started(
+                    &format!("segment-{index}"),
+                    ExplainAnalyzeNodeKindV1::Turn,
+                    None,
+                    "clock",
+                    0,
+                ),
+                0,
+                10,
+            );
+            event.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
+                available: true,
+                truncated: false,
+                attempts: vec![ExplainAnalyzeAuxiliaryAttemptV1 {
+                    attempt_id: "aux-1".into(),
+                    provider: "typesafe".into(),
+                    offering_id: "jev-1".into(),
+                    model_name: "jev1".into(),
+                    purpose: "verification_judge".into(),
+                    operation_id: "verification_judge".into(),
+                    usage_status: status,
+                    usage: (status == ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact)
+                        .then_some(ExplainAnalyzeTokenUsageV1 {
+                            basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                            fresh_input_tokens: Some(100),
+                            output_tokens: Some(0),
+                            cache_read_tokens: None,
+                            cache_creation_tokens: None,
+                        }),
+                }],
+            }));
+            graph.apply(event);
+            assert_eq!(graph.auxiliary_attempts().len(), 1);
+            assert_eq!(graph.auxiliary_attempts()[0].usage_status, status);
+            let snapshot = graph.auxiliary_usage_snapshot();
+            assert!(snapshot.available);
+            assert_eq!(snapshot.attempts.len(), 1);
+            assert_eq!(snapshot.attempts[0].usage_status, status);
+        }
+        assert_eq!(
+            graph.auxiliary_attempts()[0]
+                .usage
+                .as_ref()
+                .unwrap()
+                .fresh_input_tokens,
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn auxiliary_conflicts_are_sticky_and_permutation_independent() {
+        use crate::{
+            ExplainAnalyzeAuxiliaryAttemptV1 as Attempt,
+            ExplainAnalyzeAuxiliaryUsageStatusV1 as Status, ExplainAnalyzeAuxiliaryUsageV1,
+            ExplainAnalyzeUsageBasisV1 as Basis,
+        };
+        fn attempt(status: Status, counts: [Option<u64>; 4]) -> Attempt {
+            Attempt {
+                attempt_id: "physical-1".into(),
+                provider: "provider".into(),
+                offering_id: "offering".into(),
+                model_name: "model".into(),
+                purpose: "verification_judge".into(),
+                operation_id: "request_judgment".into(),
+                usage_status: status,
+                usage: (status != Status::Unavailable).then_some(ExplainAnalyzeTokenUsageV1 {
+                    basis: if status == Status::ProviderExact {
+                        Basis::ProviderExact
+                    } else {
+                        Basis::ProviderPartial
+                    },
+                    fresh_input_tokens: counts[0],
+                    output_tokens: counts[1],
+                    cache_read_tokens: counts[2],
+                    cache_creation_tokens: counts[3],
+                }),
+            }
+        }
+        fn graph(records: &[Attempt], order: [usize; 3]) -> ExplainAnalyzeGraphV1 {
+            let mut graph = ExplainAnalyzeGraphV1::default();
+            for index in order {
+                let mut event = finished(
+                    started(
+                        &format!("segment-{index}"),
+                        ExplainAnalyzeNodeKindV1::Turn,
+                        None,
+                        "clock",
+                        0,
+                    ),
+                    0,
+                    10,
+                );
+                event.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
+                    available: true,
+                    truncated: false,
+                    attempts: vec![records[index].clone()],
+                }));
+                assert!(event.is_valid());
+                graph.apply(event.clone());
+                graph.apply(event); // Replay cannot double-count or revive conflicts.
+            }
+            graph
+        }
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        let unknown = attempt(Status::Unavailable, [None; 4]);
+        let partial = attempt(Status::ProviderPartial, [Some(10), None, None, None]);
+        let exact = attempt(Status::ProviderExact, [Some(10), Some(0), None, None]);
+        for order in orders {
+            let graph = graph(&[unknown.clone(), partial.clone(), exact.clone()], order);
+            assert_eq!(graph.auxiliary_attempts(), vec![&exact]);
+            assert_eq!(graph.auxiliary_usage_conflict_count(), 0);
+            let snapshot = graph.auxiliary_usage_snapshot();
+            assert!(snapshot.available && !snapshot.truncated);
+            assert_eq!(
+                snapshot.attempts[0].usage.as_ref().unwrap().output_tokens,
+                Some(0)
+            );
+            assert_eq!(
+                snapshot.attempts[0]
+                    .usage
+                    .as_ref()
+                    .unwrap()
+                    .cache_read_tokens,
+                None
+            );
+        }
+        // A same-rank complementary record is not fused with another fact.
+        let complementary = attempt(Status::ProviderPartial, [None, Some(0), None, None]);
+        for order in orders {
+            let graph = graph(
+                &[partial.clone(), complementary.clone(), unknown.clone()],
+                order,
+            );
+            assert_eq!(graph.auxiliary_attempts(), vec![&partial]);
+        }
+        let mut conflicts = Vec::new();
+        for field in 0..5 {
+            let mut other = exact.clone();
+            let identity = match field {
+                0 => &mut other.provider,
+                1 => &mut other.offering_id,
+                2 => &mut other.model_name,
+                3 => &mut other.purpose,
+                _ => &mut other.operation_id,
+            };
+            *identity = "other".into();
+            conflicts.push([exact.clone(), other, exact.clone()]);
+        }
+        for bucket in 0..4 {
+            let mut ten = [None; 4];
+            ten[bucket] = Some(10);
+            let mut twenty = [None; 4];
+            twenty[bucket] = Some(20);
+            for (left, right) in [
+                (Status::ProviderPartial, Status::ProviderPartial),
+                (Status::ProviderExact, Status::ProviderExact),
+                (Status::ProviderPartial, Status::ProviderExact),
+            ] {
+                conflicts.push([attempt(left, ten), attempt(right, twenty), unknown.clone()]);
+            }
+            // The higher-ranked record cannot erase weaker known evidence.
+            let mut omitted = [None; 4];
+            omitted[(bucket + 1) % 4] = Some(0);
+            conflicts.push([
+                attempt(Status::ProviderPartial, ten),
+                attempt(Status::ProviderExact, omitted),
+                attempt(Status::ProviderPartial, twenty),
+            ]);
+        }
+        for records in conflicts {
+            for order in orders {
+                let graph = graph(&records, order);
+                assert!(graph.auxiliary_attempts().is_empty());
+                assert_eq!(graph.auxiliary_usage_conflict_count(), 1);
+                let snapshot = graph.auxiliary_usage_snapshot();
+                assert!(!snapshot.available && !snapshot.truncated);
+                assert!(snapshot.attempts.is_empty());
+                assert!(snapshot.is_valid());
+            }
+        }
+        let mut retry = exact.clone();
+        retry.attempt_id = "physical-2".into();
+        let healthy = graph(&[exact.clone(), retry.clone(), exact.clone()], [0, 1, 2]);
+        assert_eq!(healthy.auxiliary_attempts().len(), 2);
+        let mut corrupt = exact.clone();
+        corrupt.provider = "other".into();
+        let mixed = graph(&[exact, corrupt, retry], [0, 1, 2]);
+        assert_eq!(mixed.auxiliary_attempts().len(), 1);
+        assert!(!mixed.auxiliary_usage_snapshot().available);
+        assert!(!mixed.auxiliary_usage_truncated());
+    }
+
+    #[test]
+    fn conflicted_turn_usage_cannot_be_hidden_by_an_independent_snapshot() {
+        use crate::{
+            ExplainAnalyzeAuxiliaryAttemptV1, ExplainAnalyzeAuxiliaryUsageStatusV1,
+            ExplainAnalyzeAuxiliaryUsageV1, ExplainAnalyzeUsageBasisV1,
+        };
+        let make = |node: &str, count| {
+            let mut event = finished(
+                started(node, ExplainAnalyzeNodeKindV1::Turn, None, "clock", 0),
+                0,
+                10,
+            );
+            event.auxiliary_usage = Some(Box::new(ExplainAnalyzeAuxiliaryUsageV1 {
+                available: true,
+                truncated: false,
+                attempts: vec![ExplainAnalyzeAuxiliaryAttemptV1 {
+                    attempt_id: "same-attempt".into(),
+                    provider: "provider".into(),
+                    offering_id: "offering".into(),
+                    model_name: "model".into(),
+                    purpose: "verification_judge".into(),
+                    operation_id: "request_judgment".into(),
+                    usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+                    usage: Some(ExplainAnalyzeTokenUsageV1 {
+                        basis: ExplainAnalyzeUsageBasisV1::ProviderExact,
+                        fresh_input_tokens: Some(count),
+                        output_tokens: Some(0),
+                        cache_read_tokens: None,
+                        cache_creation_tokens: None,
+                    }),
+                }],
+            }));
+            event
+        };
+        for retained_has_usage in [false, true] {
+            for same_event_id in [false, true] {
+                let mut original = make("a", 10);
+                if !retained_has_usage {
+                    original.auxiliary_usage = None;
+                }
+                let mut conflict = make("a", 30);
+                if !same_event_id {
+                    conflict.event_id = "another-terminal".into();
+                }
+                let records = [original, conflict, make("b", 20)];
+                for order in [
+                    [0, 1, 2],
+                    [0, 2, 1],
+                    [1, 0, 2],
+                    [1, 2, 0],
+                    [2, 0, 1],
+                    [2, 1, 0],
+                ] {
+                    let mut graph = ExplainAnalyzeGraphV1::default();
+                    for index in order {
+                        graph.apply(records[index].clone());
+                        graph.apply(records[index].clone());
+                    }
+                    assert!(graph.auxiliary_capture_conflicted());
+                    assert_eq!(graph.auxiliary_usage_conflict_count(), 0);
+                    assert!(!graph.auxiliary_usage_truncated());
+                    let snapshot = graph.auxiliary_usage_snapshot();
+                    assert!(
+                        !snapshot.available && !snapshot.truncated && snapshot.attempts.is_empty()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn absent_auxiliary_capture_is_not_zero_usage() {
+        assert!(
+            !ExplainAnalyzeGraphV1::default()
+                .auxiliary_usage_snapshot()
+                .available
+        );
     }
 
     fn is_diagnostic(
@@ -1388,14 +2442,15 @@ mod tests {
         );
         event.context = Some(ExplainAnalyzeContextMetricsV1 {
             budget: None,
-            assembly: Some(ExplainAnalyzeContextAssemblyV1 {
+            assembly: Some(Box::new(ExplainAnalyzeContextAssemblyV1 {
+                edge_memory_selection: Vec::new(),
                 basis: ExplainAnalyzeContextAssemblyBasisV1::RuntimeTextEstimate,
                 sources: vec![ExplainAnalyzeContextSourceV1 {
                     kind: ExplainAnalyzeContextSourceKindV1::Memory,
                     section_count: 2,
                     estimated_tokens: 55,
                 }],
-            }),
+            })),
         });
         let mut graph = ExplainAnalyzeGraphV1::default();
         graph.apply(event);

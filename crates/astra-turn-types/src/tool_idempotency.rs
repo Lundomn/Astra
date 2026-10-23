@@ -87,6 +87,8 @@ pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolI
         | "inspect_work_criteria"
         | "mo_query"
         | "get_agent_info"
+        | "introspect"
+        | "model_catalog"
         | "reflect"
         | "context_analysis"
         | "diagnose"
@@ -134,6 +136,7 @@ mod tests {
             "task_list",
             "web_fetch",
             "get_agent_info",
+            "introspect",
             "reflect",
         ] {
             assert_eq!(

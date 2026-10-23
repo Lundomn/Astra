@@ -3,22 +3,6 @@
 use crate::path::{canonicalize_parent_and_append, normalize_path};
 use std::path::{Path, PathBuf};
 
-fn unique_path_variants(path: &Path) -> Vec<PathBuf> {
-    let mut variants = vec![normalize_path(path)];
-    if let Ok(canonical) = path.canonicalize()
-        && !variants.iter().any(|existing| existing == &canonical)
-    {
-        variants.push(canonical);
-    } else if let Ok(canonical_parent) = canonicalize_parent_and_append(path)
-        && !variants
-            .iter()
-            .any(|existing| existing == &canonical_parent)
-    {
-        variants.push(canonical_parent);
-    }
-    variants
-}
-
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !paths.iter().any(|existing| existing == &path) {
         paths.push(path);
@@ -262,6 +246,36 @@ const SENSITIVE_CRED_FILE_NAMES: &[&str] = &[
 /// devices, character devices, USB endpoints) remain sensitive.
 const SAFE_DEVICE_FILES: &[&str] = &["/dev/null", "/dev/zero", "/dev/full"];
 
+/// Read-only view of the existing matcher rules for execution-provider
+/// projections. This is not an executable grant or a second path validator.
+/// The canonical matcher remains authoritative; consumers must reject or
+/// explicitly narrow rules their execution boundary cannot represent.
+#[derive(Debug, Clone, Copy)]
+pub struct SensitivePathRules {
+    /// Case-sensitive substrings of the complete path, not glob patterns.
+    pub path_substrings: &'static [&'static str],
+    /// ASCII-case-insensitive exact directories and their descendants.
+    pub system_directories: &'static [&'static str],
+    /// ASCII-case-insensitive directory components and their descendants;
+    /// markers include the leading separator used by the canonical matcher.
+    pub credential_directories: &'static [&'static str],
+    /// Case-sensitive exact final path components.
+    pub credential_file_names: &'static [&'static str],
+    /// ASCII-case-insensitive exact exceptions to system-directory denial.
+    /// These do not override substring or final-component rules.
+    pub safe_device_files: &'static [&'static str],
+}
+
+pub fn sensitive_path_rules() -> SensitivePathRules {
+    SensitivePathRules {
+        path_substrings: SENSITIVE_PATH_SUBSTRINGS,
+        system_directories: SENSITIVE_SYSTEM_DIR_PREFIXES,
+        credential_directories: SENSITIVE_CRED_DIR_MARKERS,
+        credential_file_names: SENSITIVE_CRED_FILE_NAMES,
+        safe_device_files: SAFE_DEVICE_FILES,
+    }
+}
+
 /// True if `path` is a system-sensitive **directory** subtree (`/etc`, `/boot`,
 /// `/proc`, `/sys`, `/dev`, credential dirs under `$HOME`).
 ///
@@ -420,16 +434,22 @@ impl SandboxPolicy {
         if self.isolation == IsolationLevel::Permissive {
             return true;
         }
-        let path_variants = unique_path_variants(path);
-        let prefix_matches = |prefix: &Path| {
-            let prefix_variants = unique_path_variants(prefix);
-            path_variants.iter().any(|candidate| {
-                prefix_variants
-                    .iter()
-                    .any(|allowed| candidate.starts_with(allowed))
+        canonicalize_parent_and_append(path)
+            .is_ok_and(|resolved| self.is_resolved_path_allowed(&resolved))
+    }
+
+    pub(crate) fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
+        self.is_within_project_root(resolved)
+            || self.allowed_paths.iter().any(|prefix| {
+                canonicalize_parent_and_append(prefix)
+                    .is_ok_and(|prefix| resolved.starts_with(prefix))
             })
-        };
-        prefix_matches(&self.project_root) || self.allowed_paths.iter().any(|ap| prefix_matches(ap))
+    }
+
+    /// Additional absolute grants cannot authorize relative workspace escapes.
+    pub(crate) fn is_within_project_root(&self, resolved: &Path) -> bool {
+        canonicalize_parent_and_append(&self.project_root)
+            .is_ok_and(|root| resolved.starts_with(root))
     }
 
     /// Check if an environment variable should be passed to child process.

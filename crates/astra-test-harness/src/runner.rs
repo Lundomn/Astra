@@ -92,6 +92,11 @@ pub struct RunOutcome {
     pub cached_input_tokens: u64,
     /// Prompt/input tokens written into provider prompt cache.
     pub cache_creation_tokens: u64,
+    /// Coverage of token usage for the root invocation's logical provider
+    /// calls. This is deliberately not a task-tree total: child executions
+    /// may have their own provider calls and coverage.
+    #[serde(default)]
+    pub token_usage_coverage: Option<TokenUsageCoverage>,
     pub duration_ms: u64,
     /// Number of provider LLM round-trips from the typed terminal summary,
     /// with step-event evidence used when the terminal envelope is absent.
@@ -108,9 +113,231 @@ pub struct RunOutcome {
     /// Interruption kind label when final_state is interrupted.
     #[serde(default)]
     pub interruption_kind: Option<String>,
+    /// Root product failure classification from the terminal envelope. This
+    /// is intentionally separate from `interruption_kind`: a transport error
+    /// can cause an interrupted outcome without being a user cancellation.
+    #[serde(default)]
+    pub error_kind: Option<String>,
+    /// Stable source code retained independently of the failure category.
+    #[serde(default)]
+    pub error_code: Option<String>,
+    /// True only when the CLI did not dispatch Server admission.
+    #[serde(default)]
+    pub server_admission_not_dispatched: bool,
     /// Counts of tool result classes observed during the run.
     #[serde(default)]
     pub tool_result_class_counts: std::collections::BTreeMap<String, u32>,
+    /// Canonical per-attempt facts; never sum repeated snapshots as usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explain_capture: Option<crate::explain_capture::ExplainCapture>,
+    /// Private diagnostic evidence, written only to the opted-in sidecar.
+    /// Ordinary reports and dashboard serialization must not expose child text.
+    #[serde(skip)]
+    pub stream_capture: Option<StreamCapture>,
+}
+
+impl RunOutcome {
+    /// A local failure has no physical execution to bind, inspect, or cancel.
+    pub(crate) fn is_pre_execution_failure(&self) -> bool {
+        self.server_admission_not_dispatched
+            && self.exit_code > 0
+            && self.final_state.as_deref() == Some("failed")
+            && self
+                .error_kind
+                .as_deref()
+                .is_some_and(|kind| !kind.trim().is_empty())
+            && self.run_id.is_none()
+            && self.text.is_empty()
+            && self.total_tool_calls == 0
+            && self.cache_hits == 0
+            && self.interruption_kind.is_none()
+            && self.prompt_tokens == 0
+            && self.completion_tokens == 0
+            && self.cached_input_tokens == 0
+            && self.cache_creation_tokens == 0
+            && self.turn_rounds == 0
+            && self.tool_calls_count == 0
+            && self.tools_used.is_empty()
+            && self
+                .tool_result_class_counts
+                .values()
+                .all(|count| *count == 0)
+            && self.token_usage_coverage.as_ref().is_none_or(|coverage| {
+                coverage.attempts == 0
+                    && coverage.provider_reported == 0
+                    && coverage.unavailable == 0
+            })
+    }
+}
+
+pub(crate) const MAX_STREAM_CAPTURE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_STREAM_CAPTURE_RECORDS: usize = 4096;
+
+/// A bounded archive of one subprocess stream, not a child transcript reducer.
+/// Verified root bindings do not certify child lineage or final-result bytes.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StreamCapture {
+    pub session_id: Option<String>,
+    pub root_run_id: Option<String>,
+    pub identity_verified: bool,
+    pub owner: Option<crate::execution_capture::ExecutionOwner>,
+    pub execution: Option<crate::execution_capture::SessionExecutionCapture>,
+    pub records: Vec<StreamCaptureRecord>,
+    pub diagnostics: Vec<String>,
+    #[serde(skip)]
+    retained_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StreamCaptureRecord {
+    AgentLive {
+        stream_index: u64,
+        event: Box<astra_turn_core::agent_live_event::AgentLiveEvent>,
+    },
+    AgentLiveGap {
+        stream_index: u64,
+        gap: astra_turn_core::agent_live_event::AgentLiveGap,
+    },
+}
+
+impl StreamCapture {
+    pub(crate) fn diagnose(&mut self, code: &str) {
+        if !self.diagnostics.iter().any(|existing| existing == code) {
+            self.diagnostics.push(code.into());
+        }
+    }
+
+    pub(crate) fn observe(&mut self, wire: &serde_json::Value, stream_index: u64) {
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveGap, AgentLiveSignal,
+        };
+
+        let record = match wire.get("type").and_then(serde_json::Value::as_str) {
+            Some("session_bound" | "run_bound") => {
+                let Ok(owner) = serde_json::from_value::<crate::execution_capture::ExecutionOwner>(
+                    wire["owner"].clone(),
+                ) else {
+                    self.diagnose("execution_owner_unavailable");
+                    return;
+                };
+                if !owner.is_valid() || self.owner.as_ref().is_some_and(|old| old != &owner) {
+                    self.diagnose("execution_owner_conflict");
+                    return;
+                }
+                self.owner = Some(owner);
+                return;
+            }
+            Some("agent_live") => {
+                let Ok(event) = serde_json::from_value::<AgentLiveEvent>(wire["event"].clone())
+                else {
+                    self.diagnose("invalid_agent_live");
+                    return;
+                };
+                if !matches!(
+                    &event.kind,
+                    AgentLiveEventKind::OutputDelta { .. }
+                        | AgentLiveEventKind::AgentTerminated { .. }
+                        | AgentLiveEventKind::Signal(
+                            AgentLiveSignal::RunStarted { .. }
+                                | AgentLiveSignal::TranscriptCommitted { .. }
+                        )
+                ) {
+                    return;
+                }
+                StreamCaptureRecord::AgentLive {
+                    stream_index,
+                    event: Box::new(event),
+                }
+            }
+            Some("agent_live_gap") => {
+                let Ok(gap) = serde_json::from_value::<AgentLiveGap>(wire["gap"].clone()) else {
+                    self.diagnose("invalid_agent_live_gap");
+                    return;
+                };
+                if gap.dropped_event_count != 0 {
+                    self.diagnose("agent_live_gap");
+                }
+                StreamCaptureRecord::AgentLiveGap { stream_index, gap }
+            }
+            _ => return,
+        };
+        // Reserve header space for the two validated UUIDs and fixed diagnostic
+        // codes. Count serialized records and separators, including metadata.
+        let bytes = serde_json::to_vec(&record)
+            .expect("typed stream record serializes")
+            .len()
+            + 1;
+        if self.records.len() >= MAX_STREAM_CAPTURE_RECORDS
+            || self.retained_bytes.saturating_add(bytes) > MAX_STREAM_CAPTURE_BYTES - 4096
+        {
+            self.diagnose("capture_truncated");
+            return;
+        }
+        self.retained_bytes += bytes;
+        self.records.push(record);
+    }
+}
+
+/// Provider-reported token usage coverage from the root CLI terminal summary.
+/// Missing coverage remains `None`; it must not be interpreted as zero calls.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TokenUsageCoverage {
+    pub scope: String,
+    pub attempts: u32,
+    pub provider_reported: u32,
+    pub unavailable: u32,
+    pub status: String,
+}
+
+#[derive(Deserialize)]
+struct TokenUsageCoverageWire {
+    scope: String,
+    attempts: u32,
+    provider_reported: u32,
+    unavailable: u32,
+    status: String,
+}
+
+impl<'de> Deserialize<'de> for TokenUsageCoverage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = TokenUsageCoverageWire::deserialize(deserializer)?;
+        let parsed = Self {
+            scope: wire.scope,
+            attempts: wire.attempts,
+            provider_reported: wire.provider_reported,
+            unavailable: wire.unavailable,
+            status: wire.status,
+        };
+        parsed.validate().map_err(serde::de::Error::custom)
+    }
+}
+
+impl TokenUsageCoverage {
+    fn from_terminal_json(value: &serde_json::Value) -> Option<Self> {
+        serde_json::from_value(value.clone()).ok()
+    }
+
+    fn validate(self) -> Result<Self, &'static str> {
+        let expected_status = if self.attempts == 0 || self.provider_reported == 0 {
+            "none"
+        } else if self.unavailable == 0 {
+            "complete"
+        } else {
+            "partial"
+        };
+        if self.scope != "logical_provider_calls"
+            || self.provider_reported.checked_add(self.unavailable) != Some(self.attempts)
+            || self.status != expected_status
+        {
+            return Err("inconsistent logical provider-call token usage coverage");
+        }
+        Ok(self)
+    }
 }
 
 impl RunOutcome {
@@ -170,6 +397,11 @@ impl RunOutcome {
         self.interruption_kind = Some(kind.into());
         self
     }
+
+    pub fn with_error_kind(mut self, kind: impl Into<String>) -> Self {
+        self.error_kind = Some(kind.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +422,8 @@ pub struct RunnerConfig {
     /// normally has a profile-scoped CLI journal and account-scoped server
     /// step events.
     pub artifact_owner_scopes: Vec<astra_services::OwnerScope>,
+    /// Explicit opt-in for private, bounded subprocess stream sidecars.
+    pub artifacts_dir: Option<PathBuf>,
     /// Require every run to prove that typed asynchronous subsystem work
     /// remained healthy using its durable session journal.
     pub require_session_subsystem_health: bool,
@@ -200,6 +434,9 @@ pub struct RunnerConfig {
     /// Maximum time to wait for the server's durable asynchronous settlement
     /// marker after the visible chat process exits.
     pub session_settle_timeout: std::time::Duration,
+    /// Shared user-cancel signal for active CLI subprocesses. The suite uses
+    /// the same flag to avoid launching queued cases after cancellation.
+    pub cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Delete sessions created by this harness after their evidence has been
     /// captured. A resumed `--session-id` is never owned by the harness and
     /// is therefore left untouched.
@@ -214,9 +451,11 @@ impl RunnerConfig {
             working_dir: None,
             profile: None,
             artifact_owner_scopes: Vec::new(),
+            artifacts_dir: None,
             require_session_subsystem_health: false,
             require_memoria_subsystem_health: false,
             session_settle_timeout: std::time::Duration::ZERO,
+            cancel_flag: None,
             cleanup_created_sessions: false,
         }
     }
@@ -295,6 +534,7 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
                 prompt_tokens: 0,
                 cached_input_tokens: 0,
                 cache_creation_tokens: 0,
+                token_usage_coverage: None,
                 duration_ms: 0,
                 turn_rounds: 0,
                 cache_hits: 0,
@@ -302,6 +542,11 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
                 ttft_ms: 0,
                 final_state: None,
                 interruption_kind: None,
+                error_kind: None,
+                error_code: None,
+                server_admission_not_dispatched: false,
+                explain_capture: None,
+                stream_capture: None,
                 tool_result_class_counts: Default::default(),
             };
         }
@@ -348,28 +593,20 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
         );
     }
 
-    // Merge background agent results into the visible text so
-    // criteria (text_contains, judger) can see child output.
-    let mut text = v
+    let text = v
         .get("text")
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
-    if let Some(bg) = v.get("background_agent_results").and_then(|x| x.as_array()) {
-        for entry in bg {
-            let agent_id = entry
-                .get("agent_id")
-                .and_then(|x| x.as_str())
-                .unwrap_or("?");
-            let result = entry.get("result").and_then(|x| x.as_str()).unwrap_or("");
-            text.push_str(&format!("\n[background:{agent_id}]: {result}"));
-        }
-    }
     RunOutcome {
         model: model.into(),
         exit_code: v.get("exit_code").and_then(|x| x.as_i64()).unwrap_or(0) as i32,
         text,
-        stderr: String::new(),
+        stderr: v
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_owned(),
         session_id: v
             .get("session_id")
             .and_then(|x| x.as_str())
@@ -428,12 +665,17 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
             })
             .and_then(|x| x.as_u64())
             .unwrap_or(0),
+        token_usage_coverage: v
+            .get("token_usage_coverage")
+            .and_then(TokenUsageCoverage::from_terminal_json),
         duration_ms: 0,
         turn_rounds: v
             .get("llm_rounds")
             .and_then(|x| x.as_u64())
             .unwrap_or(0)
             .min(u64::from(u32::MAX)) as u32,
+        explain_capture: None,
+        stream_capture: None,
         cache_hits: 0,
         total_tool_calls: 0,
         ttft_ms: v.get("ttft_ms").and_then(|x| x.as_u64()).unwrap_or(0),
@@ -445,6 +687,18 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
             .get("interruption_kind")
             .and_then(|x| x.as_str())
             .map(str::to_string),
+        error_kind: v
+            .get("error_kind")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        error_code: v
+            .get("error_code")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned),
+        server_admission_not_dispatched: v
+            .get("server_admission_not_dispatched")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
         tool_result_class_counts: v
             .get("tool_result_class_counts")
             .and_then(|x| x.as_object())
@@ -486,6 +740,21 @@ pub(crate) fn parse_strict_cli_outcome(stdout: &str, model: &str) -> Result<RunO
     ]
     .into_iter()
     .all(is_string_or_null);
+    if object
+        .get("error")
+        .is_some_and(|value| !value.is_null() && !value.is_string())
+    {
+        return Err("terminal outcome has invalid error diagnostic".into());
+    }
+    if object
+        .get("server_admission_not_dispatched")
+        .is_some_and(|value| !value.is_boolean())
+        || object
+            .get("error_code")
+            .is_some_and(|value| !value.is_null() && !value.is_string())
+    {
+        return Err("terminal outcome has invalid local rejection fields".into());
+    }
     let cache = object
         .get("cache")
         .and_then(serde_json::Value::as_object)
@@ -567,7 +836,7 @@ pub(crate) fn parse_strict_cli_outcome(stdout: &str, model: &str) -> Result<RunO
     let final_state = object["final_state"]
         .as_str()
         .expect("validated final_state string");
-    if !matches!(final_state, "" | "completed" | "interrupted") {
+    if !matches!(final_state, "" | "completed" | "interrupted" | "failed") {
         return Err(format!(
             "terminal outcome final_state has unknown value {final_state:?}"
         ));
@@ -620,6 +889,22 @@ pub(crate) fn parse_strict_cli_outcome(stdout: &str, model: &str) -> Result<RunO
     if outcome.stderr.starts_with(PROTOCOL_ERROR_MARKER) {
         return Err(outcome.text);
     }
+    if outcome.server_admission_not_dispatched
+        && (!outcome.is_pre_execution_failure()
+            || object["prompt_tokens"].as_u64() != Some(0)
+            || object["cache"]["hit"].as_bool() != Some(false)
+            || object["cache"]["read_tokens"].as_u64() != Some(0)
+            || object["cache"]["creation_tokens"].as_u64() != Some(0)
+            || object
+                .get("token_usage_coverage")
+                .is_some_and(|value| !value.is_null())
+                && outcome.token_usage_coverage.is_none()
+            || object
+                .get("server_terminal_authoritative")
+                .is_some_and(|value| value.as_bool() != Some(false)))
+    {
+        return Err("non-dispatch fact contradicts terminal execution evidence".into());
+    }
     Ok(outcome)
 }
 
@@ -654,6 +939,8 @@ fn invalid_json_envelope(model: &str, payload: &str, reason: &str) -> RunOutcome
         "[astra-test] WARNING: stdout from astra chat --json violated the outcome envelope: {reason}"
     );
     RunOutcome {
+        error_code: None,
+        server_admission_not_dispatched: false,
         model: model.into(),
         exit_code: -1,
         text: format!("invalid JSON outcome envelope: {reason}; payload={preview}"),
@@ -666,6 +953,7 @@ fn invalid_json_envelope(model: &str, payload: &str, reason: &str) -> RunOutcome
         prompt_tokens: 0,
         cached_input_tokens: 0,
         cache_creation_tokens: 0,
+        token_usage_coverage: None,
         duration_ms: 0,
         turn_rounds: 0,
         cache_hits: 0,
@@ -673,6 +961,9 @@ fn invalid_json_envelope(model: &str, payload: &str, reason: &str) -> RunOutcome
         ttft_ms: 0,
         final_state: None,
         interruption_kind: None,
+        error_kind: None,
+        explain_capture: None,
+        stream_capture: None,
         tool_result_class_counts: Default::default(),
     }
 }
@@ -735,6 +1026,90 @@ mod tests {
     }
 
     #[test]
+    fn parse_json_outcome_preserves_valid_root_usage_coverage() {
+        let stdout = r#"{
+            "text": "ok",
+            "exit_code": 0,
+            "tool_calls_count": 0,
+            "tools_used": [],
+            "completion_tokens": 5,
+            "fresh_prompt_tokens": 10,
+            "token_usage_coverage": {
+                "scope": "logical_provider_calls",
+                "attempts": 3,
+                "provider_reported": 2,
+                "unavailable": 1,
+                "status": "partial"
+            }
+        }"#;
+        let out = parse_json_outcome(stdout, "m");
+        assert_eq!(
+            out.token_usage_coverage,
+            Some(TokenUsageCoverage {
+                scope: "logical_provider_calls".into(),
+                attempts: 3,
+                provider_reported: 2,
+                unavailable: 1,
+                status: "partial".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_json_outcome_does_not_trust_inconsistent_usage_coverage() {
+        let stdout = r#"{
+            "text": "ok",
+            "exit_code": 0,
+            "tool_calls_count": 0,
+            "tools_used": [],
+            "completion_tokens": 5,
+            "fresh_prompt_tokens": 10,
+            "token_usage_coverage": {
+                "scope": "logical_provider_calls",
+                "attempts": 3,
+                "provider_reported": 2,
+                "unavailable": 0,
+                "status": "complete"
+            }
+        }"#;
+        let out = parse_json_outcome(stdout, "m");
+        assert!(out.token_usage_coverage.is_none());
+        assert_eq!(
+            out.exit_code, 0,
+            "coverage is observational, not execution authority"
+        );
+    }
+
+    #[test]
+    fn usage_coverage_deserialization_validates_wire_and_preserves_legacy_reports() {
+        let valid = TokenUsageCoverage {
+            scope: "logical_provider_calls".into(),
+            attempts: 2,
+            provider_reported: 1,
+            unavailable: 1,
+            status: "partial".into(),
+        };
+        let encoded = serde_json::to_string(&valid).unwrap();
+        assert_eq!(
+            serde_json::from_str::<TokenUsageCoverage>(&encoded).unwrap(),
+            valid
+        );
+
+        let mut old_outcome = serde_json::to_value(RunOutcome::new("m")).unwrap();
+        old_outcome
+            .as_object_mut()
+            .unwrap()
+            .remove("token_usage_coverage");
+        let old_outcome: RunOutcome = serde_json::from_value(old_outcome).unwrap();
+        assert!(old_outcome.token_usage_coverage.is_none());
+
+        let invalid_scope = encoded.replace("logical_provider_calls", "session_tree");
+        assert!(serde_json::from_str::<TokenUsageCoverage>(&invalid_scope).is_err());
+        let invalid_status = encoded.replace("partial", "complete");
+        assert!(serde_json::from_str::<TokenUsageCoverage>(&invalid_status).is_err());
+    }
+
+    #[test]
     fn parse_json_outcome_uses_prompt_tokens_when_fresh_bucket_missing() {
         let stdout = r#"{
             "text": "legacy",
@@ -793,37 +1168,6 @@ mod tests {
         assert_eq!(out.prompt_tokens, 9);
     }
 
-    #[test]
-    fn parse_json_outcome_merges_background_agent_results() {
-        let stdout = r#"{
-            "text": "parent output",
-            "exit_code": 0,
-            "tool_calls_count": 1,
-            "tools_used": ["spawn_agent"],
-            "completion_tokens": 0,
-            "prompt_tokens": 0,
-            "background_agent_results": [
-                {"agent_id": "child-G1", "result": "inherited-ok"},
-                {"agent_id": "child-G2", "result": "delegate-G2-ok"}
-            ]
-        }"#;
-        let out = parse_json_outcome(stdout, "m");
-        assert!(
-            out.text.contains("inherited-ok"),
-            "background result must appear in text: {}",
-            out.text
-        );
-        assert!(
-            out.text.contains("delegate-G2-ok"),
-            "second background result must appear in text: {}",
-            out.text
-        );
-        assert!(
-            out.text.starts_with("parent output"),
-            "parent text must come first"
-        );
-    }
-
     fn strict_outcome_fixture() -> serde_json::Value {
         serde_json::json!({
             "trace_id": null,
@@ -864,6 +1208,26 @@ mod tests {
         let mut persistence_contradiction = strict_outcome_fixture();
         persistence_contradiction["persistence_error"] = serde_json::json!("write failed");
         assert!(parse_strict_cli_outcome(&persistence_contradiction.to_string(), "m").is_err());
+
+        // The CLI's real fatal envelope uses failed, not interrupted. Retain
+        // its identity and observed output so the failure can be investigated.
+        let mut failed = strict_outcome_fixture();
+        failed["final_state"] = serde_json::json!("failed");
+        failed["success"] = serde_json::json!(false);
+        failed["exit_code"] = serde_json::json!(1);
+        failed["error_kind"] = serde_json::json!("unknown");
+        failed["text"] = serde_json::json!("observed partial answer");
+        let parsed = parse_strict_cli_outcome(&failed.to_string(), "m").unwrap();
+        assert_eq!(parsed.exit_code, 1);
+        assert_eq!(parsed.run_id.as_deref(), Some("run-1"));
+        assert_eq!(
+            parsed.session_id.as_deref(),
+            strict_outcome_fixture()["session_id"].as_str()
+        );
+        assert_eq!(parsed.text, "observed partial answer");
+        failed["exit_code"] = serde_json::json!(0);
+        failed["success"] = serde_json::json!(true);
+        assert!(parse_strict_cli_outcome(&failed.to_string(), "m").is_err());
     }
 
     #[test]
@@ -896,10 +1260,12 @@ mod tests {
             prompt: "p".into(),
             prompt_variants: vec![],
             models: Some(vec!["opus".into()]),
+            required_models: vec![],
             criteria: vec![],
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 180,
+            cli_wall_time_seconds: None,
             capability: None,
             required_cache_scope: None,
             difficulty: None,
@@ -923,10 +1289,12 @@ mod tests {
             prompt: "p".into(),
             prompt_variants: vec![],
             models: None,
+            required_models: vec![],
             criteria: vec![],
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 180,
+            cli_wall_time_seconds: None,
             capability: None,
             required_cache_scope: None,
             difficulty: None,
@@ -952,10 +1320,12 @@ mod tests {
             prompt: "p".into(),
             prompt_variants: vec![],
             models: None,
+            required_models: vec![],
             criteria: vec![],
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 180,
+            cli_wall_time_seconds: None,
             capability: None,
             required_cache_scope: None,
             difficulty: None,
@@ -979,10 +1349,12 @@ mod tests {
             prompt: "p".into(),
             prompt_variants: vec![],
             models: None,
+            required_models: vec![],
             criteria: vec![],
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 180,
+            cli_wall_time_seconds: None,
             capability: None,
             required_cache_scope: None,
             difficulty: None,

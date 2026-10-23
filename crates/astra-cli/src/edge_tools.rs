@@ -8,7 +8,6 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     path::{Path, PathBuf},
-    sync::atomic::AtomicBool,
     time::Duration,
 };
 
@@ -19,7 +18,9 @@ use astra_runtime::tool_sandbox::{
     SandboxPolicy, sandbox_command, validate_path, wrap_command_with_limits,
 };
 use astra_services::SessionArtifactStore;
-use astra_turn_core::sync_utils::{rwlock_read_clone_or_default, rwlock_write_reset_on_poison};
+use astra_turn_core::sync_utils::{
+    rwlock_read_clone_or_default, rwlock_read_project_or_default, rwlock_write_reset_on_poison,
+};
 use astra_turn_core::tool::deferred_activation::ToolSurfaceNames;
 
 use crate::background_task_error::BackgroundTaskError;
@@ -72,28 +73,23 @@ pub enum SandboxExpansionError {
 use crossterm::style::Stylize;
 use serde_json::{Value, json};
 
-#[path = "edge_tools/agent_messaging.rs"]
-pub mod agent_messaging;
 #[path = "edge_tools/agent_spawning.rs"]
 pub mod agent_spawning;
 use astra_tools::build_test;
 pub use astra_tools::code_intel;
 use astra_tools::truncate_output;
-#[path = "edge_tools/context_sharing.rs"]
-pub mod context_sharing;
 #[path = "edge_tools/fs.rs"]
 mod fs_tools;
-pub(crate) use astra_tools::fuzzy_replacer;
 #[path = "edge_tools/lsp_stdio_session.rs"]
 mod lsp_stdio_session;
 #[path = "edge_tools/mo_tools.rs"]
 mod mo_tools;
-use astra_tools::passive_cargo_check;
+#[path = "edge_tools/native_codex.rs"]
+pub mod native_codex;
 pub(crate) use mo_tools::DatabaseSnapshotRollbackJournal;
 pub(crate) use session_state::SessionStateRollbackJournal;
 #[path = "edge_tools/passive_lsp.rs"]
 mod passive_lsp;
-use astra_tools::passive_tsc_check;
 #[path = "edge_tools/shell.rs"]
 mod shell;
 use astra_tools::env_tools;
@@ -102,10 +98,6 @@ pub use env_tools::apply_overlay as apply_env_overlay;
 pub(crate) use shell::shell_escape;
 #[path = "edge_tools/code_analysis.rs"]
 mod code_analysis;
-#[path = "edge_tools/config_tool.rs"]
-mod config_tool;
-#[path = "edge_tools/context_tools.rs"]
-mod context_tools;
 
 pub fn all_tool_schemas() -> Vec<Value> {
     let mut schemas = full_tool_schemas();
@@ -115,18 +107,18 @@ pub fn all_tool_schemas() -> Vec<Value> {
     schemas
 }
 
+pub(crate) fn is_native_collaborator_tool(name: &str) -> bool {
+    name == native_codex::TOOL_NAME
+}
+
 const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "adjust_config",
     "agent",
     "agent_fanout",
     "ask_user",
-    "brief",
     "call_graph",
     "compress_context",
-    "config",
-    "context_analysis",
     "dead_code",
-    "diagnose",
     "enter_plan_mode",
     "env",
     "exit_plan_mode",
@@ -136,19 +128,16 @@ const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "get_agent_info",
     "hover_info",
     "introspect",
+    "model_catalog",
     "lsp",
     "mo_query",
-    "notebook_edit",
     "notify",
-    "query_context",
     "reflect",
     "rename_symbol",
     "rollback_database_snapshots",
     "rollback_file_edits",
     "rollback_session_state",
-    "run_build_test",
     "session",
-    "share_context",
     "symbol_search",
     "task_list",
     "task_output",
@@ -207,7 +196,19 @@ struct CliCapabilityView {
 
 /// Authorized inventory for registry/provider setup before request restrictions.
 pub fn local_tool_schemas() -> Vec<Value> {
-    local_runtime_tool_schemas(all_tool_schemas())
+    let schemas = all_tool_schemas()
+        .into_iter()
+        .filter(|schema| {
+            astra_turn_core::tool::schema::tool_schema_name(schema)
+                .and_then(astra_turn_core::tool::registry::meta::tool_meta)
+                .is_none_or(|meta| {
+                    !meta
+                        .requires
+                        .contains(&astra_turn_core::capability::Capability::SkillsCatalog)
+                })
+        })
+        .collect();
+    local_runtime_tool_schemas(schemas)
 }
 
 /// Plan-mode write guard tool list (CLI parity with
@@ -222,14 +223,10 @@ pub(crate) fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
     astra_turn_core::plan_mode_policy::is_plan_mode_blocked_tool(tool, args)
 }
 
-#[path = "edge_tools/diagnose.rs"]
-mod diagnose;
 #[path = "edge_tools/file_state.rs"]
 mod file_state;
 #[path = "edge_tools/lsp_tools.rs"]
 mod lsp_tools;
-#[path = "edge_tools/notebook_edit.rs"]
-mod notebook_edit;
 #[path = "edge_tools/self_mod_tools.rs"]
 mod self_mod_tools;
 #[path = "edge_tools/session_state.rs"]
@@ -279,19 +276,26 @@ fn file_checkpoint_dir_for(session_id: &str) -> Option<PathBuf> {
     astra_services::SessionArtifactStore::session_path(&store, session_id, "file_checkpoints").ok()
 }
 #[path = "edge_tools/worktree.rs"]
-mod worktree;
+pub(crate) mod worktree;
 use crate::lock_recovery::LockRecovery;
 pub(crate) use worktree::GitWorktreeRollbackJournal;
 pub use worktree::WorktreeSession;
-#[path = "edge_tools/memoria.rs"]
-pub(crate) mod memoria;
-#[cfg(test)]
-use astra_tools::memoria::parse_memory_search_contents;
+
+/// Permission admission for one provider-owned collaborator declaration.
+/// This is a receipt from the existing CLI permission owner; it is not a
+/// session registry and cannot be constructed from model-visible arguments.
+pub(crate) struct ApprovedNativeRuntime {
+    pub(crate) protocol: astra_turn_core::provider_resolution::NativeCollaboratorProtocol,
+    pub(crate) snapshot: astra_turn_types::ProviderDiscoverySnapshot,
+    pub(crate) requirements: astra_turn_types::ProviderRuntimeRequirements,
+    pub(crate) workspace_root: PathBuf,
+    pub(crate) admission_source: astra_tools::tool_engine::ToolInvocationAdmissionSource,
+}
 #[path = "edge_tools/ask_user.rs"]
 mod ask_user;
+#[path = "edge_tools/memoria.rs"]
+pub(crate) mod memoria;
 pub(crate) use ask_user::parse_ask_user_prompt;
-#[path = "edge_tools/context_analysis.rs"]
-mod context_analysis;
 #[path = "edge_tools/mcp_dispatch.rs"]
 mod mcp_dispatch;
 #[path = "edge_tools/tool_search.rs"]
@@ -465,6 +469,20 @@ fn embedded_work_unit_observation(output: &str) -> Option<WorkUnitObservation> {
         .filter(WorkUnitObservation::is_valid)
 }
 
+#[derive(Default)]
+struct ToolExecutionFacts {
+    fields: Option<serde_json::Map<String, Value>>,
+    is_error: Option<bool>,
+}
+
+impl ToolExecutionFacts {
+    fn absorb_tool_result(&mut self, result: astra_tools::ToolResult) -> String {
+        self.fields = result.metadata;
+        self.is_error = Some(result.is_error);
+        result.output
+    }
+}
+
 struct EdgeToolRun {
     output: String,
     is_error: bool,
@@ -488,6 +506,15 @@ impl EdgeToolRun {
             is_error: true,
             error_kind: None,
             tool_result_fields: None,
+        }
+    }
+
+    fn from_tool_result(result: astra_tools::ToolResult) -> Self {
+        Self {
+            output: result.output,
+            is_error: result.is_error,
+            error_kind: None,
+            tool_result_fields: result.metadata,
         }
     }
 
@@ -574,6 +601,18 @@ fn cancelled_edge_tool_run(name: &str, execution_started: bool) -> EdgeToolRun {
         is_error: true,
         error_kind: Some(astra_core::ErrorKind::Cancelled),
         tool_result_fields: result.metadata,
+    }
+}
+
+pub(crate) fn workspace_lease_failure_tool_execution_outcome(
+    name: &str,
+    failure: astra_tools::workspace_observation::WorkspaceLeaseFailure,
+) -> ToolExecutionOutcome {
+    let result = astra_tools::workspace_lease_failure_tool_result(name, failure);
+    ToolExecutionOutcome {
+        output: result.output,
+        tool_result_fields: result.metadata,
+        is_error: result.is_error,
     }
 }
 
@@ -1291,6 +1330,14 @@ fn background_task_id_arg(args: &Value) -> Result<Option<String>, &'static str> 
     Ok(Some(id.to_string()))
 }
 
+/// Sandbox basis captured for one foreground exchange. A permission change may
+/// replace the root mode overlay but must retain an explicit skill restriction.
+#[derive(Clone)]
+pub(crate) struct PermissionSandboxBasis {
+    pub(crate) baseline: Option<SandboxPolicy>,
+    pub(crate) skill_policy: Option<SandboxPolicy>,
+}
+
 pub struct ToolExecutor {
     pub project_root: PathBuf,
     /// Cloud API base URL — used to proxy memory tool calls through the server
@@ -1304,12 +1351,13 @@ pub struct ToolExecutor {
     /// Wrapped in `RwLock` so the policy can be swapped per-turn (e.g. skill
     /// sandbox activation) while the executor is shared via `Arc<ToolExecutor>`.
     pub sandbox_policy: std::sync::RwLock<Option<SandboxPolicy>>,
+    pub(crate) permission_sandbox_basis: std::sync::Mutex<Option<PermissionSandboxBasis>>,
 
     /// Per-turn budget pressure (0.0 = normal, 1.0 = critical).
     /// Set before each tool execution batch, read by tools that produce
     /// variable-size output to scale their limits.
     budget_pressure: std::sync::Mutex<f64>,
-    /// Build/test iteration tracker — tracks error deltas across fix cycles.
+    /// Per-command diagnostic deltas rendered by CLI Bash build/test calls.
     build_test_tracker: std::sync::Mutex<build_test::BuildTestTracker>,
     /// Shared-state circuit breaker for process-lived Memoria availability.
     memoria_circuit: astra_tools::memoria::MemoryCircuitBreaker,
@@ -1340,11 +1388,6 @@ pub struct ToolExecutor {
     /// `StreamEvent::ToolOutput` ticker.
     pub(crate) bash_progress_sink:
         std::sync::RwLock<Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>>,
-    /// After a `.rs` file is written under a Rust workspace, set so the next
-    /// `/chat` turn with `tool_results` can run passive `cargo check` and inject diagnostics.
-    passive_cargo_pending: AtomicBool,
-    /// After `.ts` / `.tsx` edits when `tsconfig.json` exists, run passive `tsc --noEmit`.
-    passive_tsc_pending: AtomicBool,
     /// Optional passive LSP sessions (rust-analyzer, typescript-language-server).
     passive_lsp: passive_lsp::PassiveLspManager,
     /// MCP routing snapshot. Manager and MCP schemas are installed together so
@@ -1395,16 +1438,19 @@ pub struct ToolExecutor {
     pub(crate) bash_detach_slot: Option<astra_tools::detach::DetachShellSlot>,
     /// Optional agent spawning context for `agent(action='spawn'|'get_result')`.
     pub spawn_context: Option<agent_spawning::AgentActionContext>,
-    /// Optional shared context cache for cross-agent knowledge sharing.
-    /// Used by share_context and query_context tools.
-    pub context_cache: Option<std::sync::Arc<astra_runtime::orchestration::SharedContextCache>>,
-    /// Agent ID for context sharing attribution.
-    pub agent_id: Option<String>,
-    /// Optional messaging context for the `send_message` tool.
-    pub send_message_context: std::sync::Mutex<Option<agent_messaging::SendMessageRuntimeContext>>,
-    /// Optional observability session for context analysis tools.
+    /// CLI has no trusted natural-language binder for inherited descendant
+    /// requirements. A constrained child must not delegate without one.
+    delegation_requires_admission: bool,
+    /// A read-only child has no shell capability. Typed observation tools are
+    /// the only execution surface that remains available under this ceiling.
+    read_only_execution: bool,
+    /// Effective request setting, published after payload preparation. This
+    /// bounded snapshot is copied into each child admission context.
+    parent_model_reasoning:
+        std::sync::Mutex<Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning>>,
+    /// Optional canonical observability session for introspection.
     /// Provides access to per-turn context assembly traces, timing data,
-    /// drift detection, and decision explanations.
+    /// and drift detection.
     pub observability_session: Option<
         std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     >,
@@ -1432,15 +1478,8 @@ pub struct ToolExecutor {
     /// Populated once via `set_session_lessons`, then passed through on
     /// every `build_self_model_snapshot` for the session's lifetime.
     session_lessons: std::sync::Mutex<Vec<astra_services::LessonHint>>,
-    /// P3.3 seam: latest auto-invoked diagnostic skill output.
-    /// `AutoInvokeHandler::maybe_fire` writes each successful parse here;
-    /// the next `build_self_model_snapshot` injects it into the prompt and
-    /// `set_latest_skill_diagnosis(None)` clears it once the triggering
-    /// condition has resolved.
-    latest_skill_diagnosis: std::sync::Mutex<Option<astra_skills::auto_invoke::SkillDiagnosis>>,
-    /// Latest passive evaluator feedback from the previous turn. Kept separate
-    /// from auto-invoked skill diagnoses so evaluator hints are not lost to
-    /// diagnosis cooldown/clear behavior.
+    memory_selection_reports: std::sync::Mutex<Vec<astra_turn_types::MemorySelectionReport>>,
+    /// Evaluator feedback from the previous turn.
     latest_turn_quality_feedback:
         std::sync::Mutex<Option<astra_runtime::self_model::TurnQualityFeedback>>,
     /// Per-turn mutation accounting for adjust_config governor.
@@ -1493,6 +1532,26 @@ pub struct ToolExecutor {
 }
 
 impl ToolExecutor {
+    pub(crate) fn set_read_only_execution(&mut self) {
+        self.read_only_execution = true;
+    }
+
+    pub(crate) fn apply_runtime_permission_sandbox(
+        &self,
+        mode: crate::cli::permission_manager::PermissionMode,
+    ) {
+        let basis = astra_core::sync_poison::recover_mutex_lock(&self.permission_sandbox_basis);
+        let Some(basis) = basis.as_ref() else {
+            return;
+        };
+        let next = basis.skill_policy.clone().or_else(|| {
+            (mode != crate::cli::permission_manager::PermissionMode::Bypass)
+                .then(|| basis.baseline.clone())
+                .flatten()
+        });
+        *astra_core::sync_poison::recover_rwlock_write(&self.sandbox_policy) = next;
+    }
+
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         let root: PathBuf = project_root.into();
         let sandbox = astra_runtime::tool_sandbox::SandboxPolicy::for_project(&root);
@@ -1509,6 +1568,7 @@ impl ToolExecutor {
             cli_local_provider_schemas: std::sync::RwLock::new(Vec::new()),
             current_tool_surface: std::sync::RwLock::new(ToolSurfaceNames::default()),
             sandbox_policy: std::sync::RwLock::new(Some(sandbox)),
+            permission_sandbox_basis: std::sync::Mutex::new(None),
 
             budget_pressure: std::sync::Mutex::new(0.0),
             build_test_tracker: std::sync::Mutex::new(build_test::BuildTestTracker::new()),
@@ -1520,8 +1580,6 @@ impl ToolExecutor {
             convergence_authority: uuid::Uuid::new_v4().to_string(),
             aggregate_output_bytes: std::sync::atomic::AtomicUsize::new(0),
             bash_progress_sink: std::sync::RwLock::new(None),
-            passive_cargo_pending: AtomicBool::new(false),
-            passive_tsc_pending: AtomicBool::new(false),
             passive_lsp: passive_lsp::PassiveLspManager::new(),
             mcp_runtime: std::sync::RwLock::new(EdgeMcpRuntimeSnapshot::default()),
             file_journal: std::sync::Arc::new(std::sync::Mutex::new(
@@ -1543,9 +1601,9 @@ impl ToolExecutor {
             bg_task_list_cache: None,
             bash_detach_slot: None,
             spawn_context: None,
-            context_cache: None,
-            agent_id: None,
-            send_message_context: std::sync::Mutex::new(None),
+            delegation_requires_admission: false,
+            read_only_execution: false,
+            parent_model_reasoning: std::sync::Mutex::new(None),
             observability_session: None,
             introspect_snapshot: std::sync::Arc::new(std::sync::RwLock::new(None)),
             active_session_id: std::sync::Mutex::new(None),
@@ -1553,7 +1611,7 @@ impl ToolExecutor {
             current_effective_input_budget_tokens: std::sync::RwLock::new(None),
             current_context_window_tokens: std::sync::RwLock::new(None),
             session_lessons: std::sync::Mutex::new(Vec::new()),
-            latest_skill_diagnosis: std::sync::Mutex::new(None),
+            memory_selection_reports: std::sync::Mutex::new(Vec::new()),
             latest_turn_quality_feedback: std::sync::Mutex::new(None),
             self_mod_mutation_counter: std::sync::Mutex::new((0, 0)),
             default_executor: astra_tools::executor::DefaultToolExecutor::new(
@@ -1563,12 +1621,10 @@ impl ToolExecutor {
                     user_id: String::new(),
                     session_id: String::new(),
                     sandbox: astra_tools::SandboxConfig::standard(&root),
-                    http_client: None,
-                    logger: std::sync::Arc::new(astra_tools::TracingLogger),
                     cancel_token: None,
-                    detach_shell_handle: None,
                 },
-            ),
+            )
+            .with_local_network(),
             plan_mode_authoring_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             ask_user_request_tx: std::sync::Mutex::new(None),
             plan_review_request_tx: std::sync::Mutex::new(None),
@@ -1654,12 +1710,47 @@ impl ToolExecutor {
 
     /// Set the spawn context for agent spawning.
     pub fn with_spawn_context(mut self, ctx: agent_spawning::AgentActionContext) -> Self {
+        *self.parent_model_reasoning.lock_recover() = ctx.parent_model_reasoning.clone();
         self.spawn_context = Some(ctx);
         #[cfg(test)]
         {
             self.install_default_test_visible_surface();
         }
         self
+    }
+
+    pub(crate) fn require_delegation_admission(mut self, required: bool) -> Self {
+        self.delegation_requires_admission = required;
+        self
+    }
+
+    pub(crate) fn publish_parent_model_reasoning(
+        &self,
+        offering_id: Option<&str>,
+        resolved_model_name: Option<&str>,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig,
+    ) {
+        *self.parent_model_reasoning.lock_recover() = offering_id.map(|offering_id| {
+            astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
+                selection: astra_turn_types::ModelSelection {
+                    offering_id: offering_id.to_string(),
+                },
+                resolved_model_name: resolved_model_name.map(str::to_string),
+                thinking,
+            }
+        });
+    }
+
+    fn spawn_context_for_admission(&self) -> Option<agent_spawning::AgentActionContext> {
+        let mut context = self.spawn_context.clone()?;
+        context.parent_model_reasoning = self.parent_model_reasoning_snapshot();
+        Some(context)
+    }
+
+    pub(crate) fn parent_model_reasoning_snapshot(
+        &self,
+    ) -> Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning> {
+        self.parent_model_reasoning.lock_recover().clone()
     }
 
     /// Bind memory lifecycle events to one host-owned producer identity. Tool
@@ -1815,7 +1906,35 @@ impl ToolExecutor {
         ) = ToolSurfaceNames::default();
     }
 
-    /// Snapshot of the names that the model's `<deferred-tools>` manifest
+    /// Inspect the current admitted surface and discovered provider policies.
+    /// This reads existing snapshots; it does not discover or invoke providers.
+    pub(crate) async fn current_surface_requires_workspace_coordination(&self) -> bool {
+        let registry = runtime_env_builtin_registry();
+        let visible = self.current_visible_tool_schemas_snapshot();
+        let deferred = self.current_activatable_tool_names_snapshot();
+        for name in visible
+            .iter()
+            .filter_map(astra_turn_core::tool::schema::tool_schema_name)
+            .chain(deferred.iter().map(String::as_str))
+        {
+            if registry
+                .get(name)
+                .is_some_and(|spec| spec.effect.writes_workspace || spec.required.shell)
+                || astra_tools::executor::may_require_workspace_serialization(name)
+            {
+                return true;
+            }
+            if astra_runtime_env::is_mcp_namespaced_tool_name(name)
+                && let Ok((_, prepared)) = self.prepare_mcp_tool_call(name).await
+                && prepared.policy().effect == astra_turn_types::ResolvedToolEffect::Mutating
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Snapshot the exact names of deferred tools that the current prompt
     /// currently advertises. Used by the host to keep its validator-side
     /// `deferred_tool_names` set in lockstep with what the prompt rendered.
     pub fn current_activatable_tool_names_snapshot(&self) -> HashSet<String> {
@@ -1915,6 +2034,9 @@ impl ToolExecutor {
         if self.runtime_environment_tool_denial(name, args).is_some() {
             return false;
         }
+        if astra_runtime_env::is_mcp_namespaced_tool_name(name) {
+            return self.mcp_tool_has_runtime_binding(name);
+        }
 
         let Some(meta) = astra_turn_core::tool::registry::meta::tool_meta(name) else {
             return self.cli_declared_local_tool_has_name(name)
@@ -1940,7 +2062,7 @@ impl ToolExecutor {
             .err()
     }
 
-    fn runtime_environment_binding_for_tool(
+    pub(crate) fn runtime_environment_binding_for_tool(
         &self,
         name: &str,
         registry: &astra_runtime_env::ToolRegistry,
@@ -1948,29 +2070,38 @@ impl ToolExecutor {
         if astra_runtime_env::is_mcp_namespaced_tool_name(name)
             && self.mcp_tool_has_runtime_binding(name)
         {
-            let providers = vec![astra_runtime_env::mcp_provider(
-                "cli-mcp",
-                [name.to_string()],
-            )];
-            return astra_runtime_env::RunBinding::resolve_with_provider_declarations(
-                astra_runtime_env::WorkspaceBinding::none(),
-                astra_runtime_env::ExecutorBinding {
-                    kind: astra_runtime_env::ExecutorBindingKind::Mcp,
-                    executor_id: "cli-mcp".to_string(),
-                    display_name: "CLI MCP server".to_string(),
-                    transport: astra_runtime_env::ToolTransportKind::McpHttp,
-                    status: astra_runtime_env::ExecutorStatus::Online,
-                },
-                astra_runtime_env::RuntimeBinding::none(),
-                astra_runtime_env::PolicyIntent::cloud_control_plane(),
-                registry,
-                &providers,
-            );
+            return Self::mcp_runtime_environment_binding(name, registry);
         }
 
         astra_runtime_env::RunBinding::local_developer(
             self.project_root.display().to_string(),
             registry,
+        )
+    }
+
+    /// Describe a verified MCP route. Dispatch retains this binding in its result
+    /// even if connection recovery removes the route for future invocations.
+    fn mcp_runtime_environment_binding(
+        name: &str,
+        registry: &astra_runtime_env::ToolRegistry,
+    ) -> astra_runtime_env::RunBinding {
+        let providers = vec![astra_runtime_env::mcp_provider(
+            "cli-mcp",
+            [name.to_string()],
+        )];
+        astra_runtime_env::RunBinding::resolve_with_provider_declarations(
+            astra_runtime_env::WorkspaceBinding::none(),
+            astra_runtime_env::ExecutorBinding {
+                kind: astra_runtime_env::ExecutorBindingKind::Mcp,
+                executor_id: "cli-mcp".to_string(),
+                display_name: "CLI MCP server".to_string(),
+                transport: astra_runtime_env::ToolTransportKind::McpHttp,
+                status: astra_runtime_env::ExecutorStatus::Online,
+            },
+            astra_runtime_env::RuntimeBinding::none(),
+            astra_runtime_env::PolicyIntent::cloud_control_plane(),
+            registry,
+            &providers,
         )
     }
 
@@ -2189,31 +2320,6 @@ impl ToolExecutor {
         rwlock_read_clone_or_default(&self.mcp_runtime, label)
     }
 
-    /// Set the shared context cache for cross-agent knowledge sharing.
-    pub fn with_context_cache(
-        mut self,
-        cache: std::sync::Arc<astra_runtime::orchestration::SharedContextCache>,
-        agent_id: impl Into<String>,
-    ) -> Self {
-        self.context_cache = Some(cache);
-        self.agent_id = Some(agent_id.into());
-        self
-    }
-
-    /// Set or clear the messaging context for inter-agent communication.
-    pub fn set_send_message_context(
-        &self,
-        ctx: Option<agent_messaging::SendMessageRuntimeContext>,
-    ) {
-        let mut guard = self.send_message_context.lock().unwrap_or_else(|e| {
-            tracing::error!(
-                "send_message_context lock poisoned; recovering and overwriting stale slot"
-            );
-            e.into_inner()
-        });
-        *guard = ctx;
-    }
-
     /// Set the observability session for context analysis tools.
     pub fn with_observability_session(
         mut self,
@@ -2259,7 +2365,8 @@ impl ToolExecutor {
 
     pub fn set_active_session_id(&self, session_id: impl Into<String>) {
         let session_id = session_id.into();
-        let session_changed = self.active_session_id().as_deref() != Some(session_id.as_str());
+        let previous_session_id = self.active_session_id();
+        let session_changed = previous_session_id.as_deref() != Some(session_id.as_str());
         // File-edit checkpoint persistence: on session-id set, rebind the
         // journal to an auto-persist directory keyed by session.
         //
@@ -2275,7 +2382,15 @@ impl ToolExecutor {
         // - (empty, has): merge loads disk entries → memory reflects disk
         // - (has, empty): merge is no-op, flush writes memory to disk
         // - (has, has): both preserved, resequenced, flushed together
-        if let Some(dir) = file_checkpoint_dir_for(&session_id)
+        if astra_services::session_journal::journal_content_redact_enabled() {
+            let mut journal = self.file_journal.lock_recover();
+            if session_changed && previous_session_id.is_some() {
+                // The in-memory undo history still belongs to one session.
+                *journal = astra_turn_core::file_edit_journal::FileEditJournal::new(500);
+            } else {
+                journal.disable_persistence();
+            }
+        } else if let Some(dir) = file_checkpoint_dir_for(&session_id)
             && let Ok(mut journal) = self.file_journal.lock()
         {
             // Three cases:
@@ -2328,9 +2443,6 @@ impl ToolExecutor {
             }
             if let Ok(mut lessons) = self.session_lessons.lock() {
                 lessons.clear();
-            }
-            if let Ok(mut diag) = self.latest_skill_diagnosis.lock() {
-                *diag = None;
             }
             if let Ok(mut feedback) = self.latest_turn_quality_feedback.lock() {
                 *feedback = None;
@@ -2427,16 +2539,21 @@ impl ToolExecutor {
             .unwrap_or_default()
     }
 
-    /// P3.3 seam: stash the latest auto-invoke diagnosis. Pass `None` to
-    /// clear a stale diagnosis once the triggering condition resolves.
-    /// The next `build_self_model_snapshot` picks it up.
-    pub fn set_latest_skill_diagnosis(
+    pub fn set_memory_selection_reports(
         &self,
-        diag: Option<astra_skills::auto_invoke::SkillDiagnosis>,
+        report: Vec<astra_turn_types::MemorySelectionReport>,
     ) {
-        if let Ok(mut g) = self.latest_skill_diagnosis.lock() {
-            *g = diag;
+        if let Ok(mut slot) = self.memory_selection_reports.lock() {
+            *slot = report;
         }
+    }
+
+    pub fn memory_selection_reports(&self) -> Vec<astra_turn_types::MemorySelectionReport> {
+        self.memory_selection_reports
+            .lock()
+            .ok()
+            .map(|slot| slot.clone())
+            .unwrap_or_default()
     }
 
     pub fn set_latest_turn_quality_feedback(
@@ -2481,7 +2598,9 @@ impl ToolExecutor {
         // Re-apply persistence to the new journal if a session is already active.
         // Guarded by session_id presence so pure in-memory callers (no session
         // set) keep the original zero-side-effect behavior.
-        if let Some(sid) = self.active_session_id()
+        if astra_services::session_journal::journal_content_redact_enabled() {
+            self.file_journal.lock_recover().disable_persistence();
+        } else if let Some(sid) = self.active_session_id()
             && let Some(dir) = file_checkpoint_dir_for(&sid)
             && let Ok(mut j) = self.file_journal.lock()
             && j.persist_dir().is_none()
@@ -3293,7 +3412,7 @@ impl ToolExecutor {
         })
         .to_string();
         let (chunk, end, total_bytes, total_lines) =
-            astra_tools::credential_redaction::redacted_output_window(
+            astra_text_utils::credential_redaction::redacted_output_window(
                 &output,
                 offset as usize,
                 max_bytes,
@@ -3420,7 +3539,7 @@ impl ToolExecutor {
             "hint": "Recovered from the durable session journal; this is a settled historical observation, not a live fanout control handle.",
         }).to_string();
         let (chunk, end, total_bytes, total_lines) =
-            astra_tools::credential_redaction::redacted_output_window(
+            astra_text_utils::credential_redaction::redacted_output_window(
                 &output,
                 offset as usize,
                 max_bytes,
@@ -3589,9 +3708,9 @@ impl ToolExecutor {
         );
         for (turn_num, user, assistant) in shown {
             let user_safe =
-                astra_tools::credential_redaction::redact_credentials_for_display(user).0;
+                astra_text_utils::credential_redaction::redact_credentials_for_display(user).0;
             let assistant_safe =
-                astra_tools::credential_redaction::redact_credentials_for_display(assistant).0;
+                astra_text_utils::credential_redaction::redact_credentials_for_display(assistant).0;
             let user_preview: String = user_safe.chars().take(120).collect();
             let assist_preview: String = assistant_safe.chars().take(200).collect();
             out.push_str(&format!("\n**T{turn_num} User**: {user_preview}"));
@@ -3622,6 +3741,9 @@ impl ToolExecutor {
     }
 
     fn handle_introspect(&self, args: &Value) -> String {
+        if args.get("explain").is_some() {
+            return "Error: Explain selectors require the server capacity; use an existing local artifact handle for CLI/Edge snapshots".to_string();
+        }
         if args.get("artifact").is_some() {
             let request = astra_turn_core::introspect::IntrospectRequest::from_args(args);
             if !request.source_policy.allows_edge_local_artifacts() {
@@ -3692,6 +3814,50 @@ impl ToolExecutor {
             }
             None => astra_turn_core::introspect::IntrospectSnapshot::default(),
         };
+
+        // Read only for requested local-capable judgment facets. These facts
+        // are historical source-qualified observations, not live authority.
+        if request.source_policy.allows_edge_local_artifacts()
+            && astra_services::semantic_judgment_observation::semantic_judgment_facet_enabled(
+                request.facet,
+            )
+            && let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty())
+        {
+            if snap.semantic_judgments.is_none()
+                || request.source_policy == astra_core::SourcePolicy::LocalOnly
+            {
+                let window =
+                    crate::cli::journal_digest::read_attached_observation_window(&session_id, None);
+                let mut view = match window {
+                    Ok(window) => window.semantic_judgments(&session_id, request.depth),
+                    Err(_) => astra_services::semantic_judgment_observation::SemanticJudgmentView::unavailable(astra_services::semantic_judgment_observation::SemanticJudgmentCoverage::SourceUnavailable),
+                };
+                view.scope = astra_services::semantic_judgment_observation::SemanticJudgmentScope::LocalJournalAtRead;
+                snap.semantic_judgments = Some(view);
+            }
+            if snap.judgment_usage.is_none()
+                || request.source_policy == astra_core::SourcePolicy::LocalOnly
+            {
+                let captured = crate::explain_analyze_artifact::local_judgment_usage(&session_id);
+                let mut usage =
+                    astra_turn_core::introspect::JudgmentUsageSnapshot::from_ledger(captured.facts);
+                usage.scope = captured.scope;
+                usage.capture_incomplete = true;
+                usage.input_complete = false;
+                usage.output_complete = false;
+                for group in &mut usage.groups {
+                    group.input_complete = false;
+                    group.output_complete = false;
+                }
+                if usage.coverage
+                    == astra_turn_core::introspect::JudgmentUsageCoverage::LedgerUnavailable
+                {
+                    usage.coverage =
+                        astra_turn_core::introspect::JudgmentUsageCoverage::LocalCaptureUnavailable;
+                }
+                snap.judgment_usage = Some(usage);
+            }
+        }
 
         // Overlay session-scoped injection freshness. The per-turn
         // snapshot lives on `AgenticLoopState` (not session) so the
@@ -4030,7 +4196,8 @@ impl ToolExecutor {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .replace('\n', " ⏎ ");
-        let preview = astra_tools::credential_redaction::redact_credentials_for_display(&preview).0;
+        let preview =
+            astra_text_utils::credential_redaction::redact_credentials_for_display(&preview).0;
         let preview: String = preview.chars().take(80).collect();
 
         Some(format!(
@@ -4154,10 +4321,18 @@ impl ToolExecutor {
         {
             return Err(SandboxExpansionError::SystemSensitivePath);
         }
+        let mut basis = astra_core::sync_poison::recover_mutex_lock(&self.permission_sandbox_basis);
         if let Ok(mut guard) = self.sandbox_policy.write() {
             match *guard {
                 Some(ref mut policy) => {
                     policy.allowed_paths.push(dir.clone());
+                    if let Some(basis) = basis.as_mut() {
+                        if basis.skill_policy.is_some() {
+                            basis.skill_policy = Some(policy.clone());
+                        } else {
+                            basis.baseline = Some(policy.clone());
+                        }
+                    }
                 }
                 None => return Err(SandboxExpansionError::NoSandboxPolicy),
             }
@@ -4165,36 +4340,6 @@ impl ToolExecutor {
             return Err(SandboxExpansionError::PolicyLockPoisoned);
         }
         Ok(dir)
-    }
-
-    /// Run passive workspace checks (optional **rust-analyzer LSP**, `cargo`, `tsc`) after
-    /// recent edits when this turn includes tool results; returns extra `messages` for the payload.
-    pub(crate) async fn take_passive_workspace_diagnostic_messages(
-        &self,
-        project_root: &Path,
-        tool_results_nonempty: bool,
-    ) -> Vec<Value> {
-        let mut out = self
-            .passive_lsp
-            .take_diagnostic_messages(tool_results_nonempty)
-            .await;
-        out.extend(
-            passive_cargo_check::take_passive_cargo_messages(
-                &self.passive_cargo_pending,
-                project_root,
-                tool_results_nonempty,
-            )
-            .await,
-        );
-        out.extend(
-            passive_tsc_check::take_passive_tsc_messages(
-                &self.passive_tsc_pending,
-                project_root,
-                tool_results_nonempty,
-            )
-            .await,
-        );
-        out
     }
 
     /// Set per-turn budget pressure before executing a batch of tool calls.
@@ -4256,7 +4401,7 @@ impl ToolExecutor {
         // recording pipeline is the sole boundary allowed to turn oversized
         // output into a recoverable artifact handle.
         let (output, _) =
-            astra_tools::credential_redaction::redact_credentials_for_display(&output);
+            astra_text_utils::credential_redaction::redact_credentials_for_display(&output);
         normalize_empty_output(output, name)
     }
 
@@ -4308,7 +4453,7 @@ impl ToolExecutor {
             .await
     }
 
-    /// Synchronous core for `bash` / `powershell` execution. Returns
+    /// Synchronous core for Windows `powershell` execution. Returns
     /// `Some(outcome)` when `name` matches a cancel-aware shell tool, allowing
     /// the caller to invoke this directly inside `tokio::task::spawn_blocking`
     /// without re-entering the runtime via `Handle::block_on`. Returns `None`
@@ -4321,12 +4466,6 @@ impl ToolExecutor {
         invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> Option<ToolExecutionOutcome> {
-        if name == "bash" {
-            let mut outcome = self.bash_outcome_with_cancel(args, invocation, cancel_token);
-            outcome.output = self.finalize_tool_output(outcome.output, name);
-            self.record_output_size(outcome.output.len());
-            return Some(outcome);
-        }
         #[cfg(windows)]
         if name == "powershell" {
             let output =
@@ -4334,8 +4473,9 @@ impl ToolExecutor {
             self.record_output_size(output.len());
             return Some(tool_execution_outcome_from_output(output));
         }
+        let _ = invocation; // PowerShell does not consume invocation metadata.
         #[cfg(not(windows))]
-        let _ = cancel_token; // powershell branch is the only other cancel-aware tool
+        let _ = (name, args, cancel_token);
         None
     }
 
@@ -4387,7 +4527,7 @@ impl ToolExecutor {
             return outcome;
         }
         if name == "mo_query" {
-            let mut outcome = self.mo_query_with_metadata(args);
+            let mut outcome = self.mo_query_with_metadata(args, cancel_token);
             let output = self.finalize_tool_output(outcome.output, name);
             self.record_output_size(output.len());
             outcome.output = output;
@@ -4426,21 +4566,124 @@ impl ToolExecutor {
         invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> EdgeToolRun {
-        let argument_validation = if astra_runtime_env::ToolRegistry::builtins()
-            .get(name)
-            .is_none()
-        {
-            self.provider_owned_schemas_snapshot("provider_owned_schema_argument_validation")
-                .into_iter()
-                .find(|schema| {
-                    astra_turn_core::tool::schema::tool_schema_name(schema) == Some(name)
-                })
-                .map(|schema| {
-                    astra_tools::schemas::validate_tool_arguments_against_schema(
-                        name, args, &schema,
-                    )
-                })
-                .unwrap_or(Ok(()))
+        self.execute_run_with_native_interaction(
+            name,
+            args,
+            invocation,
+            cancel_token,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Selected-provider entrypoint. Its per-invocation gate must route the
+    /// exact authenticated callback identity/generation to the existing
+    /// DurableRunUserPromptGate. Never store a mutable global question gate:
+    /// foreground and child invocations may share this edge executor.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn execute_native_provider_invocation(
+        &self,
+        protocol: astra_turn_core::provider_resolution::NativeCollaboratorProtocol,
+        tool_name: &str,
+        args: &Value,
+        invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+        gate: &dyn astra_tools::ProviderInteractionGate,
+        execution_ceiling: &astra_server_types::edge_ws_protocol::EdgeExecutionCeiling,
+        runtime_approval: Option<&ApprovedNativeRuntime>,
+        input_rx: tokio::sync::mpsc::Receiver<astra_edge::EdgeInvocationInput>,
+        validate_dispatch: &(dyn Fn() -> Result<(), astra_tools::ToolResult> + Send + Sync),
+    ) -> ToolExecutionOutcome {
+        self.execute_run_with_native_interaction(
+            tool_name,
+            args,
+            invocation,
+            cancel_token,
+            Some(gate),
+            Some(execution_ceiling),
+            Some(protocol),
+            runtime_approval,
+            Some(input_rx),
+            Some(validate_dispatch),
+        )
+        .await
+        .into_outcome()
+    }
+
+    // Independent invocation controls are checked together, not inferred from tool arguments.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_run_with_native_interaction(
+        &self,
+        name: &str,
+        args: &Value,
+        invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+        native_gate: Option<&dyn astra_tools::ProviderInteractionGate>,
+        execution_ceiling: Option<&astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
+        native_protocol: Option<astra_turn_core::provider_resolution::NativeCollaboratorProtocol>,
+        runtime_approval: Option<&ApprovedNativeRuntime>,
+        input_rx: Option<tokio::sync::mpsc::Receiver<astra_edge::EdgeInvocationInput>>,
+        validate_dispatch: Option<&(dyn Fn() -> Result<(), astra_tools::ToolResult> + Send + Sync)>,
+    ) -> EdgeToolRun {
+        let canonical_native = runtime_approval.filter(|approval| {
+            native_protocol.is_none_or(|protocol| protocol == approval.protocol)
+        });
+        if runtime_approval.is_some() && canonical_native.is_none() {
+            return EdgeToolRun::failure_evidence(
+                "native collaborator protocol and admission receipt do not match".into(),
+                astra_core::ToolFailureEvidence::from_error_kind(
+                    astra_core::ErrorKind::ToolBinding,
+                ),
+            );
+        }
+        let argument_validation = if let Some(approved) = canonical_native {
+            let declaration = &approved.snapshot.tool_declarations[0];
+            astra_tools::schemas::validate_tool_arguments_against_schema(
+                name,
+                args,
+                &json!({"type": "function", "function": {
+                    "name": declaration.native_tool_name,
+                    "parameters": declaration.input_schema,
+                }}),
+            )
+        } else if runtime_env_builtin_registry().get(name).is_none() {
+            rwlock_read_project_or_default(
+                &self.cli_local_provider_schemas,
+                "provider_owned_schema_argument_validation",
+                |schemas| {
+                    schemas
+                        .iter()
+                        .find(|schema| {
+                            astra_turn_core::tool::schema::tool_schema_name(schema) == Some(name)
+                        })
+                        .cloned()
+                },
+            )
+            .or_else(|| {
+                rwlock_read_project_or_default(
+                    &self.mcp_runtime,
+                    "mcp_runtime_schema_snapshot",
+                    |runtime| {
+                        runtime
+                            .schemas
+                            .iter()
+                            .find(|schema| {
+                                astra_turn_core::tool::schema::tool_schema_name(schema)
+                                    == Some(name)
+                            })
+                            .cloned()
+                    },
+                )
+            })
+            .map(|schema| {
+                astra_tools::schemas::validate_tool_arguments_against_schema(name, args, &schema)
+            })
+            .unwrap_or(Ok(()))
         } else {
             astra_tools::schemas::validate_tool_arguments(name, args)
         };
@@ -4448,8 +4691,13 @@ impl ToolExecutor {
             let evidence = error.failure_evidence();
             return EdgeToolRun::failure_evidence(error.output(), evidence);
         }
-        if let Some(error) = self.tool_admission_denial(name, args) {
-            return error;
+        // Executor-only native capacity is admitted by the authenticated
+        // delivery grant plus its local frozen approval, not model visibility.
+        // Ordinary/root dispatch cannot supply this receipt.
+        if canonical_native.is_none() {
+            if let Some(error) = self.tool_admission_denial(name, args) {
+                return error;
+            }
         }
         // Edge-owned typed writers share the same per-workspace lease as the
         // Bash pre/post observer. Bash acquires it inside its shell boundary;
@@ -4479,35 +4727,81 @@ impl ToolExecutor {
                 &self.project_root,
             )
         });
+        let mcp_prepared = if astra_runtime_env::is_mcp_namespaced_tool_name(name) {
+            match self.prepare_mcp_tool_call(name).await {
+                Ok(prepared) => Some(prepared),
+                Err(outcome) => {
+                    return EdgeToolRun::error(outcome.output)
+                        .with_tool_result_fields(outcome.tool_result_fields);
+                }
+            }
+        } else {
+            None
+        };
+        let mcp_workspace_effect = mcp_prepared
+            .as_ref()
+            .map(|(_, prepared)| prepared.policy().effect);
+        let execution_root = if native_protocol.is_some() {
+            self.effective_project_root()
+        } else {
+            self.project_root.clone()
+        };
+        // Freeze the native write ceiling before choosing workspace ownership.
+        // Read-only native work reads the live root; it is not a snapshot.
+        let native_read_only = native_protocol.is_some()
+            && (execution_ceiling.is_none_or(|ceiling| !ceiling.workspace_write_allowed)
+                || self.read_only_execution
+                || self.plan_mode_authoring_active().await);
+        if matches!(
+            mcp_workspace_effect,
+            Some(astra_turn_types::ResolvedToolEffect::Unknown)
+        ) {
+            return EdgeToolRun::from_tool_result(
+                astra_tools::mcp_workspace_effect_undeclared_tool_result(name),
+            );
+        }
         let _workspace_mutation_lease = if name != "bash"
             && name != "run_script"
-            && (astra_tools::executor::is_workspace_mutation_tool(name, args) || targeted_observer)
+            // MCP effects are resolved once from the discovered provider
+            // declaration; typed tools use the shared built-in predicate.
+            && ((native_protocol.is_some() && !native_read_only)
+                || mcp_workspace_effect == Some(astra_turn_types::ResolvedToolEffect::Mutating)
+                || astra_tools::executor::requires_workspace_serialization(name, args)
+                || targeted_observer)
             && !nested_run_script_callback
         {
             match astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
-                &self.project_root,
+                &execution_root,
                 cancel_token,
-                std::time::Duration::from_secs(120),
+                invocation
+                    .admission_deadline
+                    .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap_or(std::time::Duration::from_secs(120))
+                    .min(std::time::Duration::from_secs(120)),
             )
             .await
             {
-                Some(guard) => Some(guard),
-                None => {
+                Ok(guard) => Some(guard),
+                Err(failure) => {
                     if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
                         if let Some(authority) = convergence_authority.as_deref() {
                             self.convergence_tracker.clear_authority(authority);
                         }
                         return cancelled_edge_tool_run(name, false);
                     }
-                    return EdgeToolRun::error(
-                        "workspace coordination lock was unavailable, contended, or the host temporary lock namespace is not trustworthy; no tool was run. Retry after the active writer finishes or repair the host temporary-directory ownership and sticky-bit permissions"
-                            .to_string(),
+                    return EdgeToolRun::from_tool_result(
+                        astra_tools::workspace_lease_failure_tool_result(name, failure),
                     );
                 }
             }
         } else {
             None
         };
+        if let Some(validate) = validate_dispatch
+            && let Err(result) = validate()
+        {
+            return EdgeToolRun::from_tool_result(result);
+        }
         // Structured writers have no trustworthy success fact in their
         // display string. Capture an owner-side bounded preimage while the
         // workspace lease is held, then stamp the result only if the bound
@@ -4543,29 +4837,76 @@ impl ToolExecutor {
             )
             .await
             {
-                Some(guard) => Some(guard),
-                None => {
-                    return EdgeToolRun::error(
-                        "workspace writer coordination was unavailable, contended, or the host temporary lock namespace is not trustworthy; run_script was not run. Retry after the active writer finishes or repair the host temporary-directory ownership and sticky-bit permissions"
-                            .to_string(),
+                Ok(guard) => Some(guard),
+                Err(failure) => {
+                    return EdgeToolRun::from_tool_result(
+                        astra_tools::workspace_lease_failure_tool_result(name, failure),
                     );
                 }
             }
         } else {
             None
         };
-        let mut tool_result_fields = None;
-        let mut source_is_error = None;
+        let mut facts = ToolExecutionFacts::default();
         let mut output = self
             .execute_raw(
                 name,
                 args,
                 invocation,
                 cancel_token,
-                &mut tool_result_fields,
-                &mut source_is_error,
+                &mut facts,
+                mcp_prepared,
+                &execution_root,
+                native_gate,
+                execution_ceiling,
+                native_protocol,
+                native_read_only,
+                runtime_approval,
+                input_rx,
             )
             .await;
+        let ToolExecutionFacts {
+            fields: mut tool_result_fields,
+            is_error: mut source_is_error,
+        } = facts;
+        if native_protocol.is_some()
+            || matches!(
+                mcp_workspace_effect,
+                Some(astra_turn_types::ResolvedToolEffect::Mutating)
+            )
+        {
+            let result = astra_tools::ToolResult {
+                output,
+                metadata: tool_result_fields,
+                is_error: source_is_error.unwrap_or(false),
+                exit_semantics: None,
+            };
+            let dispatched = result.metadata.as_ref().is_some_and(|fields| {
+                fields.get("mcp_call_dispatched").and_then(Value::as_bool) == Some(true)
+                    || (native_protocol.is_some()
+                        && fields
+                            .get("native_collaborator")
+                            .and_then(|native| native.get("target_released"))
+                            != Some(&Value::Bool(false)))
+            });
+            let settled = result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("workspace_effect_settled"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            let result = if dispatched && !settled {
+                astra_tools::workspace_observation::mark_workspace_observation_unsettled(
+                    &execution_root,
+                );
+                astra_tools::workspace_effect_unsettled_tool_result(name, result)
+            } else {
+                result
+            };
+            output = result.output;
+            tool_result_fields = result.metadata;
+            source_is_error = Some(result.is_error);
+        }
         let coordination_integrity_valid = _workspace_mutation_lease.as_ref().is_none_or(
             astra_tools::workspace_observation::WorkspaceObservationLease::coordination_integrity_valid,
         ) && _recursive_writer_epoch
@@ -4602,13 +4943,14 @@ impl ToolExecutor {
                 "\n\nError: workspace binding or coordination generation changed during execution; the mutation may have applied, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
             );
         }
-        let writer_applied_by_owner = receipt_authority_valid
+        let direct_writer_applied = coordination_integrity_valid
             && !nested_run_script_callback
             && tool_result_fields
                 .as_ref()
                 .and_then(|fields| fields.get("workspace_mutation_applied"))
                 .and_then(Value::as_bool)
                 == Some(true);
+        let writer_applied_by_owner = receipt_authority_valid && direct_writer_applied;
         let writer_applied_by_fingerprint = if writer_applied_by_owner {
             false
         } else {
@@ -4626,8 +4968,19 @@ impl ToolExecutor {
         // cache insertion: tool_call_end and the Edge→server transport must
         // never become an earlier/raw persistence lane than headless record.
         let (mut output, _) =
-            astra_tools::credential_redaction::redact_credentials_for_display(&output);
+            astra_text_utils::credential_redaction::redact_credentials_for_display(&output);
         let embedded_work_observation = embedded_work_unit_observation(&output);
+        // Only control-handler output is a producer-owned execution fact;
+        // file contents and process stdout cannot certify non-execution.
+        if matches!(name, "agent" | "agent_fanout")
+            && let Ok(parsed) = serde_json::from_str::<Value>(&output)
+        {
+            astra_tools::execution_outcome::insert_producer_execution_fact(
+                Some(&parsed),
+                tool_result_fields.get_or_insert_with(Default::default),
+            );
+        }
+
         // Source status wins over result prose. Unmigrated String handlers
         // retain their status adapter, but cannot invent an error category.
         let mut is_error = source_is_error.unwrap_or_else(|| cli_tool_output_is_error(&output))
@@ -4661,6 +5014,22 @@ impl ToolExecutor {
                 None
             }
         };
+        if !receipt_authority_valid
+            && astra_tools::workspace_observation::typed_workspace_tool_applied_bound(
+                name,
+                args,
+                &self.project_root,
+                is_error,
+                direct_writer_applied,
+            )
+        {
+            tool_result_fields
+                .get_or_insert_with(Default::default)
+                .insert(
+                    astra_tools::workspace_observation::WRITER_APPLIED_BOUND_FIELD.to_string(),
+                    Value::Bool(true),
+                );
+        }
         // Structured workspace writers have already been checked by this
         // Edge executor against its bound workspace. Preserve that typed
         // owner fact across the Edge→server ledger; the server may not stat
@@ -4718,19 +5087,51 @@ impl ToolExecutor {
         .with_tool_result_fields(tool_result_fields)
     }
 
+    // This execution boundary receives prepared capability and authority facts explicitly.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_raw(
         &self,
         name: &str,
         args: &Value,
         invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
-        tool_result_fields: &mut Option<serde_json::Map<String, Value>>,
-        source_is_error: &mut Option<bool>,
+        facts: &mut ToolExecutionFacts,
+        mcp_prepared: Option<(
+            std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>,
+            astra_mcp::PreparedMcpToolCall,
+        )>,
+        execution_root: &Path,
+        native_gate: Option<&dyn astra_tools::ProviderInteractionGate>,
+        execution_ceiling: Option<&astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
+        native_protocol: Option<astra_turn_core::provider_resolution::NativeCollaboratorProtocol>,
+        native_read_only: bool,
+        runtime_approval: Option<&ApprovedNativeRuntime>,
+        input_rx: Option<tokio::sync::mpsc::Receiver<astra_edge::EdgeInvocationInput>>,
     ) -> String {
-        let output = if let Err(error) =
-            crate::tool_safety_guard::ToolSafetyGuard::check_dispatch(name, args)
-        {
-            error
+        let ToolExecutionFacts {
+            fields: tool_result_fields,
+            is_error: source_is_error,
+        } = facts;
+        let output = if let Some(protocol) = native_protocol {
+            let result = match protocol {
+                astra_turn_core::provider_resolution::NativeCollaboratorProtocol::CodexAppServer => {
+                    self.execute_native_codex(
+                        args,
+                        invocation,
+                        cancel_token,
+                        execution_root,
+                        native_gate,
+                        execution_ceiling,
+                        native_read_only,
+                        runtime_approval,
+                        input_rx,
+                    )
+                    .await
+                }
+            };
+            *source_is_error = Some(result.is_error);
+            *tool_result_fields = result.metadata;
+            result.output
         } else if is_plan_mode_blocked_tool(name, args) && self.plan_mode_authoring_active().await {
             format!(
                 "Error: Tool '{name}' is blocked while plan mode is active. \
@@ -4754,7 +5155,12 @@ impl ToolExecutor {
                 // Uses the local CLI catalog plus plugin-installed schemas,
                 // so `select:NAME` matches the tools this surface actually
                 // exposes while still resolving MCP/skill-backed tools.
-                "tool_search" => self.tool_search(args),
+                "tool_search" => {
+                    let result = self.tool_search(args);
+                    *source_is_error = Some(result.is_error);
+                    *tool_result_fields = result.metadata;
+                    result.output
+                }
                 "read_file" => {
                     let result = self.read_file_with_metadata(args);
                     *source_is_error = Some(result.is_error);
@@ -4818,13 +5224,15 @@ impl ToolExecutor {
                 "rollback_file_edits" => self.rollback_file_edits(args),
                 "rollback_session_state" => self.rollback_session_state(args).await,
                 "str_replace" => {
-                    let args = match astra_tools::fs_ops::normalize_str_replace_args(args) {
-                        Ok(args) => args,
-                        Err(error) => {
-                            *source_is_error = Some(true);
-                            return error;
-                        }
-                    };
+                    let args =
+                        match astra_tools::fs_ops::normalize_str_replace_invocation_args(args) {
+                            Ok(args) => args,
+                            Err(result) => {
+                                *source_is_error = Some(result.is_error);
+                                *tool_result_fields = result.metadata;
+                                return result.output;
+                            }
+                        };
                     // edits array routes through the str_replace batch
                     // wrapper so both same-file and per-edit path batches
                     // share one contract.
@@ -4849,7 +5257,12 @@ impl ToolExecutor {
                     }
                 }
                 "list_dir" => self.list_dir(args),
-                "grep" => self.grep(args),
+                "grep" => {
+                    let result = self.grep(args, cancel_token).await;
+                    *source_is_error = Some(result.is_error);
+                    *tool_result_fields = result.metadata;
+                    result.output
+                }
                 // Glob is owned by the shared executor so CLI-local,
                 // CLI+Server edge callbacks, and pure Server runs have one
                 // traversal, ignore, pagination, and failure contract.
@@ -4880,7 +5293,6 @@ impl ToolExecutor {
                 "type_hierarchy" => self.type_hierarchy(args),
                 "hover_info" => self.hover_info(args),
                 "symbol_search" => self.symbol_search(args),
-                "run_build_test" => self.run_build_test(args),
                 "symbols" => self.symbols(args),
                 "mo_query" => self.mo_query(args),
 
@@ -4891,7 +5303,15 @@ impl ToolExecutor {
                         .ok()
                         .and_then(|guard| guard.clone())
                         .unwrap_or_else(|| self.project_root.to_string_lossy().to_string());
-                    astra_tools::web_fetch::fetch_with_cache_scope(args, &cache_scope).await
+                    let result = astra_tools::web_fetch::fetch_with_cache_scope(
+                        args,
+                        &cache_scope,
+                        astra_tools::web_fetch::FetchTransport::LocalEnvironment,
+                    )
+                    .await;
+                    *source_is_error = Some(result.is_error);
+                    *tool_result_fields = result.metadata;
+                    result.output
                 }
                 "display_sixel" => {
                     let result =
@@ -4904,7 +5324,7 @@ impl ToolExecutor {
                     #[cfg(unix)]
                     {
                         let config = astra_tools::run_script::RunScriptConfig::default();
-                        let result = astra_tools::run_script::handle_run_script_with_cancel(
+                        let result = astra_tools::run_script::handle_run_script(
                             args,
                             self,
                             config,
@@ -5048,8 +5468,7 @@ impl ToolExecutor {
                     ) {
                         Ok(action) => action,
                         Err(error) => {
-                            return astra_turn_core::orchestration::agent_result_wire::render_agent_tool_error_with_kind(
-                                    None,
+                            return astra_turn_core::orchestration::agent_result_wire::render_agent_tool_admission_error_with_kind(
                                     &error,
                                     Some(astra_core::ErrorKind::ToolInvalidArgs),
                                 );
@@ -5085,8 +5504,23 @@ impl ToolExecutor {
                             }
                         }
                         astra_tools::agent_tool_contract::AgentAction::Spawn => {
-                            agent_spawning::handle_agent_spawn_action(
-                                args,
+                            if self.delegation_requires_admission {
+                                *source_is_error = Some(true);
+                                return astra_turn_core::orchestration::agent_result_wire::render_agent_tool_admission_error("inherited model requirements cannot be bound to a CLI child delegation");
+                            }
+                            let context = self.spawn_context_for_admission();
+                            agent_spawning::handle_agent_spawn_action(args, context.as_ref()).await
+                        }
+                        astra_tools::agent_tool_contract::AgentAction::Wait => {
+                            let mut correlated = args.clone();
+                            if let Some(fields) = correlated.as_object_mut() {
+                                fields.remove("_tool_call_id");
+                                if let Some(id) = invocation.tool_call_id {
+                                    fields.insert("_tool_call_id".into(), Value::String(id.into()));
+                                }
+                            }
+                            astra_runtime::orchestration::handle_agent_tool(
+                                &correlated,
                                 self.spawn_context.as_ref(),
                             )
                             .await
@@ -5098,22 +5532,29 @@ impl ToolExecutor {
                             )
                             .await
                         }
-                        astra_tools::agent_tool_contract::AgentAction::SendMessage => {
-                            let mailbox_ctx = self
-                                .send_message_context
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .clone();
-                            agent_spawning::handle_agent_send_message_action(
+                        astra_tools::agent_tool_contract::AgentAction::List => {
+                            agent_spawning::handle_agent_list_action(
                                 args,
                                 self.spawn_context.as_ref(),
-                                mailbox_ctx.as_ref(),
+                            )
+                            .await
+                        }
+                        astra_tools::agent_tool_contract::AgentAction::SendMessage => {
+                            astra_runtime::orchestration::handle_agent_tool(
+                                args,
+                                self.spawn_context.as_ref(),
                             )
                             .await
                         }
                     }
                 }
                 "agent_fanout" => {
+                    if self.delegation_requires_admission
+                        && args.get("action").and_then(Value::as_str) == Some("start")
+                    {
+                        *source_is_error = Some(true);
+                        return astra_turn_core::orchestration::agent_result_wire::render_agent_tool_admission_error("inherited model requirements cannot be bound to a CLI child delegation");
+                    }
                     if self.spawn_context.is_none()
                         && args.get("action").and_then(Value::as_str) == Some("get_results")
                         && let Some(group_id) = args.get("group_id").and_then(Value::as_str)
@@ -5122,8 +5563,8 @@ impl ToolExecutor {
                     {
                         projection.snapshot.output
                     } else {
-                        agent_spawning::handle_agent_fanout_tool(args, self.spawn_context.as_ref())
-                            .await
+                        let context = self.spawn_context_for_admission();
+                        agent_spawning::handle_agent_fanout_tool(args, context.as_ref()).await
                     }
                 }
                 // ── Consolidated session tool ──────────────────────────────
@@ -5159,9 +5600,14 @@ impl ToolExecutor {
                         .ok()
                         .and_then(|guard| guard.clone())
                         .unwrap_or_else(|| self.project_root.to_string_lossy().to_string());
-                    let result =
-                        astra_tools::web_search::perform_web_search(args, &cache_scope).await;
+                    let result = astra_tools::web_search::perform_web_search(
+                        args,
+                        &cache_scope,
+                        astra_tools::web_fetch::FetchTransport::LocalEnvironment,
+                    )
+                    .await;
                     *source_is_error = Some(result.is_error);
+                    *tool_result_fields = result.metadata;
                     result.output
                 }
                 "ask_user" => "Error: ask_user requires an interactive TUI prompt sink".to_string(),
@@ -5200,18 +5646,26 @@ impl ToolExecutor {
                         .to_string()
                     }
                 }
-                "share_context" => self.share_context(args),
-                "query_context" => self.query_context(args),
                 "introspect" => self.handle_introspect(args),
-                "diagnose" => self.diagnose(args).await,
-                "lsp" => self.lsp(args),
+                "model_catalog" => {
+                    use astra_turn_core::model_catalog::{
+                        CatalogError, ModelCatalogRequest, unavailable_page,
+                    };
+                    *source_is_error = Some(true);
+                    let error = ModelCatalogRequest::from_args(args)
+                        .err()
+                        .unwrap_or(CatalogError::Unsupported);
+                    unavailable_page(error, "unbound").to_json()
+                }
+                "lsp" => self.lsp_with_facts(args, facts),
                 "env" => self.env_tool(args),
-                "notebook_edit" => self.notebook_edit(args),
-                "config" => self.config_tool(args),
-                "brief" => self.brief(args).await,
-                "context_analysis" => self.context_analysis(args),
                 _ if astra_runtime_env::is_mcp_namespaced_tool_name(name) => {
-                    let outcome = self.execute_mcp_tool(name, args).await;
+                    let outcome = if let Some((manager, prepared)) = mcp_prepared.as_ref() {
+                        self.execute_prepared_mcp_tool(manager, name, prepared, args)
+                            .await
+                    } else {
+                        self.execute_mcp_tool(name, args).await
+                    };
                     *source_is_error = Some(outcome.is_error);
                     *tool_result_fields = outcome.tool_result_fields.clone();
                     outcome.output
@@ -5225,7 +5679,7 @@ impl ToolExecutor {
             // Feedback must follow the executor's terminal fact, not prose
             // that can contain error examples or conceal a failed execution.
             // Legacy handlers without a typed outcome supply no success proof.
-            && *source_is_error == Some(false)
+            && facts.is_error == Some(false)
             && let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty())
         {
             let producer_id = self
@@ -5476,9 +5930,14 @@ impl ToolExecutor {
         if let Some(session_id) = self.active_session_id()
             && let Some(surface) = crate::cli::self_command::agent_info_surface_alias(dimension)
         {
-            return crate::cli::self_command::render_surface_for_session(&session_id, surface, 20)
-                .await
-                .unwrap_or_else(|error| serde_json::json!({ "error": error }).to_string());
+            return crate::cli::surface::self_surface::render_surface_for_session_with_profile(
+                &session_id,
+                surface,
+                20,
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| serde_json::json!({ "error": error }).to_string());
         }
 
         let self_model = self.build_self_model_snapshot();
@@ -5492,7 +5951,6 @@ impl ToolExecutor {
                         "turn": model.state.turn_number,
                         "token_budget": model.state.token_budget,
                         "scenario": model.state.scenario,
-                        "active_experiment": model.state.active_experiment,
                         "session_elapsed_secs": model.state.session_elapsed_secs,
                         "correction_count": model.state.correction_count,
                         "compression_count": model.state.compression_count,
@@ -5816,25 +6274,20 @@ impl ToolExecutor {
         let stale_runtime_signals =
             astra_turn_core::injection_tracking::stale_channel_advisories(&injection_freshness);
 
-        let mut snapshot = astra_runtime::self_model::SelfModel::snapshot_with_strategy(
+        let mut snapshot = astra_runtime::self_model::SelfModel::snapshot(
             &tool_name_refs,
             skills_slice,
             tool_health_tracker.as_ref(),
             session.turn_number,
             latest_budget,
             scenario_opt,
-            None,
             elapsed,
             session.user_corrections.len(),
             session.compressed_turns.len(),
             None,
             signals_slice,
             &session.config,
-            session.last_strategy_application.as_ref(),
         );
-        if let Some(g) = session.last_guardrail_view.clone() {
-            snapshot = snapshot.with_guardrail(g);
-        }
         if let Some(dp) = session.last_denial_pressure {
             snapshot = snapshot.with_denial_pressure(dp);
         }
@@ -5876,15 +6329,6 @@ impl ToolExecutor {
             && !lessons.is_empty()
         {
             snapshot = snapshot.with_lessons(lessons.clone());
-        }
-
-        // P3.3 seam: attach the latest auto-invoke diagnosis (if any).
-        // `with_skill_diagnosis(None)` is a no-op — we only call it when
-        // something is stashed.
-        if let Ok(diag_guard) = self.latest_skill_diagnosis.lock()
-            && let Some(ref diag) = *diag_guard
-        {
-            snapshot = snapshot.with_skill_diagnosis(Some(diag.clone()));
         }
 
         if let Ok(feedback_guard) = self.latest_turn_quality_feedback.lock()
@@ -5942,7 +6386,7 @@ impl astra_tools::ToolExecutor for ToolExecutor {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use serde_json::{Value, json};
     #[tokio::test]
     async fn removed_repository_tools_are_not_executable_or_discoverable() {
@@ -5976,14 +6420,14 @@ mod tests {
         background_task_output_result_fields, cli_tool_output_is_error,
         embedded_work_unit_observation, file_checkpoint_dir_for, format_background_task_error,
         format_background_task_output, format_background_task_output_wait_timeout,
-        format_background_task_stop_error, memoria, parse_memory_search_contents,
-        utf16_col_to_char_idx,
+        format_background_task_stop_error, utf16_col_to_char_idx,
     };
     use crate::background_task_error::BackgroundTaskError;
     use crate::lock_recovery::LockRecovery;
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn feedback_frame(
         session_turn: u32,
@@ -6136,6 +6580,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl astra_runtime::orchestration::SpawnAgentExecutor for ImmediateSpawnExecutor {
+        async fn cancel_spawned_run_durably(
+            &self,
+            run: &str,
+            binding: Option<&str>,
+            user: Option<&str>,
+            reason: &str,
+            origin: astra_runtime::orchestration::CancellationOrigin,
+        ) -> Result<astra_runtime::orchestration::SpawnRunCancellationDurability, String> {
+            let _ = (run, binding, user, reason, origin);
+            Ok(astra_runtime::orchestration::SpawnRunCancellationDurability::LocalExecution)
+        }
+
         async fn execute(
             &self,
             config: astra_runtime::orchestration::SpawnRunConfig,
@@ -6143,6 +6599,8 @@ mod tests {
             Ok(astra_runtime::orchestration::SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
+                committed_frontier: None,
+                applied_user_intents: Vec::new(),
                 status: "completed".into(),
                 finish_reason: "normal".into(),
                 cancellation_origin: astra_runtime::orchestration::CancellationOrigin::Unverified,
@@ -6162,6 +6620,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl astra_runtime::orchestration::SpawnAgentExecutor for GatedSpawnExecutor {
+        async fn cancel_spawned_run_durably(
+            &self,
+            run: &str,
+            binding: Option<&str>,
+            user: Option<&str>,
+            reason: &str,
+            origin: astra_runtime::orchestration::CancellationOrigin,
+        ) -> Result<astra_runtime::orchestration::SpawnRunCancellationDurability, String> {
+            let _ = (run, binding, user, reason, origin);
+            Ok(astra_runtime::orchestration::SpawnRunCancellationDurability::LocalExecution)
+        }
+
         async fn execute(
             &self,
             config: astra_runtime::orchestration::SpawnRunConfig,
@@ -6174,6 +6644,8 @@ mod tests {
             Ok(astra_runtime::orchestration::SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
+                committed_frontier: None,
+                applied_user_intents: Vec::new(),
                 status: "completed".into(),
                 finish_reason: "normal".into(),
                 cancellation_origin: astra_runtime::orchestration::CancellationOrigin::Unverified,
@@ -6195,10 +6667,16 @@ mod tests {
         spawner: Arc<astra_runtime::orchestration::DynamicAgentSpawner>,
     ) -> astra_runtime::orchestration::AgentToolContext {
         astra_runtime::orchestration::AgentToolContext {
+            parent_delegation_authority: astra_runtime::orchestration::DelegationAuthority::Allowed,
+            fanout_admission: spawner.fanout_parent("run-parent"),
+            reply_obligations: Arc::new(Default::default()),
             run_id: "run-parent".into(),
             agent_id: "root-agent".into(),
             delegation_chain: Vec::new(),
             current_model: None,
+            current_model_selection: None,
+            delegation_model_admission: None,
+            parent_model_reasoning: None,
             recursion_depth: 0,
             is_fork_child: false,
             working_dir: PathBuf::from("."),
@@ -6211,10 +6689,145 @@ mod tests {
             client_tool_delivery_tx: None,
             trace_context: None,
             execution_metadata: None,
+            execution_deadline: None,
             workspace_mutation: astra_runtime::orchestration::WorkspaceMutationAuthority::default(),
             transcript_location:
                 astra_runtime::orchestration::AgentTranscriptLocation::LocalJournal,
         }
+    }
+
+    #[test]
+    fn spawn_admission_snapshots_effective_parent_reasoning() {
+        use astra_turn_core::thinking_config::ThinkingConfig;
+        let executor = ToolExecutor::new(std::path::Path::new("."))
+            .with_spawn_context(fanout_test_context(test_spawner()));
+        executor.publish_parent_model_reasoning(
+            Some("offer-a"),
+            Some("model-a"),
+            ThinkingConfig::Enabled {
+                budget_tokens: 8192,
+            },
+        );
+        let admitted = executor.spawn_context_for_admission().unwrap();
+        executor.publish_parent_model_reasoning(
+            Some("offer-b"),
+            Some("model-b"),
+            ThinkingConfig::Off,
+        );
+        let updated = executor.spawn_context_for_admission().unwrap();
+        let admitted = admitted.parent_model_reasoning.unwrap();
+        assert_eq!(admitted.selection.offering_id, "offer-a");
+        assert_eq!(
+            admitted.thinking,
+            ThinkingConfig::Enabled {
+                budget_tokens: 8192
+            }
+        );
+        let updated = updated.parent_model_reasoning.unwrap();
+        assert_eq!(updated.selection.offering_id, "offer-b");
+        assert_eq!(updated.thinking, ThinkingConfig::Off);
+        executor.publish_parent_model_reasoning(None, None, ThinkingConfig::Off);
+        assert!(
+            executor
+                .spawn_context_for_admission()
+                .unwrap()
+                .parent_model_reasoning
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_agent_admission_rejection_preserves_non_execution_metadata() {
+        let executor = test_executor()
+            .with_spawn_context(fanout_test_context(test_spawner()))
+            .require_delegation_admission(true);
+        executor.set_current_visible_tool_schemas(&[
+            function_schema("agent"),
+            function_schema("agent_fanout"),
+        ]);
+        for (name, args) in [
+            (
+                "agent",
+                serde_json::json!({"action": "spawn", "description": "review", "prompt": "review"}),
+            ),
+            (
+                "agent_fanout",
+                serde_json::json!({"action": "start", "target_count": 1, "slots": [{"description":"review", "prompt":"review"}]}),
+            ),
+        ] {
+            let result = executor.execute_with_metadata(name, &args).await;
+            assert!(result.is_error, "{result:?}");
+            let fields = result.tool_result_fields.unwrap();
+            assert_eq!(
+                fields.get("execution_started"),
+                Some(&Value::Bool(false)),
+                "{name}: {} {fields:?}",
+                result.output
+            );
+            assert_eq!(fields["disposition"], "rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn constrained_cli_child_cannot_start_unbound_nested_delegation() {
+        let spawner = test_spawner();
+        let executor = test_executor()
+            .with_spawn_context(fanout_test_context(spawner.clone()))
+            .require_delegation_admission(true);
+        let spawn = executor
+            .execute(
+                "agent",
+                &serde_json::json!({
+                    "action":"spawn","description":"Review","prompt":"Review the diff"
+                }),
+            )
+            .await;
+        assert!(spawn.contains("inherited model requirements cannot be bound"));
+        let fanout = executor
+            .execute(
+                "agent_fanout",
+                &serde_json::json!({
+                    "action":"start","target_count":1,
+                    "slots":[{"id":"review","description":"Review","prompt":"Review the diff"}]
+                }),
+            )
+            .await;
+        assert!(fanout.contains("inherited model requirements cannot be bound"));
+        assert!(spawner.list_all_agents().await.is_empty());
+        assert!(spawner.list_fanout_groups().await.is_empty());
+
+        let result_lookup = executor
+            .execute(
+                "agent",
+                &serde_json::json!({"action":"get_result","agent_id":"unknown"}),
+            )
+            .await;
+        assert!(!result_lookup.contains("inherited model requirements cannot be bound"));
+
+        let unconstrained_spawner = test_spawner();
+        let unconstrained =
+            test_executor().with_spawn_context(fanout_test_context(unconstrained_spawner.clone()));
+        let allowed = unconstrained
+            .execute(
+                "agent",
+                &serde_json::json!({
+                    "action":"spawn","description":"Review","prompt":"Review the diff"
+                }),
+            )
+            .await;
+        assert!(!allowed.contains("inherited model requirements cannot be bound"));
+        let launched: serde_json::Value = serde_json::from_str(&allowed).unwrap();
+        assert_eq!(launched["status"], "launched", "{allowed}");
+        let status = unconstrained_spawner
+            .wait_for_agent(
+                launched["agent_id"].as_str().unwrap(),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect("the admitted child must complete");
+        assert!(
+            matches!(status, astra_runtime::orchestration::AgentStatus::Completed { result, .. } if result == "child result")
+        );
     }
 
     fn test_spawner() -> Arc<astra_runtime::orchestration::DynamicAgentSpawner> {
@@ -6251,21 +6864,6 @@ mod tests {
         (dir, executor)
     }
 
-    #[test]
-    fn top_level_detach_slot_is_not_inherited_by_nested_default_executor() {
-        let dir = tempfile::tempdir().unwrap();
-        let (slot, _listener) = astra_tools::detach::new_slot_with_handle();
-        let executor = ToolExecutor::new(dir.path()).with_bash_detach_slot(slot);
-        assert!(
-            executor
-                .default_executor
-                .context()
-                .detach_shell_handle
-                .is_none(),
-            "run_script's nested default executor must remain foreground-only"
-        );
-    }
-
     fn function_schema(name: &str) -> serde_json::Value {
         serde_json::json!({
             "type": "function",
@@ -6275,6 +6873,73 @@ mod tests {
                 "parameters": {"type": "object", "properties": {}}
             }
         })
+    }
+
+    #[tokio::test]
+    async fn cli_pure_edit_rejection_preserves_source_execution_facts() {
+        let (directory, executor) = temp_executor();
+        executor.set_current_visible_tool_schemas(&all_tool_schemas());
+        *executor.sandbox_policy.write().unwrap() =
+            Some(super::SandboxPolicy::permissive(directory.path()));
+        let path = directory.path().join("f.txt");
+        std::fs::write(&path, "before\n").unwrap();
+        for args in [
+            serde_json::json!({"old_str":"before", "new_str":"after"}),
+            serde_json::json!({"path":"f.txt", "old_str":"same", "new_str":"same"}),
+            serde_json::json!({"path":"f.txt", "old_str":"before", "new_str":"after", "edits":[]}),
+        ] {
+            let outcome = executor.execute_with_metadata("str_replace", &args).await;
+            assert!(outcome.is_error, "{outcome:?}");
+            let fields = outcome.tool_result_fields.unwrap();
+            assert_eq!(fields["execution_started"], false);
+            assert_eq!(fields["execution_fact"], "not_executed");
+            assert_eq!(fields["disposition"], "rejected");
+            assert_eq!(
+                fields["error_kind"],
+                astra_core::ErrorKind::ToolInvalidArgs.as_str()
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "before\n");
+        }
+        let unreadable = executor
+            .execute_with_metadata(
+                "str_replace",
+                &serde_json::json!({"path":"missing.txt", "old_str":"before", "new_str":"after"}),
+            )
+            .await;
+        assert!(unreadable.is_error);
+        assert_ne!(
+            unreadable
+                .tool_result_fields
+                .as_ref()
+                .and_then(|m| m.get("execution_fact")),
+            Some(&serde_json::json!("not_executed"))
+        );
+        let read = executor
+            .execute_with_metadata("read_file", &serde_json::json!({"path":"f.txt"}))
+            .await;
+        assert!(!read.is_error, "{read:?}");
+        let missing = executor
+            .execute_with_metadata(
+                "str_replace",
+                &serde_json::json!({"path":"f.txt", "old_str":"absent", "new_str":"after"}),
+            )
+            .await;
+        assert!(missing.is_error);
+        assert_ne!(
+            missing
+                .tool_result_fields
+                .as_ref()
+                .and_then(|m| m.get("execution_fact")),
+            Some(&serde_json::json!("not_executed"))
+        );
+        let changed = executor
+            .execute_with_metadata(
+                "str_replace",
+                &serde_json::json!({"path":"f.txt", "old_str":"before", "new_str":"after"}),
+            )
+            .await;
+        assert!(!changed.is_error, "{changed:?}");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "after\n");
     }
 
     #[tokio::test]
@@ -6369,15 +7034,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn weak_workspace_attribution_does_not_erase_direct_writer_applied_fact() {
+        let (dir, executor) = temp_executor();
+        std::fs::write(dir.path().join("target.txt"), "before\n").unwrap();
+        assert!(
+            astra_tools::workspace_observation::quarantine_after_weak_receipt(
+                dir.path(),
+                Some(astra_tools::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP),
+            )
+        );
+
+        let outcome = executor
+            .execute_with_metadata(
+                "str_replace",
+                &serde_json::json!({
+                    "path": "target.txt", "old_str": "before", "new_str": "after"
+                }),
+            )
+            .await;
+        assert!(
+            !outcome.is_error,
+            "direct writer should still run: {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("target.txt")).unwrap(),
+            "after\n"
+        );
+        let fields = outcome.tool_result_fields.as_ref().unwrap();
+        assert_eq!(fields["workspace_mutation_applied"], true);
+        assert_eq!(
+            fields[astra_tools::workspace_observation::WRITER_APPLIED_BOUND_FIELD],
+            true
+        );
+        let mut without_applied = fields.clone();
+        without_applied.remove(astra_tools::workspace_observation::WRITER_APPLIED_BOUND_FIELD);
+        assert_eq!(
+            serde_json::to_vec(fields).unwrap().len()
+                - serde_json::to_vec(&without_applied).unwrap().len(),
+            38,
+            "weak writer adds one bounded metadata fact"
+        );
+        assert!(
+            fields
+                .get(astra_tools::workspace_observation::RECEIPT_FIELD)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn structured_writer_receipts_do_not_depend_on_full_workspace_fingerprints() {
         fn invocation(tool_call_id: &str) -> astra_tools::tool_engine::ToolInvocationMetadata<'_> {
             astra_tools::tool_engine::ToolInvocationMetadata {
-                task_resolution_authority: None,
+                admission_deadline: None,
                 run_id: Some("run-convergence"),
                 turn_chain_id: Some("turn-convergence"),
                 tool_call_id: Some(tool_call_id),
                 admission_source: None,
                 expected_control_epoch: None,
+                command_timeout_cap_ms: None,
+                delegation_model_admission: None,
             }
         }
 
@@ -6559,12 +7274,14 @@ mod tests {
                     "content": content,
                 }),
                 astra_tools::tool_engine::ToolInvocationMetadata {
-                    task_resolution_authority: None,
+                    admission_deadline: None,
                     run_id: Some("run-external-noop"),
                     turn_chain_id: Some("turn-external-noop"),
                     tool_call_id: Some("call-external-noop"),
                     admission_source: None,
                     expected_control_epoch: None,
+                    command_timeout_cap_ms: None,
+                    delegation_model_admission: None,
                 },
             )
             .await;
@@ -6768,6 +7485,179 @@ mod tests {
         assert!(updated.contains("[configured-secret]"));
         assert!(!updated.contains("D4w8z9wKN1aVeT3BpQj6kIuN7wH8X0M9KfV5OqzF"));
         assert!(!updated.contains("hf_abcdefghijklmnopqrstuvwxyz123456"));
+    }
+
+    #[tokio::test]
+    async fn cli_grep_retains_current_path_authority() {
+        let (root, executor) = temp_executor();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let external = tempfile::tempdir().unwrap();
+        std::fs::write(
+            external.path().join("evidence.txt"),
+            "approved-external-evidence",
+        )
+        .unwrap();
+        let args = serde_json::json!({"path":external.path(), "pattern":"approved-external"});
+        let mut restricted = super::SandboxPolicy::for_project(root.path());
+        restricted.allowed_paths.clear();
+        *executor.sandbox_policy.write().unwrap() = Some(restricted.clone());
+        let denied = executor.execute_with_metadata("grep", &args).await;
+        assert!(
+            denied.is_error && denied.output.contains(super::SANDBOX_DENIED_PREFIX),
+            "{denied:?}"
+        );
+        executor
+            .expand_sandbox_path(external.path().canonicalize().unwrap())
+            .unwrap();
+        let approved = executor.execute_with_metadata("grep", &args).await;
+        assert!(
+            !approved.is_error && approved.output.contains("approved-external-evidence"),
+            "{approved:?}"
+        );
+        assert!(approved.tool_result_fields.as_ref().is_none_or(|fields| {
+            !fields.contains_key(astra_tools::workspace_observation::OBSERVED_FIELD)
+        }));
+        *executor.sandbox_policy.write().unwrap() = Some(restricted);
+        assert!(executor.execute_with_metadata("grep", &args).await.is_error);
+        *executor.sandbox_policy.write().unwrap() = None;
+        assert!(!executor.execute_with_metadata("grep", &args).await.is_error);
+        assert_eq!(executor.default_executor.workspace_root(), root.path());
+
+        let sensitive = root.path().join(".ssh/id_rsa");
+        std::fs::create_dir_all(sensitive.parent().unwrap()).unwrap();
+        std::fs::write(&sensitive, "never-readable-evidence").unwrap();
+        *executor.sandbox_policy.write().unwrap() =
+            Some(super::SandboxPolicy::permissive(root.path()));
+        let denied = executor
+            .execute_with_metadata(
+                "grep",
+                &serde_json::json!({"path":sensitive, "pattern":"evidence"}),
+            )
+            .await;
+        assert!(
+            denied.is_error && !denied.output.contains("never-readable-evidence"),
+            "{denied:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_grep_uses_shared_options_and_terminal_facts() {
+        let (root, executor) = temp_executor();
+        std::fs::write(
+            root.path().join("sample.rs"),
+            "a.b:first\naXb:wrong\na.b:second\na.b:third\n",
+        )
+        .unwrap();
+        let result = executor.execute_with_metadata("grep", &serde_json::json!({"pattern":"a.b", "fixed_strings":true, "include":"*.rs", "offset":1, "head_limit":1})).await;
+        assert!(
+            !result.is_error && result.output.contains("a.b:second"),
+            "{result:?}"
+        );
+        assert!(!result.output.contains("aXb:wrong") && !result.output.contains("a.b:third"));
+        assert_eq!(
+            result.tool_result_fields.unwrap()["exit_semantics"],
+            "success"
+        );
+        let empty = executor
+            .execute_with_metadata("grep", &serde_json::json!({"pattern":"absent"}))
+            .await;
+        assert!(!empty.is_error, "{empty:?}");
+        assert_eq!(
+            empty.tool_result_fields.unwrap()["exit_semantics"],
+            "empty_result"
+        );
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let cancelled = executor
+            .execute_with_metadata_cancelable(
+                "grep",
+                &serde_json::json!({"pattern":"a.b"}),
+                Some(&token),
+            )
+            .await;
+        assert!(cancelled.is_error, "{cancelled:?}");
+        assert_eq!(cancelled.tool_result_fields.unwrap()["cancelled"], true);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires working rg: FIFO targets are not regular-file fallback candidates"]
+    async fn cli_grep_cancels_after_the_backend_opens_its_target() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let (root, executor) = temp_executor();
+        let fifo = root.path().join("input");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let token = tokio_util::sync::CancellationToken::new();
+        let caller = token.clone();
+        let running = tokio::spawn(async move {
+            executor
+                .execute_with_metadata_cancelable(
+                    "grep",
+                    &serde_json::json!({"pattern":"needle", "path":"input"}),
+                    Some(&caller),
+                )
+                .await
+        });
+        let reader_opened = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&fifo)
+                {
+                    Ok(writer) => break writer,
+                    Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await
+                    }
+                    Err(error) => panic!("cannot open test FIFO: {error}"),
+                }
+            }
+        })
+        .await;
+        // Keep the writer alive: only cancellation can release the blocked search.
+        token.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reader_opened.is_ok(), "the search never opened its target");
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            result.tool_result_fields.unwrap()["exit_semantics"],
+            "cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_grep_retains_pressure_scaled_output_budget() {
+        let (root, executor) = temp_executor();
+        let content = (0..200)
+            .map(|index| format!("needle:{index}:abcdefghijklmnopqrstuvwxyz0123456789\n"))
+            .collect::<String>();
+        std::fs::write(root.path().join("evidence.txt"), content).unwrap();
+        executor.set_budget_pressure(1.0);
+        let result = executor
+            .execute_with_metadata(
+                "grep",
+                &serde_json::json!({"pattern":"needle", "head_limit":0}),
+            )
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.output.len() < 4000, "pressure budget ignored");
+        assert!(result.output.contains("truncated"));
     }
 
     #[tokio::test]
@@ -7398,7 +8288,8 @@ mod tests {
     async fn task_output_projects_fanout_group_when_registry_does_not_answer() {
         let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let spawner = test_spawner();
-        let ctx = fanout_test_context(spawner);
+        let ctx = fanout_test_context(spawner.clone());
+        let parent = ctx.fanout_admission.clone();
         let executor = test_executor()
             .with_spawn_context(ctx)
             .with_bg_task_commands(commands);
@@ -7419,11 +8310,19 @@ mod tests {
             )
             .await;
         let completed_value: serde_json::Value = serde_json::from_str(&completed).unwrap();
-        assert_eq!(completed_value["status"], "completed", "{completed}");
-        assert_eq!(
-            completed_value["fanout"]["status"], "finished",
-            "{completed}"
-        );
+        assert_eq!(completed_value["status"], "started", "{completed}");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            spawner.wait_for_direct_children(&parent),
+        )
+        .await
+        .expect("fanout children must settle before reading terminal output");
+        let group = spawner
+            .fanout_group_for_parent_run_and_id("run-parent", "review-fanout")
+            .await
+            .expect("parent-owned fanout");
+        assert_eq!(group.summary().completed, 1);
+        assert_eq!(group.summary().active, 0);
 
         let mut result_fields = None;
         let result = executor
@@ -7594,26 +8493,23 @@ mod tests {
                 .await
         });
 
-        let child_id = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if let Some(child_id) = spawner
-                    .list_fanout_groups()
-                    .await
-                    .into_iter()
-                    .find(|group| group.group_id == "live-review-fanout")
-                    .and_then(|group| {
-                        (group.summary().active > 0)
-                            .then(|| group.slots.iter().find_map(|slot| slot.agent_id.clone()))
-                            .flatten()
-                    })
-                {
-                    break child_id;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("fanout must publish a live child identity before it settles");
+        let launched = tokio::time::timeout(std::time::Duration::from_secs(2), launch)
+            .await
+            .expect("fanout admission must return without waiting for child completion")
+            .expect("fanout launch task");
+        let launched: serde_json::Value =
+            serde_json::from_str(&launched).expect("fanout launch JSON");
+        assert_eq!(launched["status"], "started", "{launched}");
+        let group = spawner
+            .fanout_group_for_parent_run_and_id("run-parent", "live-review-fanout")
+            .await
+            .expect("launch must publish the parent-owned fanout");
+        assert_eq!(group.summary().active, 3);
+        let child_id = group
+            .slots
+            .iter()
+            .find_map(|slot| slot.agent_id.clone())
+            .expect("launch must publish a live child identity");
 
         for _ in 0..2 {
             let mut fields = None;
@@ -7634,16 +8530,25 @@ mod tests {
         }
 
         release.add_permits(3);
-        let completed = launch.await.expect("fanout launch task");
-        let completed: serde_json::Value =
-            serde_json::from_str(&completed).expect("fanout result JSON");
-        assert_eq!(completed["status"], "completed", "{completed}");
+        let parent = spawner.fanout_parent("run-parent");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            spawner.wait_for_direct_children(&parent),
+        )
+        .await
+        .expect("released children must actually complete");
+        let group = spawner
+            .fanout_group_for_parent_run_and_id("run-parent", "live-review-fanout")
+            .await
+            .expect("parent-owned fanout");
+        assert_eq!(group.summary().completed, 3);
+        assert_eq!(group.summary().active, 0);
     }
 
     #[tokio::test]
     async fn bound_agent_spawn_executes_through_runtime_context() {
         let spawner = test_spawner();
-        let ctx = fanout_test_context(spawner);
+        let ctx = fanout_test_context(spawner.clone());
         let executor = test_executor().with_spawn_context(ctx);
 
         let result = executor
@@ -7660,8 +8565,7 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&result).expect("agent spawn result must be structured JSON");
 
-        assert_eq!(parsed["status"], "completed", "{result}");
-        assert_eq!(parsed["result"], "child result", "{result}");
+        assert_eq!(parsed["status"], "launched", "{result}");
         assert!(
             parsed["run_id"]
                 .as_str()
@@ -7678,12 +8582,23 @@ mod tests {
             !result.contains("multi-agent runtime is not connected"),
             "bound spawn context must not be treated as missing: {result}"
         );
+        let status = spawner
+            .wait_for_agent(
+                parsed["agent_id"].as_str().unwrap(),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect("launched child must complete");
+        assert!(
+            matches!(status, astra_runtime::orchestration::AgentStatus::Completed { result, .. } if result == "child result")
+        );
     }
 
     #[tokio::test]
     async fn task_list_bg_surfaces_recoverable_fanout_results_without_background_runner() {
         let spawner = test_spawner();
-        let ctx = fanout_test_context(spawner);
+        let ctx = fanout_test_context(spawner.clone());
+        let parent = ctx.fanout_admission.clone();
         let executor = test_executor().with_spawn_context(ctx);
 
         let completed = executor
@@ -7702,11 +8617,19 @@ mod tests {
             )
             .await;
         let completed_value: serde_json::Value = serde_json::from_str(&completed).unwrap();
-        assert_eq!(completed_value["status"], "completed", "{completed}");
-        assert_eq!(
-            completed_value["fanout"]["status"], "finished",
-            "{completed}"
-        );
+        assert_eq!(completed_value["status"], "started", "{completed}");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            spawner.wait_for_direct_children(&parent),
+        )
+        .await
+        .expect("fanout children must settle before listing recoverable results");
+        let group = spawner
+            .fanout_group_for_parent_run_and_id("run-parent", "review-fanout")
+            .await
+            .expect("parent-owned fanout");
+        assert_eq!(group.summary().completed, 1);
+        assert_eq!(group.summary().active, 0);
 
         let result = executor.task_list_bg().await;
 
@@ -8732,6 +9655,16 @@ mod tests {
         assert!(tool_search_string_array(&parsed, "missing").is_empty());
         assert_eq!(tool_search_match_names(&parsed), vec!["memory".to_string()]);
         assert!(parsed["matches"][0].get("parameters").is_some());
+        let result = astra_tools::ToolExecutor::execute_with_metadata(
+            &executor,
+            "tool_search",
+            &serde_json::json!({"query":"select:memory"}),
+        )
+        .await;
+        assert_eq!(
+            astra_tools::model_result_presentation(result.metadata.as_ref()),
+            astra_tools::ModelResultPresentation::SourceBounded
+        );
     }
 
     #[tokio::test]
@@ -9002,18 +9935,23 @@ mod tests {
             serde_json::json!({"type": "function", "function": {"name": "tool_search"}}),
         ]);
 
-        let out = executor
-            .execute(
+        let outcome = executor
+            .execute_with_metadata(
                 "run_build_test",
                 &serde_json::json!({"command": "echo should-not-run"}),
             )
             .await;
 
-        assert!(out.contains("not available in this turn"), "{out}");
-        assert!(!out.contains("select:run_build_test"), "{out}");
+        assert!(outcome.is_error, "{outcome:?}");
+        let fields = outcome
+            .tool_result_fields
+            .as_ref()
+            .expect("typed admission denial");
+        assert_eq!(fields["disposition"], "rejected");
+        assert_eq!(fields["recovery_evidence"]["kind"], "tool_binding");
         assert!(
-            !out.contains("should-not-run"),
-            "internal handler must not execute when the tool was not visible or activated; got: {out}"
+            !outcome.output.contains("should-not-run"),
+            "internal handler must not execute when the tool was not visible or activated; got: {outcome:?}"
         );
     }
 
@@ -9331,6 +10269,109 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn discovered_mcp_host_preflight_follows_existing_mutation_policy() {
+        let workspace = tempfile::tempdir().unwrap();
+        let binary = crate::mcp_client::ensure_mock_mcp_server_binary();
+        let mut manager = crate::mcp_client::McpClientManager::new();
+        manager
+            .connect(crate::mcp_client::McpServerConfig {
+                name: "host_preflight".into(),
+                transport: crate::mcp_client::Transport::Stdio {
+                    command: vec![binary.to_string_lossy().into_owned()],
+                    args: vec![],
+                    env: Default::default(),
+                },
+                description: String::new(),
+                enabled: true,
+                retry: Default::default(),
+            })
+            .await
+            .unwrap();
+        let schemas = manager.all_tool_schemas();
+        let mut executor = ToolExecutor::new(workspace.path());
+        executor.install_mcp_bundle(Arc::new(tokio::sync::RwLock::new(manager)), schemas.clone());
+        for (suffix, requires_coordination) in [("echo", false), ("write_marker", true)] {
+            let surface: Vec<_> = schemas
+                .iter()
+                .filter(|schema| {
+                    astra_turn_core::tool::schema::tool_schema_name(schema)
+                        .is_some_and(|name| name.ends_with(suffix))
+                })
+                .cloned()
+                .collect();
+            assert_eq!(surface.len(), 1);
+            executor.set_current_visible_tool_schemas(&surface);
+            assert_eq!(
+                executor
+                    .current_surface_requires_workspace_coordination()
+                    .await,
+                requires_coordination
+            );
+        }
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn dynamic_mcp_call_waits_for_the_shared_workspace_lease() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let binary = crate::mcp_client::ensure_mock_mcp_server_binary();
+        let mut manager = crate::mcp_client::McpClientManager::new();
+        manager
+            .connect(crate::mcp_client::McpServerConfig {
+                name: "lease_test".into(),
+                transport: crate::mcp_client::Transport::Stdio {
+                    command: vec![binary.to_string_lossy().into_owned()],
+                    args: vec![],
+                    env: Default::default(),
+                },
+                description: String::new(),
+                enabled: true,
+                retry: Default::default(),
+            })
+            .await
+            .expect("connect real stdio MCP process");
+        let schemas = manager.all_tool_schemas();
+        let mut executor = ToolExecutor::new(workspace.path());
+        executor.install_mcp_bundle(Arc::new(tokio::sync::RwLock::new(manager)), schemas.clone());
+        executor.set_current_visible_tool_schemas(&schemas);
+        let executor = Arc::new(executor);
+        let lease =
+            astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
+                workspace.path(),
+                None,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("hold the real workspace lease");
+        let marker_path = workspace.path().join("marker.txt");
+        let task_executor = executor.clone();
+        let mut pending = tokio::spawn(async move {
+            task_executor
+                .execute_with_metadata(
+                    "mcp__lease_test__write_marker",
+                    &serde_json::json!({"path": marker_path, "message": "ok"}),
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut pending)
+                .await
+                .is_err(),
+            "an opaque dynamic provider call must not bypass the workspace lease"
+        );
+        drop(lease);
+        let outcome = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .expect("MCP call after lease release")
+            .expect("MCP task");
+        assert!(
+            !outcome.is_error,
+            "MCP call after lease release: {outcome:?}"
+        );
+        assert!(outcome.output.contains("written"), "{outcome:?}");
+    }
+
     /// Poison recovery: CLI provider schemas are a cache. If a prior panic poisoned
     /// the RwLock, reset to a known empty state rather than reading possibly
     /// half-written inner data; a later `set_cli_local_provider_schemas` repopulates it.
@@ -9431,6 +10472,27 @@ mod tests {
             !out.contains("first turn"),
             "must not return opaque first-turn placeholder, got: {out}"
         );
+    }
+
+    #[tokio::test]
+    async fn model_catalog_without_server_binding_is_explicitly_unsupported() {
+        let executor = test_executor();
+        // No active session, observation snapshot, or local catalog is needed.
+        let output = executor
+            .execute("model_catalog", &serde_json::json!({}))
+            .await;
+        let value: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["error"]["error_kind"], "unsupported");
+        assert_eq!(value["error"]["retryable"], false);
+        assert!(value["total"].is_null());
+        let rejected = executor
+            .execute_with_metadata(
+                "model_catalog",
+                &serde_json::json!({"artifact":"not-a-path"}),
+            )
+            .await;
+        assert!(rejected.is_error);
+        assert!(!rejected.output.contains("private"));
     }
 
     #[test]
@@ -9570,6 +10632,40 @@ mod tests {
         assert!(out.contains("not yet observed"), "got: {out}");
         assert!(!out.contains("1000000"), "got: {out}");
         assert!(!out.contains("800000"), "got: {out}");
+    }
+
+    #[test]
+    fn introspect_local_usage_uses_captured_scope_and_unknown_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let executor = test_executor();
+        executor.set_active_session_id("introspect-local-usage");
+        crate::explain_analyze_artifact::persist_test_judgment_usage("introspect-local-usage");
+        for depth in ["hint", "summary"] {
+            let output = executor.handle_introspect(&serde_json::json!({
+                "facet":"session", "source_policy":"local_only", "depth":depth
+            }));
+            assert!(
+                output.contains("Judgment usage · run-scoped capture"),
+                "{output}"
+            );
+            assert!(
+                output.contains("Jev (jev) · Request classification"),
+                "{output}"
+            );
+            assert!(output.contains("123"), "{output}");
+            assert!(
+                !output.contains("source=inference_provider_attempts"),
+                "{output}"
+            );
+        }
+        let excluded = executor.handle_introspect(&serde_json::json!({
+            "facet":"session", "source_policy":"cloud_only", "depth":"summary"
+        }));
+        assert!(
+            !excluded.contains("Jev (jev) · Request classification"),
+            "{excluded}"
+        );
     }
 
     #[test]
@@ -9923,6 +11019,124 @@ mod tests {
         assert_eq!(journal.persist_dir(), Some(expected.as_path()));
     }
 
+    #[serial_test::serial]
+    #[test]
+    fn privacy_file_edits_keep_in_memory_undo_without_checkpoints() {
+        let checkpoints = tempfile::tempdir().unwrap();
+        let _root = CheckpointRootGuard::set(checkpoints.path());
+        let _policy = crate::test_utils::ProcessEnvGuard::remove("ASTRA_JOURNAL_CONTENT_REDACT");
+        unsafe { crate::test_utils::set_var_serial("ASTRA_JOURNAL_CONTENT_REDACT", "1") };
+        assert!(astra_services::session_journal::journal_content_redact_enabled());
+        let (work, executor) = temp_executor();
+        let executor = executor.with_active_session_id("private-file-edits");
+        let path = work.path().join("result.txt");
+        let (_, applied, _) = executor.write_file_with_applied(&serde_json::json!({
+            "path": "result.txt", "content": "18\n"
+        }));
+        assert!(applied);
+        assert_eq!(std::fs::read(&path).unwrap(), b"18\n");
+        {
+            let journal = executor.file_journal.lock_recover();
+            assert!(journal.persist_dir().is_none());
+            let entry = journal.entries().next().unwrap();
+            assert!(entry.before_content.is_none());
+            assert_eq!(entry.after_content, b"18\n");
+            journal.undo_file(&path).unwrap().unwrap();
+        }
+        assert!(!path.exists());
+
+        std::fs::write(&path, b"private preimage\n").unwrap();
+        executor.read_file(&serde_json::json!({"path": "result.txt"}));
+        let (_, applied, _) = executor.write_file_with_applied(&serde_json::json!({
+            "path": "result.txt", "content": "private replacement\n"
+        }));
+        assert!(applied);
+        executor
+            .file_journal
+            .lock_recover()
+            .undo_file(&path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"private preimage\n");
+        assert_eq!(std::fs::read_dir(checkpoints.path()).unwrap().count(), 0);
+
+        unsafe { crate::test_utils::set_var_serial("ASTRA_JOURNAL_CONTENT_REDACT", "0") };
+        let executor = ToolExecutor::new(work.path()).with_active_session_id("normal-file-edits");
+        let (_, applied, _) = executor.write_file_with_applied(&serde_json::json!({
+            "path": "normal.txt", "content": "normal content\n"
+        }));
+        assert!(applied);
+        let stored = checkpoints
+            .path()
+            .join("normal-file-edits/file_checkpoints/000000.json");
+        let entry: astra_turn_core::file_edit_journal::FileEditEntry =
+            serde_json::from_slice(&std::fs::read(stored).unwrap()).unwrap();
+        assert_eq!(entry.after_content, b"normal content\n");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn privacy_shared_file_journal_disables_existing_persistence_in_both_builder_orders() {
+        let checkpoints = tempfile::tempdir().unwrap();
+        let _root = CheckpointRootGuard::set(checkpoints.path());
+        let _policy = crate::test_utils::ProcessEnvGuard::remove("ASTRA_JOURNAL_CONTENT_REDACT");
+        unsafe { crate::test_utils::set_var_serial("ASTRA_JOURNAL_CONTENT_REDACT", "1") };
+        assert!(astra_services::session_journal::journal_content_redact_enabled());
+        for shared_first in [false, true] {
+            for prebound in [false, true] {
+                let work = tempfile::tempdir().unwrap();
+                let mut journal = astra_turn_core::file_edit_journal::FileEditJournal::new(500);
+                let prior = work.path().join("prior-checkpoints");
+                if prebound {
+                    journal.enable_persistence(prior.clone());
+                    journal.record_committed(
+                        &work.path().join("prior.txt"),
+                        "prior",
+                        0,
+                        None,
+                        b"old content",
+                        astra_turn_core::file_edit_journal::EditType::Create,
+                    );
+                }
+                let original = prebound.then(|| std::fs::read(prior.join("000000.json")).unwrap());
+                let shared = Arc::new(std::sync::Mutex::new(journal));
+                let executor = ToolExecutor::new(work.path());
+                let executor = if shared_first {
+                    executor
+                        .with_shared_file_journal(shared.clone())
+                        .with_active_session_id("private-shared")
+                } else {
+                    executor
+                        .with_active_session_id("private-shared")
+                        .with_shared_file_journal(shared.clone())
+                };
+                assert!(shared.lock_recover().persist_dir().is_none());
+                let (_, applied, _) = executor.write_file_with_applied(&serde_json::json!({
+                    "path": "private.txt", "content": "private content\n"
+                }));
+                assert!(applied);
+                let journal = shared.lock_recover();
+                assert_eq!(journal.len(), usize::from(prebound) + 1);
+                journal
+                    .undo_file(&work.path().join("private.txt"))
+                    .unwrap()
+                    .unwrap();
+                assert!(!work.path().join("private.txt").exists());
+                assert_eq!(std::fs::read_dir(checkpoints.path()).unwrap().count(), 0);
+                if let Some(original) = original {
+                    assert_eq!(std::fs::read(prior.join("000000.json")).unwrap(), original);
+                    assert_eq!(std::fs::read_dir(&prior).unwrap().count(), 1);
+                } else {
+                    assert!(!prior.exists());
+                }
+                drop(journal);
+                executor.set_active_session_id("another-private-session");
+                assert!(shared.lock_recover().is_empty());
+                assert_eq!(std::fs::read_dir(checkpoints.path()).unwrap().count(), 0);
+            }
+        }
+    }
+
     /// REGRESSION: the production wiring order is
     /// `ToolExecutor::new(..).with_active_session_id(sid).with_shared_file_journal(arc)`
     /// (see sse_loop/mod.rs:192-201). Before this fix, `with_shared_file_journal`
@@ -9995,8 +11209,14 @@ mod tests {
         std::fs::write(&file, b"v0").unwrap();
         {
             let mut j = shared.lock_recover();
-            j.record_before(&file, "pre", 0);
-            j.record_after(&file, "pre", b"v1");
+            j.record_committed(
+                &file,
+                "pre",
+                0,
+                Some(b"v0"),
+                b"v1",
+                astra_turn_core::file_edit_journal::EditType::Overwrite,
+            );
         }
 
         let executor = test_executor()
@@ -10047,8 +11267,14 @@ mod tests {
         ));
         {
             let mut j = shared.lock_recover();
-            j.record_before(&file, "early-call", 0);
-            j.record_after(&file, "early-call", b"after");
+            j.record_committed(
+                &file,
+                "early-call",
+                0,
+                Some(b"before"),
+                b"after",
+                astra_turn_core::file_edit_journal::EditType::Overwrite,
+            );
         }
         assert_eq!(shared.lock_recover().len(), 1);
 
@@ -10150,8 +11376,14 @@ mod tests {
         ));
         {
             let mut j = shared.lock_recover();
-            j.record_before(&pre_file, "pre-session", 0);
-            j.record_after(&pre_file, "pre-session", b"v1");
+            j.record_committed(
+                &pre_file,
+                "pre-session",
+                0,
+                Some(b"v0"),
+                b"v1",
+                astra_turn_core::file_edit_journal::EditType::Overwrite,
+            );
         }
 
         // Bind session — triggers the merge path.
@@ -10201,8 +11433,14 @@ mod tests {
         let executor = test_executor().with_active_session_id("session-g");
         {
             let mut j = executor.file_journal.lock_recover();
-            j.record_before(&file, "call", 0);
-            j.record_after(&file, "call", b"v1");
+            j.record_committed(
+                &file,
+                "call",
+                0,
+                Some(b"v0"),
+                b"v1",
+                astra_turn_core::file_edit_journal::EditType::Overwrite,
+            );
         }
 
         let before_len = executor.file_journal.lock_recover().len();
@@ -10233,8 +11471,14 @@ mod tests {
         let executor = test_executor().with_active_session_id("session-h1");
         {
             let mut j = executor.file_journal.lock_recover();
-            j.record_before(&file, "call-h1", 0);
-            j.record_after(&file, "call-h1", b"v1");
+            j.record_committed(
+                &file,
+                "call-h1",
+                0,
+                Some(b"v0"),
+                b"v1",
+                astra_turn_core::file_edit_journal::EditType::Overwrite,
+            );
         }
         let h1_dir = tmp.path().join("session-h1").join("file_checkpoints");
         let h1_count_before = std::fs::read_dir(&h1_dir).unwrap().count();
@@ -10281,8 +11525,14 @@ mod tests {
         let executor = test_executor().with_active_session_id("session-i1");
         {
             let mut j = executor.file_journal.lock_recover();
-            j.record_before(&file, "call-i1", 0);
-            j.record_after(&file, "call-i1", b"v1");
+            j.record_committed(
+                &file,
+                "call-i1",
+                0,
+                Some(b"v0"),
+                b"v1",
+                astra_turn_core::file_edit_journal::EditType::Overwrite,
+            );
         }
         // Confirm sid1 has an entry in memory.
         assert_eq!(executor.file_journal.lock_recover().len(), 1);
@@ -10364,23 +11614,34 @@ mod tests {
     mod code_intel_enhancement_tests;
     mod code_intel_integration_tests;
     mod code_intel_tests;
-    mod config_tests;
-    mod context_analysis_tests;
     mod cross_file_caller_tests;
-    mod diagnose_tests;
     mod env_tests;
     mod executor_core_tests;
 
     mod lsp_tests;
-    mod memoria_tests;
-    mod notebook_tests;
+    mod read_file_range_tests;
     mod sandbox_tests;
     mod schema_tests;
     mod self_mod_tests;
     mod sleep_tests;
     mod tool_search_tests;
     mod utf16_tests;
-    mod worktree_tests;
+    pub(crate) mod worktree_tests;
+
+    #[test]
+    fn introspect_rejects_server_explain_selectors_locally() {
+        let executor = test_executor();
+        for selector in [
+            serde_json::json!({"target": "previous"}),
+            serde_json::json!({"target": "run", "run_id": "/etc/passwd"}),
+        ] {
+            let result = executor.handle_introspect(&serde_json::json!({"explain": selector}));
+            assert!(
+                result.starts_with("Error: Explain selectors require the server capacity"),
+                "{result}"
+            );
+        }
+    }
 
     // ── introspect facet=session_memory (unhappy first) ───────────────
 

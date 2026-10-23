@@ -152,7 +152,7 @@ where
                 restored.publication = Some(outcome);
             }
             Some(Ok(astra_thin_client::StreamEvent::ExplainAnalyze(fact))) => {
-                restored.events.push(fact);
+                restored.events.push(*fact);
             }
             Some(Ok(astra_thin_client::StreamEvent::Other { event_type, raw }))
                 if event_type == "stream_gap"
@@ -310,6 +310,7 @@ fn canonical_root_turn_events(
                         }
                     },
                     text: outcome.user_notice(),
+                    link: None,
                 });
             }
         }
@@ -328,6 +329,8 @@ mod tests {
         };
 
         astra_turn_types::ExplainAnalyzeEventV1 {
+            auxiliary_usage: None,
+            auxiliary_details: None,
             schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: "clock:fact".into(),
             run_id: "run".into(),
@@ -346,6 +349,7 @@ mod tests {
             start_elapsed_ms: None,
             duration_ms: None,
             outcome: None,
+            decision_detail: None,
             usage: None,
             context: None,
             coverage_gaps: Vec::new(),
@@ -450,6 +454,8 @@ mod tests {
             ),
         ];
         let finished_turn = |run_id: &str, turn_id: &str, label: &str| ExplainAnalyzeEventV1 {
+            auxiliary_usage: None,
+            auxiliary_details: None,
             schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: format!("{run_id}:finish"),
             run_id: run_id.to_string(),
@@ -468,6 +474,7 @@ mod tests {
             start_elapsed_ms: Some(0),
             duration_ms: Some(35),
             outcome: Some(ExplainAnalyzeOutcomeV1::Completed),
+            decision_detail: None,
             usage: None,
             context: None,
             coverage_gaps: Vec::new(),
@@ -565,7 +572,7 @@ mod tests {
 
         let event = replay_fact();
         let stream = futures_util::stream::iter(vec![
-            Ok(StreamEvent::ExplainAnalyze(event.clone())),
+            Ok(StreamEvent::ExplainAnalyze(Box::new(event.clone()))),
             Ok(StreamEvent::Other {
                 event_type: "stream_gap".into(),
                 raw: serde_json::json!({
@@ -616,7 +623,7 @@ mod tests {
 
         let delayed =
             futures_util::stream::iter(vec![Ok::<_, astra_thin_client::ThinClientError>(
-                StreamEvent::ExplainAnalyze(replay_fact()),
+                StreamEvent::ExplainAnalyze(Box::new(replay_fact())),
             )])
             .chain(futures_util::stream::once(async {
                 tokio::time::sleep(Duration::from_secs(5)).await;

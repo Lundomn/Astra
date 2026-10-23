@@ -15,16 +15,25 @@ pub(crate) use edge_executor::try_edge_executor_instance_id;
 #[cfg(test)]
 pub(crate) use params::AskUserChoice;
 pub(crate) use params::BasicCliChatContext;
-pub(crate) use params::ChatTurnParams;
 pub(crate) use params::DEFAULT_TURN_INDEX;
 pub(crate) use params::{
     ApprovalRequest, ApprovalRequestTx, ApprovalResponse, AskUserAnnotation, AskUserAnswers,
     AskUserPrompt, AskUserQuestion, AskUserQuestionAnswer, AskUserRequest, AskUserRequestTx,
     AskUserResponse, ExecutionTimeBudgetClock, INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
     PlanReviewDecision, PlanReviewRequest, PlanReviewRequestTx, STREAM_EVENT_CHANNEL_CAPACITY,
-    SharedStreamEventSink, StreamEvent, StreamEventRx, StreamEventSink, StreamEventTx,
-    ToolProgressSink, enqueue_interactive_request, stream_event_channel,
+    SharedStreamEventSink, StreamEvent, StreamEventRx, StreamEventTx, ToolProgressSink,
+    enqueue_interactive_request, stream_event_channel,
 };
-pub(crate) use sse_loop::server_loop_admission_payload;
+pub(crate) use params::{ChatTurnParams, CliExecutorObserver};
+// Only the settlement-boundary test in `crate::cli::turn::turn_settlement`
+// reaches through this far; the production trait impl in `sse_loop` calls
+// the function through its own closer-scoped re-export.
+#[cfg(test)]
+pub(crate) use sse_loop::is_pre_admission_rejection;
 pub(crate) use sse_loop::stream_chat_sse;
-pub(crate) use sse_loop::turn_policy_from_payload_edge_tools;
+
+#[cfg(test)]
+pub(crate) use sse_loop::WORKSPACE_HOST_VALIDATION_FOR_TEST;
+
+#[cfg(test)]
+pub(crate) use sse_loop::retain_cli_executor;

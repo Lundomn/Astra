@@ -58,14 +58,6 @@ SCHEMA_SOURCES: tuple[SchemaSource, ...] = (
         hot_path_hint="cold establishment/recovery path with bounded idempotency lookup",
     ),
     SchemaSource(
-        owner="astra_services::config_version_cloud",
-        domain="config_versions",
-        path="crates/services/src/config_version_cloud.rs",
-        startup_owner="ensure_core_schema via CONFIG_VERSIONS_CREATE_SQL",
-        state_class_hint="durable fact",
-        hot_path_hint="warm append/read",
-    ),
-    SchemaSource(
         owner="astra_messaging::db_transport",
         domain="messaging",
         path="crates/astra-messaging/src/db_transport.rs",
@@ -80,6 +72,9 @@ SCHEMA_SOURCES: tuple[SchemaSource, ...] = (
         startup_owner="DatabaseResourceGovernor::ensure_tables",
         state_class_hint="quota fact",
         hot_path_hint="warm quota read/write",
+        # Test-only fault knobs appear before the production impl in this
+        # module; stopping at the first cfg(test) marker would hide its DDL.
+        stop_at_cfg_test=False,
     ),
     SchemaSource(
         owner="astra_services::workspace_records",
@@ -208,6 +203,16 @@ AUTO_INCREMENT_METADATA: dict[str, AutoIncrementMetadata] = {}
 
 
 TABLE_METADATA: dict[str, TableMetadata] = {
+    "model_router_deployments": TableMetadata(
+        semantic_owner="astra_services::tuning::rollout",
+        state_class="revision-fenced router deployment authority",
+        primary_query="current deployment state and revision by user_id; lock and compare revision during rollout changes",
+        retention_policy="retain the current deployment state for its owner",
+        rebuildability="not safely rebuildable from inference history because deployment revision owns concurrent rollout changes",
+        merge_guidance="keep separate from inference routes; deployment configuration governs future requests while routes preserve accepted request facts",
+        migration_owner="astra_services::storage",
+        product_owner="model router deployment and rollout",
+    ),
     "agent_mailbox_directory": TableMetadata(
         semantic_owner="astra_messaging::db_transport",
         state_class="leased distributed mailbox routing fact",
@@ -234,19 +239,9 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         primary_query="current typed provider binding and generation by isolation domain, owner, session, and branch",
         retention_policy="retain with the owning Session/Work branch; delete only with explicit Session data removal",
         rebuildability="not safely rebuildable from Run history because provider selection and generation are the write fence",
-        merge_guidance="keep this singleton authority separate from physical workspace claims and switch receipts; never project it from a Run",
+        merge_guidance="keep this singleton authority separate from switch receipts; never project it from a Run",
         migration_owner="astra_services::session_context_coordinator",
         product_owner="durable Work execution placement and cross-surface resume",
-    ),
-    "session_execution_workspace_claims": TableMetadata(
-        semantic_owner="astra_services::session_context_coordinator",
-        state_class="exclusive physical workspace claim fact",
-        primary_query="claimed physical materialization by isolation domain, owner, session, branch, and physical workspace identity",
-        retention_policy="retain while the corresponding execution binding exists; release atomically on provider switch or Session deletion",
-        rebuildability="rebuildable only from validated live bindings during controlled repair; never infer ownership from filesystem paths",
-        merge_guidance="keep claims separate from the logical provider binding so two Sessions cannot share one checkout even when labels and roots match",
-        migration_owner="astra_services::session_context_coordinator",
-        product_owner="multi-user and multi-session workspace isolation",
     ),
     "session_execution_switches": TableMetadata(
         semantic_owner="astra_services::session_context_coordinator",
@@ -254,7 +249,7 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         primary_query="handoff operation by owner, Session branch, operation/request identity, generation, state, and recovery evidence",
         retention_policy="retain through retry, observation, audit, and bounded recovery; prune only after the owning Session retention window",
         rebuildability="not safely rebuildable because switching and failure evidence determine whether a retry may resume without duplicate effects",
-        merge_guidance="keep receipts separate from the current binding and workspace claims; one operation is the idempotency boundary for all surfaces",
+        merge_guidance="keep receipts separate from the current binding; one operation is the idempotency boundary for all surfaces",
         migration_owner="astra_services::session_context_coordinator",
         product_owner="safe cross-device execution handoff and unhappy-path recovery",
     ),
@@ -301,8 +296,8 @@ TABLE_METADATA: dict[str, TableMetadata] = {
     "inference_invocations": TableMetadata(
         semantic_owner="astra_services::inference_execution",
         state_class="durable logical inference lifecycle authority",
-        primary_query="invocation ownership, status, terminal fingerprint, usage, and route lookup by user_id, invocation_id, session_id, run_id, or harness_run_id",
-        retention_policy="retain with the owning session or Harness run while replay, billing, usage, recovery, and delivery reconciliation need the logical inference boundary",
+        primary_query="invocation ownership, status, terminal fingerprint, usage, and route lookup by user_id, invocation_id, session_id or run_id",
+        retention_policy="retain with the owning session while replay, billing, usage, recovery, and delivery reconciliation need the logical inference boundary",
         rebuildability="not rebuildable after execution because terminal identity, admitted limits, usage, and delivery outcome are authoritative facts",
         merge_guidance="keep separate from provider attempts; one logical invocation may have multiple bounded delivery attempts without changing its owner or admitted route",
         migration_owner="astra_services::storage / inference_execution",
@@ -341,7 +336,7 @@ TABLE_METADATA: dict[str, TableMetadata] = {
     "inference_routes": TableMetadata(
         semantic_owner="astra_services::inference_execution",
         state_class="immutable admitted inference route fact",
-        primary_query="resolved offering, model, placement, billing owner, and policy revisions by user_id, route_id, session_id, run_id, or harness_run_id",
+        primary_query="resolved offering, model, placement, billing owner, and policy revisions by user_id, route_id, session_id or run_id",
         retention_policy="retain with invocations and historical usage so later policy or catalog changes cannot rewrite what actually executed",
         rebuildability="not rebuildable from the current catalog because eligibility, connection, and policy revisions may have changed",
         merge_guidance="keep separate from mutable model catalog and invocation state; routes freeze an admitted decision shared by one or more execution facts",
@@ -377,6 +372,46 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="keep separate from session_artifacts; references are many-to-many reachability facts used to prevent premature content deletion",
         migration_owner="astra_services::storage / session_artifact_store",
         product_owner="artifact retention safety, provenance, and tool-output compaction",
+    ),
+    "session_artifact_content_chunks": TableMetadata(
+        semantic_owner="astra_services::session_artifact_store",
+        state_class="owner-scoped immutable content bytes",
+        primary_query="content-addressed chunk lookup by user_id and content_digest",
+        retention_policy="retain while any session artifact content reference exists or an in-flight upload reservation is active; sweep unreferenced chunks after the upload grace period",
+        rebuildability="not rebuildable after the byte content is deleted",
+        merge_guidance="keep separate from session_artifacts because the catalog owns type/ACL/retention while this table deduplicates immutable bytes",
+        migration_owner="astra_services::storage / session_artifact_store",
+        product_owner="portable workspace and binary artifact content",
+    ),
+    "session_artifact_content_refs": TableMetadata(
+        semantic_owner="astra_services::session_artifact_store",
+        state_class="artifact-to-content reachability fact",
+        primary_query="ordered content chunk references by user_id, session_id, artifact_id, and chunk_index",
+        retention_policy="retain with the owning artifact; remove before session artifact deletion so unreferenced bytes become collectible",
+        rebuildability="rebuildable only from a sealed artifact manifest and verified content package",
+        merge_guidance="keep separate from session_artifact_content_chunks because references carry artifact/session ownership while chunks are deduplicated bytes",
+        migration_owner="astra_services::storage / session_artifact_store",
+        product_owner="portable artifact integrity and garbage-collection reachability",
+    ),
+    "session_artifact_content_reservations": TableMetadata(
+        semantic_owner="astra_services::session_artifact_store",
+        state_class="in-flight byte upload reachability lease",
+        primary_query="active content reservation by user_id, session_id, artifact_id, and content_digest",
+        retention_policy="remove when the artifact seals, its upload lease expires, or its Session is deleted; sealed references are the durable replacement",
+        rebuildability="not rebuildable after an upload lease expires; sealed references are the durable replacement",
+        merge_guidance="keep separate from content refs because reservations are temporary upload reachability edges and must not be mistaken for a sealed artifact edge",
+        migration_owner="astra_services::storage / session_artifact_store",
+        product_owner="in-flight artifact integrity and garbage-collection fencing",
+    ),
+    "session_artifact_content_upload_leases": TableMetadata(
+        semantic_owner="astra_services::session_artifact_store",
+        state_class="artifact-level in-flight byte upload lease",
+        primary_query="one upload lease by user_id, session_id, and artifact_id",
+        retention_policy="refresh on successful chunk upload; remove when the artifact seals, expires, or its Session is deleted",
+        rebuildability="not rebuildable after expiry because it fences abandoned uploads",
+        merge_guidance="keep as the single upload lifetime authority; per-chunk reservations are reachability edges and must not carry independent lease semantics",
+        migration_owner="astra_services::storage / session_artifact_store",
+        product_owner="in-flight artifact integrity, lock ordering, and garbage-collection fencing",
     ),
     "tool_invocation_archive_chunks": TableMetadata(
         semantic_owner="astra_services::tool_invocation_ledger / runtime compactor",
@@ -428,6 +463,16 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage",
         product_owner="session list, lifecycle cleanup, summaries, project retention",
     ),
+    "agent_session_memory_work": TableMetadata(
+        semantic_owner="astra_services::session_memory_lifecycle / canonical session lifecycle",
+        state_class="durable session-memory operation checkpoints and retry coordination",
+        primary_query="owner/session work lookup and bounded due-work scan by complete, next_attempt_at, and lease expiry",
+        retention_policy="retain frozen inputs and receipts for recovery while the owned Session is retained; session hard delete removes journal rows before the parent aggregate",
+        rebuildability="missed inputs recover from immutable canonical context, but uncertain remote write receipts and partial-stage progress cannot be reconstructed safely from transcript or events alone",
+        merge_guidance="keep separate from agent_sessions and context heads; this checkpoints existing memory algorithms and never grants authority or replaces canonical session/context state",
+        migration_owner="astra_services::storage / session_memory_lifecycle",
+        product_owner="memory extraction, close/exit consolidation, retry diagnostics",
+    ),
     "agent_session_lifecycle_fences": TableMetadata(
         semantic_owner="astra_services::session_lifecycle",
         state_class="durable session lifecycle and irreversible delete-intent authority",
@@ -437,16 +482,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="keep separate from agent_sessions; the fence must survive removal of the session aggregate and serialize every session-root writer",
         migration_owner="astra_services::storage / session_lifecycle",
         product_owner="irreversible session deletion, delayed-write fencing, and crash recovery",
-    ),
-    "session_deletion_tombstones": TableMetadata(
-        semantic_owner="astra_services::session_lifecycle",
-        state_class="durable session deletion compatibility tombstone",
-        primary_query="deleted-session lookup by user_id/session_id and retention scan by deleted_at",
-        retention_policy="retain as compatibility evidence while legacy readers and delayed event-ingestion paths can encounter the deleted identity",
-        rebuildability="not rebuildable after deletion without the surviving lifecycle fence or another durable deletion record",
-        merge_guidance="migrate consumers toward agent_session_lifecycle_fences before consolidation; do not remove while any path still checks tombstones",
-        migration_owner="astra_services::storage / session_lifecycle",
-        product_owner="session deletion compatibility and resurrection prevention",
     ),
     "agent_runs": TableMetadata(
         semantic_owner="astra_services::runs::DatabaseRunStateStore",
@@ -488,65 +523,25 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_turn_core::conversation_log",
         product_owner="LLM context assembly and session continuity",
     ),
-    "config_versions": TableMetadata(
-        semantic_owner="astra_services::config_version_cloud / event_ingestion",
-        state_class="durable tenant config version fact",
-        primary_query="config version fetch by user_id/version_id and recent version list by user_id/created_at",
-        retention_policy="retain while cloud config sync, first_seen_session linkage, and rollback/history need the TOML body; session hard delete clears first_seen_session without deleting the version fact",
-        rebuildability="not rebuildable after toml_body is removed unless the same local config version still exists outside the database",
-        merge_guidance="keep separate from agent_events; event ingestion may dual-write discovery events, but config_versions owns idempotent version fetch by user_id/version_id",
-        migration_owner="astra_services::config_version_cloud",
-        product_owner="cloud config sync and config rollback/history",
-    ),
     "session_transcript_items": TableMetadata(
         semantic_owner="runtime run lifecycle persistence",
         state_class="durable user-visible transcript stream",
-        primary_query="transcript hydration by user_id, session_id, item_seq and run/event lookup",
-        retention_policy="retain with user-visible session history; do not delete before transcript pages/history are reconciled",
-        rebuildability="partially rebuildable for new writes, but item sequence and page identity are product state",
+        primary_query="item-sequence pagination by user_id/session_id; owner/run and owner/session/source_event_id lookup",
+        retention_policy="retain with user-visible session history and owner-scoped session deletion",
+        rebuildability="accepted event replay can repair missing material; original item sequences and timestamps cannot be reconstructed arbitrarily",
         merge_guidance="do not merge with conversation_log; transcript is display state, not model context",
         migration_owner="astra_services::storage / runtime session persistence",
         product_owner="web/session transcript UI",
-    ),
-    "transcript_pages": TableMetadata(
-        semantic_owner="runtime run lifecycle persistence",
-        state_class="derived transcript projection",
-        primary_query="transcript pagination by user_id, session_id, page_seq or end item sequence",
-        retention_policy="can be cleared and rebuilt from session_transcript_items with a repair path",
-        rebuildability="rebuildable from session_transcript_items",
-        merge_guidance="candidate for repair tooling, not deletion; merge only if pagination cost is proven low",
-        migration_owner="astra_services::storage / runtime session persistence",
-        product_owner="web/session transcript pagination",
-    ),
-    "session_history_chunks": TableMetadata(
-        semantic_owner="astra_services::session_lifecycle / history search",
-        state_class="derived search/history projection",
-        primary_query="history chunk lookup by owner/session/source metadata",
-        retention_policy="retain while history search and session cleanup need chunk metadata",
-        rebuildability="rebuildable only if source transcript/history remains complete",
-        merge_guidance="do not merge with transcript until search/query owners and retention are unified",
-        migration_owner="astra_services::storage",
-        product_owner="session history search and lifecycle cleanup",
     ),
     "session_artifacts": TableMetadata(
         semantic_owner="astra_services::session_artifact_store / artifact_retention_sweeper",
         state_class="durable session artifact fact",
         primary_query="artifact lookup/list by user_id, session_id, artifact_id, artifact_kind, source, owner_run_id, root_run_id, access_scope, status, and retention_until",
-        retention_policy="retain while artifact previews, manifest refs, state items, citations, grants, and project retention need the content_json; retention sweeper marks expiring/expired and session hard delete removes owner/session rows after grants",
+        retention_policy="retain while artifact previews, manifest refs, state items, citations, and project retention need the content_json; retention sweeper marks expiring/expired and session hard delete removes owner/session rows",
         rebuildability="not rebuildable after content_json, metadata, cold_storage_ref, derived_from_artifact_id, and reference counters are lost",
-        merge_guidance="keep separate from session_artifacts_grants; artifacts own content and retention state while grants own cross-run/delegation visibility",
+        merge_guidance="keep separate from context manifests and state items; artifacts own content and retention state while callers enforce owner/run visibility",
         migration_owner="astra_services::storage / session_artifact_store",
         product_owner="work surface artifacts, previews, retention, delegation visibility",
-    ),
-    "session_artifacts_grants": TableMetadata(
-        semantic_owner="astra_services::state_projection / artifact grants",
-        state_class="durable artifact visibility grant fact",
-        primary_query="artifact grant lookup by user_id, session_id, artifact_id, grant_scope, target_run_id, target_delegation_id, root_run_id, and expires_at",
-        retention_policy="retain while delegated runs or sibling tasks may access granted artifacts; session hard delete removes grants before artifact rows",
-        rebuildability="not rebuildable after grant_scope, target_run_id/delegation_id, reason, and expires_at are lost",
-        merge_guidance="keep separate from session_artifacts; grants are visibility/control-plane facts with many targets per artifact",
-        migration_owner="astra_services::storage / state_projection",
-        product_owner="artifact sharing across delegation tree and work surface permissions",
     ),
     "prompt_request_records": TableMetadata(
         semantic_owner="astra_services::prompt_delta",
@@ -801,22 +796,22 @@ TABLE_METADATA: dict[str, TableMetadata] = {
     "context_manifest_items": TableMetadata(
         semantic_owner="astra_services::context_manifest::ContextManifestStore",
         state_class="durable manifest item fact",
-        primary_query="manifest-local item lookup/order by manifest_id and item_order; zone filtering by manifest_id, zone, included",
+        primary_query="owner-scoped manifest-local item lookup/order by user_id, manifest_id, and item_order; zone filtering by user_id, manifest_id, zone, included",
         retention_policy="delete with parent context_manifests during session deletion or manifest retention cleanup",
         rebuildability="rebuildable only by recomputing the exact manifest assembly inputs",
         merge_guidance="keep separate from context_manifests; item-level ordering, source refs, token budgets, and raw refs are independently queried",
         migration_owner="astra_services::storage / context_manifest",
         product_owner="LLM context assembly traceability",
     ),
-    "session_state_revisions": TableMetadata(
-        semantic_owner="astra_services::state_projection",
-        state_class="durable session state revision watermark",
-        primary_query="current revision and projection hash by user_id/session_id; updated sessions by user_id/updated_at",
-        retention_policy="retain with the session while device sync, state projection integrity checks, and high-watermark reconciliation need monotonic revision state; session hard delete removes owner/session row",
-        rebuildability="not safely rebuildable once monotonic_id, transcript/run high-watermarks, and device fingerprint lineage are lost",
-        merge_guidance="keep separate from session_state_items; this is the session-level revision/watermark authority, not individual projected state",
-        migration_owner="astra_services::storage / state_projection",
-        product_owner="session state sync and projection integrity",
+    "observation_identity_collisions": TableMetadata(
+        semantic_owner="astra_services::observation_capture",
+        state_class="bounded diagnostic aggregate",
+        primary_query="one collision aggregate by user_id, identity_kind, identity_id; owner/session diagnostics by last_seen_at; bounded expiry by expires_at",
+        retention_policy="fixed seven days from first collision; bounded runtime maintenance removes expired receipts and session deletion removes owner/session receipts",
+        rebuildability="not reconstructable from retained successful observations; stores only hashes and identity metadata, never rejected payloads",
+        merge_guidance="keep separate from agent_events and context_manifests; rejected identity claims must not overwrite canonical observations or grow one row per attempted hash",
+        migration_owner="astra_services::storage / observation_capture",
+        product_owner="observation integrity diagnostics and runtime maintenance",
     ),
     "session_device_leases": TableMetadata(
         semantic_owner="runtime::server::session_handlers",
@@ -846,27 +841,17 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         rebuildability="partially rebuildable only while source events, payloads, and projection rules remain complete",
         merge_guidance="keep separate from session_state_item_events; this table is the current projection surface while events preserve mutation history",
         migration_owner="astra_services::storage / state_projection",
-        product_owner="session memory/state projection and active task/delegation context",
+        product_owner="session memory/state projection and active skill context",
     ),
     "session_state_item_events": TableMetadata(
         semantic_owner="astra_services::state_projection",
         state_class="durable state projection audit event",
         primary_query="state item audit by item_id/created_at/event_id and owner session audit by user_id/session_id/created_at/event_id",
-        retention_policy="retain with session_state_items while compaction invariants, projection debugging, and user/session audit need mutation history",
+        retention_policy="retain with session_state_items while projection debugging and user/session audit need mutation history",
         rebuildability="not fully rebuildable after source mutation context is gone",
         merge_guidance="keep separate from session_state_items; the item table is current projection state, while this table records mutation history",
         migration_owner="astra_services::storage / state_projection",
-        product_owner="session state projection, compaction invariants, active skill/delegation audit",
-    ),
-    "session_delegations": TableMetadata(
-        semantic_owner="astra_services::state_projection / runtime delegation engine",
-        state_class="durable delegation topology fact",
-        primary_query="delegation tree lookup by user_id/root_run_id/depth, parent status by user_id/parent_run_id/status, and session status by user_id/session_id/status",
-        retention_policy="retain while multi-agent tree display, retry lineage, sibling artifact exposure, and recovery need parent/child topology; session hard delete removes owner/session rows after child runs are reconciled",
-        rebuildability="not fully rebuildable from agent_runs without losing ancestor_path, retry_scope, sibling exposure metadata, and delegation-specific summaries",
-        merge_guidance="do not merge into agent_runs; run lifecycle authority and delegation topology have different mutation owners and query shapes",
-        migration_owner="astra_services::storage / state_projection",
-        product_owner="multi-agent delegation tree, retries, and progress display",
+        product_owner="session state projection and active skill audit",
     ),
     "data_versioning_checkpoints": TableMetadata(
         semantic_owner="astra_services::data_versioning::DatabaseDataVersioningService",
@@ -892,7 +877,7 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         semantic_owner="astra_services::workspace_records::DatabaseWorkspaceRecordStore",
         state_class="durable workspace lifecycle fact",
         primary_query="workspace lookup/list by workspace_id, owner_id, source_key, and updated_at",
-        retention_policy="retain while a server/cloud workspace can be reused, cleaned, or audited; session deletion enqueues cleanup debts before deleting owner/session records",
+        retention_policy="retain while a server/cloud workspace can be used, cleaned, or audited; session deletion enqueues cleanup debts before deleting owner/session records",
         rebuildability="not rebuildable after root_or_volume_ref, source_json, revision, and record_json are lost",
         merge_guidance="keep separate from agent_runs/session_artifacts; workspace lifecycle and cleanup authority differ from run history and artifact refs",
         migration_owner="astra_services::workspace_records",
@@ -922,7 +907,7 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         semantic_owner="astra_services::state_sync",
         state_class="durable user preference fact",
         primary_query="preference read/update by user_id, pref_key, version, and updated_at; pull sync by user_id",
-        retention_policy="retain until the user or sync layer overwrites/deletes the preference; version increments are used for conflict detection",
+        retention_policy="retain until the user or sync layer overwrites/deletes the preference; versions describe updates; they are not compare-and-swap tokens",
         rebuildability="not rebuildable after pref_value and version are lost unless an external preference source exists",
         merge_guidance="keep separate from admin_config; user_preferences are per-user sync state while admin_config is server control-plane state",
         migration_owner="astra_services::storage / state_sync",
@@ -998,16 +983,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / auth",
         product_owner="authentication and account continuity",
     ),
-    "auth_memoria_identities": TableMetadata(
-        semantic_owner="astra_services::auth / Memoria integration",
-        state_class="durable external-to-Astra identity mapping fact",
-        primary_query="read-only legacy migration lookup; never insert new identities",
-        retention_policy="remove the legacy row atomically after explicitly issuer-authorized migration to auth_external_identities",
-        rebuildability="cannot infer missing issuer; require administrator-confirmed original provenance",
-        merge_guidance="migration source only; canonical provider identity belongs to auth_external_identities",
-        migration_owner="astra_services::storage / auth",
-        product_owner="Memoria sign-in and Astra account continuity",
-    ),
     "auth_audit_logs": TableMetadata(
         semantic_owner="astra_services::auth::admin / auth session audit",
         state_class="durable auth audit event",
@@ -1049,7 +1024,7 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         product_owner="web agent binding, runtime capability descriptors, run creation UX",
     ),
     "harness_snapshots": TableMetadata(
-        semantic_owner="astra_services::harness diagnostics",
+        semantic_owner="astra_runtime::server::harness diagnostics",
         state_class="durable harness diagnostic snapshot",
         primary_query="harness diagnostic snapshot lookup by user_id, session_id, created_at, turn_number, and causal_chain_id",
         retention_policy="retain with session diagnostic history while harness replay, hook debugging, and causal-chain inspection need snapshot_json; session hard delete removes owner/session rows",
@@ -1057,56 +1032,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="keep separate from agent_events; harness snapshots intentionally avoid polluting session event counts and carry hook_point/turn_number payloads with different query pressure",
         migration_owner="astra_services::storage / harness diagnostics",
         product_owner="harness replay, hook diagnostics, causal-chain debugging",
-    ),
-    "harness_runs": TableMetadata(
-        semantic_owner="astra_services::harness product workflow",
-        state_class="durable harness workflow parent fact",
-        primary_query="harness run lookup/list by harness_run_id, harness_id, user_id, status, session_id, and updated_at",
-        retention_policy="retain while generated items, skill drafts, rules, citations, and user workflow history may reference the run; delete children before the parent during workflow cleanup",
-        rebuildability="not rebuildable after input_json, output_json, status, error, and run linkage are lost",
-        merge_guidance="keep separate from harness_items and harness_snapshots; runs are product workflow parents while items fan out and snapshots are diagnostics",
-        migration_owner="astra_services::storage / harness workflow",
-        product_owner="Skillify and reusable harness workflow state",
-    ),
-    "harness_items": TableMetadata(
-        semantic_owner="astra_services::harness product workflow",
-        state_class="durable harness item fact",
-        primary_query="harness item queue/list by harness_run_id, status, updated_at, parent_item_id, item_type, and assigned_to",
-        retention_policy="retain with parent harness_runs while review decisions, final outputs, and assignment state are visible or auditable; workflow cleanup removes items before the run",
-        rebuildability="not rebuildable after locator_json, proposed_output_json, final_output_json, decision history, and assignment state are lost",
-        merge_guidance="keep separate from harness_runs; items are per-candidate/review facts with higher cardinality and independent decision state",
-        migration_owner="astra_services::storage / harness workflow",
-        product_owner="harness review queue, generated item decisions, workflow audit",
-    ),
-    "harness_skill_drafts": TableMetadata(
-        semantic_owner="astra_services::harness skill generation",
-        state_class="durable generated skill draft fact",
-        primary_query="skill draft lookup/list by skill_draft_id, harness_run_id, status, revision, and candidate_name",
-        retention_policy="retain while generated skill drafts can be reviewed, revised, published, or audited; cleanup must remove dependent harness_skill_rules and harness_citations first",
-        rebuildability="not rebuildable after content_markdown, source_summary_json, decision history, revision, and published_version_id are lost",
-        merge_guidance="keep separate from harness_items and user_skill_versions; drafts are pre-publication generated skill candidates with review/publish lifecycle",
-        migration_owner="astra_services::storage / harness skill generation",
-        product_owner="Skillify draft review and publish workflow",
-    ),
-    "harness_skill_rules": TableMetadata(
-        semantic_owner="astra_services::harness skill generation",
-        state_class="durable generated skill rule fact",
-        primary_query="skill rule lookup/list by skill_draft_id, harness_run_id, status, rule_type, and updated_at",
-        retention_policy="retain with parent skill drafts while review, citation evidence, and publish decisions need rule statements and rationale; cleanup removes rules before drafts",
-        rebuildability="not rebuildable after statement, rationale, decision history, source_count, and created_by_node_id are lost",
-        merge_guidance="keep separate from harness_skill_drafts; rules fan out from a draft and carry separately reviewable evidence-backed assertions",
-        migration_owner="astra_services::storage / harness skill generation",
-        product_owner="Skillify rule review, evidence mapping, publish decisions",
-    ),
-    "harness_citations": TableMetadata(
-        semantic_owner="astra_services::harness evidence",
-        state_class="durable harness citation/evidence fact",
-        primary_query="citation lookup/list by harness_run_id, item_id, skill_rule_id, skill_draft_id, and created_at",
-        retention_policy="retain with harness items/rules while evidence previews, source hashes, and auditability are required; cleanup removes citations before their referenced item, rule, draft, or run rows",
-        rebuildability="not rebuildable after source_locator_json, source_snapshot_ref, quote_hash, evidence_text_preview, and relevance_score are lost",
-        merge_guidance="keep separate from harness_items and harness_skill_rules; citations are evidence fanout rows and may later compact cold source metadata without merging the table",
-        migration_owner="astra_services::storage / harness evidence",
-        product_owner="harness evidence audit, source traceability, generated skill review",
     ),
     "ctx_snapshots": TableMetadata(
         semantic_owner="astra_services::context diagnostics",
@@ -1127,76 +1052,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="keep separate from ctx_snapshots; snapshots capture input/context state while decision audits capture model/routing decisions over that state",
         migration_owner="astra_services::storage / context decision audit",
         product_owner="context decision explainability, prompt diagnostics, evaluation traceability",
-    ),
-    "eval_gate_results": TableMetadata(
-        semantic_owner="astra_services::evaluation gates",
-        state_class="durable evaluation gate result fact",
-        primary_query="gate result lookup/list by gate_id, user_id, created_at, change_type, change_id, and passed",
-        retention_policy="retain while rollout decisions, regression analysis, and change audit need pass/fail, sessions_tested, error_rate, and score_delta; prune only under evaluation history policy",
-        rebuildability="not rebuildable after gate result metrics and change linkage are dropped",
-        merge_guidance="keep separate from eval_quality_assessments; gate results are change-level release decisions, quality assessments are target-level scores",
-        migration_owner="astra_services::storage / evaluation",
-        product_owner="evaluation gates, rollout safety, regression audit",
-    ),
-    "eval_quality_assessments": TableMetadata(
-        semantic_owner="astra_services::evaluation quality",
-        state_class="durable evaluation quality assessment fact",
-        primary_query="quality assessment lookup/list by assessment_id, target_id, user_id, level, updated_at, and score",
-        retention_policy="retain while quality dashboards, marketplace trust, or training selection need target scores and levels; update rows through evaluation lifecycle rather than generic cleanup",
-        rebuildability="not rebuildable after score, level, step_count, and target_id assessment history are lost",
-        merge_guidance="keep separate from skill_metrics and eval_gate_results; this is target-level assessment state, not marketplace aggregate ranking or release gate decisions",
-        migration_owner="astra_services::storage / evaluation",
-        product_owner="quality assessment, trust scoring, evaluation dashboards",
-    ),
-    "eval_calibration_assessments": TableMetadata(
-        semantic_owner="astra_services::evaluation calibration",
-        state_class="durable confidence calibration fact",
-        primary_query="calibration lookup/list by user_id, calibration_id, session_id, agent_id, and created_at",
-        retention_policy="retain while confidence calibration, per-agent quality analysis, and session evaluation traces need paired confidence/quality_score observations",
-        rebuildability="not rebuildable after confidence and quality_score observations are dropped",
-        merge_guidance="keep separate from eval_quality_assessments; calibration stores observation pairs for confidence reliability, not target-level quality state",
-        migration_owner="astra_services::storage / evaluation",
-        product_owner="confidence calibration, agent quality analysis, evaluation traces",
-    ),
-    "eval_training_datasets": TableMetadata(
-        semantic_owner="astra_services::evaluation datasets",
-        state_class="durable evaluation training dataset fact",
-        primary_query="training dataset lookup/list by dataset_id, user_id, status, created_at, and updated_at",
-        retention_policy="retain while dataset_json is available for evaluation, training, or replay; delete only through dataset lifecycle so sample_count and threshold metadata stay coherent",
-        rebuildability="not rebuildable after dataset_json, request_json, sample_count, and quality_threshold are lost unless the exact source generation inputs still exist",
-        merge_guidance="keep separate from eval_user_feedback and eval_quality_assessments; datasets are materialized training/eval corpora, not raw feedback or assessment outputs",
-        migration_owner="astra_services::storage / evaluation",
-        product_owner="evaluation dataset generation, training, replay",
-    ),
-    "eval_user_feedback": TableMetadata(
-        semantic_owner="astra_services::evaluation feedback",
-        state_class="durable user feedback fact",
-        primary_query="feedback lookup/list by user_id, session_id, agent_id, feedback_type, created_at, and turn_id",
-        retention_policy="retain while feedback can influence quality assessment, skill evaluation, or user-visible audit; session hard delete removes owner/session rows when feedback is session-scoped",
-        rebuildability="not rebuildable after rating, comment, feedback_type, and turn/session linkage are lost",
-        merge_guidance="keep separate from agent_events until feedback readers stop querying rating/comment directly; feedback is evaluation input rather than timeline-only audit",
-        migration_owner="astra_services::storage / evaluation",
-        product_owner="user feedback, quality loops, evaluation training inputs",
-    ),
-    "preview_template_registry": TableMetadata(
-        semantic_owner="astra_services::tool_output_preview",
-        state_class="durable preview template registry fact",
-        primary_query="preview template lookup by tool_name/version and active template list by tool_name/status/updated_at",
-        retention_policy="retain active and compatible template versions while tool output previews can be rendered or re-normalized; deactivate old versions instead of deleting while artifacts may reference them",
-        rebuildability="rebuildable only from checked-in template definitions if they exactly match deployed first_class_columns_json, field weights, and schema_json",
-        merge_guidance="keep separate from raw_ref_scheme_registry; preview templates control rendering/normalization while raw ref schemes control resolver and access semantics",
-        migration_owner="astra_services::storage / tool_output_preview",
-        product_owner="tool output preview rendering, search normalization, artifact UX",
-    ),
-    "raw_ref_scheme_registry": TableMetadata(
-        semantic_owner="astra_services::raw_ref_resolver",
-        state_class="durable raw reference scheme registry fact",
-        primary_query="raw reference scheme lookup by scheme and active resolver metadata",
-        retention_policy="retain active resolver definitions while raw refs in manifests, previews, citations, or artifacts can be dereferenced; disable schemes before deleting resolver metadata",
-        rebuildability="rebuildable only from resolver bootstrap definitions if access_check, backing_store, and canonical examples remain identical",
-        merge_guidance="keep separate from preview_template_registry; scheme rows define dereference and access-check authority, not preview rendering templates",
-        migration_owner="astra_services::storage / raw_ref_resolver",
-        product_owner="raw reference resolution, artifact/context access checks, manifest dereferencing",
     ),
     "llm_provider_admission_pacing": TableMetadata(
         semantic_owner="astra_runtime::llm_provider_admission",
@@ -1219,34 +1074,14 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         product_owner="edge agent status, dispatch routing, no-sticky edge recovery",
     ),
     "plans": TableMetadata(
-        semantic_owner="runtime::server::plan_handlers / astra_services::state_sync",
-        state_class="durable plan execution state",
+        semantic_owner="astra_plan::repository / runtime plan tools and lifecycle",
+        state_class="durable plan authoring state",
         primary_query="plan list/get/update by user_id, plan_id, session_id, phase, updated_at, and version",
-        retention_policy="retain while plan mode, rewind/redo, execution status, and edge/cloud sync need plan_json/plan_md; session hard delete removes owner/session plans after dependent plan_step_runs",
+        retention_policy="retain while plan authoring and resume need plan_json/plan_md; session hard delete removes owner/session plans",
         rebuildability="not rebuildable after plan_json, plan_md, version, progress, and subtask_count are lost",
-        merge_guidance="keep separate from plan_step_runs; plans own current mutable plan state while step runs are append-only attempt history",
-        migration_owner="astra_services::storage / runtime plan handlers",
-        product_owner="plan mode, plan execution, rewind/redo, edge sync",
-    ),
-    "plan_step_runs": TableMetadata(
-        semantic_owner="runtime::server::plan_handlers / astra_services::state_sync",
-        state_class="durable plan step attempt audit fact",
-        primary_query="step attempt history by user_id, plan_id, subtask_id, attempt, run_id, request_id, and started_at",
-        retention_policy="retain with parent plans while step status, retry history, artifacts, and edge/cloud sync need attempt chains; session hard delete removes rows before plans",
-        rebuildability="not rebuildable after attempt numbers, request_id, error, artifact_ref, and timing are lost",
-        merge_guidance="keep separate from plans; this table is append-only attempt history with unique subtask attempt semantics",
-        migration_owner="astra_services::storage / runtime plan handlers",
-        product_owner="plan step audit, retry/redo, execution history",
-    ),
-    "wf_triggers": TableMetadata(
-        semantic_owner="astra_services::triggers",
-        state_class="durable workflow trigger fact",
-        primary_query="trigger lookup/list by trigger_id, user_id, trigger_type, is_active, agent_id, and session_id",
-        retention_policy="retain while the trigger is active or webhook/cron execution can invoke it; session hard delete removes session-scoped triggers",
-        rebuildability="not rebuildable after user_input, context, cron_expr, secret, and agent/session binding are lost",
-        merge_guidance="keep separate from agent_agents; triggers bind invocation policy to agents and sessions with separate activation lifecycle",
-        migration_owner="astra_services::storage / triggers",
-        product_owner="workflow triggers, webhook/cron automation",
+        merge_guidance="plans own current mutable plan state; canonical Work and Run own execution and attempt evidence",
+        migration_owner="astra_services::storage / astra_plan::repository",
+        product_owner="plan mode authoring and resume hints",
     ),
     "infra_sandbox_metadata": TableMetadata(
         semantic_owner="astra_services::sandbox",
@@ -1257,36 +1092,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="keep separate from workspace_records; sandbox metadata tracks infrastructure sandboxes, workspace_records track reusable workspaces and cleanup debt",
         migration_owner="astra_services::storage / sandbox",
         product_owner="sandbox inventory and admin/user cleanup",
-    ),
-    "team_definitions": TableMetadata(
-        semantic_owner="astra_services::team_persistence",
-        state_class="durable team definition fact",
-        primary_query="team create/update/get/list/delete by user_id, team_id, name, and updated_at",
-        retention_policy="retain while a named team can be executed or snapshotted; delete should also consider execution history and snapshots for audit needs",
-        rebuildability="not rebuildable after coordination, members_json, context_json, worktree_mode, and budget_json are lost",
-        merge_guidance="keep separate from team_execution_history and team_snapshots; definitions are mutable team config, history/snapshots are execution/audit facts",
-        migration_owner="astra_services::storage / team_persistence",
-        product_owner="team management and multi-agent orchestration",
-    ),
-    "team_execution_history": TableMetadata(
-        semantic_owner="astra_services::team_persistence",
-        state_class="durable team execution audit fact",
-        primary_query="execution history by user_id, team_id, execution_id, started_at, status, and completed_at",
-        retention_policy="retain while team execution audit, result display, and debugging need result_json/status/timestamps; cleanup should be bounded by team/user history policy",
-        rebuildability="not rebuildable after task, result_json, status, and timing are lost",
-        merge_guidance="keep separate from team_definitions; this is append-like execution history with different retention pressure",
-        migration_owner="astra_services::storage / team_persistence",
-        product_owner="team execution history and result audit",
-    ),
-    "team_snapshots": TableMetadata(
-        semantic_owner="astra_services::team_persistence",
-        state_class="durable team snapshot fact",
-        primary_query="snapshot lookup/list by user_id, snapshot_id, team_name, session_id, and created_at",
-        retention_policy="retain while users need point-in-time team definition snapshots or git_commit/session labels for audit; delete through snapshot lifecycle",
-        rebuildability="partially rebuildable only if the original team definition, git commit, and label context still exist",
-        merge_guidance="keep separate from team_definitions; snapshots are point-in-time audit records and can outlive mutable team config changes",
-        migration_owner="astra_services::storage / team_persistence",
-        product_owner="team snapshots, audit, reproducibility",
     ),
     "works": TableMetadata(
         semantic_owner="astra_services::work::repository",
@@ -1608,6 +1413,16 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::work",
         product_owner="Work runtime projection hot coordination and sequencing",
     ),
+    "work_recovery_points": TableMetadata(
+        semantic_owner="astra_services::work::recovery_point",
+        state_class="durable Work recovery capture and idempotency fact",
+        primary_query="recovery point by owner_id/work_id/branch_id/recovery_point_id, request_id, status, and created_at",
+        retention_policy="retain preparing and terminal capture records while recovery, artifact references, and audit need them; remove with the owning branch or Work cleanup policy",
+        rebuildability="not rebuildable during capture recovery because request identity, manifest hash, status, and Work/branch binding are authoritative",
+        merge_guidance="keep recovery captures separate from Work events, Run checkpoints, and Workspace content; this table records capture request state while canonical verification owns ready publication",
+        migration_owner="astra_services::work",
+        product_owner="Work recovery capture, idempotency, and branch cleanup",
+    ),
     "auth_reauthentication_proofs": TableMetadata(
         semantic_owner="astra_services::auth::reauthentication",
         state_class="durable reauthentication trust fact",
@@ -1661,7 +1476,7 @@ TABLE_METADATA: dict[str, TableMetadata] = {
     "inference_invocation_settlement_debts": TableMetadata(
         semantic_owner="astra_services::inference_execution::settlement",
         state_class="durable inference settlement recovery authority",
-        primary_query="settlement debt by user_id, invocation_id, optional exact provider_attempt_id plus provider-delivery authorization, session_id or harness_run_id, and terminal_fingerprint",
+        primary_query="settlement debt by user_id, invocation_id, optional exact provider_attempt_id plus provider-delivery authorization, session_id or run_id, and terminal_fingerprint",
         retention_policy="retain until usage, billing, and terminal delivery settlement is acknowledged; retry pending rows with a per-row eligibility deadline, quarantine permanent conflicts outside active recovery batches, and prune only after authoritative reconciliation",
         rebuildability="not rebuildable while unsettled because this is the recovery authority for logical invocation settlement and any acknowledged exact provider-attempt terminal",
         merge_guidance="keep separate from inference_invocations, provider attempts, and metric shards; optional attempt identity plus delivery authorization distinguishes a legitimate absent pre-delivery row from loss of an already-authorized physical request",
@@ -1671,8 +1486,8 @@ TABLE_METADATA: dict[str, TableMetadata] = {
     "model_request_context_events": TableMetadata(
         semantic_owner="astra_services::inference_execution::request_context",
         state_class="append-only model request context evidence fact",
-        primary_query="accepted or terminal request context by user_id, attempt_id, invocation_id, session/harness owner, and event_stage",
-        retention_policy="retain append-only accepted and terminal evidence through inference audit, usage reconciliation, and recovery; delete with the owning session or harness history",
+        primary_query="accepted or terminal request context by user_id, attempt_id, invocation_id, session/run owner, and event_stage",
+        retention_policy="retain append-only accepted and terminal evidence through inference audit, usage reconciliation, and recovery; delete with the owning session history",
         rebuildability="not rebuildable after topology, provider/model context, token counts, and terminal status are lost",
         merge_guidance="keep append-only request context events separate from model_request_metric_shards; events preserve evidence while shards are a rebuildable aggregate projection",
         migration_owner="astra_services::storage / inference_execution",
@@ -1803,13 +1618,13 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         state_class="durable transcript projection sequence head",
         primary_query="transcript projection head by user_id/session_id, completed_turn, journal_event_seq, conversation_seq, and canonical_root_hash",
         retention_policy="retain the current projection checkpoint while transcript replay and compaction need it; replace during projection repair and remove with session cleanup",
-        rebuildability="rebuildable from transcript items and canonical journal/manifests when sequence and root evidence remain available",
+        rebuildability="advance only through contiguous canonical cursor promotion with complete materialized evidence; MAX(item_seq) cannot certify commitment",
         merge_guidance="keep separate from session_context_heads, transcript items, manifests, and events; this is transcript projection state keyed by projection sequence, not canonical history",
         migration_owner="astra_services::storage / context",
         product_owner="transcript materialization, compaction, and projection recovery",
     ),
     "session_weighted_admission_gates": TableMetadata(
-        semantic_owner="astra_services::context::weighted_admission",
+        semantic_owner="astra_services::weighted_admission",
         state_class="durable hot admission coordination gate",
         primary_query="scope-level admission gate by scope_name and updated_at",
         retention_policy="retain one gate per configured scope while admission coordination is enabled; recreate or remove with scope configuration",
@@ -1818,8 +1633,18 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / context",
         product_owner="weighted context admission hot coordination",
     ),
+    "session_weighted_admission_owner_usage": TableMetadata(
+        semantic_owner="astra_services::weighted_admission",
+        state_class="durable per-owner materialized admission usage projection",
+        primary_query="owner usage by scope_name, isolation_domain, owner_user_id, and resident/context/provider/cpu/io totals",
+        retention_policy="retain one row while the owner has active reservations; rows are maintained transactionally under the durable gate, zero-usage rows are removed on release, and all rows rebuild from live reservations after bootstrap or cleanup",
+        rebuildability="fully rebuildable from active weighted reservations in the same transaction as the global gate because this row is a materialized projection, not capacity authority",
+        merge_guidance="keep separate from weighted gates and reservations; the owner row accelerates per-owner limits while the gate coordinates the scope and reservations remain the fencing and expiry authority",
+        migration_owner="astra_services::storage / context",
+        product_owner="per-owner weighted admission usage and multi-session fairness",
+    ),
     "session_weighted_admission_reservations": TableMetadata(
-        semantic_owner="astra_services::context::weighted_admission",
+        semantic_owner="astra_services::weighted_admission",
         state_class="durable capacity reservation and fencing fact",
         primary_query="active reservation by scope_name, reservation_id, owner session/branch, idempotency_hash, and expires_at",
         retention_policy="retain reservations until expiry or release, then prune expired capacity claims in bounded batches",
@@ -1866,17 +1691,17 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         candidate="session_sync_log",
         decision="removed",
         current_read_paths=[
-            "none; MatrixOneSyncService::status no longer queries audit storage",
+            "none; sync status comes from canonical outbox facts",
         ],
         current_write_paths=[
-            "none; SyncAuditWriter emits tracing debug events only",
+            "none; context trace facts are written through DatabaseEventService",
         ],
         user_api_impact=(
-            "sync audit is tracing-only; durable sync facts remain in domain tables, and "
+            "the retired sync audit has no storage; durable sync facts remain in domain tables, and "
             "sync status no longer depends on session_sync_log"
         ),
         migration_backfill=(
-            "no backfill; schema setup drops the legacy table and live MatrixOne tests assert it is absent"
+            "no backfill; fresh schema excludes the retired table and live MatrixOne tests assert it is absent"
         ),
         rollback=(
             "rollback would require explicitly reintroducing the DDL and persistence path; "
@@ -1889,6 +1714,153 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         rationale=(
             "session_sync_log was a best-effort audit side effect, not a recovery or product fact; "
             "removing it reduces schema surface without losing durable sync state"
+        ),
+    ),
+    ConsolidationReview(
+        candidate="session_state_revisions",
+        decision="removed",
+        current_read_paths=[
+            "none; the session-state endpoint derives the revision from request input and live transcript/run watermarks"
+        ],
+        current_write_paths=[
+            "none; the hydration write-only snapshot path was removed from session_handlers"
+        ],
+        user_api_impact=(
+            "the response still returns monotonic_id and revision_hash, while rollback detection "
+            "continues to compare the request hash with the freshly derived revision"
+        ),
+        migration_backfill=(
+            "no compatibility backfill; the current schema contract excludes this unsupported "
+            "write-only projection"
+        ),
+        rollback=(
+            "rollback requires explicitly restoring the retired persistence path; the endpoint's "
+            "revision calculation is independent of the retired snapshot"
+        ),
+        test_evidence=[
+            "scripts/schema/test_schema_inventory.py::test_retired_session_projection_tables_are_absent_from_production_schema",
+            "crates/runtime/src/server/session/session_handlers.rs::get_session_state_handler",
+        ],
+        rationale=(
+            "the table was write-only state projection baggage: every hydration paid an UPDATE/INSERT "
+            "race, but no production path read it for sync, recovery, or authorization"
+        ),
+    ),
+    ConsolidationReview(
+        candidate="session_history_chunks",
+        decision="removed",
+        current_read_paths=[
+            "none; history page/search/around now use session_transcript_items as the canonical history source"
+        ],
+        current_write_paths=[
+            "none in production; repository writes were confined to ignored fixtures and obsolete benchmarks"
+        ],
+        user_api_impact=(
+            "history tools retain canonical transcript paging, root-run filtering, search, and around-turn "
+            "behavior; obsolete chunk-only rows are not part of the supported history API"
+        ),
+        migration_backfill=(
+            "no compatibility backfill; the current schema contract excludes this unsupported "
+            "secondary history projection"
+        ),
+        rollback=(
+            "rollback requires reintroducing the chunk reader and schema; that unsupported path is "
+            "not part of the current contract"
+        ),
+        test_evidence=[
+            "scripts/schema/test_schema_inventory.py::test_retired_session_projection_tables_are_absent_from_production_schema",
+            "crates/runtime/src/server/tool_session_history.rs::history_search",
+            "crates/runtime/src/server/tool_session_history.rs::session_history_tools_filter_child_agent_rows_on_matrixone",
+        ],
+        rationale=(
+            "the chunk projection had a production reader but no production population path; it added a "
+            "second history source and an extra search query without being part of the canonical transcript"
+        ),
+    ),
+    ConsolidationReview(
+        candidate="session_artifacts_grants",
+        decision="removed",
+        current_read_paths=[
+            "none; no production caller remains after removing the unused grant ACL method"
+        ],
+        current_write_paths=[
+            "none; grant inserts existed only in ignored integration fixtures and had no product creation API"
+        ],
+        user_api_impact=(
+            "artifact access remains owner/session/run scoped through session_artifacts and existing artifact "
+            "retrieval paths; the unexposed grant-only cross-run feature is retired"
+        ),
+        migration_backfill=(
+            "no compatibility backfill; the current schema contract excludes this unsupported "
+            "grant-only projection"
+        ),
+        rollback=(
+            "rollback requires a deliberate grant API, writer, revocation semantics, and enforcement path; "
+            "the retired grant rows are not a supported permission source"
+        ),
+        test_evidence=[
+            "scripts/schema/test_schema_inventory.py::test_retired_session_projection_tables_are_absent_from_production_schema",
+            "crates/services/src/state_projection.rs::DatabaseStateProjectionStore",
+        ],
+        rationale=(
+            "this was an overdesigned control-plane table with an enforcement reader but no production grant "
+            "creation path or caller, so it could not provide a supported permission capability"
+        ),
+    ),
+    ConsolidationReview(
+        candidate="session_deletion_tombstones",
+        decision="removed",
+        current_read_paths=[
+            "none; session admission now relies on the locked agent_session_lifecycle_fences row",
+        ],
+        current_write_paths=[
+            "none; session deletion records delete intent and completion on agent_session_lifecycle_fences",
+        ],
+        user_api_impact=(
+            "no user-visible deletion state is removed; the lifecycle fence remains the durable "
+            "anti-resurrection and recovery authority"
+        ),
+        migration_backfill=(
+            "none; bootstrap supports the current fresh schema without legacy data migration"
+        ),
+        rollback=(
+            "rollback would require explicitly restoring the legacy table and its readers; "
+            "the surviving lifecycle fence retains the deletion fact"
+        ),
+        test_evidence=[
+            "crates/services/tests/schema_assertions.rs::core_schema_catalog_matches_live_idempotent_bootstrap",
+        ],
+        rationale=(
+            "the tombstone duplicated the lifecycle fence's irreversible delete fact and added "
+            "a read to every admitted session write plus a write to every deletion"
+        ),
+    ),
+    ConsolidationReview(
+        candidate="auth_memoria_identities",
+        decision="removed",
+        current_read_paths=[
+            "none; identity lookup uses auth_external_identities",
+        ],
+        current_write_paths=[
+            "none; current issuer-scoped identities are written to auth_external_identities",
+        ],
+        user_api_impact=(
+            "login accepts only current issuer-scoped identities, without legacy relinking; "
+            "current issuer-scoped identity and disconnect behavior remain in auth_external_identities"
+        ),
+        migration_backfill=(
+            "none; bootstrap supports the current fresh schema without legacy data migration"
+        ),
+        rollback=(
+            "rollback requires explicitly restoring the retired importer and its source data; "
+            "fresh bootstrap does not preserve or convert legacy source rows"
+        ),
+        test_evidence=[
+            "crates/services/tests/memoria_auth_db_it.rs::memoria_issuer_atomicity_concurrent_binding_and_disconnect",
+        ],
+        rationale=(
+            "the obsolete source table has no current schema or runtime owner; restoring it "
+            "forces runtime auth and model eligibility to maintain a second identity lookup"
         ),
     ),
     ConsolidationReview(
@@ -1919,100 +1891,7 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
             "small table size is not evidence of redundancy; it is the durable root for rollback/list identity"
         ),
     ),
-    ConsolidationReview(
-        candidate="preview_template_registry + raw_ref_scheme_registry",
-        decision="keep_separate",
-        current_read_paths=[
-            "crates/services/src/runs.rs::preview_template_registry",
-            "crates/services/src/context_manifest.rs::raw_ref_scheme_registry",
-        ],
-        current_write_paths=[
-            "crates/services/src/storage.rs::seed raw_ref_scheme_registry",
-            "crates/services/src/storage.rs::seed preview_template_registry",
-        ],
-        user_api_impact=(
-            "preview templates affect artifact/tool-output rendering; raw-ref schemes affect dereference "
-            "authority and access checks"
-        ),
-        migration_backfill=(
-            "no merge; a unified table would need a typed registry model and separate indexes for resolver "
-            "authority versus rendering templates"
-        ),
-        rollback=(
-            "keep current bootstrap seeds as rollback source; merged rows would need lossless split back "
-            "into scheme metadata and template metadata"
-        ),
-        test_evidence=[
-            "crates/services/tests/schema_assertions.rs::preview_template_registry",
-            "crates/services/tests/schema_assertions.rs::raw_ref_scheme_registry",
-            "crates/runtime/tests/phase6_artifact_preview.rs",
-        ],
-        rationale=(
-            "same bootstrap area does not imply same lifecycle; resolver/access semantics differ from rendering"
-        ),
-    ),
-    ConsolidationReview(
-        candidate="harness_skill_drafts + harness_skill_rules",
-        decision="keep_separate",
-        current_read_paths=[
-            "crates/services/src/harness.rs::list_skill_drafts",
-            "crates/services/src/harness.rs::harness_skill_rules SELECT paths",
-        ],
-        current_write_paths=[
-            "crates/services/src/harness.rs::create skill drafts",
-            "crates/services/src/harness.rs::create/update skill rules",
-        ],
-        user_api_impact=(
-            "Skillify draft review/publish workflow and evidence-backed rule review have distinct "
-            "cardinality and decision surfaces"
-        ),
-        migration_backfill=(
-            "no merge; a combined table would need item_type-specific constraints and would weaken "
-            "rule fanout/query indexes"
-        ),
-        rollback=(
-            "current split tables are rollback-safe; merging would require lossless split by draft/rule "
-            "identity and citation references"
-        ),
-        test_evidence=[
-            "crates/services/tests/harness_skillify_db_it.rs",
-            "crates/services/tests/services_db_integration.rs::harness_skill_rules",
-        ],
-        rationale=(
-            "rules are evidence-backed child assertions, not just optional columns on a draft"
-        ),
-    ),
-    ConsolidationReview(
-        candidate="team_execution_history + team_snapshots",
-        decision="keep_separate",
-        current_read_paths=[
-            "crates/services/src/team_persistence.rs::list_executions_page",
-            "crates/services/src/team_persistence.rs::list_snapshots_page",
-        ],
-        current_write_paths=[
-            "crates/services/src/team_persistence.rs::record_execution_start",
-            "crates/services/src/team_persistence.rs::save_snapshot",
-        ],
-        user_api_impact=(
-            "/teams/{name}/executions and /teams/{name}/snapshots expose different resources: "
-            "execution result audit versus point-in-time team definition snapshots"
-        ),
-        migration_backfill=(
-            "no merge; both APIs now have seek pagination and different cursor keys"
-        ),
-        rollback=(
-            "current split tables avoid backfill risk; merging would require reversible event_type mapping "
-            "and separate cursor compatibility"
-        ),
-        test_evidence=[
-            "crates/services/tests/team_persistence_integration.rs",
-            "crates/runtime/tests/system_matrix_http_e2e/journey_team_snapshots_matrix.rs",
-            "crates/runtime/src/server/team_handlers.rs::team handler cursor tests",
-        ],
-        rationale=(
-            "execution history is append-like run audit; snapshots are named reproducibility artifacts"
-        ),
-    ),
+
 )
 
 
@@ -2023,11 +1902,18 @@ def repository_root() -> Path:
 def discover_production_ddl_source_paths(root: Path | None = None) -> list[str]:
     root = root or REPO_ROOT
     crates_dir = root / "crates"
+    manifest_by_path = {source.path: source for source in SCHEMA_SOURCES}
     discovered: list[str] = []
     for path in sorted(crates_dir.glob("*/src/**/*.rs")):
-        text = production_source(path.read_text(encoding="utf-8"), stop_at_cfg_test=True)
+        relative_path = path.relative_to(root).as_posix()
+        source = manifest_by_path.get(relative_path)
+        stop_at_cfg_test = True if source is None else source.stop_at_cfg_test
+        text = production_source(
+            path.read_text(encoding="utf-8"),
+            stop_at_cfg_test=stop_at_cfg_test,
+        )
         if CREATE_TABLE_RE.search(text):
-            discovered.append(path.relative_to(root).as_posix())
+            discovered.append(relative_path)
     # Path.glob ordering is filesystem/path-object dependent for a sibling
     # module directory and its parent Rust file (for example `work/` and
     # `work.rs`).  Keep the discovery contract deterministic and comparable to

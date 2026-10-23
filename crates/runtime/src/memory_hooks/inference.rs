@@ -33,6 +33,14 @@ pub struct MemoryInferenceRequest<'a> {
     pub deadline: Duration,
 }
 
+/// Execution facts travel with text across both direct and Server boundaries.
+#[derive(Debug, Clone)]
+pub struct MemoryInferenceResponse {
+    pub text: String,
+    pub model_used: String,
+    pub judgment_provenance: Option<astra_turn_types::JudgmentResponseProvenance>,
+}
+
 /// Execution boundary used by all memory inference consumers.
 ///
 /// Implementations may execute directly against a provider or through an
@@ -45,7 +53,7 @@ pub trait MemoryInferencePort: Send + Sync + std::fmt::Debug {
     async fn complete(
         &self,
         request: MemoryInferenceRequest<'_>,
-    ) -> Result<String, astra_core::ClassifiedError>;
+    ) -> Result<MemoryInferenceResponse, astra_core::ClassifiedError>;
 }
 
 pub type MemoryInferenceClient = Arc<dyn MemoryInferencePort>;
@@ -62,7 +70,7 @@ where
     async fn complete(
         &self,
         request: MemoryInferenceRequest<'_>,
-    ) -> Result<String, astra_core::ClassifiedError> {
+    ) -> Result<MemoryInferenceResponse, astra_core::ClassifiedError> {
         self.as_ref().complete(request).await
     }
 }
@@ -87,6 +95,7 @@ impl DirectMemoryInferenceClient {
     fn execution_route(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
             fixed_temperature: self.fixed_temperature,
+            supported_reasoning_efforts: None,
             thinking_protocol: self.thinking_protocol,
             model_name: &self.model_name,
             wire_model_name: self.wire_model_name.as_deref(),
@@ -145,7 +154,7 @@ impl MemoryInferencePort for DurableMemoryInferenceClient {
     async fn complete(
         &self,
         request: MemoryInferenceRequest<'_>,
-    ) -> Result<String, astra_core::ClassifiedError> {
+    ) -> Result<MemoryInferenceResponse, astra_core::ClassifiedError> {
         // Reuse the run/completion admission contract for every background
         // provider attempt. Never retain stale plaintext routes in the client.
         let execution = astra_services::revalidate_admitted_model_execution(
@@ -162,6 +171,31 @@ impl MemoryInferencePort for DurableMemoryInferenceClient {
                 format!("Memory model admission failed: {error}"),
             )
         })?;
+        // Retrieval reranking is a typed batched judgment. Its output budget
+        // is a minimum needed to represent every candidate decision, rather
+        // than a best-effort generation ceiling. Reject an admitted Offering
+        // that cannot satisfy that contract before reserving durable inference
+        // state or contacting the provider; callers can then use their normal
+        // deterministic fallback without treating truncated JSON as a model
+        // decision.
+        if request.purpose == InferencePurpose::MemoryRetrievalRerank
+            && astra_turn_types::output_budget_exceeds_completion_cap(
+                request.max_output_tokens,
+                execution.max_completion_tokens,
+            )
+        {
+            tracing::warn!(
+                offering_id = %self.offering_id,
+                model_name = %execution.model_name,
+                configured_max_completion_tokens = ?execution.max_completion_tokens,
+                required_output_tokens = request.max_output_tokens,
+                "memory judgment route cannot emit a complete typed answer; no provider request dispatched"
+            );
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ResourceLimit,
+                "memory judgment Offering output limit is below the required typed answer budget",
+            ));
+        }
         let direct = DirectMemoryInferenceClient {
             fixed_temperature: execution.fixed_temperature,
             thinking_protocol: execution.thinking_protocol,
@@ -192,14 +226,17 @@ impl MemoryInferencePort for DurableMemoryInferenceClient {
                     route: direct.execution_route(),
                     max_output_tokens: Some(request.max_output_tokens),
                     temperature: Some(request.temperature),
-                    has_fallback: false,
                     thinking: &ThinkingConfig::Off,
                 },
                 request.deadline,
             )
             .await
             .into_result()?;
-        Ok(result.full_text)
+        Ok(MemoryInferenceResponse {
+            text: result.full_text,
+            model_used: result.model_used,
+            judgment_provenance: result.judgment_provenance,
+        })
     }
 }
 
@@ -234,7 +271,7 @@ impl MemoryInferencePort for DirectMemoryInferenceClient {
     async fn complete(
         &self,
         request: MemoryInferenceRequest<'_>,
-    ) -> Result<String, astra_core::ClassifiedError> {
+    ) -> Result<MemoryInferenceResponse, astra_core::ClassifiedError> {
         let result = call_llm_nonstream(
             global_llm_client(),
             LlmCall {
@@ -245,13 +282,16 @@ impl MemoryInferencePort for DirectMemoryInferenceClient {
                 route: self.execution_route(),
                 max_output_tokens: Some(request.max_output_tokens),
                 temperature: Some(request.temperature),
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             request.deadline,
         )
         .await?;
-        Ok(result.full_text)
+        Ok(MemoryInferenceResponse {
+            text: result.full_text,
+            model_used: result.model_used,
+            judgment_provenance: result.judgment_provenance,
+        })
     }
 }
 

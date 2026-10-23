@@ -153,9 +153,9 @@ impl InterruptionKind {
             Self::StreamTransport | Self::StreamIdle => "Connection interrupted",
             Self::ProviderDeadline => "Model response deadline reached",
             Self::HarnessPaused => "Paused",
-            Self::Interrupted | Self::ExecutionIncomplete | Self::ExecutorDropped => {
-                "Needs continuation"
-            }
+            Self::Interrupted => "Needs continuation",
+            Self::ExecutionIncomplete => "Needs verification",
+            Self::ExecutorDropped => "Needs verification",
         }
     }
 
@@ -164,7 +164,7 @@ impl InterruptionKind {
     #[must_use]
     pub fn user_description(self) -> &'static str {
         match self {
-            Self::BudgetExhausted => "The run reached its turn budget.",
+            Self::BudgetExhausted => "The run reached its execution budget.",
             Self::EmptyCompletion => "The run stopped before producing a final answer.",
             Self::TokenBudgetExceeded => "The current request exceeded its input token budget.",
             Self::RateLimited => "The model provider is temporarily rate limited.",
@@ -181,7 +181,7 @@ impl InterruptionKind {
             Self::HarnessBlocked => "The execution harness blocked the run.",
             Self::HarnessPaused => "The execution harness paused the run.",
             Self::Interrupted => "The run stopped before it completed.",
-            Self::ExecutionIncomplete => "The requested execution did not complete.",
+            Self::ExecutionIncomplete => "Some work remains unverified.",
             Self::ExecutorDropped => "The execution worker stopped before returning a result.",
         }
     }
@@ -384,21 +384,39 @@ impl InterruptionRecord {
         } else {
             ""
         };
-        let tool_note = if summary.tool_calls_completed > 0 {
-            format!(" {} tool call(s) completed.", summary.tool_calls_completed)
-        } else {
-            String::new()
+        let tool_note = match (kind, summary.tool_calls_completed) {
+            (InterruptionKind::ExecutorDropped, count) if count > 0 => {
+                format!(" {count} tool call(s) were processed before the interruption.")
+            }
+            (InterruptionKind::ExecutionIncomplete, _) | (_, 0) => String::new(),
+            (_, count) => format!(" {count} tool call(s) completed."),
         };
-        let action_note = match action {
-            ResumeAction::ContinueImmediately => " Continue this session to resume.".to_string(),
-            ResumeAction::WaitAndRetry { delay_seconds } => {
+        let action_note = match (kind, action) {
+            (InterruptionKind::ExecutionIncomplete, ResumeAction::ContinueImmediately) => {
+                " Continue this session to resolve what remains.".to_string()
+            }
+            (InterruptionKind::ExecutorDropped, ResumeAction::ContinueImmediately) => {
+                if summary.has_checkpoint {
+                    " Review the saved progress and reconcile its state before retrying or continuing."
+                        .to_string()
+                } else {
+                    " Review the available execution evidence before deciding whether to retry or continue; do not retry blindly."
+                        .to_string()
+                }
+            }
+            (_, ResumeAction::ContinueImmediately) => {
+                " Continue this session to resume.".to_string()
+            }
+            (_, ResumeAction::WaitAndRetry { delay_seconds }) => {
                 format!(" Please wait ~{delay_seconds}s before retrying.")
             }
-            ResumeAction::RequiresIntervention { description } => {
+            (_, ResumeAction::RequiresIntervention { description }) => {
                 format!(" Action required: {description}")
             }
-            ResumeAction::CompactAndRetry => " Context will be compacted before retry.".to_string(),
-            ResumeAction::StartNewSession => " Please start a new session.".to_string(),
+            (_, ResumeAction::CompactAndRetry) => {
+                " Context will be compacted before retry.".to_string()
+            }
+            (_, ResumeAction::StartNewSession) => " Please start a new session.".to_string(),
         };
         let cause_note = match kind {
             InterruptionKind::BudgetExhausted
@@ -408,6 +426,21 @@ impl InterruptionRecord {
                 .as_deref()
                 .and_then(summarize_stall_signal_for_user)
                 .map(|s| format!(" Cause: {}.", s.cause)),
+            InterruptionKind::ExecutionIncomplete => None,
+            InterruptionKind::ExecutorDropped | InterruptionKind::Interrupted => {
+                summary.error_detail.as_ref().map(|_| {
+                    let cause = match kind {
+                        InterruptionKind::ExecutorDropped => {
+                            "the execution worker stopped before terminal evidence was delivered"
+                        }
+                        InterruptionKind::Interrupted => {
+                            "the run ended while its terminal state was being reconciled"
+                        }
+                        _ => unreachable!("kind constrained by match arm"),
+                    };
+                    format!(" Cause: {cause}.")
+                })
+            }
             _ => None,
         }
         .unwrap_or_default();
@@ -1158,6 +1191,84 @@ mod tests {
                 .contains("re-read overlapping file ranges 6 time(s)")
         );
         assert!(record.user_message.contains("Continue this session"));
+    }
+
+    #[test]
+    fn execution_incomplete_message_avoids_internal_boilerplate() {
+        let record = InterruptionRecord::new(
+            InterruptionKind::ExecutionIncomplete,
+            ResumeAction::ContinueImmediately,
+            InterruptionStateSummary {
+                has_checkpoint: false,
+                tool_calls_completed: 43,
+                turns_completed: 37,
+                remaining_turns: 2,
+                error_detail: Some(
+                    "persistent unresolved tool outcome; internal detail must stay private".into(),
+                ),
+                stall_signal: None,
+                resume_restricted_tools: Vec::new(),
+            },
+        );
+
+        assert!(
+            record
+                .user_message
+                .starts_with("Some work remains unverified.")
+        );
+        assert!(!record.user_message.contains("43 tool call(s)"));
+        assert!(
+            record
+                .user_message
+                .contains("Continue this session to resolve what remains")
+        );
+        assert!(!record.user_message.contains("Progress is saved"));
+        assert!(!record.user_message.contains("internal detail"));
+        assert!(!record.user_message.contains("runtime could not verify"));
+    }
+
+    #[test]
+    fn executor_dropped_message_does_not_claim_unsaved_progress() {
+        let without_checkpoint = InterruptionRecord::new(
+            InterruptionKind::ExecutorDropped,
+            ResumeAction::ContinueImmediately,
+            InterruptionStateSummary {
+                has_checkpoint: false,
+                tool_calls_completed: 2,
+                turns_completed: 1,
+                remaining_turns: 1,
+                error_detail: Some("worker exited unexpectedly".into()),
+                stall_signal: None,
+                resume_restricted_tools: Vec::new(),
+            },
+        );
+        assert!(
+            without_checkpoint
+                .user_message
+                .contains("available execution evidence")
+        );
+        assert!(
+            without_checkpoint
+                .user_message
+                .contains("do not retry blindly")
+        );
+        assert!(!without_checkpoint.user_message.contains("saved progress"));
+
+        let with_checkpoint = InterruptionRecord::new(
+            InterruptionKind::ExecutorDropped,
+            ResumeAction::ContinueImmediately,
+            InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 2,
+                turns_completed: 1,
+                remaining_turns: 1,
+                error_detail: None,
+                stall_signal: None,
+                resume_restricted_tools: Vec::new(),
+            },
+        );
+        assert!(with_checkpoint.user_message.contains("saved progress"));
+        assert!(with_checkpoint.user_message.contains("reconcile its state"));
     }
 
     // ── resume guidance ──

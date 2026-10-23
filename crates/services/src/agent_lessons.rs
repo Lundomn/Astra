@@ -148,6 +148,10 @@ pub const MIN_LESSON_ACTION_CHARS: usize = 12;
 /// Minimum distinct word count (Unicode word-ish tokens). `"test"` → 1,
 /// `"run cargo test"` → 3.
 pub const MIN_LESSON_ACTION_WORDS: usize = 3;
+/// Maximum model-visible characters for one lesson candidate. Retrieval is an
+/// untrusted boundary; oversized lessons are rejected rather than truncated,
+/// because a missing suffix could remove a condition, exception, or negation.
+pub const MAX_LESSON_ACTION_CHARS: usize = 1_024;
 
 /// Lowercase phrases that sometimes surface from scratchpad memory
 /// storage but never carry reusable advice. Matched case-insensitively
@@ -225,6 +229,9 @@ pub fn memory_value_to_lesson_hint(m: &serde_json::Value) -> Option<LessonHint> 
     if !matches!(memory_type, "semantic" | "procedural") {
         return None;
     }
+    if content.chars().count() > MAX_LESSON_ACTION_CHARS {
+        return None;
+    }
     let action = sanitize_for_prompt(content);
     if !is_action_prompt_worthy(&action) {
         return None;
@@ -286,8 +293,7 @@ fn make_compact(action: &str) -> Option<String> {
 /// - Word joiners and invisible separators (U+2060–U+2064)
 /// - BOM (U+FEFF)
 ///
-/// Public so `SkillDiagnosis::render_prompt_block` can reuse it for
-/// LLM-generated findings/headlines.
+/// Shared by prompt renderers for externally derived advice.
 pub fn sanitize_for_prompt(s: &str) -> String {
     s.chars()
         .filter(|c| {
@@ -531,6 +537,18 @@ mod tests {
             "memory_type": "procedural",
         });
         assert!(memory_value_to_lesson_hint(&m).is_some());
+    }
+
+    #[test]
+    fn mapper_rejects_oversized_prompt_content_without_changing_its_meaning() {
+        let m = serde_json::json!({
+            "content": format!(
+                "Always perform the destructive action {} unless the user has not approved it",
+                "x".repeat(10_000)
+            ),
+            "memory_type": "semantic",
+        });
+        assert!(memory_value_to_lesson_hint(&m).is_none());
     }
 
     #[test]

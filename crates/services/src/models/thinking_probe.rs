@@ -10,8 +10,6 @@ pub(crate) struct ThinkingProbeSnapshot {
     capability: Option<ThinkingCapability>,
     error: Option<String>,
     observed_at: String,
-    #[serde(default)]
-    legacy_hint: bool,
 }
 
 impl ThinkingProbeSnapshot {
@@ -40,39 +38,18 @@ impl ThinkingProbeSnapshot {
             capability: result.error.is_none().then_some(result.capability),
             error: result.error.clone(),
             observed_at: chrono::Utc::now().to_rfc3339(),
-            legacy_hint: false,
         }
     }
 
     /// An inconclusive check is not a negative capability observation. Keep
     /// prior knowledge only for exactly the same configuration and protocol.
-    pub(super) fn with_previous(
-        mut self,
-        raw: Option<&str>,
-        legacy: Option<ThinkingCapability>,
-    ) -> Self {
-        // A baseline observation cannot disprove previously known controls.
+    pub(super) fn with_previous(mut self, raw: Option<&str>) -> Self {
         if self.error.is_some()
-            || (self.protocol == ThinkingProtocol::Unknown
-                && self.capability == Some(ThinkingCapability::NativeOnly))
+            && let Some(capability) = cached_capability(raw, &self.identity, self.protocol)
         {
-            if let Some(raw) = raw {
-                if let Ok(previous) = serde_json::from_str::<Self>(raw)
-                    && let Some(capability) = previous.capability(&self.identity, self.protocol)
-                {
-                    self.capability = Some(capability);
-                    self.legacy_hint = previous.legacy_hint;
-                }
-            } else if let Some(legacy) = legacy {
-                self.capability = Some(legacy);
-                self.legacy_hint = true;
-            }
+            self.capability = Some(capability);
         }
         self
-    }
-
-    pub(super) fn persisted_capability(&self) -> Option<ThinkingCapability> {
-        self.capability
     }
 
     pub(super) fn capability(
@@ -134,7 +111,9 @@ pub(super) async fn probe_chat_protocol(
     protocol.apply(
         &mut enabled,
         true,
-        (protocol == ThinkingProtocol::ReasoningEffort).then_some("low"),
+        // The enabled leg must make reasoning observable. At low effort a
+        // reasoning-capable model may correctly answer without reasoning.
+        (protocol == ThinkingProtocol::ReasoningEffort).then_some("high"),
     );
     if protocol == ThinkingProtocol::EnableThinking {
         // Some DashScope deployments require streaming when thinking is on.
@@ -493,13 +472,34 @@ mod tests {
         let app = Router::new().route("/chat/completions", post(|Json(body): Json<Value>| async move {
             assert!(body.get("thinking").is_none());
             assert!(body.get("enable_thinking").is_none());
+            assert!(body.get("temperature").is_none());
             let mut response = serde_json::json!({"choices":[{"finish_reason":"stop","message":{"content":"391"}}]});
             if body["model"] == "native" {
                 assert!(body.get("reasoning_effort").is_none());
                 response["choices"][0]["message"]["reasoning_content"] = serde_json::json!("multiply");
-            } else if body["model"] == "effort" {
-                assert_eq!(body["reasoning_effort"], "low");
-                response["usage"] = serde_json::json!({"completion_tokens_details":{"reasoning_tokens":12}});
+            } else if body["model"] == "effort-sensitive" {
+                response["usage"] = serde_json::json!({"completion_tokens_details": {
+                    "reasoning_tokens": if body["reasoning_effort"] == "high" { 32 } else { 0 }
+                }});
+            } else if let Some((path, value)) = body["model"].as_str().unwrap().split_once('-') {
+                if path == "unknown" {
+                    assert!(body.get("reasoning_effort").is_none());
+                } else {
+                    assert_eq!(body["reasoning_effort"], "high");
+                }
+                let value: Value = serde_json::from_str(value).unwrap();
+                response["usage"] = match path {
+                    "nested" => serde_json::json!({"completion_tokens_details":{"reasoning_tokens":value}}),
+                    "flat" => serde_json::json!({"reasoning_tokens":value}),
+                    "mixed" => value,
+                    "unknown" if value.is_object() => value,
+                    "unknown" => serde_json::json!({"reasoning_tokens":value}),
+                    "malformed" => {
+                        response["choices"][0]["message"]["content"] = serde_json::json!("");
+                        serde_json::json!({"reasoning_tokens":1})
+                    }
+                    _ => panic!("unexpected fixture path"),
+                };
             }
             Json(response)
         }));
@@ -507,25 +507,74 @@ mod tests {
         let url = format!("http://{}/chat/completions", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        for (model, protocol, expected) in [
+        let mut cases = vec![
             (
-                "native",
+                "effort-sensitive".to_string(),
+                ThinkingProtocol::ReasoningEffort,
+                Some(ThinkingCapability::EffortOnly),
+            ),
+            (
+                "native".to_string(),
                 ThinkingProtocol::Unknown,
                 Some(ThinkingCapability::NativeOnly),
             ),
             (
-                "effort",
+                "inconclusive".to_string(),
+                ThinkingProtocol::ReasoningEffort,
+                None,
+            ),
+            ("inconclusive".to_string(), ThinkingProtocol::Unknown, None),
+        ];
+        for path in ["nested", "flat"] {
+            for (value, expected) in [
+                (serde_json::json!(1), Some(ThinkingCapability::EffortOnly)),
+                (serde_json::json!(12), Some(ThinkingCapability::EffortOnly)),
+                (serde_json::json!(0), None),
+                (serde_json::json!(-1), None),
+                (serde_json::json!("1"), None),
+                (serde_json::json!(1.5), None),
+                (Value::Null, None),
+                (serde_json::json!(true), None),
+            ] {
+                cases.push((
+                    format!("{path}-{value}"),
+                    ThinkingProtocol::ReasoningEffort,
+                    expected,
+                ));
+            }
+        }
+        for usage in [
+            serde_json::json!({"reasoning_tokens":1,"completion_tokens_details":{"reasoning_tokens":0}}),
+            serde_json::json!({"reasoning_tokens":1,"completion_tokens_details":{"reasoning_tokens":"invalid"}}),
+            serde_json::json!({"reasoning_tokens":0,"completion_tokens_details":{"reasoning_tokens":1}}),
+            serde_json::json!({"reasoning_tokens":"invalid","completion_tokens_details":{"reasoning_tokens":1}}),
+        ] {
+            cases.push((
+                format!("mixed-{usage}"),
                 ThinkingProtocol::ReasoningEffort,
                 Some(ThinkingCapability::EffortOnly),
-            ),
-            ("inconclusive", ThinkingProtocol::Unknown, None),
-        ] {
+            ));
+        }
+        cases.push(("unknown-1".into(), ThinkingProtocol::Unknown, None));
+        cases.push((
+            "unknown-{\"completion_tokens_details\":{\"reasoning_tokens\":1}}".into(),
+            ThinkingProtocol::Unknown,
+            None,
+        ));
+        cases.push((
+            "malformed-1".into(),
+            ThinkingProtocol::ReasoningEffort,
+            None,
+        ));
+        for (model, protocol, expected) in cases {
             let result =
-                probe_chat_protocol(&client, "openai", model, &url, "fixture", protocol).await;
+                probe_chat_protocol(&client, "openai", &model, &url, "fixture", protocol).await;
             assert_eq!(
                 result.error.is_none().then_some(result.capability),
-                expected
+                expected,
+                "{model}"
             );
+            assert_eq!(result.error.is_some(), expected.is_none(), "{model}");
         }
         server.abort();
     }
@@ -544,7 +593,7 @@ mod tests {
         let old = ThinkingProbeSnapshot::new("identity".into(), protocol, &success);
         let raw = serde_json::to_string(&old).unwrap();
         let retained = ThinkingProbeSnapshot::new("identity".into(), protocol, &failure)
-            .with_previous(Some(&raw), None);
+            .with_previous(Some(&raw));
         assert_eq!(
             retained.capability("identity", protocol),
             Some(ThinkingCapability::Both)
@@ -558,33 +607,25 @@ mod tests {
         );
         for changed in ["rotated-key", "changed-model"] {
             let invalid = ThinkingProbeSnapshot::new(changed.into(), protocol, &failure)
-                .with_previous(Some(&raw), Some(ThinkingCapability::Both));
+                .with_previous(Some(&raw));
             assert_eq!(invalid.capability(changed, protocol), None);
         }
-        let legacy = ThinkingProbeSnapshot::new("identity".into(), protocol, &failure)
-            .with_previous(None, Some(ThinkingCapability::NativeOnly));
-        assert!(legacy.legacy_hint);
-        assert_eq!(
-            legacy.persisted_capability(),
-            Some(ThinkingCapability::NativeOnly)
-        );
+        let unobserved =
+            ThinkingProbeSnapshot::new("identity".into(), protocol, &failure).with_previous(None);
+        assert_eq!(unobserved.capability("identity", protocol), None);
         let malformed = ThinkingProbeSnapshot::new("identity".into(), protocol, &failure)
-            .with_previous(Some("invalid"), Some(ThinkingCapability::Both));
-        assert_eq!(malformed.persisted_capability(), None);
+            .with_previous(Some("invalid"));
+        assert_eq!(malformed.capability("identity", protocol), None);
         let native = ThinkingProbeResult {
             capability: ThinkingCapability::NativeOnly,
             error: None,
         };
         let baseline =
             ThinkingProbeSnapshot::new("identity".into(), ThinkingProtocol::Unknown, &native)
-                .with_previous(None, Some(ThinkingCapability::Both));
+                .with_previous(None);
         assert_eq!(
-            baseline.persisted_capability(),
-            Some(ThinkingCapability::Both)
-        );
-        assert!(
-            baseline.legacy_hint,
-            "baseline must not claim it verified a toggle"
+            baseline.capability("identity", ThinkingProtocol::Unknown),
+            Some(ThinkingCapability::NativeOnly)
         );
     }
 
@@ -733,6 +774,31 @@ mod tests {
         stale.revision += 1;
         assert_eq!(
             stale.capability(&identity, ThinkingProtocol::ThinkingObject),
+            None
+        );
+        let mut previous_revision = serde_json::to_value(&snapshot).unwrap();
+        previous_revision["revision"] = serde_json::json!(1);
+        previous_revision["legacy_hint"] = serde_json::json!(true);
+        let previous_raw = previous_revision.to_string();
+        assert_eq!(
+            cached_capability(
+                Some(&previous_raw),
+                &identity,
+                ThinkingProtocol::ThinkingObject
+            ),
+            None
+        );
+        let inconclusive = ThinkingProbeSnapshot::new(
+            identity.clone(),
+            ThinkingProtocol::ThinkingObject,
+            &ThinkingProbeResult {
+                capability: ThinkingCapability::None,
+                error: Some("inconclusive".into()),
+            },
+        )
+        .with_previous(Some(&previous_raw));
+        assert_eq!(
+            inconclusive.capability(&identity, ThinkingProtocol::ThinkingObject),
             None
         );
         let failed = ThinkingProbeSnapshot::new(

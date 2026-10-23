@@ -17,6 +17,11 @@ pub(crate) struct TurnContext {
     pub tokens_in: Option<u64>,
     pub tokens_out: Option<u64>,
     pub cache_read_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub model_name: Option<String>,
+    pub auxiliary_summary: Option<String>,
+    pub input_usage_complete: bool,
+    pub usage_partial: bool,
     pub tools: u32,
     pub cumulative_tokens: Option<u64>,
     pub cumulative_cost_usd: Option<f64>,
@@ -30,6 +35,11 @@ impl TurnContext {
             tokens_in: self.tokens_in,
             tokens_out: self.tokens_out,
             cache_read_tokens: self.cache_read_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
+            model_name: self.model_name,
+            auxiliary_summary: self.auxiliary_summary,
+            input_usage_complete: self.input_usage_complete,
+            usage_partial: self.usage_partial,
             tools: self.tools,
             cumulative_tokens: self.cumulative_tokens,
             cumulative_cost_usd: self.cumulative_cost_usd,
@@ -50,8 +60,20 @@ impl TurnContext {
 /// the bottom pane, the new loop handles scrollback.
 pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
     match ev {
-        TuiAppEvent::Token(text) => Some(AppEvent::wire(WireEvent::AnswerDelta(text))),
-        TuiAppEvent::ThinkingChunk(text) => Some(AppEvent::wire(WireEvent::ReasoningDelta(text))),
+        TuiAppEvent::Token {
+            model_item_id,
+            text,
+        } => Some(AppEvent::wire(WireEvent::AnswerDelta {
+            model_item_id,
+            text,
+        })),
+        TuiAppEvent::ThinkingChunk {
+            model_item_id,
+            text,
+        } => Some(AppEvent::wire(WireEvent::ReasoningDelta {
+            model_item_id,
+            text,
+        })),
         TuiAppEvent::ThinkingStopped => Some(AppEvent::wire(WireEvent::ReasoningDone)),
         TuiAppEvent::ToolStarted {
             name,
@@ -146,15 +168,16 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
         TuiAppEvent::ExplainAnalyzeGap => Some(AppEvent::wire(WireEvent::ExplainAnalyzeGap)),
         TuiAppEvent::VerdictReport(items) => Some(AppEvent::wire(WireEvent::VerdictReport(items))),
         TuiAppEvent::Compaction(event) => Some(AppEvent::wire(WireEvent::Compaction(event))),
+        TuiAppEvent::RunBound(run_id) => Some(AppEvent::wire(WireEvent::RunBound(run_id))),
         // Bottom-pane-only events — ChatWidget doesn't care.
         TuiAppEvent::ContextWindowPolicy { .. }
         | TuiAppEvent::SessionBound(_)
-        | TuiAppEvent::RunBound(_)
         | TuiAppEvent::WorkTaskBoardUpdate(_)
         | TuiAppEvent::ContextWindowEstimated(_)
         | TuiAppEvent::ContextSystemPromptTokens(_)
         | TuiAppEvent::ContextWindowMeasured(_)
         | TuiAppEvent::RequestTokenUsage(_)
+        | TuiAppEvent::RestoreInput(_)
         | TuiAppEvent::AssistantOutputSettled
         | TuiAppEvent::TurnStreamClosed
         | TuiAppEvent::TurnProjectionDrained
@@ -162,6 +185,7 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
         | TuiAppEvent::WaitingForModel
         | TuiAppEvent::ModelResponding
         | TuiAppEvent::StatusLine(_)
+        | TuiAppEvent::ClientUpdateNotice(_)
         | TuiAppEvent::UserIntentApplied { .. }
         | TuiAppEvent::UserIntentReturned { .. }
         | TuiAppEvent::PermissionAutoApproved { .. } => None,
@@ -183,17 +207,26 @@ mod tests {
 
     #[test]
     fn token_to_answer_delta() {
-        let out = translate(TuiAppEvent::Token("hi".into()), TurnContext::default());
-        assert!(matches!(wire(&out), Some(WireEvent::AnswerDelta(s)) if s == "hi"));
+        let out = translate(
+            TuiAppEvent::Token {
+                model_item_id: None,
+                text: "hi".into(),
+            },
+            TurnContext::default(),
+        );
+        assert!(matches!(wire(&out), Some(WireEvent::AnswerDelta { text: s, .. }) if s == "hi"));
     }
 
     #[test]
     fn thinking_chunk_to_reasoning_delta() {
         let out = translate(
-            TuiAppEvent::ThinkingChunk("x".into()),
+            TuiAppEvent::ThinkingChunk {
+                model_item_id: None,
+                text: "x".into(),
+            },
             TurnContext::default(),
         );
-        assert!(matches!(wire(&out), Some(WireEvent::ReasoningDelta(s)) if s == "x"));
+        assert!(matches!(wire(&out), Some(WireEvent::ReasoningDelta { text: s, .. }) if s == "x"));
     }
 
     #[test]
@@ -249,6 +282,11 @@ mod tests {
             tokens_in: Some(200),
             tokens_out: Some(50),
             cache_read_tokens: None,
+            cache_creation_tokens: None,
+            model_name: None,
+            auxiliary_summary: None,
+            input_usage_complete: false,
+            usage_partial: false,
             tools: 2,
             cumulative_tokens: Some(250),
             cumulative_cost_usd: Some(0.014),
@@ -316,6 +354,7 @@ mod tests {
             TuiAppEvent::WaitingForModel,
             TuiAppEvent::ModelResponding,
             TuiAppEvent::StatusLine("hello".into()),
+            TuiAppEvent::ClientUpdateNotice(Some("Update available".into())),
             TuiAppEvent::UserIntentApplied {
                 intent_id: "input-1".into(),
                 delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,

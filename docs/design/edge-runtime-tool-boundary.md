@@ -46,6 +46,24 @@ The server default runtime must not imply:
 
 Server may expose a tool only when a provider contract explicitly grants that capability and safety policy permits it.
 
+A skill fork isolates model context while inheriting the parent's selected
+execution boundary. For a selected Server sandbox, its file executor and
+sandbox policy use that exact root; a missing or relative root is rejected.
+Edge and Cloud workspace paths remain with their respective providers and
+must not become Server-local filesystem roots.
+
+A managed Server sandbox records the selected executor identity in its
+Workspace source. Its owner, session, executor, root and physical capability
+are immutable; a later run may update only nonphysical metadata. Patch export,
+apply and commit resolve the current Work binding through that same selected
+provider. Another instance must skip the operation without claiming it,
+changing its recovery time, or turning a missing local directory into failure.
+After waiting for the physical workspace lease, the executor rechecks the
+binding and provider identity before durable claim or Git access. Existing
+operations with unknown external effects remain reconciliation work; affinity
+does not authorize replay of a mutation.
+
+
 ## Edge boundary
 
 Edge/CLI local runtime may expose local capabilities only within declared authority:
@@ -58,7 +76,168 @@ Edge/CLI local runtime may expose local capabilities only within declared author
 
 Path authority must be checked before execution. A model-provided path is not authority by itself.
 
+### Foreground Bash output
+
+The local CLI and Edge foreground Bash executors share the output-capture owner
+without replacing their existing process-settlement or workspace-lease owners.
+They keep stdout and stderr pipes as the command's own stdout and stderr,
+and capture their original bytes in
+separate `0600` files with a shared random 16-lowercase-hex basename and
+`.stdout` / `.stderr` suffixes under the selected workspace's
+`astra-bash-outputs/` directory. This dedicated top-level directory holds
+ordinary user-readable output data, not Astra's private `.astra/` state; it is
+excluded from executor workspace-mutation fingerprints without excluding
+other user paths. Git-backed observation excludes that exact directory before
+its bounded status probe, so retained outputs do not consume the mutation
+observer's byte or entry budget. This is a tap after the top-level Bash
+process, so shell pipelines and explicit redirection keep their normal
+behavior. The file-retention threshold is the lesser of the configured
+per-tool byte limit and the shared 8,000-character model inline budget. The
+formatted, redacted output plus its actual exit note determines retention;
+small results remain inline even with a low configured budget. Stream-preview
+capping also retains the files. Byte counting is conservative for UTF-8.
+Retained results return both
+file paths, byte counts and SHA-256 digests. The redacted preview uses space
+remaining after the receipt and terminal facts in a 4,000-byte presentation
+target; an exceptionally long workspace path can make the mandatory receipt
+itself exceed that target. The configured limit bounds disposable preview,
+not the mandatory file receipt or terminal facts; even a 64-byte budget must
+return complete paths, byte counts, digests and completeness. The owner marks
+this bounded native projection so downstream recording does not truncate its
+recovery receipt a second time. A complete capture's receipt instructs the caller
+to copy its paths exactly and filter or format the saved files locally,
+emitting only the fields or sections needed for the answer instead of
+rerunning the original command merely to change presentation. This guidance
+precedes the preview and consumes the same inline budget; incomplete captures
+do not receive it. File names are ordinary workspace paths, not authority or
+aliases; exclusive creation rejects a collision without overwriting a file.
+The inline view remains bounded and applies
+the existing display redaction; the files deliberately contain raw bytes and
+must be treated as ordinary user workspace data, not redacted or immutable
+session artifacts. The digest describes bytes observed when the receipt was
+created, not a guarantee against subsequent same-user modification.
+
+The combined capture hard limit is 50 MiB per invocation. Timeout,
+cancellation, stream failure or the capture limit yields an explicit
+`complete=false` result and never claims that partial files hold the full
+output. A post-execution capture failure preserves the command's exit and
+process-settlement facts. Capture files follow the selected workspace's
+lifetime: an ephemeral workspace disappears with its existing lease; a local
+workspace retains large-output files like any other Bash-created file. There
+is no independent output-file retention service.
+
+File outlines use the shared AST parser for supported languages, including
+Python stub, JavaScript module and TypeScript module extensions. Unsupported
+languages and comment-only files do not acquire signatures from text-prefix
+heuristics. Outline signatures are redacted for display and do not establish
+full-file delivery or authorize replacement. A bounded prefix is identified as
+partial content; its measured line count does not describe the unread suffix.
+
+Credential read views preserve assignment syntax and replace only the secret
+value with an opaque reference. Presentation boundaries retain complete,
+canonical non-secret reference envelopes across processes; this does not grant
+edit authority. Only the source executor can authenticate the reference and
+resolve one unchanged, unambiguous source span. Adjacent raw secrets remain
+subject to redaction, and display-only markers cannot authorize edits.
+
+
+### Server-owned execution
+
+The CLI admits one Server-owned loop; local tools execute only through the
+Server's authenticated callback requests. Missing terminal execution evidence
+does not transfer continuation authority to the CLI. The adapter preserves
+observed results and usage, reports a typed protocol failure, and uses the
+existing physical-run cleanup path for an unsettled owner. It must not replay
+tools or open another admission to complete an incomplete stream.
+
+A Server-issued read-only ceiling belongs to its exact tool request and travels
+through parsing, batching and execution. Stream completion cannot clear that
+ceiling while the request remains pending. Local approval cannot widen it.
+
+Bash command time is carried by the Server's `command_timeout_cap_ms` request
+metadata. The separate delivery deadline includes callback settlement time and
+must not extend the command budget. Missing or invalid command authority rejects
+a Bash request. Model arguments remain unchanged for approval, invocation identity
+and journal evidence; runtime controls are never injected into those arguments.
+
+Ordinary shell execution uses the selected provider's permission, sandbox and
+process-coordination boundaries. Optional bounded observation is evidence, not
+an execution prerequisite. The executor records pre-start rejection separately
+from started success, failure or cancellation; unavailable observation cannot
+turn either into a permission denial. A started command deadline carries typed
+`tool_timeout` evidence even after its process scope is settled. Cancellation,
+timeout and lost outcomes can leave partial effects and must not be replayed
+merely to obtain evidence.
+
+Command output can establish a current state, including an already-satisfied
+request or an absent directory, without claiming this invocation changed it.
+Neither a zero exit status nor a generic filesystem delta proves arbitrary task
+correctness. Domain tools and canonical Work retain their own result contracts.
+Inspection and diagnostics omit `mode`. Explicit `mode=verify` adds an unchanged-workspace proof obligation
+after edits. If bounded observation is unavailable, command output is retained
+but the requested verification fails closed; it must not mint a completion or
+no-change receipt. Command text does not select or weaken this contract.
+
+### Rename authority
+
+The CLI may modify symbol references only through an active semantic LSP backend
+with a position-based rename request. A text search cannot prove symbol identity
+across scopes, comments, or strings and must not authorize file modifications.
+An explicit `dry_run=true` request may produce a clearly labeled non-semantic
+text preview; it never applies edits or claims semantic reference coverage.
+Missing or failed semantic backends return an actionable error, not a text-based
+mutation fallback.
+
+### File-edit publication
+
+File-edit tools commit the prepared bytes. Write and replacement requests use
+the shared deterministic line-ending and trailing-newline normalization;
+LSP edits publish their computed candidate exactly, preserving bytes outside
+the selected ranges. They do not implicitly launch formatters. Formatting and build checks are explicit tool calls through the
+existing owned shell lifecycle, with its approval, deadline and cancellation
+boundaries. A successful `write_file` proves publication, not syntax validity;
+replacement tools retain their independent parser-based structural checks and
+explicit `allow_structural_change` control.
+Text replacements reject invalid UTF-8 before changing file bytes or recording
+journal entries, rather than silently replacing unrelated bytes during decoding.
+
+The CLI file-state guard compares current bytes with the captured content
+digest; a modification-time change alone does not invalidate read authority.
+Only a confirmed missing target may proceed without tracked content identity.
+Metadata, content-read and state-lock failures reject validation. Whole-file
+overwrites still require complete content authority, and publication retains
+its independent prepared-preimage check.
+
+Single and batch replacement candidates share the same matching owner, including
+quote-normalized ambiguity rejection, quote-style preservation and structural
+validation. Batch edits resolve sequentially against the current candidate;
+exact anchors may target an earlier edit's result, while a stale fuzzy anchor
+cannot overwrite a previously fuzzy-edited region. Region coordinates follow
+byte-length changes between edits. A failed preparation publishes no files.
+
+CLI same-file batches supply an authorized bound target and captured UTF-8
+preimage to the shared candidate owner. The physical target determines content
+normalization; the logical spelling is a display label. CLI publishes those
+candidate bytes exactly and records the committed bytes in its local journal.
+
+The shared `fs_ops::Prepared*` owner stages files using exclusive sibling
+creation and checks the captured preimage immediately before publication.
+New files use no-clobber publication. The workspace lease coordinates Astra
+writers; preimage checks are not an OS compare-and-swap against external editors.
+Multi-file edits prepare and validate all candidates before publishing;
+`PreparedMultiPathEdit` also stages the complete group first. Publication is
+atomic per file, not across the group. A partial failure must identify the
+already committed paths through the typed tool receipt, including LSP edits.
+Journal after-state, read evidence and displayed diffs
+must describe the bytes actually committed, not an implicit later rewrite.
+
 ## Cloud workspace boundary
+
+The current implementation has no production `gateway_relay` or
+`sandbox_resident_agent` execution adapter. These bindings retain explicit route
+metadata and fail with `transport_unavailable`; they never fall back to
+Server-local execution. A future provider must use the canonical owned
+invocation boundary and supply real enforcement evidence.
 
 A cloud workspace runtime is not the same as the Astra server process. It requires explicit provider binding and isolation metadata.
 
@@ -87,11 +266,37 @@ Side-effecting tools require stronger checks than read-only tools.
 | External mutation | explicit API authority and approval policy. |
 | Credential access | deny by default unless dedicated secret provider authorizes scoped access. |
 
+Filesystem path authorization is owned by `astra-sandbox`. In Standard and Strict
+isolation, relative inputs must stay within the selected workspace after resolving
+symlinks and parent components, including nonexistent tails. Additional directory
+grants apply to explicit absolute inputs; they cannot authorize relative traversal.
+CLI and shared filesystem tools use this same resolver. Explicit Permissive mode
+retains its broader authority and bypass-immune credential exclusions.
+
 ### Workspace observation coordination
 
 Local shell and typed workspace writers must serialize each executor-owned
 pre/execute/post observation window across Astra processes without placing the
 coordination authority inside the tool-writable workspace.
+
+The CLI checks this host prerequisite before submitting a turn that advertises
+locally bound workspace writers or shell tools (including deferred tools).
+Text-only and read-only surfaces do not require it. Unsupported hosts fail with
+an actionable local setup error before model execution; admission also rechecks
+the same trust boundary. Tool-level refusals use the non-retryable
+`workspace_host_unsupported` kind, distinct from a missing workspace binding.
+A CLI preflight refusal preserves `error_kind=tool_unavailable`,
+`error_code=workspace_host_unsupported`, non-retryable metadata, exit status `1`,
+and `server_admission_not_dispatched=true` in terminal JSON. It creates no Run,
+execution journal entry, accounting reconciliation, or usage publication. Human
+output retains the stable code and administrator guidance on stderr even when
+stdout uses JSON or stream-json. Interactive refusal uses the existing
+not-started settlement: the draft, recovery guidance and tool restrictions remain
+available for a later attempt.
+
+Rebinding a workspace or changing cache roots cannot repair a host whose
+coordination directory is not trusted; use a supported host or have its
+administrator provision the required root-owned sticky directory.
 
 - Linux uses a root-owned sticky temporary root, a kernel-owned abstract Unix
   socket name for each workspace generation, a per-UID integrity witness, and
@@ -108,12 +313,71 @@ coordination authority inside the tool-writable workspace.
   Concurrent contenders can retreat together, but cannot both be admitted;
   process-diverse jitter restores progress without a machine-global admission
   gate.
+- macOS watcher admission atomically reserves the kqueue descriptor and every
+  duplicated witness or opened binding descriptor before opening any watcher
+  files. The process-wide budget is the minimum of 1,024 descriptors, one
+  quarter of the current `RLIMIT_NOFILE` soft limit, and the soft limit minus
+  64 descriptors of headroom. Watched paths consume that same budget; there is
+  no unbounded path subscription pool. The 1,024 ceiling normally binds on
+  hosts with a soft limit of at least 4,096; the other terms protect low-limit
+  processes. Transient capacity shortage releases admission locks and waits
+  within the caller's remaining monotonic deadline. Exhaustion returns typed
+  `WorkspaceLeaseFailure::WatcherCapacity` facts with active/requested/limit
+  counts, carried into tool result fields as `reason: watcher_capacity` and
+  `watcher_descriptors`. These are the last observed capacity counts. If a retry
+  uses the remaining deadline before reaching watcher admission, expiry retains
+  that observed refusal instead of reclassifying it as workspace contention.
+  A definitive cancellation, binding failure, or ownership failure still wins.
+  It does not instruct the caller to wait for an operation
+  in this same workspace. A zero limit or a watcher larger than the budget
+  rejects immediately with `retryable: false` and a resource repair action.
+  Cancellation, failed registration, and lease drop
+  close descriptors before releasing the reservation. The budget covers
+  watcher-owned descriptors, not all runtime files/sockets; unrelated resource
+  exhaustion still fails closed. Lowering the soft limit does not revoke
+  existing leases, but subsequent admission uses the new limit.
 - Kernel ownership must end automatically when the holder process exits.
   Replacing or unlinking a witness or workspace binding must not admit a second
   generation, and any observed tamper revokes receipt authority permanently
   for the active lease.
 - Platforms without an equivalent trusted namespace and tamper watch fail
   closed before launching a local command.
+
+Workspace lease admission uses the asynchronous options APIs with explicit
+cancellation and wait budgets. Observation, mutation, and opaque writer APIs
+return `Result<_, WorkspaceLeaseFailure>` with typed admission failures. The unused synchronous acquisition APIs and
+no-options observation wrapper are retired from the Rust source API. Process
+coordination, generation watches, diagnostic paths, and guard cleanup remain
+shared; tests exercise the same acquisition paths as executors.
+
+Native collaborator delivery delegates workspace serialization to the CLI tool
+executor. It does not hold a workspace lease while asking for approval or acquire
+the executor's lease a second time. After acquiring the lease, the executor checks
+the current permission attachment, workspace and executable identity before
+dispatch; queueing cannot preserve revoked authority. Lease waits respect the
+invocation deadline and cancellation. The Linux CI composition test drives the
+authenticated WebSocket owner through this executor and the production process
+supervisor, including contention, cancellation, expiry and changed admission.
+
+Native discovery's physical process lifetime covers its complete caller budget;
+handshake/authentication and model-list waits cannot renew that cutoff. A typed
+collaborator uses its admitted whole-stage deadline when present; absence of a
+work deadline does not install a command-timeout fallback. Initialization and
+authentication remain bounded control exchanges, independently of the active
+turn and each command's limit. Physical Edge detach cancels and settles owned
+execution before another attachment serves work; its journal retains results
+for reconnect replay. This is separate from a client UI disconnect, which does
+not revoke the Server's durable execution authority.
+An explicit model request cannot be replaced by a provider default merely because
+discovery is unavailable; only unconstrained or explicitly accepted defaults may
+omit the selector.
+
+Linux runtime authorization remains canonical. The native sparse filesystem
+also exposes a platform bootstrap alias only when its current resolved target
+is in the approved runtime requirements. Sensitive-path rules cover both views;
+Codex's explicit minimal bootstrap preserves the logical loader paths only when
+all existing platform runtime roots are approved. Its additional `/etc` and
+inherited `/proc` views remain denied; filesystem-root read is never granted.
 
 Receipt attribution and execution coordination are independent. A completed
 foreground process group may be too weak to authorize future fingerprint-based
@@ -123,6 +387,14 @@ or prevent the next command. Unsettled execution ownership and a replaced or
 tampered binding still prevent admission. Every receipt-producing path must
 check receipt authority independently of the coordination check used to launch.
 
+Receipt-attribution quarantine is retained per workspace observation root for
+the executor process lifetime, not per conversation. It prevents new attribution
+receipts, while healthy execution coordination remains independent. Explicit
+verification still fails when the required proof is unavailable. Quarantine
+diagnostics log a root digest, not local paths or shell input. A new conversation does not clear quarantine; before restarting
+the affected Astra or astra-edge process, verify that earlier background work
+has stopped. Restart alone does not stop escaped descendants or prove safety.
+
 ### Prepared directory inspection
 
 Prepared Unix Bash invocations inspect targets through the same retained
@@ -130,6 +402,10 @@ workspace and working-directory handles used for execution. Directory acquisitio
 walks each component without following symlinks. Target inspection resolves
 symlinks with bounded traversal and checks directory ancestry by identity; it
 does not assume that an existing `/dev/fd` entry supports child-path lookup.
+On Linux, traversal and identity handles use `O_PATH`, so acquiring the filesystem
+root or workspace ancestors does not require directory-read permission from
+Landlock. Actual file reads and directory enumeration still open separate readable
+handles and remain subject to the selected provider's filesystem allowlist.
 The OS sandbox remains responsible for execution-time filesystem confinement.
 
 Source preimages read retained regular-file handles with a bounded byte budget.
@@ -140,6 +416,13 @@ Working-directory names are verified display labels, not IO authority; an
 unavailable label is reported as unknown rather than silently as the root.
 
 ## Result boundary
+
+Tool-output governance preserves retained plaintext segments and decoded JSON
+string content, including line endings and whitespace. It removes injection lines
+and redacts credentials; JSON serialization may normalize the surrounding format. Reapplying governance must preserve the same governed result; display
+projections cannot replace full journal evidence. CLI and Server journal records
+use the same governed content without UI-only diff attachments; the original
+callback and local UI output remain separate.
 
 Tool output crossing runtime boundaries must be enveloped:
 
@@ -232,8 +515,28 @@ call's successor. This shared process owner does not itself grant the full Bash
 filesystem/network sandbox to legacy typed helpers: existing provider admission,
 managed-filesystem denial, mutation leases and isolation remain their owners.
 
+On Linux, the invocation subreaper settles ownership only after kernel
+`waitpid(-1, WNOHANG)` reports `ECHILD`. Enumerating its own proc children is an
+auxiliary means to kill adopted descendants. If that enumeration is unavailable,
+the same bounded loop continues waiting and reaping under its original deadline.
+Neither an unavailable or empty scan nor deadline expiry proves settlement; a
+live child at expiry or an unexpected wait error retains unsettled ownership.
+The helper's non-dumpable boundary and nonce-bound terminal receipt remain
+required, and Server run settlement cannot replace this local scope proof.
+
 The optional asynchronous `check-ignore` adapter retains startup binding checks;
 it does not inherit synchronous invocation ownership or post-execution binding
 validation. Its input/output exchange runs concurrently under one five-second
 deadline after spawn, and cancellation drops the kill-on-drop direct child.
 Synchronous repository validation precedes that exchange.
+
+## Shared search execution
+
+CLI grep applies its current path policy, including approved additional paths,
+before invoking the shared search implementation. An authorized external target
+does not become the workspace root or acquire workspace-observation authority.
+Independent User Runner executors continue resolving targets through their own
+workspace boundary. Both paths share search arguments, ignore rules, pagination,
+bounded output, timeout and caller-owned cancellation. The CLI supplies its
+pressure-scaled output budget through the existing execution context. It preserves source
+error and exit metadata instead of reinterpreting result text.

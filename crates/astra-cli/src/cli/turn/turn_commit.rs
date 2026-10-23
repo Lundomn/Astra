@@ -65,7 +65,14 @@ fn cache_pending_context_assembly_trace(state: &mut SessionState, trace_json: &s
     match serde_json::from_value::<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>(
         trace_json.clone(),
     ) {
-        Ok(trace) => state.latest_context_assembly_trace = Some(trace),
+        Ok(trace) => {
+            state.latest_context_assembly_trace = Some(
+                crate::cli::session::session_state::LocalContextAssemblyTrace {
+                    local_turn: state.turn,
+                    trace,
+                },
+            );
+        }
         Err(err) => {
             astra_core::agent_warn!("context_trace", "failed to cache context trace: {err}")
         }
@@ -177,7 +184,6 @@ pub(crate) struct DeferredTurnSidecarWork {
     total_cache_read_tokens: u64,
     total_cache_creation_tokens: u64,
     permission_mode: String,
-    discovered_skills: Vec<String>,
     /// The context trace belongs to the turn boundary, but its workspace
     /// projection is deferred with the other derived sidecars. Keep the
     /// parsed value here so a sidecar worker cannot silently leave the
@@ -304,7 +310,6 @@ impl DeferredTurnSidecarWork {
             total_cache_read_tokens: state.total_cache_read_tokens,
             total_cache_creation_tokens: state.total_cache_creation_tokens,
             permission_mode: state.perm_manager.mode().to_string(),
-            discovered_skills: state.discovered_skills.iter().cloned().collect(),
             latest_context_assembly_trace,
             sidecar_events,
             turn_observability_events,
@@ -383,7 +388,6 @@ impl DeferredTurnSidecarWork {
                 workspace.status = "active".to_string();
                 workspace.updated_at = chrono::Utc::now().to_rfc3339();
                 workspace.permission_mode = Some(self.permission_mode.clone());
-                workspace.discovered_skills = self.discovered_skills.clone();
 
                 // Sidecars are normally serialized per session, but recovery
                 // can replay an older item after a newer turn has already
@@ -535,11 +539,10 @@ impl DeferredTurnSidecarWork {
 fn extend_runtime_sidecar_events(
     sidecar_events: &mut Vec<session_journal::JournalEvent>,
     state: &SessionState,
-    line: &str,
+    _line: &str,
     result: &StreamResult,
     learning_snap: &TurnLearningSnapshot,
 ) {
-    let latest_user_input = result.latest_user_input(line);
     for (stall_type, _) in &result.stall_events {
         let confidence = stall_type_confidence(stall_type);
         if confidence == 0.0 {
@@ -575,28 +578,14 @@ fn extend_runtime_sidecar_events(
         sidecar_events.push(verdict_event);
     }
 
-    if local_tool_observability_is_complete(result) {
-        let turn_eval_event = astra_turn_core::evaluation::build_turn_evaluation_journal_event(
-            state.session_id.as_deref(),
-            Some(state.turn),
-            "cli_repl",
-            &latest_user_input,
-            &state.recent_tools,
-            &result.tool_call_records,
-            result.stall_events.len(),
-            result.verdict_events.iter().any(|event| {
-                event.severity.eq_ignore_ascii_case("warning")
-                    || event.severity.eq_ignore_ascii_case("critical")
-            }),
-            result.budget_pressure,
-            &learning_snap.eval,
-        );
-        sidecar_events.push(turn_eval_event);
+    if let Some(event) = learning_snap.evaluation.as_ref() {
+        sidecar_events.push(event.clone());
     }
 }
 
 fn local_tool_observability_is_complete(result: &StreamResult) -> bool {
-    result.tool_calls_count == 0 || !result.tool_call_records.is_empty()
+    !result.tool_record_coverage_partial
+        && (result.tool_calls_count == 0 || !result.tool_call_records.is_empty())
 }
 
 fn build_primary_turn_event(
@@ -641,7 +630,7 @@ fn build_primary_turn_event(
         result.entity_learn_skipped_no_domain,
     )
     .with_memoria_time(result.memoria_ms)
-    .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens);
+    .with_qualified_usage(result.qualified_usage);
     // Server-owned runs expose a complete fixed-size ledger aggregate even
     // though the Edge cannot retain their per-call records. Persist that
     // authority alongside any local detail window so offline journal tools do
@@ -816,17 +805,41 @@ fn merge_interruption_metadata(
     serde_json::Value::Object(metadata)
 }
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::{
         build_primary_turn_event, commit_primary_turn, extend_runtime_sidecar_events,
         local_tool_observability_is_complete, merge_interruption_metadata,
         prepare_canonical_conversation_commit, stall_type_confidence,
     };
     use crate::cli::session::session_state::SessionState;
-    use crate::cli::turn::turn_learning::analyze_chat_turn_learning;
+    use crate::cli::turn::turn_learning::consume_chat_turn_learning;
     use astra_services::session_journal;
     use serde_json::json;
     use std::time::Instant;
+
+    pub(crate) fn server_evaluation(session_id: &str, turn: u32) -> session_journal::JournalEvent {
+        let mut event = session_journal::JournalEvent::turn_evaluation(
+            Some(session_id),
+            Some(turn),
+            "server_runtime",
+            false,
+            true,
+            0.8,
+            0.9,
+            0.0,
+            0,
+            false,
+            1,
+            vec![astra_turn_core::evaluation::eval_signal_to_json(
+                &astra_turn_core::evaluation::EvalSignal::AllToolsHealthy,
+            )],
+        )
+        .with_producer_scope(Some("server-run"));
+        event.metadata.as_mut().unwrap()["execution_owner_generation"] = json!(0);
+        event.metadata.as_mut().unwrap()["tool_evaluation_success"] = json!(true);
+        event.metadata.as_mut().unwrap()["run_status"] = json!("completed");
+        event
+    }
 
     fn commit_primary_and_project_sidecars(
         state: &mut SessionState,
@@ -843,6 +856,40 @@ mod tests {
             state.session_persistence_error = Some(error.to_string());
         }
         outcome
+    }
+
+    #[test]
+    fn journal_usage_roundtrip_preserves_unknown_partial_and_zero() {
+        use astra_turn_types::CanonicalTokenUsage;
+        let state = SessionState {
+            turn: 1,
+            session_id: Some("usage-session".into()),
+            ..Default::default()
+        };
+        for usage in [
+            None,
+            Some(CanonicalTokenUsage::new(None, None, None, None).unwrap()),
+            Some(CanonicalTokenUsage::new(Some(10), None, None, Some(2)).unwrap()),
+            Some(CanonicalTokenUsage::new(Some(0), Some(0), Some(0), Some(0)).unwrap()),
+        ] {
+            let mut result = crate::tests::stub_stream_result("done");
+            result.qualified_usage = usage;
+            result.prompt_tokens = 999;
+            result.cache_read_tokens = 888;
+            result.run_id = Some("usage-run".into());
+            result.interruption =
+                Some(serde_json::json!({"kind":"budget_exhausted","resumable":true}));
+            let (event, _) =
+                build_primary_turn_event(&state, "review", &mut result, Instant::now());
+            let restored: session_journal::JournalEvent =
+                serde_json::from_value(serde_json::to_value(event).unwrap()).unwrap();
+            assert_eq!(restored.metadata.as_ref().unwrap()["partial"], true);
+            let ingestion = astra_services::event_ingestion::IngestionEvent::from_journal_event(
+                &restored, "user",
+            )
+            .unwrap();
+            assert_eq!(ingestion.token_usage, usage.map(|usage| usage.to_json()));
+        }
     }
 
     #[test]
@@ -885,7 +932,7 @@ mod tests {
             })
         );
 
-        let learning = analyze_chat_turn_learning("review", state.turn, &[], &result);
+        let learning = consume_chat_turn_learning(&result);
         let mut sidecars = Vec::new();
         extend_runtime_sidecar_events(&mut sidecars, &state, "review", &result, &learning);
         assert!(sidecars.iter().all(|event| {
@@ -953,7 +1000,8 @@ mod tests {
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("durable answer");
-        let learning = analyze_chat_turn_learning("inspect", state.turn, &[], &result);
+        result.turn_evaluation = Some(server_evaluation(&sid, 9));
+        let learning = consume_chat_turn_learning(&result);
 
         let primary = commit_primary_turn(
             &mut state,
@@ -1028,7 +1076,7 @@ mod tests {
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("durable answer");
-        let learning = analyze_chat_turn_learning("inspect", state.turn, &[], &result);
+        let learning = consume_chat_turn_learning(&result);
         let sidecars = commit_primary_turn(
             &mut state,
             "inspect",
@@ -1092,7 +1140,7 @@ mod tests {
         trace.token_budget.max_tokens = 800_000;
         trace.token_budget.total_used = 2_222;
         result.pending_context_assembly_trace = Some((2, trace.to_json_value()));
-        let learning = analyze_chat_turn_learning("inspect", state.turn, &[], &result);
+        let learning = consume_chat_turn_learning(&result);
         let primary = commit_primary_turn(
             &mut state,
             "inspect",
@@ -1138,8 +1186,7 @@ mod tests {
             ..Default::default()
         };
         stale_result.pending_context_assembly_trace = Some((1, stale_trace.to_json_value()));
-        let stale_learning =
-            analyze_chat_turn_learning("older", stale_state.turn, &[], &stale_result);
+        let stale_learning = consume_chat_turn_learning(&stale_result);
         let stale_primary = commit_primary_turn(
             &mut stale_state,
             "older",
@@ -1176,7 +1223,8 @@ mod tests {
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("durable answer");
-        let learning = analyze_chat_turn_learning("inspect", state.turn, &[], &result);
+        result.turn_evaluation = Some(server_evaluation(&sid, 9));
+        let learning = consume_chat_turn_learning(&result);
         let primary = commit_primary_turn(
             &mut state,
             "inspect",
@@ -1246,8 +1294,9 @@ mod tests {
             ..Default::default()
         }];
 
-        let learning =
-            analyze_chat_turn_learning("git status", state.turn, &state.recent_tools, &result);
+        result.turn_evaluation = Some(server_evaluation(&sid, 9));
+        let expected = serde_json::to_value(result.turn_evaluation.as_ref().unwrap()).unwrap();
+        let learning = consume_chat_turn_learning(&result);
         commit_primary_and_project_sidecars(
             &mut state,
             "git status",
@@ -1261,15 +1310,19 @@ mod tests {
             .iter()
             .find(|event| event.event_type == session_journal::JournalEventType::TurnEvaluation)
             .expect("turn evaluation event");
-        assert_eq!(event.turn, Some(1));
-        let metadata = event.metadata.as_ref().expect("turn evaluation metadata");
-        assert_eq!(metadata["source"], "cli_repl");
-        assert_eq!(metadata["live_query"], false);
-        assert_eq!(metadata["success"], true);
-        assert_eq!(metadata["tool_call_count"], 1);
-        assert_eq!(metadata["signal_count"], 2);
-        assert_eq!(metadata["signals"][0]["kind"], "tool_error_rate");
-        assert_eq!(metadata["signals"][1]["kind"], "all_tools_healthy");
+        assert_eq!(
+            event.turn,
+            Some(9),
+            "canonical Server turn is not the local wrapper turn"
+        );
+        let mut projected = serde_json::to_value(event).unwrap();
+        let metadata = projected["metadata"].as_object_mut().unwrap();
+        assert!(metadata.remove("sidecar_projection_id").is_some());
+        assert!(metadata.remove("sidecar_projection_index").is_some());
+        assert_eq!(
+            projected, expected,
+            "projection bookkeeping must preserve every authoritative field"
+        );
     }
 
     #[test]
@@ -1292,8 +1345,7 @@ mod tests {
             json!({"role": "assistant", "content": "Done."}),
             json!({"role": "system", "content": "runtime context must not persist"}),
         ];
-        let learning =
-            analyze_chat_turn_learning("inspect the scheduler", state.turn, &[], &result);
+        let learning = consume_chat_turn_learning(&result);
 
         let primary = commit_primary_turn(
             &mut state,
@@ -1366,7 +1418,7 @@ mod tests {
         }));
         result.tool_calls_count = 3;
 
-        let learning = analyze_chat_turn_learning("continue", state.turn, &[], &result);
+        let learning = consume_chat_turn_learning(&result);
         commit_primary_and_project_sidecars(
             &mut state,
             "continue",
@@ -1453,7 +1505,7 @@ mod tests {
         trace.token_budget.total_used = 12_345;
         result.pending_context_assembly_trace = Some((99, trace.to_json_value()));
 
-        let learning = analyze_chat_turn_learning("continue", state.turn, &[], &result);
+        let learning = consume_chat_turn_learning(&result);
         commit_primary_and_project_sidecars(
             &mut state,
             "continue",
@@ -1474,8 +1526,9 @@ mod tests {
             .latest_context_assembly_trace
             .as_ref()
             .expect("cached context trace");
-        assert_eq!(cached_trace.turn_id, "turn-99");
-        assert_eq!(cached_trace.token_budget.total_used, 12_345);
+        assert_eq!(cached_trace.local_turn, state.turn);
+        assert_eq!(cached_trace.trace.turn_id, "turn-99");
+        assert_eq!(cached_trace.trace.token_budget.total_used, 12_345);
     }
 
     #[test]
@@ -1492,7 +1545,7 @@ mod tests {
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("hello");
-        let learning = analyze_chat_turn_learning("hello", state.turn, &[], &result);
+        let learning = consume_chat_turn_learning(&result);
 
         commit_primary_and_project_sidecars(
             &mut state,
@@ -1532,7 +1585,7 @@ mod tests {
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("hello");
-        let learning = analyze_chat_turn_learning("hello", state.turn, &[], &result);
+        let learning = consume_chat_turn_learning(&result);
 
         commit_primary_and_project_sidecars(
             &mut state,
@@ -1577,7 +1630,7 @@ mod tests {
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("hello");
-        let learning = analyze_chat_turn_learning("hello", state.turn, &[], &result);
+        let learning = consume_chat_turn_learning(&result);
 
         commit_primary_and_project_sidecars(
             &mut state,
@@ -1619,7 +1672,7 @@ mod tests {
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("hello");
-        let learning = analyze_chat_turn_learning("hello", state.turn, &[], &result);
+        let learning = consume_chat_turn_learning(&result);
 
         commit_primary_and_project_sidecars(
             &mut state,
@@ -1668,7 +1721,7 @@ mod tests {
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("hello");
-        let learning = analyze_chat_turn_learning("hello", state.turn, &[], &result);
+        let learning = consume_chat_turn_learning(&result);
 
         commit_primary_and_project_sidecars(
             &mut state,

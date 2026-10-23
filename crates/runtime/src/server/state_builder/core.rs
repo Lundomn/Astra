@@ -21,9 +21,11 @@ pub(super) fn build_auth_service(
     shared_pool: &SharedPool,
     control_pool: Option<&SharedPool>,
     shared_encryptor: &Arc<FernetTokenEncryptor>,
+    uc_provider: Option<astra_services::auth::uc::UcNativeProvider>,
 ) -> Result<Arc<dyn AuthService>, Box<dyn std::error::Error>> {
     let mut service = DatabaseAuthService::new(settings.matrixone.clone(), settings.jwt.clone())
         .with_pool(shared_pool.clone())
+        .with_uc_native(uc_provider)
         .with_memoria_settings(&settings.memoria)?
         .with_encryptor(shared_encryptor.as_ref().clone());
     if let Some(control_pool) = control_pool {
@@ -71,6 +73,7 @@ pub(super) fn build_core_state(
     control_pool: Option<&SharedPool>,
     shared_encryptor: &Arc<FernetTokenEncryptor>,
     auth_service: Arc<dyn AuthService>,
+    uc_provider: Option<astra_services::auth::uc::UcNativeProvider>,
 ) -> AppState {
     let execution_grant_key =
         derive_runtime_subkey(&settings.runtime_root_secret, b"execution-grant");
@@ -122,18 +125,11 @@ pub(super) fn build_core_state(
     ))
     .with_model_service(Arc::new(
         DatabaseModelService::new(settings.matrixone.clone(), Arc::clone(shared_encryptor))
+            .with_uc_native(uc_provider)
             .with_pool(shared_pool.clone()),
     ))
-    .with_job_service(Arc::new(InMemoryJobService::new()))
-    .with_trigger_service(Arc::new(
-        DatabaseTriggerService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_workflow_service(Arc::new(UnconfiguredWorkflowService))
     .with_sandbox_service(Arc::new(
         DatabaseSandboxService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_branch_service(Arc::new(
-        DatabaseBranchService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))
     .with_data_versioning_service(Arc::new(
         DatabaseDataVersioningService::new(settings.matrixone.clone())
@@ -145,9 +141,6 @@ pub(super) fn build_core_state(
     .with_marketplace_stats_service(Arc::new(
         DatabaseMarketplaceStatsService::new(settings.matrixone.clone())
             .with_pool(shared_pool.clone()),
-    ))
-    .with_replay_service(Arc::new(
-        DatabaseReplayService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))
     .with_session_audit_service(Arc::new(
         DatabaseSessionAuditService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
@@ -171,14 +164,6 @@ pub(super) fn build_core_state(
             .with_pool(shared_pool.clone()),
     ))
     .with_fernet_encryptor(shared_encryptor.as_ref().clone())
-    .with_evaluation_service(Arc::new(
-        DatabaseEvaluationService::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone())
-            .with_memoria_config(
-                settings.memoria.base_url.clone(),
-                settings.memoria.master_key.clone(),
-            ),
-    ))
     .with_introspection_service(Arc::new(
         DatabaseIntrospectionService::new(settings.matrixone.clone())
             .with_pool(shared_pool.clone()),
@@ -194,32 +179,16 @@ pub(super) fn install_turn_persistence_services(
     shared_pool: &SharedPool,
 ) -> AppState {
     state
-        .with_turn_core_event_writer(Arc::new(
-            DatabaseTurnCoreEventWriter::new(settings.matrixone.clone())
-                .with_pool(shared_pool.clone()),
-        ))
-        .with_turn_tool_event_writer(Arc::new(
-            DatabaseTurnToolEventWriter::new(settings.matrixone.clone())
-                .with_pool(shared_pool.clone()),
-        ))
         .with_turn_hook_db_writer(Arc::new(
             DatabaseTurnHookDbWriter::new(settings.matrixone.clone())
                 .with_pool(shared_pool.clone()),
         ))
-        .with_turn_reflection_lesson_writer(Arc::new(DatabaseTurnReflectionLessonWriter::new(
-            settings.memoria.base_url.clone(),
-            settings.memoria.master_key.clone(),
-        )))
         .with_turn_observer_worker(Arc::new(DatabaseTurnObserverWorker::new(
             settings.memoria.base_url.clone(),
             settings.memoria.master_key.clone(),
         )))
         .with_turn_auxiliary_event_writer(Arc::new(
             DatabaseTurnAuxiliaryEventWriter::new(settings.matrixone.clone())
-                .with_pool(shared_pool.clone()),
-        ))
-        .with_turn_session_activity_writer(Arc::new(
-            DatabaseTurnSessionActivityWriter::new(settings.matrixone.clone())
                 .with_pool(shared_pool.clone()),
         ))
 }
@@ -250,10 +219,6 @@ pub(super) fn install_admin_services(
         .with_admin_audit_reader(Arc::new(
             DatabaseAdminAuditReader::new(settings.matrixone.clone()).with_pool(pool.clone()),
         ))
-        .with_admin_feedback_stats_reader(Arc::new(
-            DatabaseAdminFeedbackStatsReader::new(settings.matrixone.clone())
-                .with_pool(pool.clone()),
-        ))
         .with_admin_user_role_manager(Arc::new(
             DatabaseAdminUserRoleManager::new(settings.matrixone.clone()).with_pool(pool.clone()),
         ))
@@ -263,7 +228,19 @@ pub(super) fn install_admin_services(
         )))
 }
 
-pub(super) fn install_execution_services(state: AppState, shared_pool: &SharedPool) -> AppState {
+pub(super) fn install_execution_services(
+    mut state: AppState,
+    shared_pool: &SharedPool,
+) -> Result<AppState, Box<dyn std::error::Error>> {
+    match std::env::var("ASTRA_EDGE_CAPACITY_RELAY_ORIGIN") {
+        Ok(origin) => {
+            state = state
+                .with_edge_capacity_relay_origin(origin)
+                .map_err(std::io::Error::other)?
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(error) => return Err(Box::new(error)),
+    }
     let metrics = state.multi_agent_metrics.clone();
     let edge_registry_service: Arc<dyn EdgeRegistryService> = Arc::new(
         DatabaseEdgeRegistryService::from_shared(shared_pool).with_metrics(metrics.clone()),
@@ -277,10 +254,10 @@ pub(super) fn install_execution_services(state: AppState, shared_pool: &SharedPo
         Arc::clone(&edge_registry_service),
         &load_deployment_tool_policy(),
     );
-    state
+    Ok(state
         .with_edge_registry_service(edge_registry_service)
         .with_edge_dispatch_service(edge_dispatch_service)
-        .with_tool_execution_service(tool_execution_service)
+        .with_tool_execution_service(tool_execution_service))
 }
 
 fn build_shared_tool_execution_service(
@@ -366,7 +343,7 @@ mod tests {
         async fn wait_result(
             &self,
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
-            _timeout: std::time::Duration,
+            _timeout: Option<std::time::Duration>,
         ) -> Result<Option<String>, String> {
             Ok(None)
         }
@@ -431,6 +408,7 @@ mod tests {
             runtime_process_authorization_required: false,
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,
+            provider_stage_dispatch: None,
             selected_offer: None,
             policy: crate::server::tool_transport::ToolPolicySnapshot::default(),
         }

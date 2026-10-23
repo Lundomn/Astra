@@ -5,6 +5,10 @@ vi.mock("@/lib/api/auth-guard", () => ({
 }));
 
 vi.mock("@/lib/api/web-store", () => ({
+  claimChatStreamProjection: vi.fn(),
+  withChatStreamProjection: vi.fn((_lease, apply) => { apply(); return true; }),
+  releaseChatStreamProjection: vi.fn(),
+  ChatStreamProjectionError: class extends Error {},
   beginStreamingMessage: vi.fn(),
   ensureChatBackendSession: vi.fn(),
   getChat: vi.fn(),
@@ -50,6 +54,7 @@ vi.mock("@/lib/runtime-client", () => ({
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
 import {
   beginStreamingMessage,
+  claimChatStreamProjection,
   ensureChatBackendSession,
   getChat,
   resolveModelOfferingSelection,
@@ -59,6 +64,22 @@ import {
 } from "@/lib/api/web-store";
 import { requireRuntimeClient } from "@/lib/runtime-client";
 import { PATH_EDGES_STATUS } from "@astra/sdk";
+import workspaceBindingContract from "../../../fixtures/contracts/workspace_binding_request.json";
+
+// Independent server fixture: this intentionally does not import the SDK
+// constant, so a stale Web major cannot make the route tests self-consistent.
+const SERVER_INTERACTION_API_MAJOR_HEADER =
+  "x-astra-agent-interaction-api-major";
+const SERVER_INTERACTION_API_MAJOR = "3";
+
+const mockClaimProjection = vi.mocked(claimChatStreamProjection);
+beforeEach(() => {
+  mockClaimProjection.mockImplementation((ownerUserId, chatId, assistantMessageId, writer, binding) => ({
+    ownerUserId, chatId, writer, projection: { assistantMessageId, sessionId: binding.sessionId, writer,
+      state: { assistantText: "", assistantRawText: "", reasoningText: "", lastStatus: "streaming",
+        protocolError: false, runLifecycle: "running", runId: binding.runId, nextEventIndex: binding.nextEventIndex ?? 0 } },
+  }));
+});
 
 const mockRequireRuntimeUser = vi.mocked(requireRuntimeUser);
 const mockGetChat = vi.mocked(getChat);
@@ -89,7 +110,9 @@ function makeBackendStream() {
   );
 
   return {
-    headers: new Headers({ "x-astra-agent-interaction-api-major": "1" }),
+    headers: new Headers({
+      [SERVER_INTERACTION_API_MAJOR_HEADER]: SERVER_INTERACTION_API_MAJOR,
+    }),
     body: {
       getReader: () => ({
         read,
@@ -102,7 +125,7 @@ function makeBackendStream() {
   };
 }
 
-function makeBackendFrameStream(frames: string[]) {
+function makeBackendFrameStream(frames: string[], readError?: Error) {
   const encoder = new TextEncoder();
   const chunks = frames.map((frame) => encoder.encode(frame));
   let index = 0;
@@ -110,11 +133,14 @@ function makeBackendFrameStream(frames: string[]) {
   const cancel = vi.fn();
 
   return {
-    headers: new Headers({ "x-astra-agent-interaction-api-major": "1" }),
+    headers: new Headers({
+      [SERVER_INTERACTION_API_MAJOR_HEADER]: SERVER_INTERACTION_API_MAJOR,
+    }),
     body: {
       getReader: () => ({
         async read() {
           if (index >= chunks.length) {
+            if (readError) throw readError;
             return { value: undefined, done: true };
           }
           const value = chunks[index];
@@ -312,6 +338,56 @@ describe("chat stream route proxy cancellation", () => {
     const body = await response.text();
     expect(body).toContain("RUNTIME_PROTOCOL_MISMATCH");
     expect(body).toContain("missing the interaction protocol contract");
+    expect(runtime.fetchResponse.mock.calls[0]?.[1]?.signal.aborted).toBe(true);
+    expect(backend.body.getReader().read).not.toHaveBeenCalled();
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      expect.objectContaining({ status: "failed" }),
+    );
+  });
+
+  it("rejects a server interaction major from the previous contract", async () => {
+    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+    const backend = makeBackendStream();
+    backend.headers = new Headers({
+      [SERVER_INTERACTION_API_MAJOR_HEADER]: "1",
+    });
+    const runtime = {
+      sdk: {
+        getRuntimeSession: vi.fn().mockResolvedValue({}),
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
+      },
+      fetchResponse: vi.fn().mockResolvedValue({
+        ok: true,
+        headers: backend.headers,
+        body: backend.body,
+      }),
+    };
+    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+
+    const response = await POST(
+      new Request("http://web.test/api/chats/chat-1/stream", {
+        method: "POST",
+        body: JSON.stringify({
+          content: "hello",
+          options: {
+            model: "sonnet-4.6-adaptive",
+            webSearch: false,
+            thinking: true,
+            activeSkills: [],
+          },
+        }),
+      }) as never,
+      { params: Promise.resolve({ chatId: "chat-1" }) },
+    );
+
+    const body = await response.text();
+    expect(body).toContain("RUNTIME_PROTOCOL_MISMATCH");
+    expect(body).toContain(
+      "Astra Server interaction protocol 1 is incompatible with Web 3",
+    );
     expect(runtime.fetchResponse.mock.calls[0]?.[1]?.signal.aborted).toBe(true);
     expect(backend.body.getReader().read).not.toHaveBeenCalled();
     expect(mockUpdateStreamingAssistantMessage).toHaveBeenCalledWith(
@@ -526,6 +602,7 @@ describe("chat stream route proxy cancellation", () => {
     const backend = makeBackendFrameStream([
       'data: {"type":"run_started","run_id":"run-soft","index":"bad"}\n\n',
       'data: {"type":"text_done","full_text":"done"}\n\n',
+      'data: {"type":"run_finished","run_id":"run-soft","status":"completed"}\n\n',
     ]);
     mockRequireRuntimeClient.mockResolvedValue({
       sdk: {
@@ -926,7 +1003,9 @@ describe("chat stream route proxy cancellation", () => {
     expect(signal?.aborted).toBe(true);
     resolveFetch({
       ok: true,
-      headers: new Headers({ "x-astra-agent-interaction-api-major": "1" }),
+      headers: new Headers({
+        [SERVER_INTERACTION_API_MAJOR_HEADER]: SERVER_INTERACTION_API_MAJOR,
+      }),
       body: makeBackendStream().body,
     });
   });
@@ -966,12 +1045,7 @@ describe("chat stream route proxy cancellation", () => {
     >;
     expect(fetchCalls[0]?.[1].json).toEqual(
       expect.objectContaining({
-        workspace_binding: {
-          kind: "none",
-          display_name: "Web",
-          authority: "none",
-          fallback_policy: "disabled",
-        },
+        workspace_binding: workspaceBindingContract.none,
         executor_binding: {
           kind: "server_local",
           executor_id: "server-control-plane",
@@ -1047,12 +1121,7 @@ describe("chat stream route proxy cancellation", () => {
     >;
     expect(fetchCalls[0]?.[1].json).toEqual(
       expect.objectContaining({
-        workspace_binding: {
-          kind: "server_sandbox",
-          display_name: "Server sandbox",
-          authority: "read_write",
-          fallback_policy: "disabled",
-        },
+        workspace_binding: workspaceBindingContract.server_sandbox,
         executor_binding: {
           kind: "server_local",
           executor_id: "server-local",
@@ -1155,13 +1224,7 @@ describe("chat stream route proxy cancellation", () => {
         attachments: [],
         model_selection: { offering_id: "model-backend" },
         enabled_tools: ["github", "web_fetch", "web_search"],
-        workspace_binding: {
-          kind: "edge_workspace",
-          display_name: "MacBook Pro",
-          cwd: "/Users/test/astra",
-          authority: "read_write",
-          fallback_policy: "disabled",
-        },
+        workspace_binding: workspaceBindingContract.edge_workspace,
         executor_binding: {
           kind: "edge_agent",
           executor_id: "edge-1",
@@ -1453,10 +1516,7 @@ describe("chat stream route proxy cancellation", () => {
         parts: [],
         attachments: [],
         model_selection: { offering_id: "model-backend" },
-        workspace_binding: expect.objectContaining({
-          kind: "edge_workspace",
-          cwd: "/Users/test/astra",
-        }),
+        workspace_binding: workspaceBindingContract.edge_workspace,
         executor_binding: expect.objectContaining({
           kind: "edge_agent",
           executor_id: "edge-1",
@@ -1912,6 +1972,82 @@ describe("chat existing run stream route", () => {
     });
   });
 
+  it.each([
+    { coalesced: false, resumed: false },
+    { coalesced: true, resumed: false },
+    { coalesced: false, resumed: true },
+  ])("preserves partial output through failure (coalesced=$coalesced, cursor=$resumed)", async ({ coalesced, resumed }) => {
+    const { GET } = await import("@/app/api/chats/[chatId]/stream/route");
+    if (resumed) {
+      const stored = mockGetChat("user-a", "web-chat-1")!.messages.find(message => message.id === "assistant-1")!;
+      stored.content = "Useful partial answer";
+      stored.reasoning = "Partial reasoning";
+      const { applyStreamEvent } = await import("@/lib/api/stream-event-handler");
+      const lease = mockClaimProjection("user-a", "web-chat-1", "assistant-1", new AbortController(),
+        { sessionId: "runtime-session-1", runId: "root" });
+      const ctx = { ownerUserId: "user-a", chatId: "web-chat-1", assistantMessageId: "assistant-1", getSessionId: () => "runtime-session-1" };
+      applyStreamEvent({ type: "text_delta", content: stored.content }, ctx, lease.projection.state);
+      applyStreamEvent({ type: "reasoning_delta", content: stored.reasoning, index: 7 }, ctx, lease.projection.state);
+      mockClaimProjection.mockReturnValue(lease);
+    }
+    const frames = [
+      { type: "session_info", session_id: "runtime-session-1", run_id: "root" },
+      { type: "text_delta", content: "Useful partial answer" },
+      { type: "reasoning_delta", content: "Partial reasoning" },
+      { type: "run_finished", run_id: "child", status: "cancelled" },
+      { type: "run_error", run_id: "root", error: "Save failed", error_code: "canonical_persistence_failed" },
+      { type: "run_finished", run_id: "root", status: "failed", error: "Save failed" },
+    ].filter(event => !resumed || !["text_delta", "reasoning_delta"].includes(event.type))
+      .map(event => `data: ${JSON.stringify(event)}\n\n`);
+    frames.push("data: [DONE]\n\n");
+    const backend = makeBackendFrameStream(coalesced ? [frames.join("")] : frames);
+    mockRequireRuntimeClient.mockResolvedValue({ sdk: { listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }) },
+      fetchResponse: vi.fn().mockResolvedValue({ ok: true, headers: backend.headers, body: backend.body }) } as never);
+    const url = `http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=root${resumed ? "&last_index=8" : ""}`;
+    const request = new Request(url, { method: "GET" });
+    Object.defineProperty(request, "nextUrl", { value: new URL(url) });
+    const response = await GET(request as never, { params: Promise.resolve({ chatId: "web-chat-1" }) });
+    const wire = await response.text();
+    expect(wire).toContain('"run_id":"child"');
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith("user-a", "web-chat-1", "assistant-1",
+      expect.objectContaining({ content: "Useful partial answer\n\nSave failed", reasoning: "Partial reasoning",
+        reasoningStatus: undefined, status: "failed" }));
+    expect(mockSetChatActiveRun.mock.calls.every(([, , run]) => run?.runId !== "child")).toBe(true);
+  });
+
+  it.each([true, false])("preserves the proxy failure cause through a reset (canonical=%s)", async (canonical) => {
+    const { GET } = await import("@/app/api/chats/[chatId]/stream/route");
+    const { streamExistingChatRun } = await import("@/lib/api/chats");
+    const events = [
+      { type: "session_info", session_id: "runtime-session-1", run_id: "root" },
+      { type: "text_delta", content: "Useful partial answer" },
+      ...(canonical ? [{ type: "run_error", run_id: "root", error: "Save failed",
+        error_code: "canonical_persistence_failed" }] : []),
+    ];
+    const backend = makeBackendFrameStream(events.map(event => `data: ${JSON.stringify(event)}\n\n`), new Error("upstream reset"));
+    mockRequireRuntimeClient.mockResolvedValue({ sdk: { listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }) }, fetchResponse: vi.fn().mockResolvedValue({
+      ok: true, headers: backend.headers, body: backend.body,
+    }) } as never);
+    const url = "http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=root";
+    const request = new Request(url);
+    Object.defineProperty(request, "nextUrl", { value: new URL(url) });
+    const response = await GET(request as never, { params: Promise.resolve({ chatId: "web-chat-1" }) });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(response);
+    const onText = vi.fn(), onDone = vi.fn();
+    try {
+      await expect(streamExistingChatRun("web-chat-1", "root", { onText, onDone })).rejects.toMatchObject({
+        code: canonical ? "canonical_persistence_failed" : "stream_observation_interrupted",
+      });
+      expect(onText).toHaveBeenLastCalledWith("Useful partial answer");
+      expect(onDone).not.toHaveBeenCalled();
+      expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith("user-a", "web-chat-1", "assistant-1",
+        expect.objectContaining({ content: canonical ? "Useful partial answer\n\nSave failed" : "Useful partial answer", status: canonical ? "failed" : "streaming" }));
+      expect(backend.releaseLock).toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
   it("uses the backend session id when reconnecting an existing run stream", async () => {
     const { GET } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendFrameStream([
@@ -1932,13 +2068,13 @@ describe("chat existing run stream route", () => {
     } as never);
 
     const request = new Request(
-      "http://web.test/api/chats/web-chat-1/stream?runId=run-1",
+      "http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=run-1",
       {
         method: "GET",
       },
     );
     Object.defineProperty(request, "nextUrl", {
-      value: new URL("http://web.test/api/chats/web-chat-1/stream?runId=run-1"),
+      value: new URL("http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=run-1"),
     });
 
     const response = await GET(request as never, {
@@ -1993,11 +2129,11 @@ describe("chat existing run stream route", () => {
       }),
     } as never);
     const request = new Request(
-      "http://web.test/api/chats/web-chat-1/stream?runId=run-1",
+      "http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=run-1",
       { method: "GET" },
     );
     Object.defineProperty(request, "nextUrl", {
-      value: new URL("http://web.test/api/chats/web-chat-1/stream?runId=run-1"),
+      value: new URL("http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=run-1"),
     });
 
     const response = await GET(request as never, {
@@ -2029,7 +2165,7 @@ describe("chat existing run stream route", () => {
     );
   });
 
-  it("fails the local run state when a backend stream event has a malformed cursor", async () => {
+  it("ignores a malformed event cursor but requires a terminal receipt", async () => {
     const { GET } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendFrameStream([
       'data: {"type":"session_info","session_id":"runtime-session-1","run_id":"run-1"}\n\n',
@@ -2047,11 +2183,11 @@ describe("chat existing run stream route", () => {
       }),
     } as never);
     const request = new Request(
-      "http://web.test/api/chats/web-chat-1/stream?runId=run-1",
+      "http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=run-1",
       { method: "GET" },
     );
     Object.defineProperty(request, "nextUrl", {
-      value: new URL("http://web.test/api/chats/web-chat-1/stream?runId=run-1"),
+      value: new URL("http://web.test/api/chats/web-chat-1/stream?assistantMessageId=assistant-1&runId=run-1"),
     });
 
     const response = await GET(request as never, {
@@ -2072,18 +2208,15 @@ describe("chat existing run stream route", () => {
     expect(body).not.toContain("Malformed stream event index.");
     expect(body).toContain("should not win");
     expect(backend.cancel).not.toHaveBeenCalled();
-    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
-      "user-a",
-      "web-chat-1",
-      undefined,
-    );
+    expect(mockSetChatActiveRun).not.toHaveBeenCalledWith("user-a", "web-chat-1", undefined);
+    expect(body).toContain("stream_observation_interrupted");
     expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
       "user-a",
       "web-chat-1",
       "assistant-1",
       expect.objectContaining({
         content: "should not win",
-        status: "complete",
+        status: "streaming",
       }),
     );
     expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalledWith(

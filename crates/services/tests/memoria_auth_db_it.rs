@@ -82,6 +82,41 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
         HeaderValue::from_str(&format!("Bearer {}", refreshed.access_token)).unwrap(),
     );
     auth.current_user(&headers).await.unwrap();
+    let principal = auth.current_principal(&headers).await.unwrap();
+    assert_eq!(principal.user.user_id, tokens.user_id);
+    assert!(matches!(
+        principal.origin,
+        astra_services::AuthPrincipalOrigin::VerifiedProvider { .. }
+    ));
+    sqlx::query("UPDATE auth_users SET is_active = 0 WHERE user_id = ?")
+        .bind(&tokens.user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let inactive = auth.current_principal(&headers).await.unwrap_err();
+    assert_eq!(inactive.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(inactive.1.0.detail, "User is inactive");
+    sqlx::query("UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE user_id = ?")
+        .bind(&tokens.user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let expired = auth.current_principal(&headers).await.unwrap_err();
+    assert_eq!(expired.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        expired.1.0.detail, "Session expired or revoked",
+        "session rejection retains precedence over the inactive user"
+    );
+    sqlx::query("UPDATE auth_refresh_tokens SET is_revoked = 0 WHERE user_id = ?")
+        .bind(&tokens.user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE auth_users SET is_active = 1 WHERE user_id = ?")
+        .bind(&tokens.user_id)
+        .execute(pool)
+        .await
+        .unwrap();
     revoked.store(true, Ordering::SeqCst);
     assert_eq!(
         auth.refresh(AuthRefreshRequestData {
@@ -135,6 +170,11 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
             assert_eq!(
                 auth.current_user(&headers).await.unwrap_err().0,
                 StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                auth.current_principal(&headers).await.unwrap_err().0,
+                StatusCode::UNAUTHORIZED,
+                "parallel principal reads retain the legacy Memoria access window"
             );
         }
     }
@@ -192,20 +232,21 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
         "auth_tokens",
         "auth_refresh_tokens",
         "auth_user_roles",
-        "auth_memoria_identities",
         "auth_external_identities",
         "auth_users",
     ] {
         let column = match table {
             "auth_tokens" => "scope_user_id",
-            "auth_memoria_identities" | "auth_external_identities" => "astra_user_id",
+            "auth_external_identities" => "astra_user_id",
             _ => "user_id",
         };
-        sqlx::query(&format!("DELETE FROM {table} WHERE {column} = ?"))
-            .bind(&tokens.user_id)
-            .execute(pool)
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE {column} = ?"
+        )))
+        .bind(&tokens.user_id)
+        .execute(pool)
+        .await
+        .unwrap();
     }
     server.abort();
 }
@@ -227,7 +268,6 @@ async fn memoria_issuer_atomicity_concurrent_binding_and_disconnect() {
                 .unwrap_or("").trim_start_matches("Bearer ");
             let owner = match key {
                 "atomic-failure" => format!("{subject}-failure"),
-                "legacy-key" => format!("{subject}-legacy"),
                 _ => subject,
             };
             (if revoked { StatusCode::UNAUTHORIZED } else { StatusCode::OK },
@@ -248,7 +288,6 @@ async fn memoria_issuer_atomicity_concurrent_binding_and_disconnect() {
         self_hosted_master_access: false,
         issuer: None,
         web_url: Some("http://localhost".into()),
-        legacy_issuer: None,
     };
     let jwt = JwtSettings {
         secret_key: "review-704-jwt".into(),
@@ -300,6 +339,22 @@ async fn memoria_issuer_atomicity_concurrent_binding_and_disconnect() {
     let encrypted: String = sqlx::query_scalar("SELECT encrypted_value FROM auth_tokens WHERE type = 'memoria_connection' AND scope_user_id = ?")
         .bind(&user).fetch_one(shared.get()).await.unwrap();
     assert_ne!(encrypted, grant.key);
+    // A present but malformed binding must error, not look like an absent
+    // credential to either public resolver.
+    let metadata: String = sqlx::query_scalar("SELECT CAST(metadata AS CHAR) FROM auth_tokens WHERE type = 'memoria_connection' AND scope_user_id = ?")
+        .bind(&user).fetch_one(shared.get()).await.unwrap();
+    for (ciphertext, metadata) in [
+        (None, metadata.as_str()),
+        (Some("invalid-ciphertext"), metadata.as_str()),
+        (Some(encrypted.as_str()), "{}"),
+    ] {
+        sqlx::query("UPDATE auth_tokens SET encrypted_value = ?, metadata = ? WHERE type = 'memoria_connection' AND scope_user_id = ?")
+            .bind(ciphertext).bind(metadata).bind(&user).execute(shared.get()).await.unwrap();
+        assert!(resolver.resolve(&user).await.is_err());
+        assert!(resolver.resolve_runtime(&user).await.is_err());
+    }
+    sqlx::query("UPDATE auth_tokens SET encrypted_value = ?, metadata = ? WHERE type = 'memoria_connection' AND scope_user_id = ?")
+        .bind(&encrypted).bind(&metadata).bind(&user).execute(shared.get()).await.unwrap();
     let mut headers = HeaderMap::new();
     headers.insert(
         "authorization",
@@ -401,67 +456,15 @@ async fn memoria_issuer_atomicity_concurrent_binding_and_disconnect() {
         ("auth_tokens", "scope_user_id"),
         ("auth_refresh_tokens", "user_id"),
     ] {
-        let rows: i64 =
-            sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?"))
-                .bind(&failed_user)
-                .fetch_one(shared.get())
-                .await
-                .unwrap();
+        let rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE {column} = ?"
+        )))
+        .bind(&failed_user)
+        .fetch_one(shared.get())
+        .await
+        .unwrap();
         assert_eq!(rows, 0, "failed login left rows in {table}");
     }
-
-    // Legacy subjects have no issuer. They are never silently assigned to
-    // whichever instance happens to answer the next login.
-    let legacy_user = format!("legacy-{}", Uuid::new_v4());
-    let legacy_subject = format!("{subject}-legacy");
-    sqlx::query("INSERT INTO auth_users (user_id,username,email,password_hash,is_active) VALUES (?, ?, ?, '', 1)")
-        .bind(&legacy_user).bind(&legacy_user).bind(format!("{legacy_user}@test.invalid"))
-        .execute(shared.get()).await.unwrap();
-    sqlx::query(
-        "INSERT INTO auth_memoria_identities (memoria_user_id,astra_user_id) VALUES (?, ?)",
-    )
-    .bind(&legacy_subject)
-    .bind(&legacy_user)
-    .execute(shared.get())
-    .await
-    .unwrap();
-    assert_eq!(
-        auth.login_memoria("legacy-key").await.err().unwrap().0,
-        StatusCode::CONFLICT
-    );
-    let migrator = auth
-        .clone()
-        .with_memoria_settings(&astra_core::MemoriaSettings {
-            legacy_issuer: Some(base),
-            ..settings.clone()
-        })
-        .unwrap();
-    assert_eq!(
-        migrator
-            .login_memoria("legacy-key")
-            .await
-            .unwrap()
-            .tokens
-            .user_id,
-        legacy_user
-    );
-    assert_eq!(
-        migrator
-            .login_memoria("legacy-key")
-            .await
-            .unwrap()
-            .tokens
-            .user_id,
-        legacy_user
-    );
-    let remaining: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM auth_memoria_identities WHERE astra_user_id = ?")
-            .bind(&legacy_user)
-            .fetch_one(shared.get())
-            .await
-            .unwrap();
-    assert_eq!(remaining, 0);
-    migrator.disconnect_memoria(&legacy_user).await.unwrap();
 
     auth.disconnect_memoria(&user).await.unwrap();
     auth.disconnect_memoria(&user).await.unwrap(); // idempotent service operation

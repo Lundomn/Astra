@@ -10,56 +10,6 @@ use serde_json::{Value, json};
 
 use super::ToolExecutor;
 
-pub use astra_tools::memoria::{BoostSearchHit, parse_memory_search_hits};
-
-pub(crate) const MEMORY_BOOST_MIN_SCORE: f64 = 0.3;
-
-pub(crate) fn filter_memory_boost_hits_for_prompt(
-    hits: Vec<BoostSearchHit>,
-) -> Vec<BoostSearchHit> {
-    hits.into_iter()
-        .filter(|hit| {
-            hit.score
-                .is_some_and(|score| score.is_finite() && score >= MEMORY_BOOST_MIN_SCORE)
-        })
-        .collect()
-}
-
-#[cfg(test)]
-mod memory_boost_prompt_filter_tests {
-    use super::{BoostSearchHit, filter_memory_boost_hits_for_prompt};
-
-    #[test]
-    fn memory_boost_prompt_filter_rejects_low_missing_and_nan_scores() {
-        let hits = vec![
-            BoostSearchHit {
-                memory_id: Some("low".into()),
-                content: "low relevance".into(),
-                score: Some(0.137),
-            },
-            BoostSearchHit {
-                memory_id: Some("missing".into()),
-                content: "missing score".into(),
-                score: None,
-            },
-            BoostSearchHit {
-                memory_id: Some("nan".into()),
-                content: "nan score".into(),
-                score: Some(f64::NAN),
-            },
-            BoostSearchHit {
-                memory_id: Some("ok".into()),
-                content: "high relevance".into(),
-                score: Some(0.3),
-            },
-        ];
-
-        let filtered = filter_memory_boost_hits_for_prompt(hits);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].memory_id.as_deref(), Some("ok"));
-    }
-}
-
 fn current_memoria_proxy_target() -> Result<(String, String), String> {
     let base = crate::cli::config_manager::resolve_api_url(None)?;
     let token =
@@ -75,11 +25,22 @@ async fn memoria_proxy_request(
     timeout: Duration,
     body: Option<&Value>,
 ) -> Result<String, String> {
-    let (base, token) = current_memoria_proxy_target()?;
-    let client = astra_core::net::client_builder_for_target(&base)
-        .timeout(timeout)
-        .build()
-        .map_err(|e| format!("build client: {e}"))?;
+    // Capture destination and credential authority together before awaiting a
+    // refresh. A workspace .env must not redirect the native account's bearer,
+    // and an in-flight request must not adopt a later login generation.
+    let binding = crate::cli::native_auth::active();
+    let (base, token) = if let Some(binding) = &binding {
+        (binding.endpoint().to_owned(), binding.access_token().await?)
+    } else {
+        current_memoria_proxy_target()?
+    };
+    let builder = astra_core::net::client_builder_for_target(&base).timeout(timeout);
+    let builder = if binding.is_some() {
+        builder.redirect(reqwest::redirect::Policy::none())
+    } else {
+        builder
+    };
+    let client = builder.build().map_err(|e| format!("build client: {e}"))?;
     let url = format!("{}{}", base.trim_end_matches('/'), path);
     let req = match method {
         astra_tools::memoria::HttpMethod::Get => client.get(&url),
@@ -289,26 +250,6 @@ pub async fn memoria_correct(
     .await
 }
 
-pub async fn memoria_governance_fire_and_forget() {
-    let _ = memoria_proxy_request(
-        astra_tools::memoria::HttpMethod::Post,
-        "/memory/governance",
-        Duration::from_secs(10),
-        Some(&json!({ "force": false })),
-    )
-    .await;
-}
-
-pub async fn memoria_consolidate_fire_and_forget() {
-    let _ = memoria_proxy_request(
-        astra_tools::memoria::HttpMethod::Post,
-        "/memory/consolidate",
-        Duration::from_secs(15),
-        Some(&json!({ "force": false })),
-    )
-    .await;
-}
-
 impl ToolExecutor {
     fn memoria_record_service_failure(&self) {
         self.memoria_circuit.record_service_failure();
@@ -398,119 +339,6 @@ impl ToolExecutor {
             self.memoria_record_service_success();
         }
         result
-    }
-
-    pub async fn memory_boost_search(&self, query: &str, top_k: u64) -> Vec<BoostSearchHit> {
-        if query.trim().is_empty() {
-            return vec![];
-        }
-        if self.memoria_circuit_open() {
-            return vec![];
-        }
-        let cloud_base = match self.cloud_base.as_deref() {
-            Some(base) => base,
-            None => return vec![],
-        };
-        let token = match self.cloud_token() {
-            Some(token) => token,
-            None => return vec![],
-        };
-        let client = match astra_core::net::client_builder_for_target(&cloud_base)
-            .timeout(Duration::from_millis(800))
-            .build()
-        {
-            Ok(c) => c,
-            Err(_) => return vec![],
-        };
-        match client
-            .post(format!("{cloud_base}/memory/retrieve"))
-            .header("Authorization", format!("Bearer {token}"))
-            .json(&json!({
-                "query": query,
-                "top_k": top_k,
-                "min_confidence": 0.3
-            }))
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                let status = resp.status();
-                match resp.text().await {
-                    Ok(text) if status.is_success() => {
-                        self.memoria_record_service_success();
-                        filter_memory_boost_hits_for_prompt(parse_memory_search_hits(&text))
-                    }
-                    Ok(_)
-                        if status.is_server_error()
-                            || matches!(
-                                status,
-                                reqwest::StatusCode::REQUEST_TIMEOUT
-                                    | reqwest::StatusCode::TOO_MANY_REQUESTS
-                            ) =>
-                    {
-                        self.memoria_record_service_failure();
-                        vec![]
-                    }
-                    Ok(_) => {
-                        self.memoria_record_service_success();
-                        vec![]
-                    }
-                    Err(_) => {
-                        self.memoria_record_service_failure();
-                        vec![]
-                    }
-                }
-            }
-            Err(_) => {
-                self.memoria_record_service_failure();
-                vec![]
-            }
-        }
-    }
-
-    /// Fire-and-forget: send "useful" feedback for retrieved memory IDs.
-    ///
-    /// Called after boost search results are injected into the prompt.
-    /// Spawns a background task — does not block the caller.
-    pub fn memory_feedback_useful(&self, memory_ids: Vec<String>) {
-        if memory_ids.is_empty() {
-            return;
-        }
-        if self.memoria_circuit.is_degraded() {
-            return;
-        }
-        let Some(cloud_base) = self.cloud_base.clone() else {
-            return;
-        };
-        let token = match self.cloud_token() {
-            Some(token) => token,
-            None => return,
-        };
-        tokio::spawn(async move {
-            let client = match astra_core::net::client_builder_for_target(&cloud_base)
-                .timeout(Duration::from_secs(5))
-                .build()
-            {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-            for mid in memory_ids {
-                let url = format!("{cloud_base}/memory/feedback/{mid}");
-                if let Err(e) = client
-                    .post(&url)
-                    .header("Authorization", format!("Bearer {token}"))
-                    .json(&json!({
-                        "signal": "useful",
-                        "context": "boost_search retrieval"
-                    }))
-                    .send()
-                    .await
-                {
-                    eprintln!("[memoria] feedback for {mid} failed: {e}");
-                    break; // don't spam on persistent failures
-                }
-            }
-        });
     }
 }
 
@@ -716,12 +544,51 @@ mod build_direct_request_tests {
 /// Retrieve procedural/semantic lessons from Memoria for session bootstrap.
 /// `context_query` should be derived from the user's first message — this
 /// produces much better semantic retrieval than keyword stuffing.
-/// Returns canonical lesson hints. Best-effort: returns empty vec
-/// on any error (circuit breaker, timeout, parse failure).
+/// Preserve retrieval failures so Explain does not mistake them for no matches.
+pub const MAX_RETRIEVED_LESSONS: usize = 32;
+const MAX_RETRIEVAL_SCAN_MULTIPLIER: usize = 4;
+
+#[derive(Debug, Clone)]
+pub struct RetrievedLessonBatch {
+    pub lessons: Vec<astra_services::LessonHint>,
+    pub source_items: u32,
+    pub truncated: bool,
+}
+
+fn project_retrieved_lessons(memories: &[serde_json::Value], top_k: u64) -> RetrievedLessonBatch {
+    let limit = usize::try_from(top_k)
+        .unwrap_or(MAX_RETRIEVED_LESSONS)
+        .min(MAX_RETRIEVED_LESSONS);
+    let scan_limit = limit
+        .saturating_mul(MAX_RETRIEVAL_SCAN_MULTIPLIER)
+        .min(MAX_RETRIEVED_LESSONS.saturating_mul(MAX_RETRIEVAL_SCAN_MULTIPLIER));
+    let mut lessons = memories
+        .iter()
+        .take(scan_limit)
+        .filter_map(astra_services::memory_value_to_lesson_hint)
+        .take(limit.saturating_add(1))
+        .collect::<Vec<_>>();
+    let oversized_content = memories.iter().take(scan_limit).any(|memory| {
+        memory
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|content| {
+                content.chars().count() > astra_services::MAX_LESSON_ACTION_CHARS
+            })
+    });
+    let truncated = memories.len() > scan_limit || lessons.len() > limit || oversized_content;
+    lessons.truncate(limit);
+    RetrievedLessonBatch {
+        lessons,
+        source_items: u32::try_from(memories.len()).unwrap_or(u32::MAX),
+        truncated,
+    }
+}
+
 pub async fn memoria_retrieve_lessons(
     top_k: u64,
     context_query: Option<&str>,
-) -> Vec<astra_services::LessonHint> {
+) -> Result<RetrievedLessonBatch, &'static str> {
     let query = context_query.unwrap_or("reusable lessons and corrections from prior sessions");
     let payload = json!({
         "query": query,
@@ -730,11 +597,11 @@ pub async fn memoria_retrieve_lessons(
     });
     let text = match memoria_retrieve(&payload, Duration::from_secs(3)).await {
         Ok(text) => text,
-        Err(_) => return Vec::new(),
+        Err(_) => return Err("memory retrieval unavailable"),
     };
     let value: serde_json::Value = match serde_json::from_str(&text) {
         Ok(v) => v,
-        Err(_) => return Vec::new(),
+        Err(_) => return Err("invalid memory retrieval response"),
     };
     // Memoria /v1/memories/retrieve returns a direct array when explain
     // is off, or {"results": [...]} when explain is on. Handle both.
@@ -745,20 +612,17 @@ pub async fn memoria_retrieve_lessons(
     } else if let Some(arr) = value.get("results").and_then(|v| v.as_array()) {
         arr
     } else {
-        return Vec::new();
+        return Err("invalid memory retrieval response");
     };
-    memories
-        .iter()
-        .filter_map(astra_services::memory_value_to_lesson_hint)
-        .collect()
+    Ok(project_retrieved_lessons(memories, top_k))
 }
 
-/// Store extracted lessons in Memoria as L3 durable memory.
+/// Store extracted lessons with their declared memory category and trust tier.
 ///
 /// Best-effort and loss-tolerant: lessons are sent one-by-one through the
 /// server proxy, but a failure on one lesson must not drop the rest.
 pub async fn memoria_store_lessons_fire_and_forget(
-    lessons: Vec<astra_runtime::learning::synthesizer::ExtractedLesson>,
+    lessons: Vec<astra_runtime::learning::lesson::ExtractedLesson>,
     session_id: Option<String>,
 ) {
     if lessons.is_empty() {
@@ -800,7 +664,7 @@ pub async fn memoria_store_lessons_fire_and_forget(
 
 #[cfg(test)]
 mod tests {
-    use super::memoria_store_lessons_fire_and_forget;
+    use super::{memoria_store_lessons_fire_and_forget, project_retrieved_lessons};
     use serial_test::serial;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -828,9 +692,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn retrieved_lessons_enforce_provider_count_before_optional_judgment() {
+        let memories = (0..20)
+            .map(|index| {
+                serde_json::json!({
+                    "content": format!("Always verify bounded lesson candidate number {index} before use"),
+                    "memory_type": "semantic"
+                })
+            })
+            .collect::<Vec<_>>();
+        let batch = project_retrieved_lessons(&memories, 6);
+        assert_eq!(batch.source_items, 20);
+        assert_eq!(batch.lessons.len(), 6);
+        assert!(batch.truncated);
+
+        let oversized = vec![serde_json::json!({
+            "content": format!("Always verify this reusable lesson {}", "x".repeat(10_000)),
+            "memory_type": "semantic"
+        })];
+        let batch = project_retrieved_lessons(&oversized, 6);
+        assert!(batch.lessons.is_empty());
+        assert!(batch.truncated);
+    }
+
     #[tokio::test]
     #[serial]
-    async fn session_end_lesson_store_continues_after_first_failure() {
+    async fn finalization_without_attached_memory_authority_does_not_use_global_credentials() {
+        assert!(crate::cli::native_auth::active().is_none());
+        let server = MockServer::start().await;
+        let _api = EnvGuard::set("ASTRA_API_URL", &server.uri());
+        let _token = EnvGuard::set("ASTRA_ACCESS_TOKEN", "default-account-token");
+        for endpoint in ["/memory/governance", "/memory/consolidate"] {
+            Mock::given(method("POST"))
+                .and(path(endpoint))
+                .and(header("authorization", "Bearer default-account-token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .mount(&server)
+                .await;
+        }
+        for session_id in [Some("selected-profile-session".to_string()), None] {
+            let mut state = crate::cli::session::session_state::SessionState {
+                session_id,
+                ingestion_user_id: Some("selected-profile-account".to_string()),
+                ..Default::default()
+            };
+            assert!(state.session_memory_port.is_none());
+            crate::cli::session::session_cleanup::finalize_session_with_budget(
+                &mut state,
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect("local finalization does not require optional remote maintenance");
+            assert!(
+                server.received_requests().await.unwrap().is_empty(),
+                "unbound session maintenance must not use the default account's credentials"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lesson_store_continues_after_first_failure() {
         let server = MockServer::start().await;
         let _api = EnvGuard::set("ASTRA_API_URL", &server.uri());
         let _token = EnvGuard::set("ASTRA_ACCESS_TOKEN", "test-token");
@@ -852,17 +775,17 @@ mod tests {
 
         memoria_store_lessons_fire_and_forget(
             vec![
-                astra_runtime::learning::synthesizer::ExtractedLesson {
+                astra_runtime::learning::lesson::ExtractedLesson {
                     memory_type: "working",
                     content: "lesson one".into(),
                     trust_tier: "T4",
                 },
-                astra_runtime::learning::synthesizer::ExtractedLesson {
+                astra_runtime::learning::lesson::ExtractedLesson {
                     memory_type: "working",
                     content: "lesson two".into(),
                     trust_tier: "T4",
                 },
-                astra_runtime::learning::synthesizer::ExtractedLesson {
+                astra_runtime::learning::lesson::ExtractedLesson {
                     memory_type: "working",
                     content: "lesson three".into(),
                     trust_tier: "T4",

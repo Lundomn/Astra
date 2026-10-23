@@ -20,17 +20,24 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use super::HistoryCell;
+use crate::cli::turn::turn_reporting::{format_cache_usage_summary, format_usage_count};
 use crate::tui::turn_event::TurnEvent;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TurnSummaryCell {
     pub elapsed_ms: Option<u64>,
     pub ttft_ms: Option<u64>,
+    /// Structured primary-provider metrics retained for diagnostics/replay and
+    /// rendered in a compact form in the default completion marker.
     pub tokens_in: Option<u64>,
     pub tokens_out: Option<u64>,
-    /// Cached input alongside the fresh `tokens_in`. Drives both total provider
-    /// traffic and the cache-rate band.
+    /// Cached input alongside the fresh `tokens_in`.
     pub cache_read_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub model_name: Option<String>,
+    pub auxiliary_summary: Option<String>,
+    pub input_usage_complete: bool,
+    pub usage_partial: bool,
     pub tools: u32,
     pub cumulative_tokens: Option<u64>,
     pub cumulative_cost_usd: Option<f64>,
@@ -47,6 +54,11 @@ impl TurnSummaryCell {
                 tokens_in,
                 tokens_out,
                 cache_read_tokens,
+                cache_creation_tokens,
+                model_name,
+                auxiliary_summary,
+                input_usage_complete,
+                usage_partial,
                 tools,
                 cumulative_tokens,
                 cumulative_cost_usd,
@@ -56,6 +68,11 @@ impl TurnSummaryCell {
                 tokens_in,
                 tokens_out,
                 cache_read_tokens,
+                cache_creation_tokens,
+                model_name,
+                auxiliary_summary,
+                input_usage_complete,
+                usage_partial,
                 tools,
                 cumulative_tokens,
                 cumulative_cost_usd,
@@ -94,6 +111,11 @@ impl HistoryCell for TurnSummaryCell {
             tokens_in: self.tokens_in,
             tokens_out: self.tokens_out,
             cache_read_tokens: self.cache_read_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
+            model_name: self.model_name.clone(),
+            auxiliary_summary: self.auxiliary_summary.clone(),
+            input_usage_complete: self.input_usage_complete,
+            usage_partial: self.usage_partial,
             tools: self.tools,
             cumulative_tokens: self.cumulative_tokens,
             cumulative_cost_usd: self.cumulative_cost_usd,
@@ -122,29 +144,33 @@ impl TurnSummaryCell {
             ]));
         }
 
-        if let (Some(tin), Some(tout)) = (self.tokens_in, self.tokens_out) {
-            let provider_tokens = tin
-                .saturating_add(self.cache_read_tokens.unwrap_or(0))
-                .saturating_add(tout);
+        let usage_observed = self.tokens_in.is_some()
+            || self.tokens_out.is_some()
+            || self.cache_read_tokens.is_some()
+            || self.cache_creation_tokens.is_some();
+        let provider_tokens = self
+            .tokens_in
+            .unwrap_or(0)
+            .saturating_add(self.cache_read_tokens.unwrap_or(0))
+            .saturating_add(self.cache_creation_tokens.unwrap_or(0))
+            .saturating_add(self.tokens_out.unwrap_or(0));
+        if usage_observed {
             sections.push(Section::primary(vec![
-                Span::styled(fmt_tokens(provider_tokens), value),
+                Span::styled(
+                    format_usage_count(provider_tokens, !self.usage_partial),
+                    value,
+                ),
                 Span::styled(" tokens", label),
             ]));
         }
 
-        if let (Some(cache_read), Some(fresh_input)) = (self.cache_read_tokens, self.tokens_in)
-            && cache_read > 0
-        {
-            let total_input = cache_read.saturating_add(fresh_input);
-            let pct = if total_input == 0 {
-                0
-            } else {
-                ((cache_read as f64 / total_input as f64) * 100.0).round() as u32
-            };
-            sections.push(Section::primary(vec![
-                Span::styled(format!("{pct}%"), value),
-                Span::styled(" cached", label),
-            ]));
+        if let Some(cache) = format_cache_usage_summary(
+            self.tokens_in,
+            self.cache_read_tokens,
+            self.cache_creation_tokens,
+            self.input_usage_complete,
+        ) {
+            sections.push(Section::primary(vec![Span::styled(cache, value)]));
         }
 
         if self.tools > 0 {
@@ -154,15 +180,10 @@ impl TurnSummaryCell {
             ]));
         }
 
-        let current_provider_tokens = self
-            .tokens_in
-            .unwrap_or(0)
-            .saturating_add(self.cache_read_tokens.unwrap_or(0))
-            .saturating_add(self.tokens_out.unwrap_or(0));
         let cumulative_tokens = self
             .cumulative_tokens
-            .filter(|c| *c > current_provider_tokens)
-            .map(|c| Span::styled(fmt_tokens(c), value));
+            .filter(|c| *c > provider_tokens)
+            .map(|c| Span::styled(format_usage_count(c, true), value));
 
         if let Some(cost) = self.cumulative_cost_usd
             && cost > 0.0
@@ -222,16 +243,6 @@ fn fmt_ms(ms: u64) -> String {
         format!("{:.1}s", ms as f64 / 1000.0)
     } else {
         format!("{ms}ms")
-    }
-}
-
-fn fmt_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
     }
 }
 
@@ -323,6 +334,67 @@ mod tests {
         buffer_to_string(&draw_widget(p, width, 3))
     }
 
+    #[test]
+    fn complete_input_cache_rate_survives_missing_output_usage() {
+        use crate::cli::stream::streaming_types::{AttributedTokenUsage, UsageAttribution};
+        use crate::cli::turn::turn_reporting::project_primary_usage;
+        use crate::tui::app_event::TuiAppEvent;
+        use crate::tui::chat_widget::{ChatWidget, TurnContext, translate};
+        for (fresh, read, write, complete, expected) in [
+            (Some(100), Some(900), Some(0), true, Some("90% cached")),
+            (Some(100), Some(900), Some(0), false, None),
+            (Some(100), Some(900), Some(100), true, Some("81% cached")),
+            (Some(0), Some(0), Some(0), true, None),
+            (Some(100), None, Some(0), false, None),
+        ] {
+            let usage = UsageAttribution {
+                primary: Some(AttributedTokenUsage {
+                    fresh_input_tokens: fresh,
+                    cache_read_tokens: read,
+                    cache_creation_tokens: write,
+                    output_tokens: None,
+                }),
+                primary_input_complete: complete,
+                primary_complete: false,
+                auxiliary: Some(AttributedTokenUsage {
+                    cache_read_tokens: Some(50_000),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let projected = project_primary_usage(&usage, true);
+            let ctx = TurnContext {
+                tokens_in: projected.fresh_input_tokens,
+                tokens_out: projected.output_tokens,
+                cache_read_tokens: projected.cache_read_tokens,
+                cache_creation_tokens: projected.cache_creation_tokens,
+                input_usage_complete: projected.input_complete,
+                usage_partial: !projected.complete,
+                ..Default::default()
+            };
+            let mut widget = ChatWidget::new("cache-input");
+            widget.handle_event(translate(TuiAppEvent::TurnComplete, ctx).unwrap());
+            let cell = widget
+                .history()
+                .iter()
+                .find_map(|cell| cell.as_any_ref().downcast_ref::<TurnSummaryCell>())
+                .unwrap();
+            let out = render(cell, 120);
+            if let Some(expected) = expected {
+                assert!(out.contains(expected), "{out}");
+            } else {
+                assert!(!out.contains('%'), "{out}");
+            }
+            if fresh == Some(100) && read == Some(900) && write == Some(0) {
+                assert!(out.contains("≥1.0k tokens"), "{out}");
+            }
+            let serialized = serde_json::to_string(&cell.to_persist().unwrap()).unwrap();
+            let restored =
+                TurnSummaryCell::from_persist(serde_json::from_str(&serialized).unwrap()).unwrap();
+            assert_eq!(render(&restored, 120), out);
+        }
+    }
+
     fn mk_full() -> TurnSummaryCell {
         TurnSummaryCell {
             elapsed_ms: Some(16_600),
@@ -330,6 +402,11 @@ mod tests {
             tokens_in: Some(23_200),
             tokens_out: Some(408),
             cache_read_tokens: None,
+            cache_creation_tokens: None,
+            model_name: None,
+            auxiliary_summary: None,
+            input_usage_complete: false,
+            usage_partial: false,
             tools: 2,
             cumulative_tokens: Some(145_000),
             cumulative_cost_usd: Some(0.014),
@@ -340,12 +417,25 @@ mod tests {
     // ── Render ───────────────────────────────────────────────────
 
     #[test]
-    fn full_summary_contains_all_sections() {
+    fn full_summary_contains_only_user_facing_sections() {
         let out = render(&mk_full(), 120);
-        for seg in ["total", "ttft", "tokens", "tools", "overall", "spent"] {
+        for seg in [
+            "16s total",
+            "ttft",
+            "1.8s",
+            "23.6k tokens",
+            "tools",
+            "overall",
+            "spent",
+        ] {
             assert!(out.contains(seg), "missing section {seg:?} in {out}");
         }
-        assert!(out.contains("145.0k"));
+        for diagnostic in ["first response", "with ", "request_judgment"] {
+            assert!(
+                !out.contains(diagnostic),
+                "diagnostic section {diagnostic:?} leaked into {out}"
+            );
+        }
     }
 
     #[test]
@@ -362,40 +452,68 @@ mod tests {
         c.ttft_ms = Some(0);
         let out = render(&c, 120);
         assert!(!out.contains("ttft"), "ttft=0 must not render: {out}");
-        assert!(out.contains("total"));
+        assert!(out.contains("16s"));
     }
 
     #[test]
-    fn cache_segment_shows_hit_rate_percentage() {
+    fn model_name_is_compact_and_user_facing() {
         let mut c = mk_full();
-        // 23.2k fresh + 18k cached input → ~44% cache hit rate.
-        c.cache_read_tokens = Some(18_000);
+        c.model_name = Some("deepseek-flash".into());
         let out = render(&c, 120);
-        assert!(out.contains("cached"), "cache label missing: {out}");
-        assert!(out.contains("44%"), "expected ~44% hit rate in: {out}");
+        assert!(
+            !out.contains("with deepseek-flash"),
+            "unexpected model decoration: {out}"
+        );
     }
 
     #[test]
-    fn headline_tokens_include_provider_cache_traffic() {
+    fn usage_details_are_not_dumped_into_default_summary() {
         let c = TurnSummaryCell {
             tokens_in: Some(1_200),
             tokens_out: Some(300),
             cache_read_tokens: Some(98_800),
+            cache_creation_tokens: Some(0),
+            auxiliary_summary: Some("Jev (jev-1.13.0) · request_judgment".into()),
+            usage_partial: true,
+            cumulative_tokens: Some(145_000),
             ..Default::default()
         };
         let out = render(&c, 120);
         assert!(
-            out.contains("100.3k tokens"),
-            "provider traffic should headline: {out}"
+            out.contains("tokens"),
+            "primary usage should remain visible: {out}"
         );
         assert!(
-            out.contains("99% cached"),
-            "cache traffic should stay visible: {out}"
+            out.contains("≥100.3k tokens"),
+            "known primary usage should remain visible: {out}"
         );
         assert!(
-            !out.contains("1.5k tokens"),
-            "fresh-only billing tokens must not masquerade as provider traffic: {out}"
+            out.contains("≥98.8k cached"),
+            "known cache reads missing: {out}"
         );
+        let restored = TurnSummaryCell::from_persist(c.to_persist().unwrap()).unwrap();
+        assert_eq!(
+            render(&restored, 120),
+            out,
+            "cache must survive history replay"
+        );
+        for diagnostic in ["Jev", "request_judgment", "usage not fully attributed"] {
+            assert!(
+                !out.contains(diagnostic),
+                "diagnostic {diagnostic:?} leaked into {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_input_without_output_remains_visible() {
+        let c = TurnSummaryCell {
+            tokens_in: Some(1_200),
+            usage_partial: true,
+            ..Default::default()
+        };
+        let out = render(&c, 120);
+        assert!(out.contains("≥1.2k tokens"), "known input missing: {out}");
     }
 
     #[test]
@@ -408,7 +526,6 @@ mod tests {
             ..Default::default()
         };
         let out = render(&c, 120);
-        assert!(out.contains("100.3k tokens"));
         assert!(
             !out.contains("overall"),
             "duplicate overall is noise: {out}"
@@ -416,42 +533,26 @@ mod tests {
     }
 
     #[test]
-    fn cache_segment_elided_when_unreported() {
-        // Many providers don't surface cache reads on first turn
-        // or when caching is disabled — absence should not render
-        // a misleading "0%" chip.
+    fn usage_summary_is_empty_when_only_diagnostics_are_present() {
         let mut c = mk_full();
+        c.ttft_ms = None;
+        c.tokens_in = None;
+        c.tokens_out = None;
         c.cache_read_tokens = None;
+        c.cache_creation_tokens = None;
+        c.elapsed_ms = None;
+        c.tools = 0;
+        c.cumulative_tokens = None;
+        c.cumulative_cost_usd = None;
         let out = render(&c, 120);
-        assert!(!out.contains("cached"), "cache chip must be elided: {out}");
-    }
-
-    #[test]
-    fn cache_segment_elided_when_read_is_zero() {
-        // Provider reported but hit rate genuinely zero — still
-        // elide rather than show "0%", which reads as noise.
-        let mut c = mk_full();
-        c.cache_read_tokens = Some(0);
-        let out = render(&c, 120);
-        assert!(
-            !out.contains("cached"),
-            "zero-hit cache chip must elide: {out}"
-        );
-    }
-
-    #[test]
-    fn sigma_section_elided_when_cumulative_zero() {
-        let mut c = mk_full();
-        c.cumulative_tokens = Some(0);
-        c.cumulative_cost_usd = Some(0.0);
-        let out = render(&c, 120);
-        assert!(!out.contains("overall"));
-        assert!(!out.contains("spent"));
+        assert!(out.trim().is_empty(), "diagnostic-only cell leaked: {out}");
     }
 
     #[test]
     fn narrow_width_wraps_summary_into_multiple_lines() {
-        let out = render(&mk_full(), 46);
+        let mut cell = mk_full();
+        cell.model_name = Some("deepseek-flash".into());
+        let out = render(&cell, 32);
         let non_empty: Vec<&str> = out.lines().filter(|line| !line.trim().is_empty()).collect();
         assert!(
             non_empty.len() >= 2,
@@ -477,36 +578,32 @@ mod tests {
         assert_eq!(fmt_duration_ms(125_000), "2m 5s");
     }
 
-    #[test]
-    fn fmt_tokens_scales() {
-        assert_eq!(fmt_tokens(0), "0");
-        assert_eq!(fmt_tokens(999), "999");
-        assert_eq!(fmt_tokens(1_234), "1.2k");
-        assert_eq!(fmt_tokens(23_200), "23.2k");
-        assert_eq!(fmt_tokens(1_500_000), "1.5M");
-    }
-
-    #[test]
-    fn fmt_cost_precision_scales_with_magnitude() {
-        assert_eq!(fmt_cost(0.0042), "$0.0042");
-        assert_eq!(fmt_cost(0.014), "$0.014");
-        assert_eq!(fmt_cost(2.5), "$2.50");
-    }
-
     // ── Persistence ──────────────────────────────────────────────
 
     #[test]
     fn persist_roundtrip_keeps_every_field() {
-        let orig = mk_full();
+        let mut orig = mk_full();
+        orig.cache_read_tokens = Some(18_000);
+        orig.cache_creation_tokens = Some(7);
+        orig.model_name = Some("deepseek-flash".into());
+        orig.auxiliary_summary = Some("Jev (deepseek-judgement) · request_judgment".into());
+        orig.usage_partial = true;
+        orig.ts = Some("2026-09-20T00:00:00Z".into());
         let ev = orig.to_persist().unwrap();
         let back = TurnSummaryCell::from_persist(ev).unwrap();
         assert_eq!(back.elapsed_ms, orig.elapsed_ms);
         assert_eq!(back.ttft_ms, orig.ttft_ms);
         assert_eq!(back.tokens_in, orig.tokens_in);
         assert_eq!(back.tokens_out, orig.tokens_out);
+        assert_eq!(back.cache_read_tokens, orig.cache_read_tokens);
+        assert_eq!(back.cache_creation_tokens, orig.cache_creation_tokens);
+        assert_eq!(back.model_name, orig.model_name);
+        assert_eq!(back.auxiliary_summary, orig.auxiliary_summary);
+        assert_eq!(back.usage_partial, orig.usage_partial);
         assert_eq!(back.tools, orig.tools);
         assert_eq!(back.cumulative_tokens, orig.cumulative_tokens);
         assert_eq!(back.cumulative_cost_usd, orig.cumulative_cost_usd);
+        assert_eq!(back.ts, orig.ts);
     }
 
     #[test]

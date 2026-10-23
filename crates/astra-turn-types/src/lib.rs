@@ -3,31 +3,65 @@
 //! This crate provides foundational types used during turn execution,
 //! extracted from the monolithic runtime crate for better modularity.
 
+mod context_history_artifact;
+mod skill_catalog_identity;
+pub use context_history_artifact::{
+    CONTEXT_HISTORY_ARTIFACT_KIND, CONTEXT_HISTORY_ARTIFACT_URI_PREFIX, ContextHistoryArtifactV1,
+    MAX_CONTEXT_HISTORY_BYTES,
+};
+pub use skill_catalog_identity::SkillCatalogIdentity;
+
 mod agent_communication;
 mod agent_transcript_evidence;
 mod agent_transcript_location;
 mod artifact_publication;
 pub use artifact_publication::{ArtifactPublicationResult, ArtifactPublicationV1};
+mod judgment;
+pub use judgment::{
+    JUDGMENT_SCHEMA_VERSION, JudgmentAnswer, JudgmentCodecError, JudgmentCriterion,
+    JudgmentNoulDecision, JudgmentQuestion, JudgmentRequest, JudgmentResponse,
+    JudgmentResponseProvenance, NormalizedJudgmentResponse, NoulCriteria, judgment_messages,
+    judgment_request_from_messages, normalize_judgment_response,
+    output_budget_exceeds_completion_cap,
+};
+mod strict_json;
+pub use strict_json::parse_unique_json;
+mod canonical_token_usage;
 mod canonical_tool_pairing;
+pub use canonical_token_usage::CanonicalTokenUsage;
 mod completion_settlement;
 #[doc(hidden)]
 pub use completion_settlement::deserialize_required_option;
 mod context_identity;
 mod context_window;
 mod deferred_tool;
+mod delegation_model_admission;
+mod execution_time_budget;
 mod explain_analyze;
+pub use execution_time_budget::{
+    ExecutionTimeRemaining, FINAL_SYNTHESIS_TIME_CAP, final_synthesis_reserve,
+};
+mod memory_selection;
+pub use memory_selection::*;
 mod explain_analyze_projection;
 mod explain_wire;
 pub use explain_wire::decode_explain_analyze_wire;
 mod inference;
 mod memory_ranking;
 mod memory_structure;
+mod permission_mode;
+pub use permission_mode::{ChildPermissionMode, ManualApprovalPolicy, PermissionMode};
+pub mod model_routing;
 mod provider_canonical_transition;
 mod provider_contract;
+mod recovery_point;
+mod reply_obligations;
 mod result_quality;
 mod resume;
 mod runtime_scaffolding;
+mod semantic_judgment_observation;
 mod semantic_read_cache;
+pub use semantic_judgment_observation::*;
 mod session_coordination;
 mod session_cursor;
 pub mod session_facts;
@@ -61,27 +95,43 @@ pub use context_identity::{
 };
 pub use context_window::{ContextWindowUsage, ContextWindowUsageSource, RequestTokenUsage};
 pub use deferred_tool::DeferredToolActivation;
+pub use delegation_model_admission::{
+    DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY, DelegationCatalogResolutionFailure,
+    DelegationIntentRequirement, DelegationIntentRequirements, DelegationModelAdmission,
+    DelegationModelAdmissionOutcome, DelegationModelInstructionSource,
+    DelegationModelSlotConstraint, DelegationReasoningEffort, DelegationReasoningRequirement,
+    DelegationRequirementPropagation, DelegationRequirementStrength,
+    DelegationUserRequirementSource, MAX_MODEL_ADMISSION_SLOTS,
+};
 pub use explain_analyze::{
     EXPLAIN_ANALYZE_EVENT_TYPE, EXPLAIN_ANALYZE_MAX_SAFE_INTEGER, EXPLAIN_ANALYZE_SCHEMA_VERSION,
+    ExplainAnalyzeAdmissionSettlementReasonV1, ExplainAnalyzeAdmissionSettlementStatusV1,
+    ExplainAnalyzeAdmissionSettlementV1, ExplainAnalyzeAuxiliaryAttemptV1,
+    ExplainAnalyzeAuxiliaryCallV1, ExplainAnalyzeAuxiliaryDetailsV1,
+    ExplainAnalyzeAuxiliaryUsageStatusV1, ExplainAnalyzeAuxiliaryUsageV1,
     ExplainAnalyzeContextAssemblyBasisV1, ExplainAnalyzeContextAssemblyV1,
     ExplainAnalyzeContextBudgetBasisV1, ExplainAnalyzeContextBudgetV1,
     ExplainAnalyzeContextMetricsV1, ExplainAnalyzeContextSourceKindV1,
-    ExplainAnalyzeContextSourceV1, ExplainAnalyzeCoverageGapV1, ExplainAnalyzeEventV1,
-    ExplainAnalyzeNodeKindV1, ExplainAnalyzeOutcomeV1, ExplainAnalyzeTokenUsageV1,
-    ExplainAnalyzeTransitionV1, ExplainAnalyzeUsageBasisV1,
+    ExplainAnalyzeContextSourceV1, ExplainAnalyzeCoverageGapV1, ExplainAnalyzeDecisionDetailV1,
+    ExplainAnalyzeEventV1, ExplainAnalyzeNodeKindV1, ExplainAnalyzeOutcomeV1,
+    ExplainAnalyzeTokenUsageV1, ExplainAnalyzeTransitionV1, ExplainAnalyzeUsageBasisV1,
 };
 pub use explain_analyze_projection::{
     ExplainAnalyzeGraphIntegrityV1, ExplainAnalyzeGraphV1, ExplainAnalyzeProjectedNodeV1,
     ExplainAnalyzeProjectionApplyResultV1, ExplainAnalyzeProjectionDiagnosticCodeV1,
     ExplainAnalyzeProjectionDiagnosticV1, ExplainAnalyzeProjectionDiagnosticsV1,
+    ExplainAnalyzeScopeCoverageV1,
 };
 pub use inference::{
-    CLIENT_DIRECT_EXECUTION_FIELDS, InferenceInvocationScope, InferencePurpose, ModelSelection,
-    client_direct_execution_field,
+    AutoModelStrategy, CLIENT_DIRECT_EXECUTION_FIELDS, InferenceInvocationScope, InferencePurpose,
+    ModelSelection, ModelSelector, RequestedModelPolicy, RequestedModelPolicyError,
+    client_direct_execution_field, resolve_requested_model_selection,
+    resolve_requested_model_selector,
 };
 pub use memory_ranking::{
     MemoryRetrievalOutcome, PERSISTENT_TYPES, RankableMemory, SESSION_SCOPED_TYPE,
-    freshness_suffix_for, is_persistent_type, partition_by_scope, sort_by_retrieval_score,
+    freshness_suffix_for, is_persistent_type, partition_by_scope, rfc3339_days_ago,
+    sort_by_retrieval_score,
 };
 pub use memory_structure::{
     PERSISTENT_MEMORY_TYPES, PersistentStoreRejection, is_persistent_memory_type,
@@ -96,20 +146,35 @@ pub use provider_canonical_transition::{
     ProviderCanonicalTransitionError, ProviderCanonicalTransitionV2, ProviderCanonicalWalBaseV2,
 };
 pub use provider_contract::{
-    DescriptorVersion, NativeToolId, PROVIDER_INTERACTION_REQUEST_METADATA_KEY,
-    PROVIDER_INTERACTION_RESPONSE_METADATA_KEY, ProviderBindingRef, ProviderCallOutcome,
-    ProviderCallPayload, ProviderClaim, ProviderClaimSource, ProviderClaimTrust,
-    ProviderContractError, ProviderDiscoverySnapshot, ProviderIdentity, ProviderInteractionOutcome,
-    ProviderInteractionRequest, ProviderInteractionResponse, ProviderProtocolId, ProviderRejection,
-    ProviderRejectionCode, ProviderResolverVersion, ProviderSemanticCacheContract,
-    ProviderSemanticDiagnostic, ProviderSemanticDiagnosticCode, ProviderTaskSupport,
-    ProviderToolClaims, ProviderToolDeclaration, PublicToolAlias, ResolvedConcurrencyBaseline,
-    ResolvedProviderClaim, ResolvedProviderSnapshot, ResolvedProviderSnapshotRef,
-    ResolvedProviderToolClaims, ResolvedSemanticCacheBaseline, ResolvedToolDescriptor,
-    ResolvedToolDescriptorDraft, ResolvedToolDescriptorRef, ResolvedToolEffect,
-    ResolvedToolIdempotency, ResolvedToolSemantics, STABLE_TOOL_ALIAS_METADATA_KEY,
-    STABLE_TOOL_ALIAS_SCHEMA_KEY, StableToolAlias, ToolIdentity,
+    DescriptorVersion, MAX_PROVIDER_MODEL_CATALOG_BYTES, MAX_PROVIDER_MODEL_CATALOG_ITEMS,
+    MAX_PROVIDER_STAGE_INPUT_BYTES, NATIVE_COLLABORATOR_OBSERVATION_KEY,
+    NativeCollaboratorObservation, NativeStageDispatchState, NativeToolId,
+    PROVIDER_COLLABORATOR_STAGE_KEY, PROVIDER_INTERACTION_REQUEST_METADATA_KEY,
+    PROVIDER_INTERACTION_RESPONSE_METADATA_KEY, PROVIDER_MODEL_CATALOG_KEY,
+    PROVIDER_RUNTIME_REQUIREMENTS_KEY, PROVIDER_STAGE_INPUT_ACK_TIMEOUT, ProviderBindingRef,
+    ProviderCallOutcome, ProviderCallPayload, ProviderClaim, ProviderClaimSource,
+    ProviderClaimTrust, ProviderContractError, ProviderDiscoverySnapshot, ProviderIdentity,
+    ProviderInteractionOutcome, ProviderInteractionRequest, ProviderInteractionResponse,
+    ProviderModelCatalog, ProviderModelDescriptor, ProviderProtocolId, ProviderRejection,
+    ProviderRejectionCode, ProviderResolverVersion, ProviderRuntimeRequirements,
+    ProviderSemanticCacheContract, ProviderSemanticDiagnostic, ProviderSemanticDiagnosticCode,
+    ProviderStageInput, ProviderStageInputAck, ProviderTaskSupport, ProviderToolClaims,
+    ProviderToolDeclaration, PublicToolAlias, ResolvedConcurrencyBaseline, ResolvedProviderClaim,
+    ResolvedProviderSnapshot, ResolvedProviderSnapshotRef, ResolvedProviderToolClaims,
+    ResolvedSemanticCacheBaseline, ResolvedToolDescriptor, ResolvedToolDescriptorDraft,
+    ResolvedToolDescriptorRef, ResolvedToolEffect, ResolvedToolIdempotency, ResolvedToolSemantics,
+    STABLE_TOOL_ALIAS_METADATA_KEY, STABLE_TOOL_ALIAS_SCHEMA_KEY, StableToolAlias, ToolIdentity,
+    project_native_collaborator_observation,
 };
+pub use recovery_point::{
+    RECOVERY_POINT_MANIFEST_SCHEMA_VERSION, RecoveryPointArtifactReferenceV1,
+    RecoveryPointBindingStateV1, RecoveryPointCapabilityAssessmentV1,
+    RecoveryPointEnvironmentRequirementsV1, RecoveryPointExecutionBindingV1,
+    RecoveryPointExecutorKindV1, RecoveryPointManifestV1, RecoveryPointReasonV1,
+    RecoveryPointRunFrontierV1, RecoveryPointRunStateV1, RecoveryPointValidationError,
+    RecoveryPointWorkspaceReferenceV1,
+};
+pub use reply_obligations::{MAX_PENDING_REPLIES, PendingReply, ReplyObligationsSnapshotV1};
 pub use result_quality::{ResultQuality, classify_result, quality_feedback};
 pub use resume::{
     CAUSAL_PROJECTION_ENVELOPE_SCHEMA_VERSION, CausalProjectionEnvelopeV1, CursorRelationV1,
@@ -154,7 +219,8 @@ pub use session_cursor::{
     ConversationCommitV1, ConversationDeltaV1, ConversationReplaceReason,
     DEFAULT_CONVERSATION_BRANCH_ID, SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION,
     SESSION_CURSOR_SCHEMA_VERSION, SessionCursorV1, canonical_conversation_identity,
-    canonical_conversation_root, canonical_conversation_serialized_len, json_serialized_len,
+    canonical_conversation_root, canonical_conversation_serialized_len, json_serialized_fits,
+    json_serialized_len,
 };
 pub use session_fork::{
     ForkBasisDimensionV1, ForkDimensionDispositionV1, ForkDimensionEvidenceV1,
@@ -169,7 +235,11 @@ pub use session_handoff::{
     SessionHandoffValidationError, SessionPlacementV1, WorkspaceHandoffEvidenceV1,
     valid_transition,
 };
-pub use stop_hooks::{StopHook, StopHookObligations};
+pub use stop_hooks::{
+    CompletionCheckDeclarations, CompletionCheckPhase, MAX_COMPLETION_CHECKS,
+    MAX_COMPLETION_DECLARATION_BYTES, StopHook, StopHookObligations, build_execution_layers,
+    validate_completion_check_declarations,
+};
 pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};
 pub use tool_invocation::{
     DispatchCertainty, DurableToolReference, TOOL_INVOCATION_CACHE_COMPLETION_CONTRACT_VERSION,
@@ -185,17 +255,25 @@ pub use tool_invocation::{
     canonical_public_arguments_hash, canonical_public_tool_arguments,
 };
 pub use turn_provenance::{
-    TURN_MESSAGE_PROVENANCE_FIELD, TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
+    MODEL_ITEM_ID_FIELD, TURN_MESSAGE_PROVENANCE_FIELD, TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
     TurnMessageProvenanceError, TurnMessageProvenanceV1, clear_turn_message_provenance,
-    mark_turn_message, turn_message_provenance,
+    mark_model_message, mark_turn_message, model_item_id, turn_message_provenance,
 };
 pub use user_intent::{
-    ObjectiveRelation, USER_TURN_SEMANTICS_FIELD, USER_TURN_SEMANTICS_SCHEMA_VERSION, UserFeedback,
-    UserFeedbackKind, UserFeedbackTarget, UserIntentDelivery, UserIntentStatus, UserTurnSemantics,
-    UserTurnSemanticsError, mark_user_turn_semantics, user_turn_semantics,
+    AssessmentConfidence, FeedbackResponseReference, FeedbackResponseRelation, ObjectiveRelation,
+    ResponseSatisfaction, TaskDifficulty, TaskUrgency, TurnAssessment, USER_TURN_SEMANTICS_FIELD,
+    USER_TURN_SEMANTICS_SCHEMA_VERSION, UserFeedback, UserFeedbackKind, UserFeedbackTarget,
+    UserIntentDelivery, UserIntentStatus, UserTurnSemantics, UserTurnSemanticsError,
+    mark_user_turn_semantics, user_turn_semantics,
 };
 pub use verification_frontier::{
     BoundVerificationFrontier, BoundWorkspaceObservation, VerificationEvidence,
     VerificationHandoff, VerificationUnavailable, WorkspaceMutationSource,
     WorkspaceObservationProof,
+};
+
+pub mod permission_control;
+pub use permission_control::{
+    RunPermissionModeApplied, RunPermissionModeRequest, RunPermissionModeSelection,
+    RunPermissionModeSnapshot,
 };

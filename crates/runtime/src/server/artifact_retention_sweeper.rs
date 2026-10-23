@@ -1,7 +1,7 @@
 use super::*;
 use astra_services::db_row::{RowDecoder, RowExt};
 use futures_util::{StreamExt, stream};
-use sqlx::Row;
+use sqlx::{Acquire, Row};
 use uuid::Uuid;
 
 const SWEEP_INTERVAL_SECS: u64 = 3_600;
@@ -15,6 +15,7 @@ pub struct ArtifactRetentionSweepOutcome {
     pub referenced_retained: usize,
     pub extended: usize,
     pub expired: usize,
+    pub content_chunks_deleted: u64,
     pub backlog_overflow_warning: bool,
 }
 
@@ -162,7 +163,89 @@ pub async fn run_artifact_retention_gc_once(
     if let Some(error) = first_apply_error {
         return Err(error);
     }
+    outcome.content_chunks_deleted =
+        reap_unreferenced_content_chunks(&pool, effective_limit).await?;
     Ok(outcome)
+}
+
+async fn reap_unreferenced_content_chunks(
+    pool: &SharedPool,
+    limit: u32,
+) -> Result<u64, sqlx::Error> {
+    // Uploads have one authoritative lease per artifact. Lock leases, then
+    // their catalog rows and temporary chunk edges in that order before
+    // collecting bytes. Put and seal use the same order, so an expired-GC
+    // pass cannot form a row-lock cycle with an upload that is renewing.
+    let mut tx = pool.get().begin().await?;
+    let expired_leases = sqlx::query(
+        "SELECT user_id, session_id, artifact_id
+         FROM session_artifact_content_upload_leases
+         WHERE expires_at <= NOW(6)
+         ORDER BY user_id ASC, session_id ASC, artifact_id ASC
+         LIMIT ?
+         FOR UPDATE",
+    )
+    .bind(i64::from(limit.max(1)))
+    .fetch_all(&mut *tx)
+    .await?;
+    for lease in expired_leases {
+        let user_id: String = lease.try_get("user_id")?;
+        let session_id: String = lease.try_get("session_id")?;
+        let artifact_id: String = lease.try_get("artifact_id")?;
+        // Serialize with byte puts/seals after the lease lock. The artifact
+        // may already have been deleted by Session cleanup; the lease and
+        // edges are still safe to remove in that case.
+        let _ = sqlx::query(
+            "SELECT 1 FROM session_artifacts
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?
+             FOR UPDATE",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&artifact_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM session_artifact_content_reservations
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&artifact_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM session_artifact_content_upload_leases
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&artifact_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let deleted = sqlx::query(
+        "DELETE FROM session_artifact_content_chunks
+         WHERE created_at <= DATE_SUB(NOW(6), INTERVAL 1 DAY)
+           AND NOT EXISTS (
+               SELECT 1 FROM session_artifact_content_refs refs
+               WHERE refs.user_id = session_artifact_content_chunks.user_id
+                 AND refs.content_digest = session_artifact_content_chunks.content_digest
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM session_artifact_content_reservations reservations
+               WHERE reservations.user_id = session_artifact_content_chunks.user_id
+                 AND reservations.content_digest = session_artifact_content_chunks.content_digest
+           )
+         ORDER BY user_id ASC, updated_at ASC, content_digest ASC
+         LIMIT ?",
+    )
+    .bind(i64::from(limit.max(1)))
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(deleted)
 }
 
 async fn record_artifact_retention_backlog_warning(
@@ -171,25 +254,40 @@ async fn record_artifact_retention_backlog_warning(
     limit: u32,
 ) -> Result<(), sqlx::Error> {
     let event_id = Uuid::new_v4().to_string();
-    let mut tx = pool.get().begin().await?;
+    let content =
+        format!("artifact retention sweep reached scan limit: scanned={scanned}, limit={limit}");
+    let metadata = serde_json::json!({
+        "scanned": scanned,
+        "limit": limit,
+        "action": "reschedule_and_alert",
+    });
+    let payload_hash = astra_services::observation_capture::canonical_observation_payload_hash(
+        astra_services::observation_capture::ObservationPayloadDomain::AgentEvent,
+        &serde_json::json!({
+            "event_id": event_id,
+            "session_id": "system",
+            "user_id": "system",
+            "event_type": "artifact_retention_backlog_overflow",
+            "content": content,
+            "metadata": metadata,
+        }),
+    );
+    let ingestion_write_id = Uuid::new_v4().to_string();
+    let mut connection =
+        astra_services::CancellationSafePoolConnection::acquire(pool.get()).await?;
+    let mut tx = connection.begin().await?;
     astra_services::storage::admit_session_event_write(&mut tx, "system", "system", true).await?;
     let insert_result = sqlx::query(
         "INSERT INTO agent_events
-         (event_id, session_id, user_id, event_type, content, metadata, created_at)
-         VALUES (?, 'system', 'system', 'artifact_retention_backlog_overflow', ?, ?, NOW(6))",
+         (event_id, session_id, user_id, event_type, content, metadata,
+          payload_hash, ingestion_write_id, created_at)
+         VALUES (?, 'system', 'system', 'artifact_retention_backlog_overflow', ?, ?, ?, ?, NOW(6))",
     )
     .bind(&event_id)
-    .bind(format!(
-        "artifact retention sweep reached scan limit: scanned={scanned}, limit={limit}"
-    ))
-    .bind(
-        serde_json::json!({
-            "scanned": scanned,
-            "limit": limit,
-            "action": "reschedule_and_alert",
-        })
-        .to_string(),
-    )
+    .bind(content)
+    .bind(metadata.to_string())
+    .bind(payload_hash)
+    .bind(ingestion_write_id)
     .execute(&mut *tx)
     .await?;
     let inserted_events = match i64::try_from(insert_result.rows_affected()) {
@@ -201,8 +299,8 @@ async fn record_artifact_retention_backlog_warning(
             ));
         }
     };
-    astra_services::storage::add_agent_session_event_count_or_create(
-        &mut tx,
+    astra_services::storage::bump_agent_session_event_count(
+        &mut *tx,
         "system",
         "system",
         inserted_events,
@@ -210,6 +308,7 @@ async fn record_artifact_retention_backlog_warning(
     )
     .await?;
     tx.commit().await?;
+    connection.release();
     tracing::warn!(
         target: "astra_runtime::artifact_retention_sweeper",
         scanned,
@@ -289,6 +388,21 @@ async fn apply_artifact_retention_policy(
         return Ok(ArtifactRetentionAction::ReferencedRetained);
     }
 
+    let mut expiration_tx = pool.get().begin().await?;
+    // Byte upload paths acquire the optional artifact lease before the
+    // catalog row. Retention expiry must take the same order so a server
+    // running the sweeper cannot deadlock with a concurrent put or seal.
+    let _upload_lease = sqlx::query(
+        "SELECT expires_at
+         FROM session_artifact_content_upload_leases
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?
+         FOR UPDATE",
+    )
+    .bind(&artifact.user_id)
+    .bind(&artifact.session_id)
+    .bind(&artifact.artifact_id)
+    .fetch_optional(&mut *expiration_tx)
+    .await?;
     let expired_rows = sqlx::query(
         "UPDATE session_artifacts
          SET status = 'expired',
@@ -313,12 +427,41 @@ async fn apply_artifact_retention_policy(
     .bind(&artifact.user_id)
     .bind(&artifact.session_id)
     .bind(&artifact.artifact_id)
-    .execute(pool.get())
+    .execute(&mut *expiration_tx)
     .await?
     .rows_affected();
     if expired_rows > 0 {
+        sqlx::query(
+            "DELETE FROM session_artifact_content_refs
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(&artifact.user_id)
+        .bind(&artifact.session_id)
+        .bind(&artifact.artifact_id)
+        .execute(&mut *expiration_tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM session_artifact_content_reservations
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(&artifact.user_id)
+        .bind(&artifact.session_id)
+        .bind(&artifact.artifact_id)
+        .execute(&mut *expiration_tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM session_artifact_content_upload_leases
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(&artifact.user_id)
+        .bind(&artifact.session_id)
+        .bind(&artifact.artifact_id)
+        .execute(&mut *expiration_tx)
+        .await?;
+        expiration_tx.commit().await?;
         return Ok(ArtifactRetentionAction::Expired);
     }
+    expiration_tx.commit().await?;
 
     let marked_rows = sqlx::query(
         "UPDATE session_artifacts

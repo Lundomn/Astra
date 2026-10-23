@@ -7,11 +7,10 @@ use std::time::Instant;
 use astra_turn_core::conversation_log::manager::CslManager;
 
 use super::turn_commit::{PrimaryTurnCommit, TurnCommitOutcome, commit_primary_turn};
-use super::turn_learning::{analyze_chat_turn_learning, turn_quality_feedback_from_eval};
+use super::turn_learning::consume_chat_turn_learning;
 use super::turn_post_commit::{
     TurnPostCommitJob, account_turn_post_commit_queue, apply_turn_post_commit_completion,
-    attach_deferred_sidecars, execute_turn_post_commit_job, extract_csl_fields_from_result,
-    prepare_turn_post_commit_job,
+    attach_deferred_sidecars, execute_turn_post_commit_job, prepare_turn_post_commit_job,
 };
 use super::turn_reporting::{build_history_text, print_turn_status_line};
 use crate::cli::cli_config::cli_utils::persist_profile_last_session_or_warn;
@@ -88,7 +87,6 @@ pub(crate) async fn apply_turn_success_async(
         astra_core::history_work::HistoryWorkSite::CliPostCommitSnapshot,
         &result.final_messages,
     );
-    let csl_checkpoint_fields = extract_csl_fields_from_result(&result);
     let primary_commit_started = Instant::now();
     let primary_commit =
         apply_turn_success_on_blocking_worker(state, profile, line, result, turn_start).await;
@@ -101,14 +99,8 @@ pub(crate) async fn apply_turn_success_async(
     );
     if commit_outcome.turn_persisted {
         let post_commit_started = Instant::now();
-        let mut post_commit = prepare_turn_post_commit_job(
-            state,
-            api,
-            profile,
-            final_messages,
-            csl_checkpoint_fields,
-            turn_start,
-        );
+        let mut post_commit =
+            prepare_turn_post_commit_job(state, api, profile, final_messages, turn_start);
         attach_deferred_sidecars(&mut post_commit, primary_commit.deferred_sidecars);
         if let Some(tx) = post_commit_tx {
             account_turn_post_commit_queue(&mut post_commit);
@@ -246,19 +238,18 @@ struct TurnSuccessLiveSnapshot {
     total_completion_tokens: u64,
     total_cache_read_tokens: u64,
     total_cache_creation_tokens: u64,
-    total_session_cost: f64,
+    total_session_cost: Option<f64>,
     last_response: Option<String>,
     continuation_anchor: Option<ContinuationAnchor>,
     pending_followup_suggestion: Option<crate::cli::followup_suggestion::FollowupSuggestion>,
     active_conversation: Option<astra_turn_core::active_conversation::ActiveConversation>,
-    redo_stack: Vec<(String, String, u32)>,
     history: Vec<(String, String)>,
     recent_tools: Vec<String>,
     resume_restricted_tools: Vec<String>,
     tool_health_entries: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
     latest_turn_quality_feedback: Option<astra_runtime::self_model::TurnQualityFeedback>,
     latest_context_assembly_trace:
-        Option<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>,
+        Option<crate::cli::session::session_state::LocalContextAssemblyTrace>,
     runtime_pipeline_state: Option<serde_json::Value>,
     runtime_compaction_state: Option<serde_json::Value>,
     runtime_consecutive_context_window_errors: u32,
@@ -268,7 +259,7 @@ struct TurnSuccessLiveSnapshot {
     observability_session: Option<
         std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     >,
-    pending_adaptive_state: Option<crate::cli::session::session_state::PersistedAdaptiveState>,
+    observability_config_pending: bool,
     last_turn_interrupted: bool,
     session_persistence_error: Option<String>,
 }
@@ -289,7 +280,6 @@ impl TurnSuccessLiveSnapshot {
             continuation_anchor: state.continuation_anchor.clone(),
             pending_followup_suggestion: state.pending_followup_suggestion.clone(),
             active_conversation: state.active_conversation.clone(),
-            redo_stack: state.redo_stack.clone(),
             history: crate::cli::history_work::clone_pair_history(
                 astra_core::history_work::HistoryWorkSite::CliSettlementRollbackSnapshot,
                 &state.history,
@@ -306,7 +296,7 @@ impl TurnSuccessLiveSnapshot {
             workspace_observation_quarantine: state.workspace_observation_quarantine.clone(),
             last_turn_event: state.last_turn_event.clone(),
             observability_session: state.observability_session.clone(),
-            pending_adaptive_state: state.pending_adaptive_state.clone(),
+            observability_config_pending: state.observability_config_pending,
             last_turn_interrupted: state.last_turn_interrupted,
             session_persistence_error: state.session_persistence_error.clone(),
         }
@@ -348,7 +338,6 @@ impl TurnSuccessLiveSnapshot {
         state.continuation_anchor = self.continuation_anchor;
         state.pending_followup_suggestion = self.pending_followup_suggestion;
         state.active_conversation = self.active_conversation;
-        state.redo_stack = self.redo_stack;
         state.history = self.history;
         state.recent_tools = self.recent_tools;
         state.resume_restricted_tools = self.resume_restricted_tools;
@@ -362,7 +351,7 @@ impl TurnSuccessLiveSnapshot {
         state.workspace_observation_quarantine = quarantine_after_rollback;
         state.last_turn_event = self.last_turn_event;
         state.observability_session = self.observability_session;
-        state.pending_adaptive_state = self.pending_adaptive_state;
+        state.observability_config_pending = self.observability_config_pending;
         state.last_turn_interrupted = self.last_turn_interrupted;
         state.session_persistence_error = self.session_persistence_error;
     }
@@ -432,14 +421,9 @@ fn apply_turn_success_primary_sync(
     state.total_cache_read_tokens += result.cache_read_tokens;
     state.total_cache_creation_tokens += result.cache_creation_tokens;
 
-    let turn_cost = crate::cli::slash::slash_stats::cost_for_tokens(
-        result.prompt_tokens,
-        result.completion_tokens,
-        result.cache_read_tokens,
-        result.cache_creation_tokens,
-        &state.cached_pricing,
-    );
-    state.total_session_cost += turn_cost;
+    // Aggregate counters and the currently selected price do not attribute
+    // primary, auxiliary, retry and delegated work to their actual rates.
+    state.total_session_cost = None;
     let effective_user_input = result.effective_user_input(line);
     let latest_user_input = result.latest_user_input(line);
     if !latest_user_input.trim().is_empty() {
@@ -448,10 +432,8 @@ fn apply_turn_success_primary_sync(
             crate::cli::followup_suggestion::suggest_followup(&latest_user_input, state, &result);
     }
 
-    state.redo_stack.clear();
     let recent_tools = recent_tools_after_successful_turn(&state.recent_tools, &result);
-    let learning_snap =
-        analyze_chat_turn_learning(&latest_user_input, state.turn, &recent_tools, &result);
+    let learning_snap = consume_chat_turn_learning(&result);
     state.last_response = Some(result.full_text.clone());
     state.history.push((
         effective_user_input.clone(),
@@ -469,9 +451,8 @@ fn apply_turn_success_primary_sync(
         state.tool_health_entries = result.tool_health_export.clone();
     }
 
-    state.latest_turn_quality_feedback =
-        turn_quality_feedback_from_eval(state.turn, &learning_snap.eval);
-    let entity_skipped = learning_snap.eval.success
+    state.latest_turn_quality_feedback = learning_snap.quality_feedback();
+    let entity_skipped = learning_snap.succeeded()
         && !result.tools_used.is_empty()
         && result.routing_domain_hint.is_none();
     result.entity_learn_skipped_no_domain = entity_skipped;
@@ -502,7 +483,7 @@ fn apply_turn_success_primary_sync(
     state.last_turn_interrupted = result.interruption.is_some()
         || result.interruption_kind.is_some()
         || result.final_state == "interrupted";
-    print_turn_status_line(state, &result, Some(&learning_snap.eval), turn_start);
+    print_turn_status_line(state, &result, turn_start);
     if state.tui_render_policy.is_none() {
         if let Some(suggestion) = state.pending_followup_suggestion.as_ref() {
             eprintln!(
@@ -556,7 +537,6 @@ fn apply_turn_success_sync(
 #[cfg(test)]
 mod tests {
     use super::{apply_turn_success, apply_turn_success_async, apply_turn_success_sync};
-    use crate::cli::session::session_state::PersistedAdaptiveState;
     use crate::cli::session::session_state::SessionState;
     use crate::cli::turn::turn_post_commit::{
         apply_turn_post_commit_completion, execute_turn_post_commit_job,
@@ -601,6 +581,11 @@ mod tests {
             }],
         );
         result.session_id = Some(session_id.clone());
+        result.run_id = Some("server-run".into());
+        result.turn_evaluation = Some(super::super::turn_commit::tests::server_evaluation(
+            &session_id,
+            1,
+        ));
 
         apply_turn_success(
             &mut state,
@@ -749,6 +734,31 @@ mod tests {
         );
         result.llm_rounds = Some(40);
         result.prompt_tokens = 94_900;
+
+        let mut evaluation = session_journal::JournalEvent::turn_evaluation(
+            Some("server-session"),
+            Some(9),
+            "server_runtime",
+            false,
+            false,
+            0.2,
+            0.9,
+            0.0,
+            0,
+            false,
+            1,
+            vec![astra_turn_core::evaluation::eval_signal_to_json(
+                &astra_turn_core::evaluation::EvalSignal::ToolOutcomeFailure {
+                    class: "path_resolution_failure".into(),
+                    count: 1,
+                },
+            )],
+        )
+        .with_producer_scope(Some("server-run"));
+        evaluation.metadata.as_mut().unwrap()["execution_owner_generation"] = serde_json::json!(0);
+        evaluation.metadata.as_mut().unwrap()["tool_evaluation_success"] = serde_json::json!(false);
+        evaluation.metadata.as_mut().unwrap()["run_status"] = serde_json::json!("completed");
+        result.turn_evaluation = Some(evaluation);
 
         apply_turn_success(
             &mut state,
@@ -915,7 +925,7 @@ mod tests {
             total_completion_tokens: 50,
             total_cache_read_tokens: 7,
             total_cache_creation_tokens: 3,
-            total_session_cost: 1.25,
+            total_session_cost: Some(1.25),
             last_response: Some("old response".into()),
             history: vec![("old question".into(), "old answer".into())],
             recent_tools: vec!["read_file".into()],
@@ -951,7 +961,7 @@ mod tests {
         assert_eq!(state.total_completion_tokens, 50);
         assert_eq!(state.total_cache_read_tokens, 7);
         assert_eq!(state.total_cache_creation_tokens, 3);
-        assert_eq!(state.total_session_cost, 1.25);
+        assert_eq!(state.total_session_cost, Some(1.25));
         assert_eq!(state.last_response.as_deref(), Some("old response"));
         assert_eq!(
             state.history,
@@ -1024,10 +1034,7 @@ mod tests {
             observability_hub: Some(std::sync::Arc::new(
                 astra_runtime::observability::ObservabilityHub::new(),
             )),
-            pending_adaptive_state: Some(PersistedAdaptiveState {
-                active_experiment_id: Some("exp-1".into()),
-                ..Default::default()
-            }),
+            observability_config_pending: true,
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("new response");
@@ -1053,7 +1060,7 @@ mod tests {
         assert!(state.csl_manager.is_none());
         assert!(state.observability_session.is_none());
         assert!(state.last_turn_interrupted);
-        assert!(state.pending_adaptive_state.is_some());
+        assert!(state.observability_config_pending);
         assert!(
             !crate::cli::session::session_recovery::io::csl_log_path_for(&sid).exists(),
             "post-commit CSL persistence must be skipped when the primary turn commit fails"
@@ -1082,6 +1089,10 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let mut ui = crate::tests::TestUi::default();
         let mut result = crate::tests::stub_stream_result("The canonical event is durable.");
+        result.session_id = Some(sid.clone());
+        result.run_id = Some("server-run".into());
+        let evaluation = super::super::turn_commit::tests::server_evaluation(&sid, 1);
+        result.turn_evaluation = Some(evaluation.clone());
         result.final_messages = vec![
             serde_json::json!({"role": "user", "content": "inspect persistence"}),
             serde_json::json!({"role": "assistant", "content": "The canonical event is durable."}),
@@ -1133,9 +1144,20 @@ mod tests {
         let errors = apply_turn_post_commit_completion(completion, &mut state);
         assert!(errors.is_empty(), "{errors:?}");
         let projected_events = session_journal::read_journal(&sid).unwrap();
-        assert!(projected_events.iter().any(|event| {
-            event.event_type == session_journal::JournalEventType::TurnEvaluation
-        }));
+        let evaluations = projected_events
+            .into_iter()
+            .filter(|event| event.event_type == session_journal::JournalEventType::TurnEvaluation)
+            .collect::<Vec<_>>();
+        assert_eq!(evaluations.len(), 1);
+        let mut projected = serde_json::to_value(&evaluations[0]).unwrap();
+        let metadata = projected
+            .get_mut("metadata")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        metadata.remove("sidecar_projection_id");
+        metadata.remove("sidecar_projection_index");
+        assert_eq!(projected, serde_json::to_value(evaluation).unwrap());
     }
 
     #[tokio::test]
@@ -1204,10 +1226,7 @@ mod tests {
             ingestion_user_id: Some("user-1".into()),
             observability_hub: Some(hub.clone()),
             observability_session: Some(pending),
-            pending_adaptive_state: Some(PersistedAdaptiveState {
-                active_experiment_id: Some("exp-1".into()),
-                ..Default::default()
-            }),
+            observability_config_pending: true,
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("done");
@@ -1234,6 +1253,6 @@ mod tests {
         );
         assert!(hub.get_session("pending").is_none());
         assert!(hub.get_session("sess-live").is_some());
-        assert!(state.pending_adaptive_state.is_none());
+        assert!(!state.observability_config_pending);
     }
 }

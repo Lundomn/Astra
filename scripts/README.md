@@ -51,7 +51,9 @@ cache before enabling it. Backend startup failures fall back to direct `rustc`,
 and sccache's native I/O fallback covers interruptions after startup. The
 offline fault-injection contract is included in `validate_repository.py`.
 
-The remaining Harness tests exercise Harbor integration contracts and require
+The model seed suite also verifies catalog-selected Offering identity and exact
+reasoning admission without Harbor, services, or model calls. It runs in the
+existing offline CI gate. The remaining Harness tests exercise Harbor integration contracts and require
 the benchmark environment. Run the complete suite there with
 `python3 -m unittest discover -s scripts/harness -p 'test_*.py'`.
 
@@ -73,6 +75,14 @@ python3 -m unittest \
   scripts.harness.test_fresh_database_contract
 bash scripts/harness/test_local_gateway_contract.sh
 ```
+
+`work_surface_live.py` is a separate opt-in Linux cross-surface product journey. It
+uses a real controlling TUI terminal plus a real Playwright browser against an
+exact-build candidate Server. It is not discovered by `make test-offline` or
+the mocked `web` E2E suite. Run it through `make test-work-live` with a
+disposable owner token; the command retains evidence and never restarts a
+shared API process. Other platforms return `not_tested` before setup because
+the lane requires Linux process ownership and descendant reaping.
 
 See the [Terminal-Bench results](../README.md#terminal-bench-21) for the public
 benchmark summary.
@@ -230,8 +240,10 @@ python3 scripts/schema/test_schema_inventory.py
 
 ### `scripts/e2e/validate_capability_matrix.py`
 Validates that every `system_test` name in the product capability matrix still
-resolves to a real Rust function somewhere under `crates/`. This is an
-offline, dependency-free guard against renamed or deleted evidence anchors:
+resolves to a real Rust function somewhere under `crates/`. It also understands
+the `matrix_test!` and `current_thread_matrix_test!` registrations used by the
+system E2E crate. This is an offline, dependency-free guard against renamed or
+deleted evidence anchors:
 
 ```sh
 python3 scripts/e2e/validate_capability_matrix.py

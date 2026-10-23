@@ -13,9 +13,28 @@ interaction. The canonical metadata lives in
   Select an entry to insert it into the composer.
 - Run `/help keys` for the current workbench keyboard shortcuts.
 
-Commands that only work in line mode are intentionally omitted from TUI
-completion. Typing one in the workbench shows an unavailable message; Astra
-never switches to a second terminal interface to complete it.
+Commands without a native workbench action are omitted from TUI completion.
+Typing one shows an unavailable message. There is no separate console slash
+frontend; non-interactive commands use the [CLI routes](cli-commands.md).
+
+## Input delivery
+
+While a run is active, **Enter** submits conversational input as guidance when
+the run still admits it; startup and settlement fallback rules may instead queue
+it. **Ctrl+Q** explicitly queues conversational input for the next turn, so the
+current run does not receive that message as guidance. You can still use Enter
+to guide the current run after queueing a follow-up. **Shift+Enter** and
+**Alt+Enter** insert a newline.
+
+The next-turn queue runs in FIFO order through ordinary submission after the
+existing lifecycle permits a safe handoff. Failed/interrupted turns, session
+changes, or a draft being edited retain input for review instead of sending it
+automatically. Queueing is local to this client process; it is not a durable
+Server acknowledgement and does not survive closing the client. When idle,
+Ctrl+Q submits normally. Slash/shell controls keep their ordinary dispatcher
+semantics, and a focused modal retains its keyboard input. With the slash menu
+open, Enter and Ctrl+Q both use the highlighted completion; command arguments
+and drafts with no matching completion are submitted unchanged.
 
 ## Common
 
@@ -31,6 +50,35 @@ current model, `/model clear` to clear the selection, or `/model <name>` to
 switch directly. `/model list` remains accepted as an alias for the picker,
 but the bare command is the suggested form.
 
+For an admitted effort-capable model, `/model <name>(thinking:low)` and
+`/model <name>(thinking:high)` request a thinking depth; `/model <name>` keeps
+the provider default. The picker only exposes options admitted by the model's
+catalog capability and protocol. `effort_only` does not support Off. Custom
+gateways may need an administrator-verified protocol declaration and a fresh
+model check; see [model management](cli-commands.md#astra-admin).
+
+The selected model name, Offering identity and catalog pricing form one session
+selection. Switching or clearing it replaces that selection; unknown catalog
+prices stay unknown, while explicit zero prices remain zero. `/model info <name>`
+shows that model's catalog prices. `/cost` evaluates usage at the current model's
+rates; it is not a historical invoice across model switches.
+
+Without an explicit model, Astra loads the server's configured default. Model
+catalog requests allow up to 30 seconds per page. If that lookup fails, the turn
+reports the lookup failure before model or tool execution; it does not report
+that you forgot to select a model. After sign-in, a model lookup failure leaves
+the completed login intact. Retry your message or use `/model` to choose a model
+once the service is available. `missing_model_selection` is reserved for a
+successful lookup with no usable default and no explicit selection.
+
+A model-catalog HTTP 401 can enter the existing session refresh-and-retry path
+when refresh credentials are available. HTTP 403 and provider authentication
+failures do not trigger that session refresh. Inconsistent catalog pagination
+or default-selection data is reported as `contract_violation`, not as a missing
+model selection.
+UC native credentials continue to rotate through their bearer provider before
+dispatch; a rejected native token never falls back to legacy profile refresh.
+
 ## Sessions
 
 | Command | What it does |
@@ -44,8 +92,14 @@ but the bare command is the suggested form.
 `/session analyze [id]` opens a concise session summary; `/session history [id]`
 opens that transcript; and `/session export [id]` writes it as Markdown in the
 current working directory. `/session list` remains accepted as an alias for
-`/resume`. `/session fork` is a line-mode command and is not available in the
-TUI.
+`/resume`. `/session fork` is not supported by the workbench.
+
+Starting a new session in a directory already used by another session is
+allowed when the new session has no unresolved execution debt. Sessions keep
+their own binding and history; they do not take over one another. Physical
+workspace operations are serialized by the executor-owned lease, and a
+temporarily unavailable lease returns a typed retryable result. Use `/resume`
+only when you intend to continue the existing session.
 
 ## Work
 
@@ -55,11 +109,20 @@ TUI.
 | `/stop` | Stop the active run. |
 | `/plan` | Enter or exit plan mode, then describe the plan in the composer. |
 | `/work` | Open the Work board or start durable work. |
+| `/tasks` | Open the live background task panel. |
 | `/agent` | Open the agent monitor for active and recent runs. |
 
-`/work` opens the canonical task board. Use `/work start <goal>` to track the
-current conversation as durable Work; the conversation must have a saved
-session first. `/work status` remains accepted as an alias for the board.
+`/work` opens the canonical durable Work board. Use `/work start <goal>` to track the
+current conversation as durable Work. If this TUI has not sent a message yet,
+the command creates and binds its durable Session automatically; no throwaway
+message or `/resume` is required. `/work status` remains accepted as an alias
+for the board. If you press Enter with a normal message while that first Work
+action is still starting, the message is shown in the queue and sent after the
+same Session is attached. A deliberate Session switch leaves the message in
+the composer for review instead of sending it to the wrong conversation. `/tasks`
+opens the live shell and local-agent task panel. Shift+Down/Ctrl+B detaches
+foreground shell work; agents already run asynchronously. The panel reuses the
+same session-bound registry and controls.
 
 Selecting an agent in `/agent` opens its conversation and work record, where
 you can inspect, guide, pause, resume, or stop the run. `/agent list` remains
@@ -69,7 +132,7 @@ accepted as an alias for the monitor.
 
 | Command | What it does |
 | --- | --- |
-| `/explain` | Cycle execution detail through off, on, and verbose. |
+| `/explain [on\|verbose\|off] [--format html\|markdown\|text]` | Show measured execution facts at the selected detail and choose the derived local report format. A bare `/explain` is the idempotent `on` form; format-only commands keep the current mode. |
 | `/reflect` | Review session evidence with a read-only reflection. |
 | `/inspect` | Open the current runtime inspector. |
 | `/stats` | Browse session, tool, cost, health, and learning stats. |
@@ -80,6 +143,14 @@ accepted as an alias for the monitor.
 diff` compares evidence. `/stats` opens a selector, or you can open a focused
 view with `/stats cost`, `/stats health`, `/stats history`, `/stats learn`, or
 `/stats tools`. `/context dump [path]` writes a JSON snapshot to a file.
+
+`/explain` changes presentation only; it never changes the recorded execution
+facts. `on` keeps subsequent execution concise, `verbose` adds context,
+dependency, and coverage details, and `off` suppresses the projection for
+subsequent execution while retaining durable evidence and already recorded
+history. The local report defaults to HTML; Markdown and text remain explicit
+derived representations. Invalid arguments leave both mode and format
+unchanged.
 
 ## Tools
 
@@ -109,14 +180,22 @@ read-only; server configuration changes are not available here.
 | `/config` | Edit runtime configuration. |
 | `/allow` | Choose a permission mode and manage workspace trust. |
 | `/instructions` | View, reload, or disable project instructions. |
-| `/login` | Sign in to your Astra account. |
-| `/register` | Create a new Astra account. |
+| `/login` | Discover the connected server's login method: UC/Memoria browser sign-in or a self-hosted password form. |
+| `/register` | Open the discovered provider's website for registration, or the self-hosted registration form. |
 
 `/config edit` remains accepted as an alias for `/config`. `/allow` opens a mode
 picker with no arguments. Its modes include `auto`, `bypass`, `read_only`,
 `accept_edits`, `prompt`, and `deny`; additional actions show rules, manage
-workspace trust, or inspect the permission trace. The TUI asks for confirmation
-before enabling `bypass`.
+workspace trust, or inspect the permission trace. The picker asks for confirmation
+before enabling `bypass`. `Shift+Tab` explicitly cycles
+`Ask → Edits → Read-only → Auto → Bypass → Ask`; `Deny` remains an explicit
+`/allow` choice. Shift+Tab also works while an inline approval is waiting;
+Tab navigates approval entries, while open modal pickers retain their own navigation.
+During execution the selected mode appears as `next: …` until
+the server applies it before the next model round. It does not wait for another
+user message. Already executing tools retain their captured policy. The current
+mode chip changes only after execution acknowledges the change. If the response
+ends first, the selection becomes the next response's mode.
 
 `/instructions` opens the project-instructions actions. The accepted forms are
 `/instructions show`, `/instructions reload`, and `/instructions off`.
@@ -138,5 +217,6 @@ redundant completion rows:
 | `/skill` | `/skill browse`, `/skill list` |
 | `/resume` | `/session list` |
 
-Line-mode-only commands such as `/grep`, `/diff`, and `/review` are not TUI
-commands. Use `/` to see every root command that the workbench can complete.
+Workspace commands such as `astra grep`, `astra diff`, and `astra review`
+use non-interactive CLI routes, not a console slash loop. Use `/` to see every
+root command that the workbench can complete.

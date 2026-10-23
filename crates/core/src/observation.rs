@@ -1,80 +1,9 @@
-//! Turn metrics: pure data collection for agent self-observation.
-//!
-//! This module collects orthogonal metric dimensions from each turn's tool
-//! calls. The data is surfaced through `introspect` so the agent can observe
-//! its own behavior and adjust — no intermediate layer pre-judges agent state.
-//!
-//! # Architecture
-//!
-//! ```text
-//! ToolCallRecords → TurnMetrics → introspect exposure → Agent self-adjusts
-//! ```
-//!
-//! All judgment ("am I stuck?", "should I change approach?") belongs to the
-//! agent, not to the framework. TurnMetrics is a mirror, not a teacher.
+//! Canonical observation contracts, tool families, and evidence projections.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-
-/// Lightweight sample representing a single tool call for metrics computation.
-/// Decoupled from `astra_services::session_journal::ToolCallRecord` to avoid
-/// cross-crate dependency from core → services.
-#[derive(Debug, Clone)]
-pub struct ToolCallSample<'a> {
-    pub name: &'a str,
-    pub ok: bool,
-    pub round: Option<u32>,
-    pub file_path: Option<&'a str>,
-    pub error: Option<&'a str>,
-}
-
-/// A consecutive streak of failures for the same tool.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ErrorStreak {
-    /// Tool name that failed.
-    pub tool_name: String,
-    /// Number of consecutive failures.
-    pub count: u32,
-    /// First error message (truncated to 200 chars).
-    pub first_error: String,
-}
-
-/// Orthogonal metric dimensions extracted from turn state.
-///
-/// These are intentionally coarse-grained to avoid overfitting to specific
-/// tool names or scenarios. Tool families are abstract categories.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TurnMetrics {
-    /// Total LLM rounds completed this turn.
-    pub rounds_completed: u32,
-    /// Total tool calls (successful + failed).
-    pub tool_calls_total: u32,
-    /// Tool calls grouped by abstract family.
-    pub tool_calls_by_family: BTreeMap<ToolFamily, u32>,
-    /// Number of distinct tool names used.
-    pub unique_tools_used: u32,
-    /// Workspace-mutating operations (writes, edits, git commits).
-    pub mutation_count: u32,
-    /// Failed tool calls.
-    pub error_count: u32,
-    /// Calls that hit idempotency cache or returned identical results.
-    pub cache_hits: u32,
-    /// Rounds since the last workspace mutation.
-    pub rounds_since_last_mutation: u32,
-    /// Tokens consumed this turn (approximate).
-    pub tokens_consumed: u64,
-    /// Top tools by frequency: (tool_name, call_count), sorted descending.
-    /// Used for evidence-driven nudges.
-    pub top_tools: Vec<(String, u32)>,
-    /// File access counts: (file_path, access_count) for read/write tools.
-    /// Used to detect excessive exploration of the same file.
-    pub file_access_counts: BTreeMap<String, u32>,
-    /// Consecutive failure streaks per tool, sorted by count descending.
-    /// Used to detect spirals on the same tool (e.g., str_replace 3x old_str not found).
-    pub error_streaks: Vec<ErrorStreak>,
-}
 
 /// Abstract tool families — coarser than individual tool names.
 ///
@@ -125,192 +54,6 @@ pub fn classify_tool_family(tool_name: &str) -> ToolFamily {
     }
 }
 
-fn is_workspace_mutation_tool(tool_name: &str, family: ToolFamily) -> bool {
-    match family {
-        ToolFamily::Write => true,
-        ToolFamily::Git => tool_name == "worktree",
-        _ => false,
-    }
-}
-
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    value.chars().take(max_chars).collect()
-}
-
-impl TurnMetrics {
-    /// Build metrics from lightweight `ToolCallSample` records.
-    pub fn from_samples(
-        samples: &[ToolCallSample<'_>],
-        rounds_completed: u32,
-        tokens_consumed: u64,
-    ) -> Self {
-        let mut by_family: BTreeMap<ToolFamily, u32> = BTreeMap::new();
-        let mut unique_tools = std::collections::HashSet::new();
-        let mut mutation_count = 0u32;
-        let mut error_count = 0u32;
-        let mut last_mutation_round: Option<u32> = None;
-        let mut file_access_counts: BTreeMap<String, u32> = BTreeMap::new();
-        // Track consecutive failure streaks: tool_name → (count, first_error)
-        let mut streak_map: BTreeMap<String, (u32, String)> = BTreeMap::new();
-        let mut last_tool: Option<String> = None;
-
-        for sample in samples {
-            let lower = sample.name.to_lowercase();
-            unique_tools.insert(lower.clone());
-
-            let family = classify_tool_family(&lower);
-            *by_family.entry(family).or_insert(0) += 1;
-
-            if is_workspace_mutation_tool(&lower, family) {
-                mutation_count += 1;
-                if let Some(r) = sample.round {
-                    last_mutation_round = Some(last_mutation_round.map_or(r, |prev| prev.max(r)));
-                }
-            }
-            if !sample.ok {
-                error_count += 1;
-                // Extend or start a streak
-                if let Some(ref last) = last_tool {
-                    if *last == lower {
-                        // Same tool failed consecutively — extend streak
-                        if let Some(entry) = streak_map.get_mut(&lower) {
-                            entry.0 += 1;
-                        } else {
-                            streak_map.insert(
-                                lower.clone(),
-                                (
-                                    1,
-                                    sample
-                                        .error
-                                        .map(|e| truncate_chars(e, 200))
-                                        .unwrap_or_default(),
-                                ),
-                            );
-                        }
-                    } else {
-                        // Different tool failed — start new streak for this tool
-                        let first_err = sample
-                            .error
-                            .map(|e| truncate_chars(e, 200))
-                            .unwrap_or_default();
-                        streak_map.insert(lower.clone(), (1, first_err));
-                    }
-                } else {
-                    // First failure in turn
-                    let first_err = sample
-                        .error
-                        .map(|e| truncate_chars(e, 200))
-                        .unwrap_or_default();
-                    streak_map.insert(lower.clone(), (1, first_err));
-                }
-                last_tool = Some(lower);
-            } else {
-                // Success resets streak for this tool
-                if let Some(ref last) = last_tool
-                    && *last == lower
-                {
-                    streak_map.remove(&lower);
-                }
-                last_tool = Some(lower);
-            }
-
-            // Track file access for read/write tools
-            if matches!(family, ToolFamily::Read | ToolFamily::Write)
-                && let Some(path) = sample.file_path
-            {
-                *file_access_counts.entry(path.to_string()).or_insert(0) += 1;
-            }
-        }
-
-        let rounds_since_last_mutation = match last_mutation_round {
-            None => rounds_completed,
-            Some(r) => rounds_completed.saturating_sub(r),
-        };
-
-        // Build top_tools: sorted by frequency descending, take top 5
-        let mut tool_freq: Vec<(String, u32)> = unique_tools
-            .iter()
-            .map(|name| {
-                let count = samples
-                    .iter()
-                    .filter(|s| s.name.to_lowercase() == *name)
-                    .count() as u32;
-                (name.clone(), count)
-            })
-            .collect();
-        tool_freq.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
-        let top_tools: Vec<(String, u32)> = tool_freq.into_iter().take(5).collect();
-
-        // Convert streak map to sorted list
-        let mut error_streaks: Vec<ErrorStreak> = streak_map
-            .into_iter()
-            .map(|(tool, (count, first_error))| ErrorStreak {
-                tool_name: tool,
-                count,
-                first_error,
-            })
-            .collect();
-        error_streaks.sort_by_key(|b| std::cmp::Reverse(b.count));
-
-        Self {
-            rounds_completed,
-            tool_calls_total: samples.len() as u32,
-            tool_calls_by_family: by_family,
-            unique_tools_used: unique_tools.len() as u32,
-            mutation_count,
-            error_count,
-            cache_hits: 0, // not tracked in journal records
-            rounds_since_last_mutation,
-            tokens_consumed,
-            top_tools,
-            file_access_counts,
-            error_streaks,
-        }
-    }
-
-    /// Compute derived metrics that are ratios or aggregates.
-    pub fn read_write_ratio(&self) -> Option<f64> {
-        let reads = self
-            .tool_calls_by_family
-            .get(&ToolFamily::Read)
-            .copied()
-            .unwrap_or(0);
-        let writes = self
-            .tool_calls_by_family
-            .get(&ToolFamily::Write)
-            .copied()
-            .unwrap_or(0);
-        if writes == 0 {
-            None
-        } else {
-            Some(reads as f64 / writes as f64)
-        }
-    }
-
-    pub fn repetition_ratio(&self) -> f64 {
-        if self.tool_calls_total == 0 {
-            0.0
-        } else {
-            self.unique_tools_used as f64 / self.tool_calls_total as f64
-        }
-    }
-
-    pub fn error_rate(&self) -> f64 {
-        if self.tool_calls_total == 0 {
-            0.0
-        } else {
-            self.error_count as f64 / self.tool_calls_total as f64
-        }
-    }
-
-    pub fn cache_hit_ratio(&self) -> f64 {
-        if self.tool_calls_total == 0 {
-            0.0
-        } else {
-            self.cache_hits as f64 / self.tool_calls_total as f64
-        }
-    }
-}
 /// Canonical observation facet vocabulary shared by `introspect` and `reflect`.
 ///
 /// This enum defines the unified observation-plane taxonomy. Both tools map their
@@ -882,6 +625,121 @@ pub struct ObservationEvidence {
     pub confidence: ObservationConfidence,
 }
 
+/// Shared presentation priority. Severity is authoritative; prose and kind names
+/// are not classifiers. Confidence only breaks ties within a severity band.
+pub fn observation_priority_key(observation: &ObservationRecord) -> i64 {
+    let severity = match observation.severity.as_str() {
+        "critical" => 3000,
+        "error" => 2000,
+        "warning" => 1000,
+        _ => 0,
+    };
+    severity
+        + ((observation.confidence.evidence.unwrap_or(0.5)
+            + observation.confidence.classification.unwrap_or(0.0)
+            + observation.confidence.causal.unwrap_or(0.0))
+            * 100.0) as i64
+}
+
+/// Select observations together with their supporting evidence, then hints with
+/// all their observation dependencies. Preferred support wins within a severity
+/// band, never over a higher-severity diagnostic. No source-specific kind rules.
+pub fn budget_observation_support(
+    depth: ObservationDepth,
+    observations: &mut Vec<ObservationRecord>,
+    evidence: &mut Vec<ObservationEvidence>,
+    action_hints: &mut Vec<ObservationActionHint>,
+    preferred_evidence: &BTreeSet<String>,
+) -> ObservationBudgetResult {
+    let (max_observations, max_evidence, max_hints) = depth.report_limits();
+    let before = (observations.len(), evidence.len(), action_hints.len());
+    observations.sort_by_key(|observation| {
+        std::cmp::Reverse(
+            observation_priority_key(observation)
+                + if observation
+                    .evidence_refs
+                    .iter()
+                    .any(|id| preferred_evidence.contains(id))
+                {
+                    400
+                } else {
+                    0
+                },
+        )
+    });
+    let available: BTreeSet<_> = evidence.iter().map(|item| &item.ref_id).collect();
+    let mut selected = BTreeSet::new();
+    let mut kept = 0;
+    observations.retain(|observation| {
+        if kept == max_observations {
+            return false;
+        }
+        if !observation.evidence_refs.is_empty() {
+            let support = observation
+                .evidence_refs
+                .iter()
+                .find(|id| selected.contains(*id))
+                .or_else(|| {
+                    (selected.len() < max_evidence)
+                        .then(|| {
+                            observation
+                                .evidence_refs
+                                .iter()
+                                .find(|id| available.contains(id))
+                        })
+                        .flatten()
+                });
+            let Some(support) = support else {
+                return false;
+            };
+            selected.insert(support.clone());
+        }
+        kept += 1;
+        true
+    });
+    for observation in observations.iter() {
+        for id in &observation.evidence_refs {
+            if selected.len() < max_evidence && available.contains(id) {
+                selected.insert(id.clone());
+            }
+        }
+    }
+    // Independent evidence remains useful even when no observation cites it.
+    // Referenced support owns the budget first; previews use only spare slots.
+    for item in evidence.iter() {
+        if selected.len() < max_evidence {
+            selected.insert(item.ref_id.clone());
+        }
+    }
+    evidence.retain(|item| selected.contains(&item.ref_id));
+    for observation in observations.iter_mut() {
+        observation.evidence_refs.retain(|id| selected.contains(id));
+    }
+    let retained: BTreeSet<_> = observations.iter().map(|item| &item.ref_id).collect();
+    action_hints.retain(|hint| {
+        !hint.observation_refs.is_empty()
+            && hint.observation_refs.iter().all(|id| retained.contains(id))
+    });
+    action_hints.sort_by_key(|hint| {
+        observations
+            .iter()
+            .position(|observation| hint.observation_refs.contains(&observation.ref_id))
+            .unwrap_or(usize::MAX)
+    });
+    action_hints.truncate(max_hints);
+    let omitted = ObservationBudgetOmitted {
+        observations: before.0.saturating_sub(observations.len()) as i64,
+        evidence_previews: before.1.saturating_sub(evidence.len()) as i64,
+        action_hints: before.2.saturating_sub(action_hints.len()) as i64,
+        ..Default::default()
+    };
+    ObservationBudgetResult {
+        truncated: !omitted.is_empty(),
+        omitted,
+        next_cursor: None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ObservationActionHint {
     pub target_type: String,
@@ -1032,6 +890,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn model_catalog_is_not_an_observation_facet() {
+        for value in ["models", "Models", "model_catalog", "runtime/models"] {
+            assert!(value.parse::<ObservationFacet>().is_err());
+            assert!(serde_json::from_value::<ObservationFacet>(serde_json::json!(value)).is_err());
+        }
+    }
+
+    #[test]
     fn observation_facet_parses_advertised_edge_local_facets() {
         assert_eq!(
             "cache".parse::<ObservationFacet>().unwrap(),
@@ -1088,84 +954,6 @@ mod tests {
         assert_eq!(json["confidence"]["classification"], 0.8);
         assert_eq!(json["confidence"]["evidence"], 0.0);
         assert!(json["confidence"].get("causal").is_none());
-    }
-
-    #[test]
-    fn removed_git_tools_do_not_count_as_workspace_mutations() {
-        let samples = [
-            ToolCallSample {
-                name: "git_diff",
-                ok: true,
-                round: Some(1),
-                file_path: None,
-                error: None,
-            },
-            ToolCallSample {
-                name: "git_log",
-                ok: true,
-                round: Some(1),
-                file_path: None,
-                error: None,
-            },
-            ToolCallSample {
-                name: "git_blame",
-                ok: true,
-                round: Some(1),
-                file_path: None,
-                error: None,
-            },
-        ];
-        let metrics = TurnMetrics::from_samples(&samples, 1, 100);
-        assert_eq!(
-            metrics.tool_calls_by_family.get(&ToolFamily::Other),
-            Some(&3)
-        );
-        assert_eq!(
-            metrics.mutation_count, 0,
-            "read-only git inspection must not fabricate workspace progress"
-        );
-    }
-
-    #[test]
-    fn worktree_lifecycle_counts_as_workspace_mutations() {
-        let samples = [
-            ToolCallSample {
-                name: "worktree",
-                ok: true,
-                round: Some(2),
-                file_path: None,
-                error: None,
-            },
-            ToolCallSample {
-                name: "worktree",
-                ok: true,
-                round: Some(2),
-                file_path: None,
-                error: None,
-            },
-        ];
-        let metrics = TurnMetrics::from_samples(&samples, 2, 100);
-        assert_eq!(metrics.mutation_count, 2);
-        assert_eq!(metrics.rounds_since_last_mutation, 0);
-    }
-
-    #[test]
-    fn error_streak_preview_truncates_on_utf8_char_boundary() {
-        let error = format!("{}⚠ task returned an error", "x".repeat(199));
-        let samples = [ToolCallSample {
-            name: "task_board.create",
-            ok: false,
-            round: Some(1),
-            file_path: None,
-            error: Some(&error),
-        }];
-
-        let metrics = TurnMetrics::from_samples(&samples, 1, 100);
-
-        assert_eq!(metrics.error_streaks.len(), 1);
-        let first_error = &metrics.error_streaks[0].first_error;
-        assert_eq!(first_error.chars().count(), 200);
-        assert!(first_error.ends_with('⚠'));
     }
 
     #[test]

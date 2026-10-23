@@ -24,6 +24,7 @@ pub enum ExplainAnalyzeNodeKindV1 {
     Admission,
     Preparation,
     ContextAssembly,
+    Judgment,
     ModelRound,
     ProviderAttempt,
     ToolBatch,
@@ -58,6 +59,42 @@ pub enum ExplainAnalyzeOutcomeV1 {
     Fallback,
     Unavailable,
     Delegated,
+}
+
+/// Bounded evidence for a material runtime decision. These facts are
+/// explanatory only and never grant execution authority.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExplainAnalyzeDecisionDetailV1 {
+    DelegationCatalogResolution {
+        requirement_index: u32,
+        match_count: u32,
+    },
+}
+
+impl ExplainAnalyzeDecisionDetailV1 {
+    fn is_valid_for(
+        &self,
+        kind: ExplainAnalyzeNodeKindV1,
+        transition: ExplainAnalyzeTransitionV1,
+        outcome: Option<ExplainAnalyzeOutcomeV1>,
+    ) -> bool {
+        match self {
+            Self::DelegationCatalogResolution {
+                requirement_index,
+                match_count,
+            } => {
+                kind == ExplainAnalyzeNodeKindV1::Admission
+                    && transition == ExplainAnalyzeTransitionV1::Finished
+                    && matches!(
+                        outcome,
+                        Some(ExplainAnalyzeOutcomeV1::Blocked | ExplainAnalyzeOutcomeV1::Rejected)
+                    )
+                    && *requirement_index < 16
+                    && *match_count != 1
+            }
+        }
+    }
 }
 
 /// Execution boundaries that the current producer cannot independently time.
@@ -127,9 +164,6 @@ pub enum ExplainAnalyzeContextSourceKindV1 {
     Skills,
     RuntimeIdentity,
     RuntimeVolatile,
-    EmergentSkills,
-    EmergentMemory,
-    EmergentSummary,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -183,12 +217,20 @@ pub struct ExplainAnalyzeContextSourceV1 {
 pub struct ExplainAnalyzeContextAssemblyV1 {
     pub basis: ExplainAnalyzeContextAssemblyBasisV1,
     pub sources: Vec<ExplainAnalyzeContextSourceV1>,
+    /// Selected CLI/Edge reports selection, not proof of final prompt injection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edge_memory_selection: Vec<crate::MemorySelectionReport>,
 }
 
 impl ExplainAnalyzeContextAssemblyV1 {
     pub fn is_valid(&self) -> bool {
         let mut kinds = HashSet::with_capacity(self.sources.len());
-        self.sources.len() <= 15
+        self.edge_memory_selection.len() <= 2
+            && self
+                .edge_memory_selection
+                .iter()
+                .all(crate::MemorySelectionReport::is_valid)
+            && self.sources.len() <= 15
             && self.sources.iter().all(|source| {
                 source.estimated_tokens <= EXPLAIN_ANALYZE_MAX_SAFE_INTEGER
                     && kinds.insert(source.kind)
@@ -205,7 +247,7 @@ pub struct ExplainAnalyzeContextMetricsV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<ExplainAnalyzeContextBudgetV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub assembly: Option<ExplainAnalyzeContextAssemblyV1>,
+    pub assembly: Option<Box<ExplainAnalyzeContextAssemblyV1>>,
 }
 
 impl ExplainAnalyzeContextMetricsV1 {
@@ -245,6 +287,207 @@ impl ExplainAnalyzeTokenUsageV1 {
     }
 }
 
+/// Read-only physical-attempt usage snapshot for auxiliary inference in one turn.
+/// Timing and semantic settlement facts live in the separate
+/// `auxiliary_details` field on the terminal turn fact so physical usage is
+/// never confused with logical call latency or executor authority.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplainAnalyzeAuxiliaryUsageV1 {
+    pub available: bool,
+    /// The bounded capture omitted physical attempts. Counts and token sums
+    /// describe captured evidence only, not complete turn/session totals.
+    #[serde(default, skip_serializing_if = "auxiliary_capture_not_truncated")]
+    pub truncated: bool,
+    pub attempts: Vec<ExplainAnalyzeAuxiliaryAttemptV1>,
+}
+
+/// One locally measured logical auxiliary call. This interval covers the
+/// `SummaryLlmClient` call as observed by the runtime. It is not provider
+/// compute time and must not be added to the parent turn interval or to
+/// another call's interval.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplainAnalyzeAuxiliaryCallV1 {
+    pub call_id: String,
+    pub operation_id: String,
+    pub stage: String,
+    pub start_elapsed_ms: u64,
+    pub duration_ms: u64,
+    pub outcome: ExplainAnalyzeOutcomeV1,
+}
+
+/// The settlement status at the Work-admission boundary.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExplainAnalyzeAdmissionSettlementStatusV1 {
+    Accepted,
+    Rejected,
+    Unavailable,
+    NotDispatched,
+}
+
+/// Typed reason for the admission settlement. Provider response text is not
+/// part of the Explain contract.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExplainAnalyzeAdmissionSettlementReasonV1 {
+    Accepted,
+    ClassifierUncertain,
+    ClassifierConflicting,
+    InvalidClassifierResponse,
+    ProviderRejected,
+    PlanningRejected,
+    ReconciliationRejected,
+    Unavailable {
+        reason: crate::SemanticJudgmentUnavailableReasonV1,
+    },
+    NotDispatched {
+        reason: crate::SemanticJudgmentPreDispatchReasonV1,
+    },
+}
+
+/// Bounded classifier evidence and the runtime's admission settlement. The
+/// classification is deliberately separate from settlement: a valid
+/// classification can still be rejected later by planning or reconciliation.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplainAnalyzeAdmissionSettlementV1 {
+    pub status: ExplainAnalyzeAdmissionSettlementStatusV1,
+    pub reason: ExplainAnalyzeAdmissionSettlementReasonV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<crate::RequestJudgmentResultV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<crate::RequestJudgmentResultV1>,
+}
+
+/// Bounded semantic and timing details attached to the terminal turn fact.
+/// These details are observational and never grant execution authority.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplainAnalyzeAuxiliaryDetailsV1 {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<ExplainAnalyzeAuxiliaryCallV1>,
+    #[serde(default, skip_serializing_if = "auxiliary_details_not_truncated")]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<ExplainAnalyzeAdmissionSettlementV1>,
+}
+
+fn auxiliary_details_not_truncated(value: &bool) -> bool {
+    !value
+}
+
+impl ExplainAnalyzeAuxiliaryDetailsV1 {
+    const MAX_CALLS: usize = 16;
+
+    pub fn is_valid(&self, terminal_elapsed_ms: u64) -> bool {
+        let mut call_ids = HashSet::new();
+        self.calls.len() <= Self::MAX_CALLS
+            && self.calls.iter().all(|call| {
+                valid_id(&call.call_id)
+                    && valid_id(&call.operation_id)
+                    && valid_id(&call.stage)
+                    && call.start_elapsed_ms <= terminal_elapsed_ms
+                    && call
+                        .start_elapsed_ms
+                        .checked_add(call.duration_ms)
+                        .is_some_and(|end| end <= terminal_elapsed_ms.saturating_add(1))
+                    && call_ids.insert(&call.call_id)
+            }) && self.admission.as_ref().is_none_or(|admission| {
+            admission
+                .classification
+                .as_ref()
+                .is_none_or(|classification| classification.validate().is_ok())
+                && admission
+                    .decision
+                    .as_ref()
+                    .is_none_or(|decision| decision.validate().is_ok())
+                && match (&admission.status, &admission.reason) {
+                    (
+                        ExplainAnalyzeAdmissionSettlementStatusV1::Accepted,
+                        ExplainAnalyzeAdmissionSettlementReasonV1::Accepted,
+                    ) => admission.decision.as_ref().is_some_and(|decision| {
+                        matches!(decision, crate::RequestJudgmentResultV1::Decided { .. })
+                    }),
+                    (ExplainAnalyzeAdmissionSettlementStatusV1::Rejected, reason) => {
+                        !matches!(
+                            reason,
+                            ExplainAnalyzeAdmissionSettlementReasonV1::Accepted
+                                | ExplainAnalyzeAdmissionSettlementReasonV1::Unavailable { .. }
+                                | ExplainAnalyzeAdmissionSettlementReasonV1::NotDispatched { .. }
+                        ) && admission.decision.is_none()
+                    }
+                    (
+                        ExplainAnalyzeAdmissionSettlementStatusV1::Unavailable,
+                        ExplainAnalyzeAdmissionSettlementReasonV1::Unavailable { .. },
+                    )
+                    | (
+                        ExplainAnalyzeAdmissionSettlementStatusV1::NotDispatched,
+                        ExplainAnalyzeAdmissionSettlementReasonV1::NotDispatched { .. },
+                    ) => admission.decision.is_none(),
+                    _ => false,
+                }
+        })
+    }
+}
+
+fn auxiliary_capture_not_truncated(value: &bool) -> bool {
+    !value
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplainAnalyzeAuxiliaryAttemptV1 {
+    pub attempt_id: String,
+    pub usage_status: ExplainAnalyzeAuxiliaryUsageStatusV1,
+    pub provider: String,
+    pub offering_id: String,
+    pub model_name: String,
+    pub purpose: String,
+    pub operation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ExplainAnalyzeTokenUsageV1>,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExplainAnalyzeAuxiliaryUsageStatusV1 {
+    ProviderExact,
+    ProviderPartial,
+    Unavailable,
+}
+
+impl ExplainAnalyzeAuxiliaryUsageV1 {
+    pub fn is_valid(&self) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        (self.available || (self.attempts.is_empty() && !self.truncated))
+            && self.attempts.iter().all(|a| {
+                valid_id(&a.attempt_id)
+                    && seen.insert(&a.attempt_id)
+                    && valid_id(&a.provider)
+                    && valid_id(&a.offering_id)
+                    && valid_id(&a.purpose)
+                    && valid_id(&a.operation_id)
+                    && match a.usage_status {
+                        ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact => a
+                            .usage
+                            .as_ref()
+                            .is_some_and(|u| u.basis == ExplainAnalyzeUsageBasisV1::ProviderExact),
+                        ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderPartial => a
+                            .usage
+                            .as_ref()
+                            .is_none_or(|u| u.basis == ExplainAnalyzeUsageBasisV1::ProviderPartial),
+                        ExplainAnalyzeAuxiliaryUsageStatusV1::Unavailable => a.usage.is_none(),
+                    }
+                    && !a.model_name.trim().is_empty()
+                    && a.model_name.len() <= 255
+                    && !a.model_name.chars().any(char::is_control)
+                    && a.usage.as_ref().is_none_or(|u| {
+                        u.is_valid() && u.basis != ExplainAnalyzeUsageBasisV1::RuntimeEstimated
+                    })
+            })
+    }
+}
+
 /// One idempotent fact about a node in a run/turn execution graph.
 ///
 /// `elapsed_ms` is measured in `clock_domain_id` from the producer's turn
@@ -281,8 +524,19 @@ pub struct ExplainAnalyzeEventV1 {
     pub duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<ExplainAnalyzeOutcomeV1>,
+    /// Safe structured detail for a completed material decision. It is
+    /// omitted when a decision has no additional bounded evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_detail: Option<ExplainAnalyzeDecisionDetailV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<ExplainAnalyzeTokenUsageV1>,
+    /// Auxiliary usage is separate from timed provider-attempt node usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auxiliary_usage: Option<Box<ExplainAnalyzeAuxiliaryUsageV1>>,
+    /// Auxiliary timing and accepted semantic settlement are separate from
+    /// physical provider-attempt usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auxiliary_details: Option<Box<ExplainAnalyzeAuxiliaryDetailsV1>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ExplainAnalyzeContextMetricsV1>,
     /// Known boundaries without a measured graph interval. Only terminal turn
@@ -294,6 +548,20 @@ pub struct ExplainAnalyzeEventV1 {
 impl ExplainAnalyzeEventV1 {
     /// Validate a decoded/public event before projection or graph mutation.
     pub fn is_valid(&self) -> bool {
+        if self.auxiliary_usage.as_ref().is_some_and(|a| {
+            self.kind != ExplainAnalyzeNodeKindV1::Turn
+                || self.transition != ExplainAnalyzeTransitionV1::Finished
+                || !a.is_valid()
+        }) {
+            return false;
+        }
+        if self.auxiliary_details.as_ref().is_some_and(|details| {
+            self.kind != ExplainAnalyzeNodeKindV1::Turn
+                || self.transition != ExplainAnalyzeTransitionV1::Finished
+                || !details.is_valid(self.elapsed_ms)
+        }) {
+            return false;
+        }
         if self.schema_version != EXPLAIN_ANALYZE_SCHEMA_VERSION
             || !valid_id(&self.event_id)
             || !valid_id(&self.run_id)
@@ -334,7 +602,9 @@ impl ExplainAnalyzeEventV1 {
                 self.start_elapsed_ms.is_none()
                     && self.duration_ms.is_none()
                     && self.outcome.is_none()
+                    && self.decision_detail.is_none()
                     && self.usage.is_none()
+                    && self.auxiliary_details.is_none()
                     && self.context.is_none()
                     && self.coverage_gaps.is_empty()
             }
@@ -345,6 +615,9 @@ impl ExplainAnalyzeEventV1 {
                             self.elapsed_ms.abs_diff(start).abs_diff(duration) <= 1
                         })
                 }) && self.outcome.is_some()
+                    && self.decision_detail.as_ref().is_none_or(|detail| {
+                        detail.is_valid_for(self.kind, self.transition, self.outcome)
+                    })
                     && self
                         .usage
                         .as_ref()
@@ -391,10 +664,34 @@ fn valid_id(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        RequestJudgmentCapabilityV1, RequestJudgmentClassificationV1, RequestJudgmentDomainV1,
+        RequestJudgmentMutationV1, RequestJudgmentResultV1, RequestJudgmentScopeV1,
+        RequestJudgmentStageV1, SEMANTIC_JUDGMENT_PRESENTATION_MAX_BYTES, SemanticJudgmentFactV1,
+    };
+
+    #[test]
+    fn auxiliary_capture_overflow_is_partial_evidence_not_unavailability() {
+        use super::ExplainAnalyzeAuxiliaryUsageV1;
+        let legacy = r#"{"available":true,"attempts":[]}"#;
+        let mut facts: ExplainAnalyzeAuxiliaryUsageV1 = serde_json::from_str(legacy).unwrap();
+        assert!(!facts.truncated);
+        assert_eq!(serde_json::to_string(&facts).unwrap(), legacy);
+        facts.truncated = true;
+        assert!(facts.is_valid());
+        let roundtrip: ExplainAnalyzeAuxiliaryUsageV1 =
+            serde_json::from_value(serde_json::to_value(&facts).unwrap()).unwrap();
+        assert!(roundtrip.truncated);
+        facts.available = false;
+        assert!(!facts.is_valid());
+    }
+
     use super::*;
 
     fn started() -> ExplainAnalyzeEventV1 {
         ExplainAnalyzeEventV1 {
+            auxiliary_usage: None,
+            auxiliary_details: None,
             schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
             event_id: "turn-1/provider/0/started".to_string(),
             run_id: "run-1".to_string(),
@@ -413,10 +710,78 @@ mod tests {
             start_elapsed_ms: None,
             duration_ms: None,
             outcome: None,
+            decision_detail: None,
             usage: None,
             context: None,
             coverage_gaps: Vec::new(),
         }
+    }
+
+    #[test]
+    fn semantic_judgment_presentation_is_valid_for_explain_event() {
+        let fact = SemanticJudgmentFactV1 {
+            stage: RequestJudgmentStageV1::Clarification,
+            result: RequestJudgmentResultV1::Decided {
+                classification: RequestJudgmentClassificationV1 {
+                    work_required: true,
+                    activation_deferred: true,
+                    domain: Some(RequestJudgmentDomainV1::Database),
+                    mutation: RequestJudgmentMutationV1::MustMutate,
+                    scope: RequestJudgmentScopeV1::Mixed,
+                    parallel_subruns: true,
+                    capabilities: vec![
+                        RequestJudgmentCapabilityV1::Web,
+                        RequestJudgmentCapabilityV1::AgentSpawner,
+                    ],
+                },
+            },
+        };
+        let mut event = started();
+        event.label = fact.presentation_label();
+        assert!(event.label.len() <= SEMANTIC_JUDGMENT_PRESENTATION_MAX_BYTES);
+        assert!(event.is_valid(), "{}", event.label);
+    }
+
+    #[test]
+    fn delegation_catalog_detail_is_limited_to_blocked_admission_terminals() {
+        let mut event = started();
+        event.event_id = "turn-1/admission/0/finished".to_string();
+        event.node_id = "turn-1/admission/0".to_string();
+        event.kind = ExplainAnalyzeNodeKindV1::Admission;
+        event.round_index = None;
+        event.attempt_index = None;
+        event.transition = ExplainAnalyzeTransitionV1::Finished;
+        event.elapsed_ms = 20;
+        event.start_elapsed_ms = Some(15);
+        event.duration_ms = Some(5);
+        event.outcome = Some(ExplainAnalyzeOutcomeV1::Blocked);
+        event.decision_detail = Some(
+            ExplainAnalyzeDecisionDetailV1::DelegationCatalogResolution {
+                requirement_index: 0,
+                match_count: 0,
+            },
+        );
+        assert!(event.is_valid());
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            encoded["decision_detail"],
+            serde_json::json!({
+                "kind": "delegation_catalog_resolution",
+                "requirement_index": 0,
+                "match_count": 0,
+            })
+        );
+
+        event.outcome = Some(ExplainAnalyzeOutcomeV1::Succeeded);
+        assert!(!event.is_valid());
+        event.outcome = Some(ExplainAnalyzeOutcomeV1::Blocked);
+        event.decision_detail = Some(
+            ExplainAnalyzeDecisionDetailV1::DelegationCatalogResolution {
+                requirement_index: 0,
+                match_count: 1,
+            },
+        );
+        assert!(!event.is_valid());
     }
 
     #[test]
@@ -454,6 +819,94 @@ mod tests {
         assert_eq!(event.event_type(), "explain_analyze");
         assert_eq!(event.elapsed_ms - event.start_elapsed_ms.unwrap(), 74);
         assert_eq!(event.duration_ms, Some(73));
+    }
+
+    #[test]
+    fn auxiliary_details_validate_bounds_and_runtime_acceptance() {
+        let mut event = terminal(started());
+        event.kind = ExplainAnalyzeNodeKindV1::Turn;
+        event.node_id = "turn-1".to_string();
+        event.parent_node_id = None;
+        event.auxiliary_details = Some(Box::new(ExplainAnalyzeAuxiliaryDetailsV1 {
+            calls: vec![ExplainAnalyzeAuxiliaryCallV1 {
+                call_id: "request_judgment:initial:0".into(),
+                operation_id: "request_judgment".into(),
+                stage: "initial".into(),
+                start_elapsed_ms: 15,
+                duration_ms: 15,
+                outcome: ExplainAnalyzeOutcomeV1::Succeeded,
+            }],
+            truncated: false,
+            admission: Some(ExplainAnalyzeAdmissionSettlementV1 {
+                status: ExplainAnalyzeAdmissionSettlementStatusV1::Accepted,
+                reason: ExplainAnalyzeAdmissionSettlementReasonV1::Accepted,
+                classification: Some(crate::RequestJudgmentResultV1::Decided {
+                    classification: crate::RequestJudgmentClassificationV1 {
+                        work_required: false,
+                        activation_deferred: false,
+                        domain: None,
+                        mutation: crate::RequestJudgmentMutationV1::ReadOnly,
+                        scope: crate::RequestJudgmentScopeV1::Unknown,
+                        parallel_subruns: false,
+                        capabilities: Vec::new(),
+                    },
+                }),
+                decision: Some(crate::RequestJudgmentResultV1::Decided {
+                    classification: crate::RequestJudgmentClassificationV1 {
+                        work_required: false,
+                        activation_deferred: false,
+                        domain: None,
+                        mutation: crate::RequestJudgmentMutationV1::ReadOnly,
+                        scope: crate::RequestJudgmentScopeV1::Unknown,
+                        parallel_subruns: false,
+                        capabilities: Vec::new(),
+                    },
+                }),
+            }),
+        }));
+        assert!(event.is_valid());
+
+        let mut out_of_bounds = event.clone();
+        out_of_bounds.auxiliary_details.as_mut().unwrap().calls[0].start_elapsed_ms = 31;
+        assert!(!out_of_bounds.is_valid());
+
+        let mut not_decided = event;
+        not_decided
+            .auxiliary_details
+            .as_mut()
+            .unwrap()
+            .admission
+            .as_mut()
+            .unwrap()
+            .status = ExplainAnalyzeAdmissionSettlementStatusV1::Accepted;
+        not_decided
+            .auxiliary_details
+            .as_mut()
+            .unwrap()
+            .admission
+            .as_mut()
+            .unwrap()
+            .reason = ExplainAnalyzeAdmissionSettlementReasonV1::Accepted;
+        not_decided
+            .auxiliary_details
+            .as_mut()
+            .unwrap()
+            .admission
+            .as_mut()
+            .unwrap()
+            .classification = Some(crate::RequestJudgmentResultV1::Unavailable {
+            reason: crate::SemanticJudgmentUnavailableReasonV1::Deadline,
+            delivery: crate::SemanticJudgmentDeliveryV1::Unresolved,
+        });
+        not_decided
+            .auxiliary_details
+            .as_mut()
+            .unwrap()
+            .admission
+            .as_mut()
+            .unwrap()
+            .decision = None;
+        assert!(!not_decided.is_valid());
     }
 
     #[test]
@@ -578,6 +1031,7 @@ mod tests {
 
     fn context_assembly() -> ExplainAnalyzeContextAssemblyV1 {
         ExplainAnalyzeContextAssemblyV1 {
+            edge_memory_selection: Vec::new(),
             basis: ExplainAnalyzeContextAssemblyBasisV1::RuntimeTextEstimate,
             sources: vec![ExplainAnalyzeContextSourceV1 {
                 kind: ExplainAnalyzeContextSourceKindV1::Identity,
@@ -601,7 +1055,7 @@ mod tests {
         assembly.kind = ExplainAnalyzeNodeKindV1::ContextAssembly;
         assembly.context = Some(ExplainAnalyzeContextMetricsV1 {
             budget: None,
-            assembly: Some(context_assembly()),
+            assembly: Some(Box::new(context_assembly())),
         });
         assert!(assembly.is_valid());
 
@@ -621,7 +1075,7 @@ mod tests {
 
         assembly.context = Some(ExplainAnalyzeContextMetricsV1 {
             budget: Some(context_budget()),
-            assembly: Some(context_assembly()),
+            assembly: Some(Box::new(context_assembly())),
         });
         assert!(!assembly.is_valid());
 
@@ -676,7 +1130,7 @@ mod tests {
         event.kind = ExplainAnalyzeNodeKindV1::ContextAssembly;
         event.context = Some(ExplainAnalyzeContextMetricsV1 {
             budget: None,
-            assembly: Some(context_assembly()),
+            assembly: Some(Box::new(context_assembly())),
         });
 
         let encoded = serde_json::to_string(&event).unwrap();

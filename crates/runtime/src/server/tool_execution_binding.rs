@@ -192,6 +192,17 @@ pub(crate) fn runtime_execution_provider_id_for_executor(executor: &ExecutorBind
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ToolPolicySnapshot {
+    /// Installed by the invocation owner and persisted in its decision only.
+    /// Provider requests cannot carry Work causality or invent an attempt.
+    #[serde(skip)]
+    pub work_attribution: astra_services::runs::WorkInvocationAttribution,
+    /// Invocation-local monotonic admission cutoff selected from the admitted
+    /// run authority. Never a provider permission or a serialized deadline.
+    #[serde(skip)]
+    pub admission_deadline: Option<std::time::Instant>,
+    /// Same admitted work cutoff as admission_deadline, for remote transport.
+    #[serde(skip)]
+    pub execution_deadline_unix_ms: Option<u64>,
     pub allowed_tools: Vec<String>,
     pub approval_policy: Option<String>,
     pub network_policy: Option<String>,
@@ -218,6 +229,10 @@ pub struct ToolPolicySnapshot {
     /// route execution, preventing policy TOCTOU within one invocation.
     #[serde(skip)]
     pub admission_snapshot: Option<ToolExecutionAdmissionSnapshot>,
+    /// Trusted, invocation-local delegation instruction. The durable decision
+    /// persists this separately; provider/tool arguments must never carry it.
+    #[serde(skip)]
+    pub delegation_model_admission: Option<astra_turn_types::DelegationModelAdmission>,
     /// Server-derived Session provider-selection generation. It is runtime
     /// authority only and is deliberately omitted from serialized provider
     /// requests and durable tool decisions.
@@ -228,14 +243,18 @@ pub struct ToolPolicySnapshot {
     /// never serialized to an external executor or accepted from tool args.
     #[serde(skip)]
     pub expected_control_epoch: Option<i64>,
-    /// Request-local completion authority; never accepted from serialized input.
-    #[serde(skip)]
-    pub task_resolution_authority:
-        Option<astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority>,
     /// Concrete, trusted revision facts for one semantic pure-read decision.
     /// Eligibility in the provider descriptor is insufficient without this.
     #[serde(skip)]
     pub semantic_read_freshness: Option<astra_turn_types::SemanticReadFreshnessResolution>,
+}
+
+impl ToolPolicySnapshot {
+    /// Fence only new dispatch. Already-started execution keeps its existing
+    /// completion owner and drains its result under the total bound.
+    pub(crate) fn dispatch_deadline_rejection(&self) -> Option<astra_tools::ToolResult> {
+        astra_tools::dispatch_deadline_result(self.admission_deadline, false)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -267,6 +286,13 @@ pub struct ToolPermissionGrantSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolExecutionRequest {
+    /// Never serialized or recovered: only this dispatch may enable steering.
+    #[serde(skip)]
+    pub provider_stage_dispatch: Option<
+        tokio::sync::watch::Sender<
+            Option<astra_server_types::edge_connection_pool::ProviderStageDispatchBinding>,
+        >,
+    >,
     pub user_id: String,
     pub run_id: String,
     pub turn_chain_id: String,
@@ -403,6 +429,10 @@ pub struct ExecutionBindingSnapshot {
     pub runtime: Option<astra_runtime_env::RuntimeBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_binding_generation: Option<u64>,
+    /// Stable physical checkout identity for native Edge execution. The live
+    /// executor id may change after a CLI restart; this identity must not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_workspace_id: Option<String>,
 }
 
 impl ExecutionBindingSnapshot {
@@ -416,6 +446,7 @@ impl ExecutionBindingSnapshot {
             executor,
             runtime: Some(runtime),
             execution_binding_generation: None,
+            physical_workspace_id: None,
         }
     }
 
@@ -425,6 +456,7 @@ impl ExecutionBindingSnapshot {
             executor,
             runtime: None,
             execution_binding_generation: None,
+            physical_workspace_id: None,
         }
     }
 }
@@ -580,6 +612,7 @@ impl ExecutionBindingState {
             runtime_process_authorization_required: false,
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,
+            provider_stage_dispatch: None,
         }
         .with_execution_binding_generation(self.execution_binding_generation)
     }
@@ -634,13 +667,17 @@ mod tests {
     fn durable_control_epoch_is_not_a_provider_wire_field() {
         let mut policy = ToolPolicySnapshot {
             expected_control_epoch: Some(7),
+            admission_deadline: Some(std::time::Instant::now()),
             ..ToolPolicySnapshot::default()
         };
         let mut wire = serde_json::to_value(&policy).expect("serialize policy wire");
         assert!(wire.get("expected_control_epoch").is_none());
+        assert!(wire.get("admission_deadline").is_none());
 
         wire["expected_control_epoch"] = json!(99);
+        wire["admission_deadline"] = json!("unbounded");
         policy = serde_json::from_value(wire).expect("decode provider-shaped policy");
+        assert!(policy.admission_deadline.is_none());
         assert_eq!(
             policy.expected_control_epoch, None,
             "external/provider bytes cannot manufacture action-admission authority"

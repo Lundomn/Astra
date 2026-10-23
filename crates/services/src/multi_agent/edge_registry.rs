@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::metrics::SharedMultiAgentMetrics;
+use crate::cancellation_safe_db::CancellationSafeTransaction;
 use crate::db_row::RowExt as EdgeRegistryDbRow;
 
 const CURRENT_READ_MAX_ATTEMPTS: u32 = 6;
@@ -334,7 +335,7 @@ fn registration_before_mutation_decision(
 }
 
 async fn transition_error_with_rollback(
-    transaction: sqlx::Transaction<'_, sqlx::MySql>,
+    mut transaction: CancellationSafeTransaction,
     operation: &str,
     registry_id: &str,
     error: impl std::fmt::Display,
@@ -375,6 +376,11 @@ impl std::fmt::Display for HeartbeatError {
 
 #[async_trait]
 pub trait EdgeRegistryService: Send + Sync {
+    /// Whether registry lookups own cross-process routing. An explicitly
+    /// unconfigured single-process registry has no durable route to consult.
+    fn has_durable_routing(&self) -> bool {
+        true
+    }
     #[allow(clippy::too_many_arguments)]
     async fn register_or_update(
         &self,
@@ -644,7 +650,7 @@ impl DatabaseEdgeRegistryService {
     }
 
     async fn load_registration_state_for_update(
-        transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        transaction: &mut CancellationSafeTransaction,
         user_id: &str,
         registry_id: &str,
     ) -> Result<Option<RegistrationState>, sqlx::Error> {
@@ -672,7 +678,7 @@ impl DatabaseEdgeRegistryService {
     /// row lock for `SELECT ... FOR UPDATE`, while a no-op UPDATE participates
     /// in commit-time conflict detection.
     async fn establish_registry_current_read(
-        transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        transaction: &mut CancellationSafeTransaction,
         user_id: &str,
         registry_id: &str,
     ) -> Result<(), sqlx::Error> {
@@ -688,7 +694,7 @@ impl DatabaseEdgeRegistryService {
     }
 
     async fn establish_generation_current_read(
-        transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        transaction: &mut CancellationSafeTransaction,
         user_id: &str,
         edge_agent_id: &str,
     ) -> Result<(), sqlx::Error> {
@@ -704,7 +710,7 @@ impl DatabaseEdgeRegistryService {
     }
 
     async fn load_generation_state(
-        transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        transaction: &mut CancellationSafeTransaction,
         user_id: &str,
         edge_agent_id: &str,
     ) -> Result<Option<RegistrationGenerationState>, sqlx::Error> {
@@ -749,9 +755,13 @@ impl DatabaseEdgeRegistryService {
                 .await;
             }
 
-            let mut transaction = self.pool.begin().await.map_err(|error| {
-                format!("edge_registry {operation} verification begin (attempt {attempt}): {error}")
-            })?;
+            let mut transaction = CancellationSafeTransaction::begin(&self.pool)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "edge_registry {operation} verification begin (attempt {attempt}): {error}"
+                    )
+                })?;
             if let Err(error) =
                 Self::establish_generation_current_read(&mut transaction, user_id, edge_agent_id)
                     .await
@@ -885,7 +895,12 @@ impl DatabaseEdgeRegistryService {
                 .await;
             }
 
-            let mut transaction = self.pool.begin().await.map_err(|error| {
+            // Publication/cleanup attempts can be cancelled by their caller.
+            // Guard the checkout before BEGIN is sent: SQLx constructs its
+            // Transaction only after the BEGIN response, so cancellation in
+            // that window otherwise has no transaction Drop to roll back.
+            // The same guard covers statements, COMMIT, and explicit ROLLBACK.
+            let mut transaction = CancellationSafeTransaction::begin(&self.pool).await.map_err(|error| {
                 format!(
                     "edge_registry {operation} registration {registry_id} begin (attempt {attempt}): {error}"
                 )
@@ -1163,16 +1178,14 @@ impl DatabaseEdgeRegistryService {
                     .await;
             }
 
-            let mut transaction = self
-                .pool
-                .begin()
+            let mut transaction = CancellationSafeTransaction::begin(&self.pool)
                 .await
                 .map_err(|e| format!("edge_registry lease begin (attempt {attempt}): {e}"))?;
             let lookup_sql = format!(
                 "SELECT {EDGE_AGENT_RECORD_COLUMNS}, registration_state \
                  FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?"
             );
-            let row = sqlx::query(&lookup_sql)
+            let row = sqlx::query(sqlx::AssertSqlSafe(lookup_sql))
                 .bind(user_id)
                 .bind(edge_agent_id)
                 .fetch_optional(&mut *transaction)
@@ -1436,9 +1449,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                 ))
                 .await;
             }
-            let mut transaction = self
-                .pool
-                .begin()
+            let mut transaction = CancellationSafeTransaction::begin(&self.pool)
                 .await
                 .map_err(|e| format!("edge_registry begin (attempt {attempt}): {e}"))?;
             // Fetch registry_id + registered_at in one query; construct the
@@ -1830,7 +1841,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                AND ((? IS NOT NULL AND workspace_id = ?) OR (? IS NULL AND workspace_id IS NULL)) \
              ORDER BY last_heartbeat_at DESC LIMIT 1"
         );
-        let row = sqlx::query(&lookup_sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(lookup_sql))
             .bind(edge_agent_id)
             .bind(workspace_id)
             .bind(workspace_id)
@@ -1856,7 +1867,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                AND ((? IS NOT NULL AND workspace_id = ?) OR (? IS NULL AND workspace_id IS NULL)) \
              LIMIT 1"
         );
-        let row = sqlx::query(&lookup_sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(lookup_sql))
             .bind(user_id)
             .bind(edge_agent_id)
             .bind(workspace_id)
@@ -1875,7 +1886,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
              WHERE user_id = ? AND registration_state = 1 \
              ORDER BY last_heartbeat_at DESC"
         );
-        let rows = sqlx::query(&list_sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(list_sql))
             .bind(user_id)
             .fetch_all(&self.pool)
             .await
@@ -1900,7 +1911,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                AND CHAR_LENGTH(TRIM(worktree_path)) > 0 \
              ORDER BY edge_agent_id ASC LIMIT ?"
         );
-        let rows = sqlx::query(&list_sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(list_sql))
             .bind(user_id)
             .bind(i64::from(limit.clamp(1, 100)))
             .fetch_all(&self.pool)
@@ -1914,6 +1925,9 @@ pub struct UnconfiguredEdgeRegistryService;
 
 #[async_trait]
 impl EdgeRegistryService for UnconfiguredEdgeRegistryService {
+    fn has_durable_routing(&self) -> bool {
+        false
+    }
     /// When no cross-pod registry is configured (single-pod deployment), edge
     /// registration is a successful no-op: the connection is tracked in the
     /// in-memory pool and there is no cross-pod source of truth to fail. This is

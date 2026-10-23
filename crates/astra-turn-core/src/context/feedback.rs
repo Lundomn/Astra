@@ -79,12 +79,20 @@ pub struct RuntimeContextFeedback {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimePolicySignal {
     ExplorationFamilyChurn,
-    RedundantReads,
+    /// Historical range overlap, not proof that content is unchanged or retained.
+    ReadCoverageOverlap,
     UnresolvedToolOutcomes,
     RejectedToolRequests,
     SearchFanout,
     ValidationRetryChurn,
-    LowYieldRoundChurn,
+    /// Review-triggering activity; its count does not measure semantic progress.
+    RoundActivity,
+    /// Repeated operation identity, not evidence of unchanged results or failure.
+    RepeatedOperation,
+    /// The same read-only request delivered the same observable result again;
+    /// this is equality-only evidence, not proof that the external state is
+    /// unchanged.
+    NoNewObservationEvidence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,12 +106,12 @@ pub enum RuntimePolicyStage {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimePolicyRecommendation {
     TestExactHypothesis,
-    ReuseKnownContent,
+    ReviewReadCoverage,
     DiagnoseToolOutcomes,
     RepairToolRequest,
     NarrowEvidenceSearch,
     ChangeValidationStrategy,
-    SynthesizeAndDecide,
+    ReviewTaskProgress,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,10 +169,49 @@ impl RuntimePolicyFeedbackEntry {
     }
 }
 
+/// Bounded current recovery facts projected from TurnGuard. This snapshot
+/// carries neither advisory text nor authority to stop or restrict execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeRecoveryEvidence {
+    /// All recent error pressure, including the timeout subset below.
+    pub error_pressure: u32,
+    pub timeout_pressure: u32,
+    pub cautioned_tools: Vec<String>,
+    pub timeout_dominant_tools: Vec<String>,
+    /// Tool-list entries omitted across both lists because of bounds or invalid names.
+    pub omitted_tools: u32,
+}
+
+impl RuntimeRecoveryEvidence {
+    pub const MAX_TOOLS: usize = 8;
+    pub const MAX_TOOL_NAME_BYTES: usize = 256;
+
+    pub(crate) fn valid_tool_name(name: &str) -> bool {
+        bounded_nonempty(name, Self::MAX_TOOL_NAME_BYTES) && !name.chars().any(char::is_control)
+    }
+
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        let valid_tools = |tools: &[String]| {
+            tools.len() <= Self::MAX_TOOLS
+                && tools.iter().all(|name| Self::valid_tool_name(name))
+                && tools.windows(2).all(|pair| pair[0] < pair[1])
+        };
+        self.timeout_pressure <= self.error_pressure
+            && valid_tools(&self.cautioned_tools)
+            && valid_tools(&self.timeout_dominant_tools)
+            && (self.error_pressure > 0
+                || !self.cautioned_tools.is_empty()
+                || !self.timeout_dominant_tools.is_empty()
+                || self.omitted_tools > 0)
+    }
+}
+
 /// One immutable policy evaluation delivered to a concrete provider request.
 /// Unknown and evaluated-without-advisory are deliberately different states.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RuntimePolicyFeedbackSet {
     #[default]
     NotEvaluated,
@@ -174,11 +221,13 @@ pub enum RuntimePolicyFeedbackSet {
         evaluated_at_round: u32,
         subject: RuntimePolicySubject,
         entries: Vec<RuntimePolicyFeedbackEntry>,
+        #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+        recovery: Option<Box<RuntimeRecoveryEvidence>>,
     },
 }
 
 impl RuntimePolicyFeedbackSet {
-    pub const SCHEMA_VERSION: u32 = 2;
+    pub const SCHEMA_VERSION: u32 = 4;
     pub const MAX_ENTRIES: usize = 4;
 
     #[must_use]
@@ -191,11 +240,15 @@ impl RuntimePolicyFeedbackSet {
                 evaluated_at_round,
                 subject,
                 entries,
+                recovery,
             } => {
                 *schema_version == Self::SCHEMA_VERSION
                     && *revision > 0
                     && *evaluated_at_round <= llm_rounds_completed
                     && subject.is_valid()
+                    && recovery
+                        .as_deref()
+                        .is_none_or(RuntimeRecoveryEvidence::is_valid)
                     && entries.len() <= Self::MAX_ENTRIES
                     && entries
                         .iter()
@@ -214,19 +267,35 @@ impl RuntimePolicyFeedbackSet {
         match self {
             Self::NotEvaluated => "not_evaluated".to_string(),
             Self::Evaluated {
-                subject, entries, ..
-            } if entries.is_empty() => format!("{}:none", policy_subject_label(subject)),
-            Self::Evaluated {
-                subject, entries, ..
-            } => format!(
-                "{}:{}",
-                policy_subject_label(subject),
-                entries
+                subject,
+                entries,
+                recovery,
+                ..
+            } => {
+                let mut summaries = entries
                     .iter()
                     .map(|entry| format!("{:?}/{:?}", entry.signal, entry.stage))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ),
+                    .collect::<Vec<_>>();
+                if let Some(recovery) = recovery {
+                    summaries.push(format!(
+                        "recovery(errors={},timeouts={},cautioned={},timeout_tools={},omitted={})",
+                        recovery.error_pressure,
+                        recovery.timeout_pressure,
+                        recovery.cautioned_tools.len(),
+                        recovery.timeout_dominant_tools.len(),
+                        recovery.omitted_tools,
+                    ));
+                }
+                format!(
+                    "{}:{}",
+                    policy_subject_label(subject),
+                    if summaries.is_empty() {
+                        "none".into()
+                    } else {
+                        summaries.join(",")
+                    }
+                )
+            }
         }
     }
 }
@@ -311,7 +380,9 @@ impl RuntimeFeedbackFrame {
 
     #[must_use]
     pub fn cache_hit_ratio(&self) -> Option<f64> {
-        self.request_usage.map(|usage| usage.cache_hit_ratio())
+        self.request_usage
+            .filter(|usage| usage.total_input() > 0)
+            .map(|usage| usage.cache_hit_ratio())
     }
 
     /// Compare provider-reported cache reads with the estimated stable prefix.
@@ -325,17 +396,6 @@ impl RuntimeFeedbackFrame {
             return None;
         }
         Some(cache_read as f64 / eligible as f64)
-    }
-
-    pub fn detect_cache_break(&mut self, turn: u32, min_creation_threshold: u64) {
-        if turn > 1
-            && self.request_usage.is_some_and(|usage| {
-                usage.cache_read == 0 && usage.cache_creation >= min_creation_threshold
-            })
-            && self.cache_break_detected.is_none()
-        {
-            self.cache_break_detected = Some(CacheBreakReason::UnknownColdStart);
-        }
     }
 
     pub fn attribute_cache_break(&mut self, reason: CacheBreakReason) {
@@ -399,19 +459,6 @@ impl ContextFeedback {
             cache_hit_ratio,
             was_truncated,
             cache_break_detected: None,
-        }
-    }
-
-    /// Detect a cache break from cold creation (no cache reads, significant creation).
-    /// Call this with the turn number to determine if a break occurred.
-    pub fn detect_cache_break(&mut self, turn: u32, min_creation_threshold: u64) {
-        if turn > 1
-            && self.tokens.cache_read == 0
-            && self.tokens.cache_creation >= min_creation_threshold
-        {
-            if self.cache_break_detected.is_none() {
-                self.cache_break_detected = Some(CacheBreakReason::UnknownColdStart);
-            }
         }
     }
 
@@ -485,6 +532,11 @@ mod tests {
             policy_feedback: RuntimePolicyFeedbackSet::NotEvaluated,
         };
         frame.context.estimated_cache_eligible_tokens = Some(100);
+        assert_eq!(frame.cache_hit_ratio(), None);
+        frame.request_usage = Some(TokenAccounting::default());
+        assert_eq!(frame.cache_hit_ratio(), None);
+        frame.request_usage = Some(TokenAccounting::from_fields(20, 0, 0, 5));
+        assert_eq!(frame.cache_hit_ratio(), Some(0.0));
         frame.request_usage = Some(TokenAccounting::from_fields(20, 80, 0, 0));
 
         assert_eq!(frame.cache_read_vs_eligible_ratio(), Some(0.8));
@@ -503,26 +555,9 @@ mod tests {
     }
 
     #[test]
-    fn detects_cache_break_from_cold_creation() {
-        let mut f = ContextFeedback::from_usage(0, 0, 5000, 100, false);
-        f.detect_cache_break(2, 1000);
-        assert_eq!(
-            f.cache_break_detected,
-            Some(CacheBreakReason::UnknownColdStart)
-        );
-    }
-
-    #[test]
-    fn no_cache_break_on_turn_1() {
-        let mut f = ContextFeedback::from_usage(0, 0, 5000, 100, false);
-        f.detect_cache_break(1, 1000);
-        assert!(f.cache_break_detected.is_none());
-    }
-
-    #[test]
     fn attribute_replaces_unknown() {
         let mut f = ContextFeedback::from_usage(0, 0, 5000, 100, false);
-        f.detect_cache_break(2, 1000);
+        f.attribute_cache_break(CacheBreakReason::UnknownColdStart);
         f.attribute_cache_break(CacheBreakReason::ToolSchemasChanged {
             added: vec!["bash".to_string()],
             removed: Vec::new(),
@@ -548,11 +583,11 @@ mod tests {
             expected_result: "The typed frame is projected unchanged".into(),
         };
         let entry = RuntimePolicyFeedbackEntry {
-            signal: RuntimePolicySignal::RedundantReads,
+            signal: RuntimePolicySignal::ReadCoverageOverlap,
             stage: RuntimePolicyStage::Observe,
             observed_at_round: 3,
             evidence_count: 8,
-            recommendation: RuntimePolicyRecommendation::ReuseKnownContent,
+            recommendation: RuntimePolicyRecommendation::ReviewReadCoverage,
         };
         let evaluated = |subject, entries| RuntimePolicyFeedbackSet::Evaluated {
             schema_version: RuntimePolicyFeedbackSet::SCHEMA_VERSION,
@@ -560,10 +595,16 @@ mod tests {
             evaluated_at_round: 3,
             subject,
             entries,
+            recovery: None,
         };
 
         assert!(evaluated(subject.clone(), vec![entry.clone()]).is_valid(3));
         assert!(!evaluated(subject.clone(), vec![entry.clone(), entry.clone()]).is_valid(3));
+        let mut invalid_version = evaluated(subject.clone(), vec![entry.clone()]);
+        if let RuntimePolicyFeedbackSet::Evaluated { schema_version, .. } = &mut invalid_version {
+            *schema_version = 0;
+        }
+        assert!(!invalid_version.is_valid(3));
 
         let mut future = entry.clone();
         future.observed_at_round = 4;
@@ -584,6 +625,7 @@ mod tests {
             revision: 1,
             evaluated_at_round: 0,
             subject: RuntimePolicySubject::Run,
+            recovery: None,
             entries: Vec::new(),
         };
 
@@ -593,6 +635,79 @@ mod tests {
             "not_evaluated"
         );
         assert_eq!(evaluated.inline_summary(), "run:none");
+    }
+
+    #[test]
+    fn recovery_snapshot_requires_current_bounded_sorted_facts() {
+        let valid = RuntimeRecoveryEvidence {
+            error_pressure: 3,
+            timeout_pressure: 2,
+            cautioned_tools: vec!["a".into(), "b".into()],
+            timeout_dominant_tools: vec!["a".into()],
+            omitted_tools: 0,
+        };
+        assert!(valid.is_valid());
+        for tools in [
+            vec!["b".into(), "a".into()],
+            vec!["a".into(), "a".into()],
+            (0..9).map(|n| format!("tool_{n}")).collect(),
+            vec!["界".repeat(100)],
+            vec!["invalid\nname".into()],
+            vec![" ".into()],
+        ] {
+            let mut invalid = valid.clone();
+            invalid.cautioned_tools = tools.clone();
+            assert!(!invalid.is_valid());
+            invalid = valid.clone();
+            invalid.timeout_dominant_tools = tools;
+            assert!(!invalid.is_valid());
+        }
+        let mut invalid = valid.clone();
+        invalid.timeout_pressure = 4;
+        assert!(!invalid.is_valid());
+        invalid.error_pressure = 0;
+        invalid.timeout_pressure = 0;
+        invalid.cautioned_tools.clear();
+        invalid.timeout_dominant_tools.clear();
+        assert!(!invalid.is_valid());
+        invalid.omitted_tools = 1;
+        assert!(invalid.is_valid());
+    }
+
+    #[test]
+    fn policy_v4_requires_recovery_field_and_preserves_health_only_snapshot() {
+        let policy = RuntimePolicyFeedbackSet::Evaluated {
+            schema_version: RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            revision: 1,
+            evaluated_at_round: 0,
+            subject: RuntimePolicySubject::Run,
+            entries: Vec::new(),
+            recovery: Some(Box::new(RuntimeRecoveryEvidence {
+                error_pressure: 1,
+                timeout_pressure: 0,
+                cautioned_tools: Vec::new(),
+                timeout_dominant_tools: Vec::new(),
+                omitted_tools: 0,
+            })),
+        };
+        assert!(policy.is_valid(0));
+        assert_ne!(policy.inline_summary(), "run:none");
+        let mut wire = serde_json::to_value(&policy).unwrap();
+        assert_eq!(
+            serde_json::from_value::<RuntimePolicyFeedbackSet>(wire.clone()).unwrap(),
+            policy
+        );
+        wire["schema_version"] = serde_json::json!(3);
+        assert!(
+            !serde_json::from_value::<RuntimePolicyFeedbackSet>(wire.clone())
+                .unwrap()
+                .is_valid(0)
+        );
+        wire["schema_version"] = serde_json::json!(4);
+        wire["recovery"]["unknown"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<RuntimePolicyFeedbackSet>(wire.clone()).is_err());
+        wire.as_object_mut().unwrap().remove("recovery");
+        assert!(serde_json::from_value::<RuntimePolicyFeedbackSet>(wire).is_err());
     }
 
     #[test]
@@ -626,6 +741,7 @@ mod tests {
             revision: 2,
             evaluated_at_round: 3,
             subject: RuntimePolicySubject::Run,
+            recovery: None,
             entries: vec![RuntimePolicyFeedbackEntry {
                 signal: RuntimePolicySignal::UnresolvedToolOutcomes,
                 stage: RuntimePolicyStage::Observe,
@@ -646,6 +762,7 @@ mod tests {
             revision: 3,
             evaluated_at_round: 3,
             subject: RuntimePolicySubject::Run,
+            recovery: None,
             entries: Vec::new(),
         };
         assert!(!frame.has_unresolved_tool_outcomes());

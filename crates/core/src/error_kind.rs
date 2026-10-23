@@ -24,6 +24,8 @@ pub enum ErrorKind {
     // ── LLM provider ─────────────────────────────────
     /// 429, TPM/RPM exceeded.
     RateLimit,
+    /// 402, provider balance or billing limit prevents inference.
+    PaymentRequired,
     /// 5xx from provider.
     ServerError,
     /// 401/403, bad API key or expired token.
@@ -77,6 +79,8 @@ pub enum ErrorKind {
     ToolUnavailable,
     /// Runtime advertised a tool but failed to bind an executor/transport for it.
     ToolBinding,
+    /// The tool may have applied an external effect, but its acknowledgement was lost.
+    ToolOutcomeUnknown,
     /// OOM, disk full, fork exhaustion, too many open files.
     ResourceLimit,
 
@@ -115,6 +119,8 @@ pub enum ToolFailureCause {
     PermissionBoundary,
     CapabilityUnavailable,
     TransientTransport,
+    /// Dispatch may have completed, so a new call requires outcome reconciliation first.
+    OutcomeUnknown,
     ResourceExhausted,
     /// The tool invocation itself was valid, but an invoked command returned
     /// a non-semantic failure status. This is deliberately distinct from
@@ -135,6 +141,7 @@ pub enum ToolRecoveryAction {
     RefreshCredentials,
     SelectAvailableCapability,
     WaitAndRetry,
+    ReconcileOutcome,
     ReduceResourcePressure,
     InspectStructuredFailure,
 }
@@ -187,6 +194,10 @@ impl ToolFailureEvidence {
                 ToolFailureCause::CapabilityUnavailable,
                 ToolRecoveryAction::SelectAvailableCapability,
             ),
+            ErrorKind::ToolOutcomeUnknown => (
+                ToolFailureCause::OutcomeUnknown,
+                ToolRecoveryAction::ReconcileOutcome,
+            ),
             ErrorKind::ResourceLimit | ErrorKind::ConnectionPoolExhausted => (
                 ToolFailureCause::ResourceExhausted,
                 ToolRecoveryAction::ReduceResourcePressure,
@@ -215,6 +226,7 @@ impl ErrorKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::RateLimit => "rate_limit",
+            Self::PaymentRequired => "payment_required",
             Self::ServerError => "server_error",
             Self::Auth => "auth",
             Self::ContextWindow => "context_window",
@@ -233,6 +245,7 @@ impl ErrorKind {
             Self::ToolTimeout => "tool_timeout",
             Self::ToolUnavailable => "tool_unavailable",
             Self::ToolBinding => "tool_binding",
+            Self::ToolOutcomeUnknown => "tool_outcome_unknown",
             Self::ResourceLimit => "resource_limit",
             Self::DatabaseError => "database_error",
             Self::Stall => "stall",
@@ -283,6 +296,10 @@ impl ErrorKind {
     #[must_use]
     pub fn guidance(self) -> &'static str {
         match self {
+            Self::PaymentRequired => {
+                "Model inference requires available credit or a higher billing limit. \
+                 Do NOT retry or re-authenticate; resolve the provider billing restriction first."
+            }
             Self::RateLimit => {
                 "Rate limit hit. The system will retry automatically. \
                  Reduce parallel tool calls if this persists."
@@ -358,6 +375,10 @@ impl ErrorKind {
                  Do NOT retry the same tool call and do NOT assume a shell command \
                  is equivalent; continue degraded only after making the lost capability explicit."
             }
+            Self::ToolOutcomeUnknown => {
+                "The tool may have applied its operation, but the acknowledgement was lost. \
+                 Reconcile the provider's state before deciding whether any new call is safe."
+            }
             Self::ResourceLimit => {
                 "System resource limit reached (memory/disk/processes). \
                  This tool is BLOCKED for the rest of this session. \
@@ -396,6 +417,7 @@ impl ErrorKind {
     #[must_use]
     pub fn diagnosis_hint(self) -> &'static str {
         match self {
+            Self::PaymentRequired => "Check the model provider balance and billing limits.",
             Self::RateLimit => "Reduce parallel tool calls or raise the provider rate-limit quota.",
             Self::ServerError => {
                 "Transient provider issue. If it persists, switch model or provider."
@@ -465,6 +487,10 @@ impl ErrorKind {
                  executor or edge transport is bound for the turn, or wire the \
                  missing transport before activation."
             }
+            Self::ToolOutcomeUnknown => {
+                "Inspect the provider's state or invocation receipt to determine whether the \
+                 operation was applied. Do not replay an uncertain external effect."
+            }
             Self::ResourceLimit => {
                 "Check system limits: `ulimit -u` (max procs), `ulimit -n` (open files). \
                  Kill orphan processes: `ps aux | grep defunct`. May need to restart \
@@ -511,6 +537,7 @@ impl ErrorKind {
     pub fn parse_tag(s: &str) -> Option<Self> {
         match s {
             "rate_limit" => Some(Self::RateLimit),
+            "payment_required" => Some(Self::PaymentRequired),
             "server_error" => Some(Self::ServerError),
             "auth" => Some(Self::Auth),
             "context_window" => Some(Self::ContextWindow),
@@ -529,6 +556,7 @@ impl ErrorKind {
             "tool_timeout" => Some(Self::ToolTimeout),
             "tool_unavailable" => Some(Self::ToolUnavailable),
             "tool_binding" => Some(Self::ToolBinding),
+            "tool_outcome_unknown" => Some(Self::ToolOutcomeUnknown),
             "resource_limit" => Some(Self::ResourceLimit),
             "database_error" => Some(Self::DatabaseError),
             "stall" => Some(Self::Stall),
@@ -721,6 +749,27 @@ pub fn classify_llm_error_message(message: &str) -> ErrorKind {
 #[must_use]
 pub fn classify_model_resolution_error_message(message: &str) -> ErrorKind {
     let lower = message.to_ascii_lowercase();
+    if lower.contains("[genesis_access_denied]") {
+        return ErrorKind::PolicyDenied;
+    }
+    // These are server-authored dependency errors, not an invalid selection or
+    // a missing user credential. Preserve the stable code across the legacy
+    // string-based resolution boundary rather than matching human prose.
+    if [
+        "[genesis_timeout]",
+        "[genesis_not_ready]",
+        "[genesis_credential_rejected]",
+        "[moi_model_policy_unavailable]",
+        "[uc_unavailable]",
+        "[model_catalog_unavailable]",
+        "[model_selection_changed]",
+        "[model_admission_incomplete]",
+    ]
+    .iter()
+    .any(|code| lower.contains(code))
+    {
+        return ErrorKind::ServerError;
+    }
     if lower.contains("model selection is required")
         || lower.contains("missing model selection")
         || lower.contains("no concrete model was selected")
@@ -736,6 +785,13 @@ pub fn classify_model_resolution_error_message(message: &str) -> ErrorKind {
         || lower.contains("is inactive")
         || lower.contains(" is ambiguous")
         || lower.contains("empty model name")
+        || lower.contains("[model_selection_invalid]")
+        || lower.contains("[model_admission_batch_invalid]")
+        || lower.contains("[model_admission_batch_too_large]")
+        || lower.contains("[model_offering_not_found]")
+        || lower.contains("[model_offering_unavailable]")
+        || lower.contains("[model_reasoning_unsupported]")
+        || lower.contains("[model_purpose_unsupported]")
     {
         return ErrorKind::InvalidRequest;
     }
@@ -1105,6 +1161,7 @@ mod tests {
     /// Every ErrorKind variant. Keep in sync when adding new variants.
     const ALL_VARIANTS: &[ErrorKind] = &[
         ErrorKind::RateLimit,
+        ErrorKind::PaymentRequired,
         ErrorKind::ServerError,
         ErrorKind::Auth,
         ErrorKind::ContextWindow,
@@ -1123,6 +1180,7 @@ mod tests {
         ErrorKind::ToolTimeout,
         ErrorKind::ToolUnavailable,
         ErrorKind::ToolBinding,
+        ErrorKind::ToolOutcomeUnknown,
         ErrorKind::ResourceLimit,
         ErrorKind::DatabaseError,
         ErrorKind::Stall,
@@ -1353,6 +1411,38 @@ mod tests {
     #[test]
     fn classify_model_resolution_error_message_cases() {
         let cases: &[(&str, ErrorKind)] = &[
+            (
+                "[genesis_access_denied] Access denied.",
+                ErrorKind::PolicyDenied,
+            ),
+            (
+                "[genesis_credential_rejected] Authorization unavailable.",
+                ErrorKind::ServerError,
+            ),
+            (
+                "Model resolution failed: [genesis_timeout] Model access took too long.",
+                ErrorKind::ServerError,
+            ),
+            (
+                "Model resolution failed: [genesis_not_ready] Model access is unavailable.",
+                ErrorKind::ServerError,
+            ),
+            (
+                "Model resolution failed: [moi_model_policy_unavailable] Policy unavailable.",
+                ErrorKind::ServerError,
+            ),
+            (
+                "[model_catalog_unavailable] The authorized model catalog is temporarily unavailable.",
+                ErrorKind::ServerError,
+            ),
+            (
+                "[model_selection_changed] The selected model changed during admission; retry delegation.",
+                ErrorKind::ServerError,
+            ),
+            (
+                "[model_offering_unavailable] The requested model is unavailable.",
+                ErrorKind::InvalidRequest,
+            ),
             (
                 "Model resolution failed: DB query: error communicating with database: expected to read 4 bytes, got 0 bytes at EOF",
                 ErrorKind::DatabaseError,
@@ -1691,6 +1781,14 @@ mod tests {
             !timeout.retryable,
             "local command timeouts are not automatic retries"
         );
+
+        let uncertain = ToolFailureEvidence::from_error_kind(ErrorKind::ToolOutcomeUnknown);
+        assert_eq!(uncertain.cause, ToolFailureCause::OutcomeUnknown);
+        assert_eq!(
+            uncertain.recovery_actions,
+            vec![ToolRecoveryAction::ReconcileOutcome]
+        );
+        assert!(!uncertain.retryable);
     }
 
     #[test]

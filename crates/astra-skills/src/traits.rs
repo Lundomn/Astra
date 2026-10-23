@@ -129,6 +129,14 @@ pub struct ResolvedSkill {
     pub trust_tier: super::manifest::TrustTier,
 }
 
+/// Package-relative text, returned through the same admitted Skill owner.
+/// Resources do not register tools, hooks, agents, or execution authority.
+#[derive(Clone, Debug)]
+pub struct SkillResource {
+    pub path: String,
+    pub content: String,
+}
+
 /// Resolves skill names to instructions.
 #[async_trait]
 pub trait SkillResolver: Send + Sync {
@@ -143,8 +151,41 @@ pub trait SkillResolver: Send + Sync {
         self.resolve(name)
     }
 
+    async fn read_resource(&self, _name: &str, _path: &str) -> Result<SkillResource, SkillError> {
+        Err(SkillError::LoadFailed(
+            "skill_resource_not_supported".into(),
+        ))
+    }
+
     /// List available skills for schema generation.
     fn available_skills(&self) -> Vec<SkillToolInfo>;
+
+    /// Whether [`available_skills`] is the complete model-facing admission
+    /// catalog for this resolver. Authoritative catalogs reject public names
+    /// that are not advertised before attempting a lazy or remote load.
+    /// Trusted composition steps use [`execution_catalog_contains`] as their
+    /// separate execution admission check. Resolvers that intentionally
+    /// support opaque dynamic names may keep the default and enforce their own
+    /// public admission contract.
+    fn catalog_is_authoritative(&self) -> bool {
+        false
+    }
+
+    /// Whether this resolver can execute custody-backed opaque selections
+    /// without enumerating its remote catalog in the prompt. Such resolvers
+    /// must validate each selection at resolution, not infer it from a name.
+    fn has_dynamic_catalog(&self) -> bool {
+        false
+    }
+
+    /// Whether a name belongs to the trusted execution catalog, including
+    /// non-user-invocable skills that a declared composition may call.
+    ///
+    /// This is intentionally separate from available_skills: the latter is
+    /// the model-facing surface and may omit internal composable steps.
+    fn execution_catalog_contains(&self, _name: &str) -> bool {
+        false
+    }
 
     /// Closed workflow topology declared by trusted manifest metadata.
     /// Instruction prose is intentionally not parsed for execution authority.

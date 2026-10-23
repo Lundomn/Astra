@@ -12,9 +12,7 @@ use serde_json::Value;
 use std::io::Write;
 
 fn catalog_schemas() -> Vec<Value> {
-    let mut schemas = astra_tools::schemas::all_tool_schemas();
-    schemas.push(astra_runtime::turn::skill_tool::skill_tool_schema_v2());
-    schemas
+    astra_tools::schemas::all_tool_schemas()
 }
 
 fn names(schemas: &[Value]) -> Vec<String> {
@@ -106,16 +104,13 @@ pinned_tools = ["web_fetch"]
             );
             // Default always-load tools still there.
             assert!(always_load.iter().any(|n| n == "bash"));
-            // The compact remember/recall shape is a core resident primitive;
-            // only its advanced fields require the canonical deferred schema.
-            assert!(always_load.iter().any(|n| n == "memory"));
-            assert!(
-                !surface
-                    .deferred()
-                    .iter()
-                    .any(|entry| entry.name == "memory"),
-                "resident memory must not be duplicated in the deferred manifest"
-            );
+            for name in ["memory", "reflect", "notify"] {
+                assert!(!always_load.iter().any(|n| n == name));
+                assert!(
+                    surface.deferred().iter().any(|entry| entry.name == name),
+                    "{name} must remain discoverable when another tool is pinned"
+                );
+            }
         },
     );
 }
@@ -135,10 +130,34 @@ fn missing_toml_defaults_are_in_wire() {
                 "missing default {must}"
             );
         }
-        assert!(always_load.iter().any(|n| n == "memory"));
+        for name in ["memory", "reflect", "notify"] {
+            assert!(!always_load.iter().any(|n| n == name));
+            assert!(surface.deferred().iter().any(|entry| entry.name == name));
+        }
         // Workflow-sized tools are intentionally deferred by default.
         assert!(!always_load.iter().any(|n| n == "web_fetch"));
     });
+}
+
+#[test]
+#[serial_test::serial]
+fn user_pinned_tools_can_restore_deferred_workflows_to_wire() {
+    with_user_runtime_toml(
+        r#"
+[tool_surface]
+pinned_tools = ["memory", "reflect", "notify"]
+"#,
+        |config| {
+            let surface = ToolSurface::build(catalog_schemas(), &config.tool_surface, &[]);
+            let always_load = names(&surface.always_load_schemas());
+            for name in ["memory", "reflect", "notify"] {
+                assert_eq!(always_load.iter().filter(|n| *n == name).count(), 1);
+                assert!(!surface.deferred().iter().any(|entry| entry.name == name));
+            }
+            assert!(always_load.iter().any(|n| n == "tool_search"));
+            assert!(always_load.iter().any(|n| n == "introspect"));
+        },
+    );
 }
 
 #[test]

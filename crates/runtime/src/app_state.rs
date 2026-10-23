@@ -1,9 +1,7 @@
 use super::server::tool_transport::ToolExecutionService;
 use super::*;
 use crate::turn::services::{
-    InMemoryTurnReflectionStateStore, NoopTurnAuxiliaryEventWriter, NoopTurnCoreEventWriter,
-    NoopTurnHookDbWriter, NoopTurnObserverWorker, NoopTurnReflectionLessonWriter,
-    NoopTurnSessionActivityWriter, NoopTurnToolEventWriter,
+    NoopTurnAuxiliaryEventWriter, NoopTurnHookDbWriter, NoopTurnObserverWorker,
 };
 use astra_services::auth;
 
@@ -100,27 +98,17 @@ impl MemoriaHealth {
 
 #[derive(Clone)]
 pub(crate) struct TurnPersistenceState {
-    pub(crate) core_event_writer: Arc<dyn TurnCoreEventWriter>,
-    pub(crate) tool_event_writer: Arc<dyn TurnToolEventWriter>,
     pub(crate) hook_db_writer: Arc<dyn TurnHookDbWriter>,
-    pub(crate) reflection_state_store: Arc<dyn TurnReflectionStateStore>,
-    pub(crate) reflection_lesson_writer: Arc<dyn TurnReflectionLessonWriter>,
     pub(crate) observer_worker: Arc<dyn TurnObserverWorker>,
     pub(crate) auxiliary_event_writer: Arc<dyn TurnAuxiliaryEventWriter>,
-    pub(crate) session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
 }
 
 impl Default for TurnPersistenceState {
     fn default() -> Self {
         Self {
-            core_event_writer: Arc::new(NoopTurnCoreEventWriter),
-            tool_event_writer: Arc::new(NoopTurnToolEventWriter),
             hook_db_writer: Arc::new(NoopTurnHookDbWriter),
-            reflection_state_store: Arc::new(InMemoryTurnReflectionStateStore::default()),
-            reflection_lesson_writer: Arc::new(NoopTurnReflectionLessonWriter),
             observer_worker: Arc::new(NoopTurnObserverWorker),
             auxiliary_event_writer: Arc::new(NoopTurnAuxiliaryEventWriter),
-            session_activity_writer: Arc::new(NoopTurnSessionActivityWriter),
         }
     }
 }
@@ -132,7 +120,6 @@ pub(crate) struct AdminState {
     pub(crate) token_reader: Arc<dyn AdminTokenReader>,
     pub(crate) token_writer: Arc<dyn AdminTokenWriter>,
     pub(crate) audit_reader: Arc<dyn AdminAuditReader>,
-    pub(crate) feedback_stats_reader: Arc<dyn AdminFeedbackStatsReader>,
     pub(crate) user_role_manager: Arc<dyn AdminUserRoleManager>,
     pub(crate) config_service: Arc<dyn astra_services::AdminConfigService>,
 }
@@ -145,7 +132,6 @@ impl Default for AdminState {
             token_reader: Arc::new(auth::UnconfiguredAdminTokenReader),
             token_writer: Arc::new(auth::UnconfiguredAdminTokenWriter),
             audit_reader: Arc::new(auth::UnconfiguredAdminAuditReader),
-            feedback_stats_reader: Arc::new(auth::UnconfiguredAdminFeedbackStatsReader),
             user_role_manager: Arc::new(auth::UnconfiguredAdminUserRoleManager),
             config_service: Arc::new(astra_services::UnconfiguredAdminConfigService),
         }
@@ -154,6 +140,7 @@ impl Default for AdminState {
 
 #[derive(Clone)]
 pub(crate) struct ExecutionServicesState {
+    pub(crate) edge_capacity_relay_origin: Option<String>,
     pub(crate) edge_registry_service: Arc<dyn EdgeRegistryService>,
     pub(crate) edge_dispatch_service: Arc<dyn EdgeDispatchService>,
     pub(crate) run_lifecycle_service: Arc<dyn RunLifecycleService>,
@@ -162,6 +149,7 @@ pub(crate) struct ExecutionServicesState {
 impl Default for ExecutionServicesState {
     fn default() -> Self {
         Self {
+            edge_capacity_relay_origin: None,
             edge_registry_service: Arc::new(UnconfiguredEdgeRegistryService),
             edge_dispatch_service: Arc::new(UnconfiguredEdgeDispatchService),
             run_lifecycle_service: Arc::new(UnconfiguredRunLifecycleService),
@@ -180,16 +168,11 @@ pub struct AppState {
     pub(crate) context_service: Arc<dyn ContextService>,
     pub(crate) decision_service: Arc<dyn DecisionService>,
     pub(crate) model_service: Arc<dyn ModelService>,
-    pub(crate) job_service: Arc<dyn JobService>,
-    pub(crate) trigger_service: Arc<dyn TriggerService>,
-    pub(crate) workflow_service: Arc<dyn WorkflowService>,
-    pub(crate) harness_service: Arc<dyn HarnessService>,
+    pub(crate) model_catalog_cache: astra_services::models::AuthorizedModelCatalogCache,
     pub(crate) sandbox_service: Arc<dyn SandboxService>,
-    pub(crate) branch_service: Arc<dyn BranchService>,
     pub(crate) data_versioning_service: Arc<dyn DataVersioningService>,
     pub(crate) marketplace_service: Arc<dyn MarketplaceService>,
     pub(crate) marketplace_stats_service: Arc<dyn MarketplaceStatsService>,
-    pub(crate) replay_service: Arc<dyn ReplayService>,
     pub(crate) session_audit_service: Arc<dyn SessionAuditService>,
     pub(crate) skill_service: Arc<dyn SkillService>,
     pub(crate) skill_config_service: Arc<dyn SkillConfigService>,
@@ -197,7 +180,6 @@ pub struct AppState {
     pub(crate) agent_binding_service: Arc<dyn astra_services::AgentBindingService>,
     pub(crate) llm_trusted_domain_service:
         Arc<dyn astra_services::llm_trusted_domains::LlmTrustedDomainService>,
-    pub(crate) evaluation_service: Arc<dyn EvaluationService>,
     pub(crate) introspection_service: Arc<dyn IntrospectionService>,
     pub(crate) reflect_service: Arc<dyn ReflectService>,
     pub(crate) fernet_encryptor: FernetTokenEncryptor,
@@ -229,13 +211,8 @@ pub struct AppState {
     /// Edge §5.5 callbacks (`/tools/result`, `/approval/respond`); keys via [`astra_turn_core::edge_ledger`].
     pub(crate) edge_callback_ledger:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
-    /// Multi-agent profile registry — defines agent tiers, delegation rules.
-    pub(crate) agent_profile_registry: Arc<astra_services::AgentProfileRegistry>,
     /// Delegation engine — coordinates multi-agent runs.
     pub(crate) delegation_engine: Option<Arc<crate::server::delegation::engine::DelegationEngine>>,
-    /// Team persistence store — CRUD for team definitions and execution history.
-    pub(crate) team_store:
-        Option<Arc<dyn astra_services::team_persistence::TeamPersistenceService>>,
     /// Per-user resource governor for limit checking and usage tracking (Phase 5).
     pub resource_governor: std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>,
     /// Canonical branch authority. Production always wires the database
@@ -297,16 +274,11 @@ impl AppState {
             context_service: Arc::new(UnconfiguredContextService),
             decision_service: Arc::new(UnconfiguredDecisionService),
             model_service: Arc::new(UnconfiguredModelService),
-            job_service: Arc::new(UnconfiguredJobService),
-            trigger_service: Arc::new(UnconfiguredTriggerService),
-            workflow_service: Arc::new(UnconfiguredWorkflowService),
-            harness_service: Arc::new(UnconfiguredHarnessService),
+            model_catalog_cache: Default::default(),
             sandbox_service: Arc::new(UnconfiguredSandboxService),
-            branch_service: Arc::new(UnconfiguredBranchService),
             data_versioning_service: Arc::new(UnconfiguredDataVersioningService),
             marketplace_service: Arc::new(UnconfiguredMarketplaceService),
             marketplace_stats_service: Arc::new(NoopMarketplaceStatsService),
-            replay_service: Arc::new(UnconfiguredReplayService),
             session_audit_service: Arc::new(UnconfiguredSessionAuditService),
             skill_service: Arc::new(UnconfiguredSkillService),
             skill_config_service: Arc::new(UnconfiguredSkillConfigService),
@@ -315,7 +287,6 @@ impl AppState {
             llm_trusted_domain_service: Arc::new(
                 astra_services::llm_trusted_domains::UnconfiguredLlmTrustedDomainService,
             ),
-            evaluation_service: Arc::new(UnconfiguredEvaluationService),
             introspection_service: Arc::new(UnconfiguredIntrospectionService),
             reflect_service: Arc::new(UnconfiguredReflectService),
             fernet_encryptor: FernetTokenEncryptor::new("dev-key-not-for-production")
@@ -348,9 +319,7 @@ impl AppState {
             edge_callback_ledger: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            agent_profile_registry: Arc::new(astra_services::AgentProfileRegistry::new()),
             delegation_engine: None,
-            team_store: None,
             resource_governor: std::sync::Arc::new(
                 astra_services::resource_governor::InMemoryResourceGovernor::new(),
             ),
@@ -540,33 +509,8 @@ impl AppState {
         self
     }
 
-    pub fn with_job_service(mut self, job_service: Arc<dyn JobService>) -> Self {
-        self.job_service = job_service;
-        self
-    }
-
-    pub fn with_trigger_service(mut self, trigger_service: Arc<dyn TriggerService>) -> Self {
-        self.trigger_service = trigger_service;
-        self
-    }
-
-    pub fn with_workflow_service(mut self, workflow_service: Arc<dyn WorkflowService>) -> Self {
-        self.workflow_service = workflow_service;
-        self
-    }
-
-    pub fn with_harness_service(mut self, harness_service: Arc<dyn HarnessService>) -> Self {
-        self.harness_service = harness_service;
-        self
-    }
-
     pub fn with_sandbox_service(mut self, sandbox_service: Arc<dyn SandboxService>) -> Self {
         self.sandbox_service = sandbox_service;
-        self
-    }
-
-    pub fn with_branch_service(mut self, branch_service: Arc<dyn BranchService>) -> Self {
-        self.branch_service = branch_service;
         self
     }
 
@@ -591,11 +535,6 @@ impl AppState {
         marketplace_stats_service: Arc<dyn MarketplaceStatsService>,
     ) -> Self {
         self.marketplace_stats_service = marketplace_stats_service;
-        self
-    }
-
-    pub fn with_replay_service(mut self, replay_service: Arc<dyn ReplayService>) -> Self {
-        self.replay_service = replay_service;
         self
     }
 
@@ -649,14 +588,6 @@ impl AppState {
         self
     }
 
-    pub fn with_evaluation_service(
-        mut self,
-        evaluation_service: Arc<dyn EvaluationService>,
-    ) -> Self {
-        self.evaluation_service = evaluation_service;
-        self
-    }
-
     pub fn with_introspection_service(
         mut self,
         introspection_service: Arc<dyn IntrospectionService>,
@@ -678,22 +609,6 @@ impl AppState {
         self
     }
 
-    pub fn with_turn_core_event_writer(
-        mut self,
-        turn_core_event_writer: Arc<dyn TurnCoreEventWriter>,
-    ) -> Self {
-        self.turn_persistence.core_event_writer = turn_core_event_writer;
-        self
-    }
-
-    pub fn with_turn_tool_event_writer(
-        mut self,
-        turn_tool_event_writer: Arc<dyn TurnToolEventWriter>,
-    ) -> Self {
-        self.turn_persistence.tool_event_writer = turn_tool_event_writer;
-        self
-    }
-
     pub fn with_turn_hook_db_writer(
         mut self,
         turn_hook_db_writer: Arc<dyn TurnHookDbWriter>,
@@ -701,35 +616,11 @@ impl AppState {
         self.turn_persistence.hook_db_writer = turn_hook_db_writer;
         self
     }
-    pub fn with_turn_reflection_lesson_writer(
-        mut self,
-        turn_reflection_lesson_writer: Arc<dyn TurnReflectionLessonWriter>,
-    ) -> Self {
-        self.turn_persistence.reflection_lesson_writer = turn_reflection_lesson_writer;
-        self
-    }
-
-    pub fn with_turn_reflection_state_store(
-        mut self,
-        turn_reflection_state_store: Arc<dyn TurnReflectionStateStore>,
-    ) -> Self {
-        self.turn_persistence.reflection_state_store = turn_reflection_state_store;
-        self
-    }
-
     pub fn with_turn_observer_worker(
         mut self,
         turn_observer_worker: Arc<dyn TurnObserverWorker>,
     ) -> Self {
         self.turn_persistence.observer_worker = turn_observer_worker;
-        self
-    }
-
-    pub fn with_turn_session_activity_writer(
-        mut self,
-        turn_session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
-    ) -> Self {
-        self.turn_persistence.session_activity_writer = turn_session_activity_writer;
         self
     }
 
@@ -747,6 +638,15 @@ impl AppState {
     ) -> Self {
         self.execution.edge_registry_service = edge_registry_service;
         self
+    }
+
+    /// Operator-owned address of this exact node, never a load-balanced
+    /// service URL or an endpoint supplied by an Edge or invocation.
+    pub fn with_edge_capacity_relay_origin(mut self, origin: String) -> Result<Self, String> {
+        crate::server::validate_relay_origin(&origin)
+            .map_err(|_| "invalid Edge capacity node origin".to_string())?;
+        self.execution.edge_capacity_relay_origin = Some(origin);
+        Ok(self)
     }
 
     pub fn with_edge_dispatch_service(
@@ -791,14 +691,6 @@ impl AppState {
         admin_audit_reader: Arc<dyn AdminAuditReader>,
     ) -> Self {
         self.admin.audit_reader = admin_audit_reader;
-        self
-    }
-
-    pub fn with_admin_feedback_stats_reader(
-        mut self,
-        admin_feedback_stats_reader: Arc<dyn AdminFeedbackStatsReader>,
-    ) -> Self {
-        self.admin.feedback_stats_reader = admin_feedback_stats_reader;
         self
     }
 
@@ -887,27 +779,11 @@ impl AppState {
         self
     }
 
-    pub fn with_agent_profile_registry(
-        mut self,
-        registry: Arc<astra_services::AgentProfileRegistry>,
-    ) -> Self {
-        self.agent_profile_registry = registry;
-        self
-    }
-
     pub fn with_delegation_engine(
         mut self,
         engine: Arc<crate::server::delegation::engine::DelegationEngine>,
     ) -> Self {
         self.delegation_engine = Some(engine);
-        self
-    }
-
-    pub fn with_team_store(
-        mut self,
-        store: Arc<dyn astra_services::team_persistence::TeamPersistenceService>,
-    ) -> Self {
-        self.team_store = Some(store);
         self
     }
 
@@ -919,15 +795,10 @@ impl AppState {
         self
     }
 
-    /// Access the agent profile registry.
     /// Shared Prometheus-style metrics registry. Handlers and pipeline code
     /// register/increment counters here; `/metrics` renders its contents.
     pub fn metrics_registry(&self) -> Arc<astra_turn_core::pipeline_metrics::MetricsRegistry> {
         self.metrics_registry.clone()
-    }
-
-    pub fn agent_profile_registry(&self) -> &astra_services::AgentProfileRegistry {
-        &self.agent_profile_registry
     }
 
     /// Access the delegation engine (if configured).
@@ -1663,6 +1534,7 @@ mod tests {
             runtime_process_authorization_required: false,
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,
+            provider_stage_dispatch: None,
             selected_offer: None,
             policy: crate::server::tool_transport::ToolPolicySnapshot::default(),
         };

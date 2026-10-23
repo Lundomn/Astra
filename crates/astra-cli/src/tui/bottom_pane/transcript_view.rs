@@ -16,7 +16,7 @@ use super::view::{
     ViewActionDisposition, ViewActionRequest, ViewCompletion,
 };
 use crate::tui::history_cell::{HistoryCell, reasoning::ReasoningCell, tool::ToolCell};
-use crate::tui::render::line_utils::sanitize_lines_for_terminal;
+use crate::tui::render::line_utils::{history_cell_lines_for_buffer, sanitize_lines_for_buffer};
 
 /// Lines reserved for chrome (title + scroll indicator + hint blank + hint).
 /// Kept in one place so `desired_height` and `visible_line_count` agree.
@@ -62,6 +62,7 @@ impl TranscriptItemId {
 enum TranscriptContent {
     Committed(Arc<dyn HistoryCell>),
     Rendered(Vec<Line<'static>>),
+    RenderedTrusted(Vec<Line<'static>>),
     Reasoning(ReasoningCell),
     Tool(ToolCell),
 }
@@ -128,6 +129,8 @@ pub(crate) enum TranscriptItemKind {
 /// projections of the same canonical cell; expansion state lives in the view.
 #[derive(Debug, Clone)]
 pub(crate) struct TranscriptItem {
+    model_item_id: Option<String>,
+    tool_identity: Option<(String, bool)>,
     id: TranscriptItemId,
     kind: TranscriptItemKind,
     content: TranscriptContent,
@@ -135,6 +138,23 @@ pub(crate) struct TranscriptItem {
 }
 
 impl TranscriptItem {
+    pub(crate) fn with_tool_use_id(mut self, tool_use_id: Option<&str>, settled: bool) -> Self {
+        self.tool_identity = tool_use_id.map(|id| (id.to_owned(), settled));
+        self
+    }
+
+    pub(crate) fn tool_identity(&self) -> Option<&str> {
+        self.tool_identity.as_ref().map(|(id, _)| id.as_str())
+    }
+
+    pub(crate) fn is_settled_tool(&self) -> bool {
+        self.tool_identity
+            .as_ref()
+            .is_some_and(|(_, settled)| *settled)
+    }
+    pub(crate) fn model_identity(&self) -> Option<(&str, TranscriptItemKind)> {
+        self.model_item_id.as_deref().map(|id| (id, self.kind))
+    }
     #[cfg(test)]
     pub(crate) fn id(&self) -> &TranscriptItemId {
         &self.id
@@ -146,6 +166,8 @@ impl TranscriptItem {
         separator_rows: usize,
     ) -> Self {
         Self {
+            model_item_id: cell.model_item_id().map(str::to_owned),
+            tool_identity: None,
             id,
             kind: committed_cell_kind(cell.as_ref()),
             content: TranscriptContent::Committed(cell),
@@ -168,6 +190,8 @@ impl TranscriptItem {
         separator_rows: usize,
     ) -> Self {
         Self {
+            model_item_id: None,
+            tool_identity: None,
             id,
             kind,
             content: TranscriptContent::Rendered(lines),
@@ -181,7 +205,23 @@ impl TranscriptItem {
         lines: Vec<Line<'static>>,
         separator_rows: usize,
     ) -> Self {
-        Self::rendered_kind(id, committed_cell_kind(cell), lines, separator_rows)
+        let kind = committed_cell_kind(cell);
+        let content = if cell
+            .as_any_ref()
+            .is::<crate::tui::history_cell::system::SystemCell>()
+        {
+            TranscriptContent::RenderedTrusted(lines)
+        } else {
+            TranscriptContent::Rendered(lines)
+        };
+        Self {
+            model_item_id: cell.model_item_id().map(str::to_owned),
+            tool_identity: None,
+            id,
+            kind,
+            content,
+            separator_rows,
+        }
     }
 
     pub(crate) fn reasoning(
@@ -190,6 +230,8 @@ impl TranscriptItem {
         separator_rows: usize,
     ) -> Self {
         Self {
+            model_item_id: cell.model_item_id.clone(),
+            tool_identity: None,
             id,
             kind: TranscriptItemKind::Reasoning,
             content: TranscriptContent::Reasoning(cell),
@@ -199,6 +241,8 @@ impl TranscriptItem {
 
     pub(crate) fn tool(id: TranscriptItemId, cell: ToolCell, separator_rows: usize) -> Self {
         Self {
+            model_item_id: None,
+            tool_identity: None,
             id,
             kind: TranscriptItemKind::Tool,
             content: TranscriptContent::Tool(cell),
@@ -209,7 +253,7 @@ impl TranscriptItem {
     fn is_expandable(&self, width: u16) -> bool {
         match &self.content {
             TranscriptContent::Committed(cell) => cell_expandable(cell.as_ref(), width),
-            TranscriptContent::Rendered(_) => false,
+            TranscriptContent::Rendered(_) | TranscriptContent::RenderedTrusted(_) => false,
             TranscriptContent::Reasoning(cell) => cell.has_transcript_details(width),
             TranscriptContent::Tool(cell) => cell.has_transcript_details(),
         }
@@ -218,7 +262,7 @@ impl TranscriptItem {
     fn label(&self) -> &'static str {
         match &self.content {
             TranscriptContent::Committed(cell) => cell_label(cell.as_ref()),
-            TranscriptContent::Rendered(_) => "item",
+            TranscriptContent::Rendered(_) | TranscriptContent::RenderedTrusted(_) => "item",
             TranscriptContent::Reasoning(_) => "reasoning",
             TranscriptContent::Tool(_) => "tool details",
         }
@@ -228,10 +272,22 @@ impl TranscriptItem {
         let lines = match &self.content {
             TranscriptContent::Committed(cell) => cell_lines(cell.as_ref(), width, expanded),
             TranscriptContent::Rendered(lines) => lines.clone(),
+            TranscriptContent::RenderedTrusted(lines) => lines.clone(),
             TranscriptContent::Reasoning(cell) => cell.transcript_lines(width, expanded),
             TranscriptContent::Tool(cell) => cell.transcript_lines(width, expanded),
         };
-        sanitize_lines_for_terminal(lines)
+        if matches!(
+            &self.content,
+            TranscriptContent::Committed(cell)
+                if cell
+                    .as_any_ref()
+                    .is::<crate::tui::history_cell::system::SystemCell>()
+        ) || matches!(&self.content, TranscriptContent::RenderedTrusted(_))
+        {
+            crate::tui::render::line_utils::sanitize_lines_for_buffer_with_links(lines)
+        } else {
+            sanitize_lines_for_buffer(lines)
+        }
     }
 
     fn matches_filter(&self, filter: TranscriptFilter) -> bool {
@@ -301,7 +357,7 @@ fn cell_lines(cell: &dyn HistoryCell, width: u16, expanded: bool) -> Vec<Line<'s
     } else if let Some(tool) = cell.as_any_ref().downcast_ref::<ToolCell>() {
         tool.transcript_lines(width, expanded)
     } else {
-        cell.display_lines(width)
+        history_cell_lines_for_buffer(cell, width)
     }
 }
 
@@ -896,7 +952,7 @@ impl BottomPaneView for TranscriptView {
         // Helper: advance `y` by 1 with saturating add. Without this,
         // a child Rect placed near `u16::MAX` (deeply nested overlay /
         // tiled layout edge) would wrap to 0 and start drawing rows at
-        // the top of the buffer. Same fix as C-TUI-1 in task_detail_view.
+        // the top of the buffer.
         let next_y = |y: u16| y.saturating_add(1).min(bottom);
 
         // Title

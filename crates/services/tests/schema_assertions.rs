@@ -8,15 +8,33 @@ use astra_services::storage::{ensure_core_schema, load_core_schema_table_contrac
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
-    let (pool, settings) = common::setup_pool_and_settings().await;
+    let mut settings = common::require_db_it_env();
     let bootstrap_catalog =
         std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+    let mut admin_settings = settings.clone();
+    admin_settings.database = bootstrap_catalog.clone();
+    let admin = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_settings.database_url_with_password())
+        .await
+        .expect("connect bootstrap catalog");
+    settings.database = format!("astra_schema_it_{}", uuid::Uuid::new_v4().simple());
+    settings.db_pool_max_connections = 4;
+    settings.db_pool_min_connections = 1;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE `{}`",
+        settings.database
+    )))
+    .execute(&admin)
+    .await
+    .expect("create isolated schema database");
     ensure_core_schema(&settings, &bootstrap_catalog)
         .await
-        .expect("second core schema bootstrap");
+        .expect("fresh core schema bootstrap");
+    let pool = astra_core::SharedPool::new(&settings).await.unwrap();
     ensure_core_schema(&settings, &bootstrap_catalog)
         .await
-        .expect("third core schema bootstrap");
+        .expect("repeated core schema bootstrap");
 
     let schema = current_schema(&pool).await;
     let existing =
@@ -53,15 +71,58 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
             "missing live table: {expected}"
         );
     }
-    for retired in ["work_plan_proposal_sequences", "work_plan_proposals"] {
+    for retired in [
+        "session_delegations",
+        "tool_result_projection_decisions",
+        "tool_result_projection_receipts",
+        "config_versions",
+        "plan_step_runs",
+        "work_plan_proposal_sequences",
+        "work_plan_proposals",
+        "harness_runs",
+        "harness_items",
+        "harness_skill_drafts",
+        "harness_skill_rules",
+        "harness_citations",
+        "eval_gate_results",
+        "eval_quality_assessments",
+        "eval_calibration_assessments",
+        "eval_training_datasets",
+        "eval_user_feedback",
+    ] {
         assert!(
             !contracts.iter().any(|table| table.name == retired),
-            "type-specific proposal table must not become a second schema owner: {retired}"
+            "retired table must not remain in schema authority: {retired}"
         );
         assert!(
             !existing.contains(retired),
-            "retired proposal table must not survive the clean schema cut: {retired}"
+            "retired table must not survive the clean schema cut: {retired}"
         );
+    }
+    assert!(
+        !contracts
+            .iter()
+            .any(|table| table.name == "session_deletion_tombstones"),
+        "the redundant deletion tombstone must not remain a schema owner"
+    );
+    assert!(
+        !existing.contains("session_deletion_tombstones"),
+        "fresh bootstrap must not create the redundant deletion tombstone table"
+    );
+    assert!(
+        !contracts
+            .iter()
+            .any(|table| table.name == "auth_memoria_identities"),
+        "the migration-only Memoria identity table must not remain a schema owner"
+    );
+    assert!(
+        !existing.contains("auth_memoria_identities"),
+        "fresh bootstrap must not create the obsolete Memoria identity table"
+    );
+    let model_columns = column_names(&pool, &schema, "infra_llm_models").await;
+    assert!(model_columns.contains(&"thinking_probe_json".into()));
+    for retired in ["thinking_capability", "thinking_probe_error"] {
+        assert!(!model_columns.iter().any(|column| column == retired));
     }
     let proposal_columns = column_names(&pool, &schema, "work_proposals").await;
     for expected in [
@@ -195,6 +256,161 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     .try_get::<i64, _>("count")
     .unwrap();
     assert_eq!(contracts, 1, "repeated bootstrap must remain idempotent");
+
+    // An interrupted fresh bootstrap can leave canonical tables and claims,
+    // no readiness marker, and an expired lease. It must be safe to retry.
+    for sql in [
+        "DELETE FROM astra_schema_contracts WHERE component = 'astra-core'",
+        "DELETE FROM astra_schema_table_contracts WHERE table_name = 'session_weighted_admission_owner_usage'",
+        "DROP TABLE session_weighted_admission_owner_usage",
+        "INSERT INTO astra_schema_bootstrap_leases (component, holder_id, lease_expires_at) VALUES ('astra-core', 'crashed-owner', DATE_SUB(NOW(6), INTERVAL 1 SECOND))",
+    ] {
+        sqlx::query(sql).execute(pool.get()).await.unwrap();
+    }
+    ensure_core_schema(&settings, &bootstrap_catalog)
+        .await
+        .expect("retry interrupted fresh bootstrap through expired lease");
+    let current: String = sqlx::query_scalar(
+        "SELECT contract_version FROM astra_schema_contracts WHERE component = 'astra-core'",
+    )
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        current,
+        astra_services::storage::CORE_SCHEMA_CONTRACT_VERSION
+    );
+
+    sqlx::query("UPDATE astra_schema_contracts SET contract_version = 'unsupported-old-schema' WHERE component = 'astra-core'")
+        .execute(pool.get()).await.unwrap();
+    let error = ensure_core_schema(&settings, &bootstrap_catalog)
+        .await
+        .expect_err("old completion marker must never enter bootstrap")
+        .to_string();
+    assert!(error.contains("recreate the database"), "{error}");
+    let unchanged: String = sqlx::query_scalar(
+        "SELECT contract_version FROM astra_schema_contracts WHERE component = 'astra-core'",
+    )
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(unchanged, "unsupported-old-schema");
+
+    sqlx::query(
+        "UPDATE astra_schema_contracts SET contract_version = ? WHERE component = 'astra-core'",
+    )
+    .bind(&current)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE auth_user_roles DROP INDEX idx_auth_user_roles_role_id")
+        .execute(pool.get())
+        .await
+        .unwrap();
+    for completed in [true, false] {
+        if !completed {
+            sqlx::query("DELETE FROM astra_schema_contracts WHERE component = 'astra-core'")
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+        let error = ensure_core_schema(&settings, &bootstrap_catalog)
+            .await
+            .expect_err("missing key must fail validation without repair")
+            .to_string();
+        assert!(error.contains("idx_auth_user_roles_role_id"), "{error}");
+        assert!(
+            index_columns(
+                &pool,
+                &schema,
+                "auth_user_roles",
+                "idx_auth_user_roles_role_id"
+            )
+            .await
+            .is_empty()
+        );
+    }
+    // Restore only this disposable fixture's index to isolate column drift.
+    sqlx::query("CREATE INDEX idx_auth_user_roles_role_id ON auth_user_roles (role_id)")
+        .execute(pool.get())
+        .await
+        .unwrap();
+    ensure_core_schema(&settings, &bootstrap_catalog)
+        .await
+        .expect("restored fixture is valid");
+    sqlx::query("ALTER TABLE prompt_request_records DROP INDEX uq_prompt_request_attempt")
+        .execute(pool.get())
+        .await
+        .unwrap();
+    sqlx::query("CREATE UNIQUE INDEX uq_prompt_request_attempt ON prompt_request_records (user_id, session_id, turn, round, source, attempt)")
+        .execute(pool.get())
+        .await
+        .unwrap();
+    let error = ensure_core_schema(&settings, &bootstrap_catalog)
+        .await
+        .expect_err("completed bootstrap must reject incorrect diagnostic attribution key")
+        .to_string();
+    assert!(error.contains("uq_prompt_request_attempt"), "{error}");
+    assert!(error.contains("run_id"), "{error}");
+    sqlx::query("ALTER TABLE prompt_request_records DROP INDEX uq_prompt_request_attempt")
+        .execute(pool.get())
+        .await
+        .unwrap();
+    sqlx::query("CREATE UNIQUE INDEX uq_prompt_request_attempt ON prompt_request_records (user_id, session_id, run_id, turn, round, source, attempt)")
+        .execute(pool.get())
+        .await
+        .unwrap();
+    ensure_core_schema(&settings, &bootstrap_catalog)
+        .await
+        .expect("restored diagnostic attribution key is valid");
+    sqlx::query("ALTER TABLE user_llm_models DROP COLUMN thinking_probe_json")
+        .execute(pool.get())
+        .await
+        .unwrap();
+    for completed in [true, false] {
+        if !completed {
+            sqlx::query("DELETE FROM astra_schema_contracts WHERE component = 'astra-core'")
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+        let error = ensure_core_schema(&settings, &bootstrap_catalog)
+            .await
+            .expect_err("missing runtime field must fail without repair")
+            .to_string();
+        assert!(
+            error.contains("user_llm_models.thinking_probe_json"),
+            "{error}"
+        );
+        assert!(
+            !column_names(&pool, &schema, "user_llm_models")
+                .await
+                .iter()
+                .any(|column| column == "thinking_probe_json")
+        );
+    }
+    let markers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM astra_schema_contracts WHERE component = 'astra-core'",
+    )
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(markers, 0, "failed validation must not publish readiness");
+    // MatrixOne does not complete SQLx's graceful MySQL shutdown handshake.
+    // These task-owned pools have no concurrent borrowers; drop their sockets.
+    while pool.get().size() > 0 {
+        drop(pool.get().acquire().await.unwrap().detach());
+    }
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE `{}`",
+        settings.database
+    )))
+    .execute(&admin)
+    .await
+    .expect("drop isolated schema database");
+    while admin.size() > 0 {
+        drop(admin.acquire().await.unwrap().detach());
+    }
 }
 
 #[tokio::test]
@@ -329,11 +545,6 @@ async fn schema_rationalization_runtime_contract() {
         "model request metric totals must remain bounded to explicit low-cardinality dimensions"
     );
     assert_eq!(
-        primary_key_columns(&pool, &schema, "eval_calibration_assessments").await,
-        ["user_id", "calibration_id"],
-        "eval_calibration_assessments identity must be owner-bound"
-    );
-    assert_eq!(
         primary_key_columns(&pool, &schema, "agent_sessions").await,
         ["user_id", "session_id"],
         "agent_sessions primary key must carry the owner boundary"
@@ -446,20 +657,6 @@ async fn schema_rationalization_runtime_contract() {
         "edge registry identity must be owner-bound so registry_id lookups never scan across tenants"
     );
 
-    for table in [
-        "harness_items",
-        "harness_skill_drafts",
-        "harness_skill_rules",
-    ] {
-        let columns = column_names(&pool, &schema, table).await;
-        assert!(
-            columns
-                .iter()
-                .any(|column| column == "decision_history_json"),
-            "{table} must retain inline decision history"
-        );
-    }
-
     let harness_snapshots = column_names(&pool, &schema, "harness_snapshots").await;
     for expected in [
         "user_id",
@@ -524,71 +721,10 @@ async fn schema_rationalization_runtime_contract() {
         );
     }
 
-    let harness_runs = column_names(&pool, &schema, "harness_runs").await;
-    for expected in ["harness_run_id", "user_id", "session_id", "updated_at"] {
-        assert!(
-            harness_runs.iter().any(|column| column == expected),
-            "harness_runs missing {expected}"
-        );
-    }
     assert_eq!(
         primary_key_columns(&pool, &schema, "run_display_projections").await,
         ["user_id", "run_id"],
         "run_display_projections primary key must carry the owner boundary"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "harness_runs",
-            "idx_harness_runs_owner_session_updated"
-        )
-        .await,
-        ["user_id", "session_id", "updated_at"],
-        "harness run session lifecycle paths must be owner/session scoped"
-    );
-    assert!(
-        index_columns(&pool, &schema, "harness_runs", "idx_harness_runs_session")
-            .await
-            .is_empty(),
-        "harness_runs must not keep ownerless session index idx_harness_runs_session"
-    );
-
-    let citation_columns = column_names(&pool, &schema, "harness_citations").await;
-    for expected in [
-        "source_snapshot_ref",
-        "source_content_hash",
-        "source_metadata_json",
-    ] {
-        assert!(
-            citation_columns.iter().any(|column| column == expected),
-            "harness_citations missing {expected}"
-        );
-    }
-
-    let eval_feedback = column_names(&pool, &schema, "eval_user_feedback").await;
-    for expected in ["feedback_id", "user_id", "session_id", "created_at"] {
-        assert!(
-            eval_feedback.iter().any(|column| column == expected),
-            "eval_user_feedback missing {expected}"
-        );
-    }
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "eval_user_feedback",
-            "idx_euf_owner_session_created"
-        )
-        .await,
-        ["user_id", "session_id", "created_at"],
-        "feedback session cleanup must be owner/session scoped"
-    );
-    assert!(
-        index_columns(&pool, &schema, "eval_user_feedback", "idx_euf_session")
-            .await
-            .is_empty(),
-        "eval_user_feedback must not keep ownerless session index idx_euf_session"
     );
 }
 
@@ -830,57 +966,6 @@ async fn work_foundation_schema_has_single_owner_and_session_binding() {
     }
 }
 
-#[tokio::test]
-#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn evaluation_schema_supports_calibration_reads() {
-    let pool = common::setup_pool().await;
-    let schema = current_schema(&pool).await;
-
-    let calibration = column_names(&pool, &schema, "eval_calibration_assessments").await;
-    for expected in [
-        "calibration_id",
-        "user_id",
-        "agent_id",
-        "session_id",
-        "confidence",
-        "quality_score",
-        "created_at",
-    ] {
-        assert!(
-            calibration.iter().any(|column| column == expected),
-            "eval_calibration_assessments missing {expected}"
-        );
-    }
-    assert_eq!(
-        column_character_maximum_length(&pool, &schema, "eval_calibration_assessments", "user_id")
-            .await,
-        Some(128),
-        "eval_calibration_assessments.user_id must use the standard owner width"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "eval_calibration_assessments",
-            "idx_eval_calibration_user_created"
-        )
-        .await,
-        ["user_id", "created_at"],
-        "calibration reads without agent_id must use user/created ordering"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "eval_calibration_assessments",
-            "idx_eval_calibration_user_agent_created"
-        )
-        .await,
-        ["user_id", "agent_id", "created_at"],
-        "calibration reads with agent_id must use user/agent/created ordering"
-    );
-}
-
 async fn current_schema(pool: &astra_core::SharedPool) -> String {
     let row = sqlx::query("SELECT DATABASE() AS db")
         .fetch_one(pool.get())
@@ -1056,6 +1141,9 @@ async fn phase1_run_durability_schema_contract() {
         "tool_call_id",
         "parent_agent_id",
         "trace_kind",
+        "payload_hash",
+        "ingestion_write_id",
+        "server_received_at",
     ] {
         assert!(
             agent_events.iter().any(|column| column == expected),
@@ -1067,6 +1155,13 @@ async fn phase1_run_durability_schema_contract() {
         ["user_id", "event_id"],
         "agent_events identity must be owner-bound so cross-tenant event ids do not collide"
     );
+    for column in ["payload_hash", "ingestion_write_id", "server_received_at"] {
+        assert_eq!(
+            column_nullable(&pool, &schema, "agent_events", column).await,
+            Some(false),
+            "agent_events.{column} must be required for identity classification"
+        );
+    }
     for column in ["event_id", "parent_event_id", "causal_chain_id"] {
         assert_eq!(
             column_character_maximum_length(&pool, &schema, "agent_events", column).await,
@@ -1390,12 +1485,13 @@ async fn phase1_run_durability_schema_contract() {
         [
             "user_id",
             "session_id",
+            "run_id",
             "turn",
             "round",
             "source",
             "attempt"
         ],
-        "prompt request idempotency must be bound to owner/session attempt identity"
+        "prompt request idempotency must be bound to owner/session/run attempt identity"
     );
     assert_eq!(
         index_columns(
@@ -1583,15 +1679,58 @@ async fn phase1_run_durability_schema_contract() {
     );
     assert_eq!(
         primary_key_columns(&pool, &schema, "session_weighted_admission_reservations").await,
-        ["scope_name", "reservation_id"],
-        "distributed admission reservations need one cross-pod physical identity"
+        [
+            "scope_name",
+            "isolation_domain",
+            "owner_user_id",
+            "idempotency_hash"
+        ],
+        "cross-pod admission replay must use the complete logical identity"
     );
+    assert_eq!(
+        unique_key_columns(
+            &pool,
+            &schema,
+            "session_weighted_admission_reservations",
+            "uq_weighted_admission_reservation"
+        )
+        .await,
+        ["scope_name", "reservation_id"],
+        "each admitted generation must retain a unique physical identity"
+    );
+    let admission_gate_columns =
+        column_names(&pool, &schema, "session_weighted_admission_gates").await;
     assert!(
-        column_names(&pool, &schema, "session_weighted_admission_gates")
-            .await
+        admission_gate_columns
             .iter()
             .any(|column| column == "capacity_hash"),
         "distributed admission gate must persist the deployment capacity snapshot"
+    );
+    for expected in [
+        "usage_initialized",
+        "earliest_expiry_at",
+        "used_resident_bytes",
+        "used_context_tokens",
+        "used_provider_slots",
+        "used_cpu_units",
+        "used_io_bytes",
+        "allocated_resident_bytes",
+        "allocated_context_tokens",
+        "allocated_provider_slots",
+        "allocated_cpu_units",
+        "allocated_io_bytes",
+    ] {
+        assert!(
+            admission_gate_columns
+                .iter()
+                .any(|column| column == expected),
+            "distributed admission gate must persist materialized usage column {expected}"
+        );
+    }
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_weighted_admission_owner_usage").await,
+        ["scope_name", "isolation_domain", "owner_user_id"],
+        "per-owner materialized admission usage must be isolated by scope, domain, and owner"
     );
     assert_eq!(
         primary_key_columns(&pool, &schema, "session_context_authority_events").await,
@@ -1982,11 +2121,11 @@ async fn phase2_web_hydration_schema_contract() {
             &pool,
             &schema,
             "session_transcript_items",
-            "idx_transcript_owner_run_event"
+            "idx_transcript_owner_run"
         )
         .await,
-        ["user_id", "run_id", "source_event_idx"],
-        "transcript source event lookups must be owner-bound"
+        ["user_id", "run_id"],
+        "transcript run lookups must be owner-bound"
     );
     assert_eq!(
         index_columns(
@@ -1998,35 +2137,6 @@ async fn phase2_web_hydration_schema_contract() {
         .await,
         ["user_id", "session_id", "source_event_id"],
         "transcript source-event idempotency lookups must be owner/session-bound"
-    );
-    let transcript_page_columns = column_names(&pool, &schema, "transcript_pages").await;
-    assert!(
-        transcript_page_columns
-            .iter()
-            .any(|column| column == "user_id"),
-        "transcript_pages must carry physical owner scope"
-    );
-    assert!(
-        column_default(&pool, &schema, "transcript_pages", "user_id")
-            .await
-            .is_none_or(|default| !default.trim_matches('\'').is_empty()),
-        "transcript_pages.user_id must not use an empty-string owner sentinel"
-    );
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "transcript_pages").await,
-        ["user_id", "session_id", "page_seq"],
-        "transcript page identity must be owner/session scoped"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "transcript_pages",
-            "idx_transcript_pages_owner_session_end"
-        )
-        .await,
-        ["user_id", "session_id", "end_item_seq"],
-        "transcript page lookups must use owner/session/end index"
     );
     let ctx_snapshot_columns = column_names(&pool, &schema, "ctx_snapshots").await;
     assert!(
@@ -2318,26 +2428,6 @@ async fn phase2_web_hydration_schema_contract() {
         ["user_id", "session_id", "state", "last_accessed_at"],
         "capacity and deterministic LRU operations require one session/state/access index"
     );
-
-    let revision_columns = column_names(&pool, &schema, "session_state_revisions").await;
-    for expected in [
-        "monotonic_id",
-        "revision_hash",
-        "device_fingerprint",
-        "transcript_high_watermark",
-        "run_event_high_watermark",
-        "state_projection_hash",
-    ] {
-        assert!(
-            revision_columns.iter().any(|column| column == expected),
-            "session_state_revisions missing {expected}"
-        );
-    }
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "session_state_revisions").await,
-        ["user_id", "session_id"],
-        "session_state_revisions primary key must carry the owner boundary"
-    );
 }
 
 #[tokio::test]
@@ -2394,12 +2484,19 @@ async fn phase3_context_manifest_schema_contract() {
         "budget_template_id",
         "reason",
         "dropped_count",
+        "payload_hash",
+        "ingestion_write_id",
     ] {
         assert!(
             manifests.iter().any(|column| column == expected),
             "context_manifests missing {expected}"
         );
     }
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "context_manifests").await,
+        ["user_id", "manifest_id"],
+        "manifest identity must be tenant-scoped"
+    );
     assert_eq!(
         index_columns(
             &pool,
@@ -2438,15 +2535,22 @@ async fn phase3_context_manifest_schema_contract() {
     }
 
     let items = column_names(&pool, &schema, "context_manifest_items").await;
-    for expected in ["render_mode", "included", "raw_ref", "budget_tokens"] {
+    for expected in [
+        "user_id",
+        "render_mode",
+        "included",
+        "raw_ref",
+        "budget_tokens",
+    ] {
         assert!(
             items.iter().any(|column| column == expected),
             "context_manifest_items missing {expected}"
         );
     }
-    assert!(
-        !items.iter().any(|column| column == "user_id"),
-        "context_manifest_items must inherit owner scope through context_manifests, not store a second owner column"
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "context_manifest_items").await,
+        ["user_id", "manifest_id", "item_order"],
+        "manifest item identity must be tenant-scoped"
     );
     assert_eq!(
         index_columns(
@@ -2456,8 +2560,59 @@ async fn phase3_context_manifest_schema_contract() {
             "idx_manifest_items_manifest_zone"
         )
         .await,
-        ["manifest_id", "zone", "included"],
-        "manifest items must be indexed by their parent manifest boundary, not bare session"
+        ["user_id", "manifest_id", "zone", "included"],
+        "manifest items must be indexed by their tenant-scoped parent boundary"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "context_manifest_items",
+            "idx_manifest_items_source"
+        )
+        .await,
+        ["user_id", "source_table", "source_id"]
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "context_manifest_items",
+            "idx_manifest_items_raw_ref"
+        )
+        .await,
+        ["user_id", "raw_ref"]
+    );
+
+    let collisions = column_names(&pool, &schema, "observation_identity_collisions").await;
+    for expected in [
+        "user_id",
+        "identity_kind",
+        "identity_id",
+        "stored_payload_hash",
+        "attempted_payload_hash",
+        "collision_count",
+        "expires_at",
+    ] {
+        assert!(
+            collisions.iter().any(|column| column == expected),
+            "observation_identity_collisions missing {expected}"
+        );
+    }
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "observation_identity_collisions").await,
+        ["user_id", "identity_kind", "identity_id"],
+        "collision receipts must have one bounded row per tenant-scoped identity"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "observation_identity_collisions",
+            "idx_observation_collisions_expiry"
+        )
+        .await,
+        ["expires_at", "user_id", "identity_kind", "identity_id"]
     );
     assert!(
         index_columns(
@@ -2480,33 +2635,6 @@ async fn phase3_context_manifest_schema_contract() {
     assert!(
         render_modes.is_ok(),
         "context_manifest_items.render_mode must accept code_block_preserved"
-    );
-
-    let raw_ref_schemes = sqlx::query("SELECT scheme FROM raw_ref_scheme_registry")
-        .fetch_all(pool.get())
-        .await
-        .expect("load raw_ref schemes")
-        .into_iter()
-        .map(|row| row.try_get::<String, _>("scheme").unwrap())
-        .collect::<Vec<_>>();
-    for expected in ["artifact", "s3", "conversation_log"] {
-        assert!(
-            raw_ref_schemes.iter().any(|scheme| scheme == expected),
-            "raw_ref_scheme_registry missing {expected}"
-        );
-    }
-
-    let preview_count = sqlx::query(
-        "SELECT COUNT(*) AS count FROM preview_template_registry WHERE status = 'active'",
-    )
-    .fetch_one(pool.get())
-    .await
-    .expect("preview template count")
-    .try_get::<i64, _>("count")
-    .unwrap();
-    assert!(
-        preview_count >= 18,
-        "preview_template_registry should seed at least 18 baseline templates"
     );
 }
 
@@ -2637,68 +2765,6 @@ async fn phase4_state_projection_schema_contract() {
         "plans must not keep ownerless session index idx_plans_session"
     );
 
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "plan_step_runs",
-            "idx_step_runs_plan_started"
-        )
-        .await,
-        ["user_id", "plan_id", "started_at"],
-        "step-run history must be owner-bound before plan ordering"
-    );
-    assert!(
-        index_columns(&pool, &schema, "plan_step_runs", "idx_step_runs_session")
-            .await
-            .is_empty(),
-        "plan_step_runs must not keep an ownerless session scan index"
-    );
-
-    let history_chunks = column_names(&pool, &schema, "session_history_chunks").await;
-    for expected in [
-        "user_id",
-        "session_id",
-        "source_session_id",
-        "seq_start",
-        "seq_end",
-    ] {
-        assert!(
-            history_chunks.iter().any(|column| column == expected),
-            "session_history_chunks missing {expected}"
-        );
-    }
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_history_chunks",
-            "idx_history_owner_session_seq"
-        )
-        .await,
-        ["user_id", "session_id", "seq_start", "seq_end"],
-        "history chunk seq lookup must stay owner/session-bound"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_history_chunks",
-            "idx_history_owner_source_session"
-        )
-        .await,
-        ["user_id", "source_session_id", "chunk_type", "created_at"],
-        "history source-session lookup must stay owner-bound"
-    );
-    for removed_index in ["idx_history_session_seq", "idx_history_source_session"] {
-        assert!(
-            index_columns(&pool, &schema, "session_history_chunks", removed_index)
-                .await
-                .is_empty(),
-            "session_history_chunks must not keep ownerless history index {removed_index}"
-        );
-    }
-
     let state_items = column_names(&pool, &schema, "session_state_items").await;
     for expected in [
         "scope",
@@ -2810,75 +2876,6 @@ async fn phase4_state_projection_schema_contract() {
         "session_state_item_events must not keep ownerless session index idx_state_events_session_created"
     );
 
-    let delegations = column_names(&pool, &schema, "session_delegations").await;
-    for expected in [
-        "delegation_id",
-        "user_id",
-        "session_id",
-        "parent_run_id",
-        "child_run_id",
-        "root_run_id",
-        "ancestor_path",
-        "depth",
-        "agent_id",
-        "title",
-        "status",
-        "retry_of",
-        "retry_scope",
-        "last_summary_ref",
-        "last_summary_text",
-    ] {
-        assert!(
-            delegations.iter().any(|column| column == expected),
-            "session_delegations missing {expected}"
-        );
-    }
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_delegations",
-            "idx_delegations_owner_root_depth"
-        )
-        .await,
-        ["user_id", "root_run_id", "depth", "created_at"],
-        "delegation root-tree scans must stay owner-bound"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_delegations",
-            "idx_delegations_owner_parent_status_updated"
-        )
-        .await,
-        ["user_id", "parent_run_id", "status", "updated_at"],
-        "delegation parent/status scans must stay owner-bound"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_delegations",
-            "idx_delegations_owner_session_status"
-        )
-        .await,
-        ["user_id", "session_id", "status", "updated_at"],
-        "delegation session/status scans must stay owner-bound"
-    );
-    for removed_index in [
-        "idx_delegations_root_depth",
-        "idx_delegations_parent",
-        "idx_delegations_session_status",
-    ] {
-        assert!(
-            index_columns(&pool, &schema, "session_delegations", removed_index)
-                .await
-                .is_empty(),
-            "session_delegations must not keep ownerless delegation index {removed_index}"
-        );
-    }
-
     let artifacts = column_names(&pool, &schema, "session_artifacts").await;
     for expected in [
         "access_scope",
@@ -2960,74 +2957,6 @@ async fn phase4_state_projection_schema_contract() {
             "artifact_id"
         ],
         "artifact same-root ACL must use root/scope index"
-    );
-
-    let grants = column_names(&pool, &schema, "session_artifacts_grants").await;
-    for expected in [
-        "grant_id",
-        "artifact_id",
-        "root_run_id",
-        "source_run_id",
-        "target_run_id",
-        "target_delegation_id",
-        "grant_scope",
-    ] {
-        assert!(
-            grants.iter().any(|column| column == expected),
-            "session_artifacts_grants missing {expected}"
-        );
-    }
-    assert_eq!(
-        unique_key_columns(
-            &pool,
-            &schema,
-            "session_artifacts_grants",
-            "uq_artifacts_grant_target"
-        )
-        .await,
-        [
-            "user_id",
-            "session_id",
-            "artifact_id",
-            "grant_scope",
-            "target_run_id",
-            "target_delegation_id"
-        ],
-        "artifact grant idempotency must include owner/session"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_artifacts_grants",
-            "idx_artifacts_grants_target"
-        )
-        .await,
-        [
-            "user_id",
-            "session_id",
-            "target_run_id",
-            "artifact_id",
-            "expires_at"
-        ],
-        "run artifact grants must use a target/artifact/expiry index"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_artifacts_grants",
-            "idx_artifacts_grants_delegation_target"
-        )
-        .await,
-        [
-            "user_id",
-            "session_id",
-            "target_delegation_id",
-            "artifact_id",
-            "expires_at"
-        ],
-        "delegation artifact grants must use a target/artifact/expiry index"
     );
 }
 
@@ -3345,60 +3274,4 @@ async fn phase6_artifact_retention_preview_schema_contract() {
             "session_tool_outputs must not keep legacy ownerless index {removed_index}"
         );
     }
-
-    let preview_templates = column_names(&pool, &schema, "preview_template_registry").await;
-    for expected in [
-        "tool_name",
-        "version",
-        "max_preview_bytes",
-        "normalize_version",
-        "schema_json",
-    ] {
-        assert!(
-            preview_templates.iter().any(|column| column == expected),
-            "preview_template_registry missing {expected}"
-        );
-    }
-    let template_count = sqlx::query(
-        "SELECT COUNT(*) AS count FROM preview_template_registry WHERE status = 'active'",
-    )
-    .fetch_one(pool.get())
-    .await
-    .expect("count preview templates")
-    .try_get::<i64, _>("count")
-    .unwrap_or(0);
-    assert!(
-        template_count >= 18,
-        "expected at least 18 active preview templates, got {template_count}"
-    );
-    let required_templates = sqlx::query(
-        "SELECT tool_name FROM preview_template_registry
-         WHERE tool_name IN ('pg_dump', 'fetch_url', 'parse_pdf', 'SKILL.md', 'cargo', 'rustc',
-          'clippy', 'pg_schema_structurize', 'slow_query_analyzer', 'curl',
-          'git', 'docker_logs', 'kubectl', 'python_stdout', 'npm_build', 'csv_head',
-          'json_preview', 'markdown_preview', 'list_dir', 'glob', 'grep', 'symbols',
-          'task_board', 'agent', 'agent_fanout', 'session', 'web_fetch', 'tool_search',
-          'memory', 'mo_query')
-         AND status = 'active'",
-    )
-    .fetch_all(pool.get())
-    .await
-    .expect("load required preview templates");
-    assert!(
-        required_templates.len() >= 30,
-        "required Phase 6 template set is incomplete"
-    );
-
-    let scheme_rows = sqlx::query(
-        "SELECT scheme FROM raw_ref_scheme_registry
-         WHERE scheme IN ('artifact', 's3', 'conversation_log', 'tool_output', 'chunk', 'state_item')
-           AND is_active = 1",
-    )
-    .fetch_all(pool.get())
-    .await
-    .expect("load raw_ref schemes");
-    assert!(
-        scheme_rows.len() >= 6,
-        "raw_ref_scheme_registry missing Phase 6 schemes"
-    );
 }

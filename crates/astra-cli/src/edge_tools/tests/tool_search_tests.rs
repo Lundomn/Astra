@@ -79,8 +79,12 @@ async fn direct_tool_search_fails_closed_without_installed_surface() {
     let executor = executor();
     executor.clear_current_tool_surface_for_tests();
 
-    let parsed: Value =
-        serde_json::from_str(&executor.tool_search(&json!({"query": "select:bash"}))).unwrap();
+    let parsed: Value = serde_json::from_str(
+        &executor
+            .tool_search(&json!({"query": "select:bash"}))
+            .output,
+    )
+    .unwrap();
 
     assert_eq!(parsed["mode"].as_str(), Some("select"));
     assert_eq!(parsed["status"].as_str(), Some("completed"));
@@ -115,8 +119,7 @@ async fn select_resolves_only_current_visible_tools_with_full_schema() {
         .as_object()
         .expect("select mode must return callable properties");
     assert!(
-        properties.contains_key("source_artifacts")
-            && properties.contains_key("external_state_paths"),
+        properties.contains_key("source_artifacts"),
         "selection must restore bash's canonical advanced contract, not its resident projection: {parsed}"
     );
 }

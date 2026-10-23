@@ -9,6 +9,7 @@ use astra_core::{
     is_duplicate_key_error, matrixone_statement_with_null_shape,
 };
 
+use crate::CancellationSafePoolConnection;
 use crate::db_row::RowExt as EventDbRow;
 use crate::pagination::MAX_API_LIST_LIMIT;
 use crate::storage::bump_agent_session_event_count;
@@ -375,7 +376,7 @@ fn event_list_can_use_session_summary(filter: &EventListFilter) -> bool {
         && filter.causal_chain_id.is_none()
 }
 
-fn push_event_list_filters<'a>(qb: &mut QueryBuilder<'a, MySql>, filter: &'a EventListFilter) {
+fn push_event_list_filters(qb: &mut QueryBuilder<MySql>, filter: &EventListFilter) {
     qb.push_bind(&filter.user_id);
     if let Some(sid) = &filter.session_id {
         qb.push(" AND session_id = ");
@@ -590,10 +591,41 @@ impl EventService for DatabaseEventService {
         let event_type = normalize_required_event_field("event_type", event_type)?;
 
         // Start transaction for atomicity of INSERT event + UPDATE session
-        let mut conn = pool.acquire().await.map_err(internal_error)?;
-        let mut tx = conn.begin().await.map_err(internal_error)?;
+        let mut connection = CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(internal_error)?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(internal_error)?;
 
         let client_event_id = normalize_client_event_id(event_id)?;
+        let canonical_content = if ingestion_source == EventIngestionSource::SyncOutbox {
+            serde_json::from_str::<serde_json::Value>(&content).map_err(|_| {
+                error_response(
+                    StatusCode::BAD_REQUEST,
+                    "sync_outbox content must be valid JSON",
+                )
+            })?
+        } else {
+            serde_json::Value::String(content.clone())
+        };
+        let payload_hash = crate::observation_capture::canonical_observation_payload_hash(
+            crate::observation_capture::ObservationPayloadDomain::AgentEvent,
+            &serde_json::json!({
+                "session_id": session_id,
+                "user_id": user_id,
+                "event_type": event_type,
+                "content": canonical_content,
+                "agent_id": agent_id.as_deref().unwrap_or("system"),
+                "agent_version": agent_version.as_deref().unwrap_or("1.0.0"),
+                "parent_event_id": parent_event_id,
+                "parent_event_ids": parent_event_ids,
+                "causal_chain_id": causal_chain_id,
+                "metadata": metadata.as_ref().cloned().unwrap_or_else(|| serde_json::json!({})),
+            }),
+        );
         let sync_outbox_ingestion = ingestion_source == EventIngestionSource::SyncOutbox;
         let verified_sync_payload_hash = verified_sync_outbox_payload_hash_for_source(
             ingestion_source,
@@ -633,31 +665,53 @@ impl EventService for DatabaseEventService {
             })?;
         if let Some(existing_id) = client_event_id.as_deref() {
             let select_sql = format!(
-                "SELECT {} FROM agent_events WHERE event_id = ? AND user_id = ?",
+                "SELECT {}, payload_hash FROM agent_events WHERE event_id = ? AND user_id = ?",
                 EVENT_DETAIL_SELECT_COLS
             );
-            if let Some(row) = query(&select_sql)
+            if let Some(row) = query(sqlx::AssertSqlSafe(select_sql))
                 .bind(existing_id)
                 .bind(&user_id)
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(internal_error)?
             {
+                let stored_hash = row
+                    .try_get::<String, _>("payload_hash")
+                    .map_err(internal_error)?;
                 let existing = Self::event_record_from_row(row)?;
-                if duplicate_event_matches_request(
-                    &existing,
-                    &session_id,
-                    &event_type,
-                    &content,
-                    metadata.as_ref(),
-                    verified_sync_payload_hash.as_deref(),
-                ) {
+                if stored_hash == payload_hash
+                    && duplicate_event_matches_request(
+                        &existing,
+                        &session_id,
+                        &event_type,
+                        &content,
+                        metadata.as_ref(),
+                        verified_sync_payload_hash.as_deref(),
+                    )
+                {
                     if sync_outbox_ingestion {
                         repair_sync_event_session_summary(&mut tx, &session_id, &user_id).await?;
                     }
                     tx.commit().await.map_err(internal_error)?;
+                    connection.release();
                     return Ok(EventCreateOutcome::replayed(existing));
                 }
+                crate::observation_capture::record_observation_collisions(
+                    &mut tx,
+                    &[crate::observation_capture::ObservationCollisionReceipt {
+                        user_id: &user_id,
+                        domain: crate::observation_capture::ObservationPayloadDomain::AgentEvent,
+                        identity_id: existing_id,
+                        session_id: &session_id,
+                        stored_payload_hash: &stored_hash,
+                        attempted_payload_hash: &payload_hash,
+                        source: "event_service",
+                    }],
+                )
+                .await
+                .map_err(internal_error)?;
+                tx.commit().await.map_err(internal_error)?;
+                connection.release();
                 return Err(error_response(
                     StatusCode::CONFLICT,
                     format!("event_id {existing_id} already exists with a different payload hash"),
@@ -692,8 +746,8 @@ impl EventService for DatabaseEventService {
             "INSERT INTO agent_events \
              (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
               parent_event_id, causal_chain_id, `metadata`, tool_call_id, meta_tool_name, \
-              meta_duration_ms, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+              meta_duration_ms, payload_hash, ingestion_write_id, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
             [
                 primary_parent_event_id.is_some(),
                 tool_call_id.is_some(),
@@ -701,7 +755,7 @@ impl EventService for DatabaseEventService {
                 meta_duration_ms.is_some(),
             ],
         );
-        let insert_result = match query(&insert_sql)
+        let insert_result = match query(insert_sql)
             .bind(&event_id)
             .bind(&session_id)
             .bind(&user_id)
@@ -715,38 +769,63 @@ impl EventService for DatabaseEventService {
             .bind(&tool_call_id)
             .bind(&meta_tool_name)
             .bind(meta_duration_ms)
+            .bind(&payload_hash)
+            .bind(Uuid::new_v4().to_string())
             .execute(&mut *tx)
             .await
         {
             Ok(result) => result,
             Err(error) if client_supplied_event_id && is_duplicate_key_error(&error) => {
                 let select_sql = format!(
-                    "SELECT {} FROM agent_events WHERE event_id = ? AND user_id = ?",
+                    "SELECT {}, payload_hash FROM agent_events WHERE event_id = ? AND user_id = ?",
                     EVENT_DETAIL_SELECT_COLS
                 );
-                if let Some(row) = query(&select_sql)
+                if let Some(row) = query(sqlx::AssertSqlSafe(select_sql))
                     .bind(&event_id)
                     .bind(&user_id)
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(internal_error)?
                 {
+                    let stored_hash = row
+                        .try_get::<String, _>("payload_hash")
+                        .map_err(internal_error)?;
                     let existing = Self::event_record_from_row(row)?;
-                    if duplicate_event_matches_request(
-                        &existing,
-                        &session_id,
-                        &event_type,
-                        &content,
-                        metadata.as_ref(),
-                        verified_sync_payload_hash.as_deref(),
-                    ) {
+                    if stored_hash == payload_hash
+                        && duplicate_event_matches_request(
+                            &existing,
+                            &session_id,
+                            &event_type,
+                            &content,
+                            metadata.as_ref(),
+                            verified_sync_payload_hash.as_deref(),
+                        )
+                    {
                         if sync_outbox_ingestion {
                             repair_sync_event_session_summary(&mut tx, &session_id, &user_id)
                                 .await?;
                         }
                         tx.commit().await.map_err(internal_error)?;
+                        connection.release();
                         return Ok(EventCreateOutcome::replayed(existing));
                     }
+                    crate::observation_capture::record_observation_collisions(
+                        &mut tx,
+                        &[crate::observation_capture::ObservationCollisionReceipt {
+                            user_id: &user_id,
+                            domain:
+                                crate::observation_capture::ObservationPayloadDomain::AgentEvent,
+                            identity_id: &event_id,
+                            session_id: &session_id,
+                            stored_payload_hash: &stored_hash,
+                            attempted_payload_hash: &payload_hash,
+                            source: "event_service",
+                        }],
+                    )
+                    .await
+                    .map_err(internal_error)?;
+                    tx.commit().await.map_err(internal_error)?;
+                    connection.release();
                 }
                 return Err(error_response(
                     StatusCode::CONFLICT,
@@ -757,7 +836,7 @@ impl EventService for DatabaseEventService {
         };
 
         crate::storage::insert_agent_event_edges(
-            &mut *tx,
+            &mut tx,
             &user_id,
             &session_id,
             &event_id,
@@ -784,7 +863,7 @@ impl EventService for DatabaseEventService {
             "SELECT {} FROM agent_events WHERE event_id = ? AND user_id = ?",
             EVENT_DETAIL_SELECT_COLS
         );
-        let row = query(&select_sql)
+        let row = query(sqlx::AssertSqlSafe(select_sql))
             .bind(&event_id)
             .bind(&user_id)
             .fetch_one(&mut *tx)
@@ -795,6 +874,7 @@ impl EventService for DatabaseEventService {
         result.parent_event_ids = normalized_parent_event_ids;
 
         tx.commit().await.map_err(internal_error)?;
+        connection.release();
 
         Ok(EventCreateOutcome::created(result))
     }
@@ -869,7 +949,7 @@ impl EventService for DatabaseEventService {
             "SELECT {} FROM agent_events WHERE event_id = ? AND user_id = ?",
             EVENT_DETAIL_SELECT_COLS
         );
-        let row = query(&select_sql)
+        let row = query(sqlx::AssertSqlSafe(select_sql))
             .bind(&event_id)
             .bind(&user_id)
             .fetch_optional(&pool)
@@ -897,7 +977,7 @@ impl EventService for DatabaseEventService {
             "SELECT {} FROM agent_events WHERE causal_chain_id = ? AND user_id = ? ORDER BY created_at ASC LIMIT ?",
             EVENT_DETAIL_SELECT_COLS
         );
-        let rows = query(&select_sql)
+        let rows = query(sqlx::AssertSqlSafe(select_sql))
             .bind(&causal_chain_id)
             .bind(&user_id)
             .bind(MAX_CAUSAL_CHAIN_EVENTS)
@@ -1002,7 +1082,7 @@ impl EventService for DatabaseEventService {
             "SELECT {} FROM agent_events WHERE event_id = ? AND user_id = ?",
             EVENT_DETAIL_SELECT_COLS
         );
-        let row = query(&select_sql)
+        let row = query(sqlx::AssertSqlSafe(select_sql))
             .bind(&event_id)
             .bind(&user_id)
             .fetch_optional(&pool)

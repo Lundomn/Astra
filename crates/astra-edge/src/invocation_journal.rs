@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use astra_server_types::edge_ws_protocol::{EdgeClientMessage, ToolInvocationIdentity};
+use astra_server_types::edge_ws_protocol::{
+    EdgeClientMessage, MAX_EDGE_MESSAGE_BYTES, ToolInvocationIdentity,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -13,7 +15,6 @@ const MAX_JOURNAL_STATE_BYTES: usize = 192 * 1024 * 1024;
 const MAX_WAL_BYTES: usize = 256 * 1024 * 1024;
 const WAL_COMPACTION_ENTRY_THRESHOLD: usize = 4_096;
 const WAL_COMPACTION_BYTE_THRESHOLD: usize = 8 * 1024 * 1024;
-const MAX_RESULT_BYTES: usize = 256 * 1024;
 const _: () = {
     assert!(MAX_RECORDS >= 512);
     assert!(MAX_JOURNAL_STATE_BYTES <= 256 * 1024 * 1024);
@@ -137,15 +138,24 @@ struct DurableInvocationRecord {
     execution_generation: Option<u64>,
     tool: String,
     canonical_arguments_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    execution_ceiling: Option<astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
     state: DurableState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     result: Option<DurableEdgeResult>,
 }
 
 impl DurableInvocationRecord {
-    fn matches(&self, identity: &ToolInvocationIdentity, tool: &str, args: &Value) -> bool {
+    fn matches(
+        &self,
+        identity: &ToolInvocationIdentity,
+        tool: &str,
+        args: &Value,
+        ceiling: Option<&astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
+    ) -> bool {
         self.identity == *identity
             && self.tool == tool
+            && self.execution_ceiling.as_ref() == ceiling
             && self.canonical_arguments_hash
                 == astra_turn_types::canonical_public_arguments_hash(args)
     }
@@ -346,13 +356,30 @@ impl EdgeInvocationJournal {
                 let mut record = record.clone();
                 record.state = DurableState::OutcomeUnknownAwaitingAck;
                 record.result = Some(DurableEdgeResult::outcome_unknown(
-                    "Edge process restarted after dispatch but before durable completion; the tool outcome is unknown and was not re-executed",
+                    "Edge recovered an invocation dispatched without a durable completion; the tool outcome is unknown and was not re-executed",
                 ));
                 (request_id.clone(), record)
             })
             .collect::<Vec<_>>();
         for (request_id, record) in running {
             journal.commit_record(request_id, Some(record)).await?;
+        }
+        let oversized = journal
+            .state
+            .records
+            .iter()
+            .filter_map(
+                |(id, record)| match wire_result_len(&journal.path, id, record) {
+                    Ok(Some(size)) if size > MAX_EDGE_MESSAGE_BYTES => {
+                        Some(Ok((id.clone(), record.clone())))
+                    }
+                    Err(error) => Some(Err(error)),
+                    _ => None,
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+        for (id, record) in oversized {
+            journal.commit_record(id, Some(record)).await?;
         }
         if journal.should_compact() {
             journal.compact().await?;
@@ -381,6 +408,9 @@ impl EdgeInvocationJournal {
         }
     }
 
+    // Keep the wire request key, durable identity, payload and frozen ceiling
+    // explicit at this admission boundary; none is inferred from another.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn prepare(
         &mut self,
         request_id: &str,
@@ -389,31 +419,35 @@ impl EdgeInvocationJournal {
         tool: &str,
         args: &Value,
         execution_capacity_available: bool,
+        execution_ceiling: Option<&astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
     ) -> Result<PrepareOutcome, JournalError> {
         if request_id != identity.storage_key() {
             return Err(JournalError::IdentityConflict {
                 request_id: request_id.to_string(),
             });
         }
-        if let Some(record) = self.state.records.get(request_id).cloned() {
-            if !record.matches(identity, tool, args) {
+        // Refuse identities that cannot carry even a bounded terminal result
+        // before recording dispatch or permitting any side effects.
+        let terminal = DurableEdgeResult::outcome_unknown(
+            "Edge tool result exceeded the transport limit; outcome evidence is unavailable and the tool was not re-executed",
+        ).client_message(request_id.to_owned(), identity.clone(), u64::MAX);
+        if serialized_json_len(&self.path, &terminal, "terminal result")? > MAX_EDGE_MESSAGE_BYTES {
+            return Err(JournalError::TooLarge);
+        }
+        if let Some(mut record) = self.state.records.get(request_id).cloned() {
+            if !record.matches(identity, tool, args, execution_ceiling) {
                 return Err(JournalError::IdentityConflict {
                     request_id: request_id.to_string(),
                 });
             }
-            let mut updated = record.clone();
-            updated.delivery_generation = delivery_generation;
-            self.commit_record(request_id.to_string(), Some(updated))
+            record.delivery_generation = delivery_generation;
+            self.commit_record(request_id.to_string(), Some(record))
                 .await?;
+            let record = &self.state.records[request_id];
             let outcome = match record.state {
                 DurableState::Running => PrepareOutcome::Active,
                 DurableState::CompletedAwaitingAck | DurableState::OutcomeUnknownAwaitingAck => {
-                    PrepareOutcome::Replay(record.result.clone().ok_or_else(|| {
-                        JournalError::Corrupt {
-                            path: self.path.clone(),
-                            detail: format!("terminal record {request_id} has no result"),
-                        }
-                    })?)
+                    PrepareOutcome::Replay(self.terminal_result(request_id, record)?)
                 }
             };
             return Ok(outcome);
@@ -427,6 +461,7 @@ impl EdgeInvocationJournal {
             execution_generation: execution_capacity_available.then_some(delivery_generation),
             tool: tool.to_string(),
             canonical_arguments_hash: astra_turn_types::canonical_public_arguments_hash(args),
+            execution_ceiling: execution_ceiling.cloned(),
             state: if execution_capacity_available {
                 DurableState::Running
             } else {
@@ -451,28 +486,11 @@ impl EdgeInvocationJournal {
     pub(crate) async fn complete(
         &mut self,
         request_id: &str,
-        delivery_generation: u64,
+        execution_generation: u64,
         result: DurableEdgeResult,
-    ) -> Result<DurableEdgeResult, JournalError> {
-        let serialized_result =
-            serde_json::to_vec(&result).map_err(|error| JournalError::Corrupt {
-                path: self.path.clone(),
-                detail: format!("result serialization failed: {error}"),
-            })?;
-        let (state, durable_result) = if serialized_result.len() > MAX_RESULT_BYTES {
-            (
-                DurableState::OutcomeUnknownAwaitingAck,
-                DurableEdgeResult::outcome_unknown(format!(
-                    "Edge tool completed but its {} byte result exceeded the durable {} byte boundary; outcome evidence is unavailable",
-                    serialized_result.len(),
-                    MAX_RESULT_BYTES
-                )),
-            )
-        } else {
-            (DurableState::CompletedAwaitingAck, result)
-        };
+    ) -> Result<PendingResult, JournalError> {
         let mut record = self
-            .execution_record(request_id, delivery_generation)?
+            .execution_record(request_id, execution_generation)?
             .clone();
         if record.state != DurableState::Running {
             return Err(JournalError::Corrupt {
@@ -480,11 +498,11 @@ impl EdgeInvocationJournal {
                 detail: format!("record {request_id} is not running"),
             });
         }
-        record.state = state;
-        record.result = Some(durable_result.clone());
+        record.state = DurableState::CompletedAwaitingAck;
+        record.result = Some(result);
         self.commit_record(request_id.to_string(), Some(record))
             .await?;
-        Ok(durable_result)
+        self.pending_result(request_id, &self.state.records[request_id])
     }
 
     pub(crate) async fn acknowledge(
@@ -531,18 +549,32 @@ impl EdgeInvocationJournal {
                     DurableState::CompletedAwaitingAck | DurableState::OutcomeUnknownAwaitingAck
                 )
             })
-            .map(|(request_id, record)| {
-                Ok(PendingResult {
-                    request_id: request_id.clone(),
-                    identity: record.identity.clone(),
-                    delivery_generation: record.delivery_generation,
-                    result: record.result.clone().ok_or_else(|| JournalError::Corrupt {
-                        path: self.path.clone(),
-                        detail: format!("terminal record {request_id} has no result"),
-                    })?,
-                })
-            })
+            .map(|(request_id, record)| self.pending_result(request_id, record))
             .collect()
+    }
+
+    fn pending_result(
+        &self,
+        request_id: &str,
+        record: &DurableInvocationRecord,
+    ) -> Result<PendingResult, JournalError> {
+        Ok(PendingResult {
+            request_id: request_id.to_string(),
+            identity: record.identity.clone(),
+            delivery_generation: record.delivery_generation,
+            result: self.terminal_result(request_id, record)?,
+        })
+    }
+
+    fn terminal_result(
+        &self,
+        request_id: &str,
+        record: &DurableInvocationRecord,
+    ) -> Result<DurableEdgeResult, JournalError> {
+        record.result.clone().ok_or_else(|| JournalError::Corrupt {
+            path: self.path.clone(),
+            detail: format!("terminal record {request_id} has no result"),
+        })
     }
 
     fn execution_record(
@@ -571,6 +603,22 @@ impl EdgeInvocationJournal {
         request_id: String,
         record: Option<DurableInvocationRecord>,
     ) -> Result<(), JournalError> {
+        let record = record.map(|mut record| {
+            if wire_result_len(&self.path, &request_id, &record)?.is_some_and(|size| size > MAX_EDGE_MESSAGE_BYTES) {
+                // A completed tool may have had side effects. Preserve unknown
+                // evidence semantics and never turn this into a retry request.
+                record.result = Some(DurableEdgeResult::outcome_unknown(
+                    "Edge tool result exceeded the transport limit; outcome evidence is unavailable and the tool was not re-executed",
+                ));
+                if record.execution_generation.is_some() {
+                    record.state = DurableState::OutcomeUnknownAwaitingAck;
+                }
+                if wire_result_len(&self.path, &request_id, &record)?.is_some_and(|size| size > MAX_EDGE_MESSAGE_BYTES) {
+                    return Err(JournalError::TooLarge);
+                }
+            }
+            Ok(record)
+        }).transpose()?;
         let old_bytes = self
             .state
             .records
@@ -602,8 +650,8 @@ impl EdgeInvocationJournal {
         let mutation = JournalMutation {
             contract_version: JOURNAL_VERSION.to_string(),
             sequence,
-            request_id: request_id.clone(),
-            record: record.clone(),
+            request_id,
+            record,
         };
         let mut line = serde_json::to_vec(&mutation).map_err(|error| JournalError::Corrupt {
             path: self.wal_path.clone(),
@@ -630,6 +678,9 @@ impl EdgeInvocationJournal {
                 path: self.wal_path.clone(),
                 source,
             })?;
+        let JournalMutation {
+            request_id, record, ..
+        } = mutation;
         match record {
             Some(record) => {
                 self.state.records.insert(request_id, record);
@@ -710,27 +761,33 @@ impl EdgeInvocationJournal {
 }
 
 fn encoded_state_len(path: &Path, state: &JournalFile) -> Result<usize, JournalError> {
-    serde_json::to_vec(state)
-        .map(|bytes| bytes.len())
-        .map_err(|error| JournalError::Corrupt {
-            path: path.to_path_buf(),
-            detail: format!("snapshot serialization failed: {error}"),
-        })
+    serialized_json_len(path, state, "snapshot")
 }
 
 fn encoded_record_entry_len(
     request_id: &str,
     record: &DurableInvocationRecord,
 ) -> Result<usize, JournalError> {
-    let key_bytes = serde_json::to_vec(request_id).map_err(|error| JournalError::Corrupt {
-        path: PathBuf::from("<memory>"),
-        detail: format!("record key serialization failed: {error}"),
-    })?;
-    let record_bytes = serde_json::to_vec(record).map_err(|error| JournalError::Corrupt {
-        path: PathBuf::from("<memory>"),
-        detail: format!("record serialization failed: {error}"),
-    })?;
-    Ok(key_bytes.len() + 1 + record_bytes.len() + 1)
+    let key_bytes = serialized_json_len(Path::new("<memory>"), request_id, "record key")?;
+    let record_bytes = serialized_json_len(Path::new("<memory>"), record, "record")?;
+    key_bytes
+        .checked_add(1)
+        .and_then(|bytes| bytes.checked_add(record_bytes))
+        .and_then(|bytes| bytes.checked_add(1))
+        .ok_or(JournalError::TooLarge)
+}
+
+fn serialized_json_len<T: Serialize + ?Sized>(
+    path: &Path,
+    value: &T,
+    label: &str,
+) -> Result<usize, JournalError> {
+    let bytes =
+        astra_turn_types::json_serialized_len(value).map_err(|error| JournalError::Corrupt {
+            path: path.to_path_buf(),
+            detail: format!("{label} serialization failed: {error}"),
+        })?;
+    usize::try_from(bytes).map_err(|_| JournalError::TooLarge)
 }
 
 fn replay_wal(
@@ -763,14 +820,7 @@ fn replay_wal(
             });
         }
         if mutation.sequence > state.last_sequence {
-            let expected =
-                state
-                    .last_sequence
-                    .checked_add(1)
-                    .ok_or_else(|| JournalError::Corrupt {
-                        path: path.to_path_buf(),
-                        detail: "journal sequence overflow".to_string(),
-                    })?;
+            let expected = state.last_sequence + 1;
             if mutation.sequence != expected {
                 return Err(JournalError::Corrupt {
                     path: path.to_path_buf(),
@@ -832,6 +882,28 @@ fn validate_file(path: &Path, state: &JournalFile) -> Result<(), JournalError> {
     Ok(())
 }
 
+fn wire_result_len(
+    path: &Path,
+    request_id: &str,
+    record: &DurableInvocationRecord,
+) -> Result<Option<usize>, JournalError> {
+    record
+        .result
+        .as_ref()
+        .map(|result| {
+            serialized_json_len(
+                path,
+                &result.client_message(
+                    request_id.to_owned(),
+                    record.identity.clone(),
+                    record.delivery_generation,
+                ),
+                "result",
+            )
+        })
+        .transpose()
+}
+
 fn validate_record(
     path: &Path,
     request_id: &str,
@@ -863,21 +935,6 @@ fn validate_record(
             detail: format!("record {request_id} crossed dispatch without an execution generation"),
         });
     }
-    if let Some(result) = &record.result {
-        let result_bytes = serde_json::to_vec(result).map_err(|error| JournalError::Corrupt {
-            path: path.to_path_buf(),
-            detail: format!("record {request_id} result cannot be serialized: {error}"),
-        })?;
-        if result_bytes.len() > MAX_RESULT_BYTES {
-            return Err(JournalError::Corrupt {
-                path: path.to_path_buf(),
-                detail: format!(
-                    "record {request_id} result is {} bytes; maximum is {MAX_RESULT_BYTES}",
-                    result_bytes.len()
-                ),
-            });
-        }
-    }
     Ok(())
 }
 
@@ -888,6 +945,195 @@ mod tests {
 
     fn identity(id: &str) -> ToolInvocationIdentity {
         ToolInvocationIdentity::new("user", "session", "run", "turn", id).unwrap()
+    }
+
+    #[tokio::test]
+    async fn full_wire_budget_bounds_results_and_replays_until_ack() {
+        for output in [
+            "x".repeat(262_000),
+            "\"\n".repeat(90_000),
+            "界".repeat(90_000),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("journal.json");
+            let identity = identity("boundary");
+            let id = identity.storage_key();
+            let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
+            journal
+                .prepare(&id, &identity, 1, "bash", &json!({}), true, None)
+                .await
+                .unwrap();
+            let result = journal
+                .complete(
+                    &id,
+                    1,
+                    DurableEdgeResult {
+                        output,
+                        is_error: false,
+                        duration_ms: 1,
+                        tool_result_fields: None,
+                    },
+                )
+                .await
+                .unwrap()
+                .result;
+            assert!(result.is_error);
+            assert_eq!(
+                result.tool_result_fields.as_ref().unwrap()["outcome_certainty"],
+                "unknown"
+            );
+            let wire = result.client_message(id.clone(), identity.clone(), 1);
+            assert!(serde_json::to_vec(&wire).unwrap().len() <= MAX_EDGE_MESSAGE_BYTES);
+            drop(journal);
+            let mut restored = EdgeInvocationJournal::open(path).await.unwrap();
+            assert!(matches!(
+                restored
+                    .prepare(&id, &identity, u64::MAX, "bash", &json!({}), true, None)
+                    .await
+                    .unwrap(),
+                PrepareOutcome::Replay(_)
+            ));
+            assert!(!restored.acknowledge(&id, 1).await.unwrap());
+            assert!(restored.acknowledge(&id, u64::MAX).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_wire_boundary_survives_restart_and_bounds_new_delivery_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.json");
+        let identity = identity(&"long-identity".repeat(100));
+        let id = identity.storage_key();
+        let args = json!({"command": "echo once"});
+        let mut result = DurableEdgeResult {
+            output: String::new(),
+            is_error: false,
+            duration_ms: u64::MAX,
+            tool_result_fields: Some(Map::from_iter([(
+                "metadata".into(),
+                json!("\"界\n".repeat(1000)),
+            )])),
+        };
+        let overhead = serde_json::to_vec(&result.client_message(id.clone(), identity.clone(), 1))
+            .unwrap()
+            .len();
+        result.output = "x".repeat(MAX_EDGE_MESSAGE_BYTES - overhead);
+        assert_eq!(
+            serde_json::to_vec(&result.client_message(id.clone(), identity.clone(), 1))
+                .unwrap()
+                .len(),
+            MAX_EDGE_MESSAGE_BYTES
+        );
+        let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
+        assert!(matches!(
+            journal
+                .prepare(&id, &identity, 1, "bash", &args, true, None)
+                .await
+                .unwrap(),
+            PrepareOutcome::Execute
+        ));
+        assert_eq!(
+            journal
+                .complete(&id, 1, result.clone())
+                .await
+                .unwrap()
+                .result,
+            result
+        );
+        drop(journal);
+
+        let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
+        assert_eq!(journal.pending_results().unwrap()[0].result, result);
+        // Increasing the generation expands the envelope even when the result
+        // body is unchanged. Bound and persist the new envelope before replay.
+        let PrepareOutcome::Replay(bounded) = journal
+            .prepare(&id, &identity, u64::MAX, "bash", &args, true, None)
+            .await
+            .unwrap()
+        else {
+            panic!("a completed invocation must never be executed again")
+        };
+        assert!(bounded.is_error);
+        assert_eq!(
+            bounded.tool_result_fields.as_ref().unwrap()["outcome_certainty"],
+            "unknown"
+        );
+        assert!(
+            serde_json::to_vec(&bounded.client_message(id.clone(), identity, u64::MAX))
+                .unwrap()
+                .len()
+                <= MAX_EDGE_MESSAGE_BYTES
+        );
+        assert!(!journal.acknowledge(&id, 1).await.unwrap());
+        drop(journal);
+        let mut journal = EdgeInvocationJournal::open(path).await.unwrap();
+        let pending = journal.pending_results().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].delivery_generation, u64::MAX);
+        assert_eq!(pending[0].result, bounded);
+        assert!(journal.acknowledge(&id, u64::MAX).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn oversized_persisted_result_is_repaired_durably_before_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.json");
+        let identity = identity("oversized");
+        let id = identity.storage_key();
+        let result = DurableEdgeResult {
+            // Keep this above the removed legacy body-only limit as well as
+            // above the authoritative full-envelope limit.
+            output: "x".repeat(262_200),
+            is_error: false,
+            duration_ms: 1,
+            tool_result_fields: None,
+        };
+        let record = DurableInvocationRecord {
+            identity,
+            delivery_generation: 1,
+            execution_generation: Some(1),
+            tool: "bash".into(),
+            canonical_arguments_hash: astra_turn_types::canonical_public_arguments_hash(&json!({})),
+            execution_ceiling: None,
+            state: DurableState::CompletedAwaitingAck,
+            result: Some(result),
+        };
+        assert!(wire_result_len(&path, &id, &record).unwrap().unwrap() > MAX_EDGE_MESSAGE_BYTES);
+        let mut state = JournalFile::default();
+        state.records.insert(id.clone(), record);
+        tokio::fs::write(&path, serde_json::to_vec(&state).unwrap())
+            .await
+            .unwrap();
+        let journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
+        assert!(journal.pending_results().unwrap()[0].result.is_error);
+        drop(journal);
+        let mut journal = EdgeInvocationJournal::open(path).await.unwrap();
+        assert!(journal.pending_results().unwrap()[0].result.is_error);
+        assert!(journal.acknowledge(&id, 1).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn oversized_identity_is_rejected_before_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = EdgeInvocationJournal::open(dir.path().join("journal.json"))
+            .await
+            .unwrap();
+        let identity = identity(&"x".repeat(MAX_EDGE_MESSAGE_BYTES));
+        assert!(matches!(
+            journal
+                .prepare(
+                    &identity.storage_key(),
+                    &identity,
+                    1,
+                    "bash",
+                    &json!({}),
+                    true,
+                    None
+                )
+                .await,
+            Err(JournalError::TooLarge)
+        ));
+        assert_eq!(journal.status().records, 0);
     }
 
     #[tokio::test]
@@ -906,12 +1152,13 @@ mod tests {
                     "read_file",
                     &json!({"path":"a"}),
                     true,
+                    None,
                 )
                 .await
                 .unwrap(),
             PrepareOutcome::Execute
         ));
-        journal
+        let pending = journal
             .complete(
                 &request_id,
                 7,
@@ -924,6 +1171,9 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(pending.request_id, request_id);
+        assert_eq!(pending.delivery_generation, 7);
+        assert_eq!(pending.result.output, "body");
         drop(journal);
 
         let mut restored = EdgeInvocationJournal::open(path).await.unwrap();
@@ -944,20 +1194,20 @@ mod tests {
             .unwrap();
         assert!(matches!(
             journal
-                .prepare(&request_id, &identity, 4, "bash", &args, true)
+                .prepare(&request_id, &identity, 4, "bash", &args, true, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Execute
         ));
         assert!(matches!(
             journal
-                .prepare(&request_id, &identity, 5, "bash", &args, true)
+                .prepare(&request_id, &identity, 5, "bash", &args, true, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Active
         ));
 
-        journal
+        let completed = journal
             .complete(
                 &request_id,
                 4,
@@ -970,6 +1220,9 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(completed.request_id, request_id);
+        assert_eq!(completed.delivery_generation, 5);
+        assert_eq!(completed.result.output, "done");
         let pending = journal.pending_results().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].delivery_generation, 5);
@@ -986,7 +1239,7 @@ mod tests {
         let args = json!({"command":"effect"});
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         journal
-            .prepare(&request_id, &identity, 4, "bash", &args, true)
+            .prepare(&request_id, &identity, 4, "bash", &args, true, None)
             .await
             .unwrap();
         drop(journal);
@@ -1001,7 +1254,7 @@ mod tests {
         );
         assert!(matches!(
             restored
-                .prepare(&request_id, &identity, 5, "bash", &args, true)
+                .prepare(&request_id, &identity, 5, "bash", &args, true, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
@@ -1018,7 +1271,7 @@ mod tests {
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         assert!(matches!(
             journal
-                .prepare(&request_id, &identity, 4, "bash", &args, false)
+                .prepare(&request_id, &identity, 4, "bash", &args, false, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
@@ -1034,7 +1287,7 @@ mod tests {
         );
         assert!(matches!(
             restored
-                .prepare(&request_id, &identity, 5, "bash", &args, true)
+                .prepare(&request_id, &identity, 5, "bash", &args, true, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
@@ -1051,7 +1304,7 @@ mod tests {
         let args = json!({"path":"a"});
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         journal
-            .prepare(&request_id, &identity, 1, "read_file", &args, false)
+            .prepare(&request_id, &identity, 1, "read_file", &args, false, None)
             .await
             .unwrap();
         drop(journal);
@@ -1072,7 +1325,7 @@ mod tests {
         );
         assert!(matches!(
             restored
-                .prepare(&request_id, &identity, 2, "read_file", &args, true)
+                .prepare(&request_id, &identity, 2, "read_file", &args, true, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
@@ -1095,6 +1348,7 @@ mod tests {
                 "read_file",
                 &json!({"path":"a"}),
                 true,
+                None,
             )
             .await
             .unwrap();
@@ -1136,6 +1390,7 @@ mod tests {
                 "bash",
                 &json!({"command":"a"}),
                 true,
+                None,
             )
             .await
             .unwrap();
@@ -1147,11 +1402,119 @@ mod tests {
                 "bash",
                 &json!({"command":"b"}),
                 true,
+                None,
             )
             .await
             .err()
             .unwrap();
         assert!(matches!(error, JournalError::IdentityConflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn redelivery_cannot_change_or_remove_frozen_execution_grant() {
+        use astra_server_types::edge_ws_protocol::EdgeExecutionCeiling;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.json");
+        let identity = identity("grant-fence");
+        let id = identity.storage_key();
+        let grant = EdgeExecutionCeiling {
+            workspace_root: "/selected/workspace".into(),
+            workspace_id: Some("workspace".into()),
+            materialization_id: Some("materialization".into()),
+            execution_binding_generation: 7,
+            runtime_read_paths: vec!["/selected/runtime/codex".into()],
+            workspace_write_allowed: false,
+            network_allowed: false,
+        };
+        let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
+        assert!(matches!(
+            journal
+                .prepare(&id, &identity, 1, "native", &json!({}), true, Some(&grant))
+                .await
+                .unwrap(),
+            PrepareOutcome::Execute
+        ));
+        drop(journal);
+        let mut journal = EdgeInvocationJournal::open(path).await.unwrap();
+        let mut variants = Vec::new();
+        let mut changed_runtime = grant.clone();
+        changed_runtime
+            .runtime_read_paths
+            .push("/another/runtime".into());
+        variants.push(changed_runtime);
+        let mut changed = grant.clone();
+        changed.workspace_root.push_str("/other");
+        variants.push(changed);
+        let mut changed = grant.clone();
+        changed.workspace_id = None;
+        variants.push(changed);
+        let mut changed = grant.clone();
+        changed.materialization_id = None;
+        variants.push(changed);
+        let mut changed = grant.clone();
+        changed.execution_binding_generation += 1;
+        variants.push(changed);
+        let mut changed = grant.clone();
+        changed.workspace_write_allowed = true;
+        variants.push(changed);
+        let mut changed = grant.clone();
+        changed.network_allowed = true;
+        variants.push(changed);
+        for changed in &variants {
+            assert!(matches!(
+                journal
+                    .prepare(&id, &identity, 2, "native", &json!({}), true, Some(changed))
+                    .await,
+                Err(JournalError::IdentityConflict { .. })
+            ));
+        }
+        assert!(matches!(
+            journal
+                .prepare(&id, &identity, 2, "native", &json!({}), true, None)
+                .await,
+            Err(JournalError::IdentityConflict { .. })
+        ));
+        assert!(matches!(
+            journal
+                .prepare(&id, &identity, 2, "native", &json!({}), true, Some(&grant))
+                .await
+                .unwrap(),
+            PrepareOutcome::Replay(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn acknowledged_recovered_entries_stay_removed_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.json");
+        let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
+        for call in ["recovered-0", "recovered-1"] {
+            let identity = identity(call);
+            journal
+                .prepare(
+                    &identity.storage_key(),
+                    &identity,
+                    1,
+                    "bash",
+                    &json!({}),
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        drop(journal);
+        let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
+        let pending = journal.pending_results().unwrap();
+        assert_eq!(pending.len(), 2);
+        for result in pending {
+            assert!(!journal.acknowledge(&result.request_id, 2).await.unwrap());
+            assert!(journal.acknowledge(&result.request_id, 1).await.unwrap());
+        }
+        drop(journal);
+        let journal = EdgeInvocationJournal::open(path).await.unwrap();
+        assert_eq!(journal.status().records, 0);
+        assert!(journal.pending_results().unwrap().is_empty());
     }
 
     #[tokio::test]

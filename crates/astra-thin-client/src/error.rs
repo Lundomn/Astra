@@ -25,6 +25,18 @@ pub enum ThinClientError {
     IncompatibleRuntime { expected: String, actual: String },
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    #[error("invalid provider interaction response: {0}")]
+    InvalidProviderInteractionResponse(String),
+    #[error("HTTP response exceeded the {limit} byte capture limit")]
+    ResponseTooLarge { limit: usize },
+    #[error("Server admission deadline expired before request dispatch")]
+    AdmissionDeadlineExpired,
+    #[error(
+        "session {session_id} cancellation has not been confirmed complete: {reason}. Retry `astra session cancel {session_id}`; keep the session history"
+    )]
+    SessionCancellationPending { session_id: String, reason: String },
+    #[error("invalid session cancellation response: {0}")]
+    InvalidSessionCancellationResponse(String),
     #[error("expected JSON object in SSE data line, got: {0}")]
     InvalidSseJson(serde_json::Value),
     #[error("JSON error: {0}")]
@@ -56,6 +68,11 @@ mod tests {
     fn invalid_auth_header_display() {
         let err = ThinClientError::InvalidAuthHeader;
         assert!(err.to_string().contains("Authorization"));
+    }
+
+    #[test]
+    fn admission_deadline_expiry_is_not_a_retriable_transport_error() {
+        assert!(!ThinClientError::AdmissionDeadlineExpired.is_transport());
     }
 
     #[test]

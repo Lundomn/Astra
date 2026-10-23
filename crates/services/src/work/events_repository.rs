@@ -157,7 +157,6 @@ async fn prune_expired_event_fact(
             "expired acceptance decision",
         )),
         WorkEventKind::WorkCreated
-        | WorkEventKind::GoalRevised
         | WorkEventKind::CriteriaAccepted
         | WorkEventKind::BranchBasisAdopted
         | WorkEventKind::GraphReplaced
@@ -173,6 +172,7 @@ async fn prune_expired_event_fact(
         | WorkEventKind::RunDelegated
         | WorkEventKind::RunFailed
         | WorkEventKind::RunCancelled
+        | WorkEventKind::RecoveryPointCaptured
         | WorkEventKind::RuntimeEventsExpired => None,
     };
     if let Some((statement, entity)) = deletion {
@@ -215,7 +215,7 @@ async fn insert_event(
             payload_hash.is_some(),
         ],
     );
-    query(&insert_sql)
+    query(insert_sql)
         .bind(event.owner_id.as_str())
         .bind(event.work_id.as_str())
         .bind(event_seq.get())

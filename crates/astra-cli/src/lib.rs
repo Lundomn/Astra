@@ -72,6 +72,8 @@ pub mod diff_utils;
 pub mod edge_tools;
 pub mod entrypoint;
 pub(crate) mod explain_analyze_artifact;
+pub(crate) mod explain_analyze_format;
+pub(crate) mod explain_analyze_html;
 pub(crate) mod explain_analyze_report;
 pub mod git_branch_cache;
 pub mod lock_recovery;
@@ -94,7 +96,7 @@ pub(crate) use crate::cli::stream::streaming_types::{
 };
 
 // Session state
-pub(crate) use cli::session::session_state::{ExplainMode, SessionState, SkillDevState};
+pub(crate) use cli::session::session_state::{ExplainMode, SessionState};
 
 // Cloud sync
 pub(crate) use cli::cloud_sync::post_auth_cloud_resync;
@@ -113,7 +115,6 @@ pub(crate) mod tests {
     pub(crate) use super::test_utils::test_temp_dir;
     pub(crate) use super::test_utils::wait_until;
 
-    pub(crate) use crate::cli::slash::slash_session::resolve_journal_target_session;
     pub(crate) use astra_services::session_journal;
     use axum::{Router, routing::get};
 
@@ -131,7 +132,7 @@ pub(crate) mod tests {
         ]))
     }
 
-    async fn spawn_mock_app(app: Router) -> String {
+    pub(crate) async fn spawn_mock_app(app: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base = format!("http://{addr}");
@@ -142,7 +143,7 @@ pub(crate) mod tests {
         base
     }
 
-    async fn spawn_mock(app: Router) -> String {
+    pub(crate) async fn spawn_mock(app: Router) -> String {
         spawn_mock_app(
             app.route("/models", get(mock_models_response))
                 .route("/model-access", get(mock_model_access_response)),
@@ -159,6 +160,4 @@ pub(crate) mod tests {
     mod preamble_tests;
     mod resume_tests;
     mod self_command_tests;
-    mod slash_command_tests;
-    mod stats_tools_tests;
 }

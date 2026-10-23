@@ -6,8 +6,8 @@
 //! terminal UI to complete an action.
 
 use crate::cli::command_registry;
-use crate::cli::session::session_state::ExplainMode;
 use crate::cli::session::session_state::SessionState;
+use crate::cli::session::session_state::{ExplainMode, ExplainSlashCommand};
 use crate::tui::bottom_pane::BottomPane;
 use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
 use crate::tui::bottom_pane::view::{
@@ -19,6 +19,9 @@ use crate::tui::terminal::TerminalGuard;
 pub(crate) enum SlashResult {
     Handled,
     Deferred,
+    Authenticate {
+        register: bool,
+    },
     /// Open the canonical root transcript workspace. The event loop owns the
     /// durable/local source selection because it also owns session binding,
     /// live suffix refresh and asynchronous page loading.
@@ -26,6 +29,10 @@ pub(crate) enum SlashResult {
         session_id: Option<String>,
     },
     OpenWorkTasks,
+    /// Open the same live background-task panel used by Shift+Down/Ctrl+B.
+    /// The event loop owns the registry so this route cannot accidentally
+    /// create a second task model or lose session-bound local projections.
+    OpenBackgroundTasks,
     StartWork(Box<WorkStartRequest>),
     BackgroundRead(Box<SlashBackgroundRead>),
     Exit,
@@ -34,7 +41,14 @@ pub(crate) enum SlashResult {
 pub(crate) struct WorkStartRequest {
     pub api: astra_thin_client::ThinClient,
     pub profile: Option<String>,
-    pub session_id: String,
+    /// A new TUI has no durable Session until its first turn. Starting Work
+    /// is itself a durable action, so the worker creates and binds one rather
+    /// than asking the user to send a meaningless message first.
+    pub session_id: Option<String>,
+    /// Attachment generation at the moment the user asked to start Work.
+    /// A completion from an earlier conversation must never adopt a Session
+    /// after the user has explicitly switched elsewhere.
+    pub attachment_epoch: u64,
     pub goal: String,
 }
 
@@ -62,10 +76,10 @@ impl SlashResult {
     }
 }
 
-/// A read-only workbench action whose I/O is owned by the event loop rather
-/// than the slash dispatcher. These actions have no mutable session effect,
-/// so they can complete after the user keeps composing without borrowing UI
-/// state across a filesystem or process wait.
+/// A workbench action whose I/O is owned by the event loop rather than the
+/// slash dispatcher. Reads and the small, idempotent progress-save request
+/// can complete after the user keeps composing without borrowing UI state
+/// across a network wait.
 pub(crate) enum SlashBackgroundRead {
     Clipboard {
         text: String,
@@ -79,6 +93,27 @@ pub(crate) enum SlashBackgroundRead {
         api: astra_thin_client::ThinClient,
         profile: Option<String>,
         session_id: String,
+    },
+    WorkRecoveryPointCapture {
+        api: astra_thin_client::ThinClient,
+        profile: Option<String>,
+        session_id: String,
+        request_id: String,
+    },
+    WorkCatalog {
+        api: astra_thin_client::ThinClient,
+        profile: Option<String>,
+        cursor: Option<astra_thin_client::WorkCatalogCursorV1>,
+    },
+    WorkContinue {
+        api: astra_thin_client::ThinClient,
+        profile: Option<String>,
+        work_id: String,
+        branch_id: Option<String>,
+        message: String,
+        client_id: String,
+        request_id: String,
+        attachment_request_id: String,
     },
     ResumePicker,
     SessionHub {
@@ -106,24 +141,81 @@ pub(crate) enum SlashBackgroundRead {
     },
 }
 
+/// A Work turn whose transport ended before the Server proved a terminal
+/// outcome. Keeping the exact request identity lets `/work retry <id>` ask
+/// the canonical lifecycle to replay or reconcile the same turn instead of
+/// creating a second run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingWorkContinue {
+    pub work_id: String,
+    pub branch_id: Option<String>,
+    pub message: String,
+    pub request_id: String,
+    pub attachment_request_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkCommandRoute {
+    Catalog,
     Tasks,
     Execution,
+    SaveProgress,
     Start(String),
+    Continue { work_id: String, message: String },
+    Retry(String),
     MissingGoal,
+    MissingContinueInput,
+    MissingRetryInput,
     Unsupported,
 }
 
 pub(crate) fn work_command_route(args: &str) -> WorkCommandRoute {
     let (subcommand, remainder) = split_sub(args.trim());
     match subcommand {
-        "" | "status" if remainder.trim().is_empty() => WorkCommandRoute::Tasks,
+        "" | "list" if remainder.trim().is_empty() => WorkCommandRoute::Catalog,
+        "status" if remainder.trim().is_empty() => WorkCommandRoute::Tasks,
         "execution" if remainder.trim().is_empty() => WorkCommandRoute::Execution,
+        "save" | "checkpoint" if remainder.trim().is_empty() => WorkCommandRoute::SaveProgress,
         "start" if remainder.trim().is_empty() => WorkCommandRoute::MissingGoal,
         "start" => WorkCommandRoute::Start(remainder.trim().to_owned()),
+        "continue" if remainder.trim().is_empty() => WorkCommandRoute::MissingContinueInput,
+        "continue" => {
+            let (work_id, message) = split_sub(remainder);
+            if work_id.is_empty() || message.trim().is_empty() {
+                WorkCommandRoute::MissingContinueInput
+            } else {
+                WorkCommandRoute::Continue {
+                    work_id: work_id.to_owned(),
+                    message: message.trim().to_owned(),
+                }
+            }
+        }
+        "retry" if remainder.trim().is_empty() => WorkCommandRoute::MissingRetryInput,
+        "retry" => WorkCommandRoute::Retry(remainder.trim().to_owned()),
         _ => WorkCommandRoute::Unsupported,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundTasksCommandRoute {
+    Open,
+    Unsupported,
+}
+
+fn background_tasks_command_route(args: &str) -> BackgroundTasksCommandRoute {
+    if args.trim().is_empty() {
+        BackgroundTasksCommandRoute::Open
+    } else {
+        BackgroundTasksCommandRoute::Unsupported
+    }
+}
+
+fn explain_mode_for_command(args: &str) -> Result<ExplainMode, String> {
+    ExplainMode::parse_slash_arg(args)
+}
+
+fn explain_command_for_command(args: &str) -> Result<ExplainSlashCommand, String> {
+    ExplainMode::parse_slash_command(args)
 }
 
 /// Immutable request captured when a read-only memory surface is submitted.
@@ -170,6 +262,14 @@ pub(crate) struct DispatchContext<'a> {
     pub bottom_pane: &'a mut BottomPane,
     pub chat_widget: &'a mut crate::tui::chat_widget::ChatWidget,
     pub width: u16,
+    /// Stable identity for this TUI process. Work attachments use it to keep
+    /// two local TUIs independent while allowing retries from one process to
+    /// renew the same bounded attachment.
+    pub client_id: &'a str,
+    /// Work continuation identities that ended without a proven terminal
+    /// event. They are keyed by the full request id so a retry can be
+    /// explicit and exact without coupling Work state to the current Session.
+    pub pending_work_retries: &'a mut std::collections::BTreeMap<String, PendingWorkContinue>,
 }
 
 impl<'a> DispatchContext<'a> {
@@ -293,19 +393,8 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
         // ── Auth forms (inline TUI card instead of dropping out to
         //    bare-terminal prompts that looked disjoint and stole keys) ─
-        "/login" => {
-            use crate::tui::bottom_pane::login_view::{LoginMode, LoginView};
-            ctx.open_deferred_view("Opened login", Box::new(LoginView::new(LoginMode::Login)));
-            SlashResult::Deferred
-        }
-        "/register" => {
-            use crate::tui::bottom_pane::login_view::{LoginMode, LoginView};
-            ctx.open_deferred_view(
-                "Opened registration",
-                Box::new(LoginView::new(LoginMode::Register)),
-            );
-            SlashResult::Deferred
-        }
+        "/login" => SlashResult::Authenticate { register: false },
+        "/register" => SlashResult::Authenticate { register: true },
 
         // ── Model ───────────────────────────────────────────────────
         //
@@ -340,8 +429,19 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         "/mcp" => handle_mcp_dispatch(args, ctx),
 
         "/work" => match work_command_route(args) {
+            WorkCommandRoute::Catalog => {
+                ctx.show_response(
+                    "Loading Work… choose a task to view or continue, or use `/work start <goal>` to begin one."
+                        .to_string(),
+                );
+                SlashResult::background_read(SlashBackgroundRead::WorkCatalog {
+                    api: ctx.api.clone(),
+                    profile: ctx.profile.map(str::to_owned),
+                    cursor: None,
+                })
+            }
             WorkCommandRoute::Tasks => {
-                ctx.show_response("Opened Work tasks".to_string());
+                ctx.show_response("Opened tasks for this conversation".to_string());
                 SlashResult::OpenWorkTasks
             }
             WorkCommandRoute::Execution => {
@@ -353,7 +453,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     .map(str::to_owned)
                 else {
                     ctx.show_error(
-                        "This conversation has no durable session yet. Send one message, then inspect Work execution."
+                        "This conversation has no Work yet. Use `/work start <goal>` to track it, or `/work` to choose an existing task; execution becomes available after a Work is selected."
                             .to_string(),
                     );
                     return SlashResult::Handled;
@@ -365,11 +465,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     session_id,
                 })
             }
-            WorkCommandRoute::MissingGoal => {
-                ctx.show_error("Usage: /work start <goal>".to_string());
-                SlashResult::Handled
-            }
-            WorkCommandRoute::Start(goal) => {
+            WorkCommandRoute::SaveProgress => {
                 let Some(session_id) = ctx
                     .state
                     .session_id
@@ -378,21 +474,109 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     .map(str::to_owned)
                 else {
                     ctx.show_error(
-                        "This conversation has no durable session yet. Send one message, then start Work."
+                        "There is no Work checkpoint to save yet. Use `/work start <goal>` first, or `/work` to choose an existing task."
                             .to_string(),
                     );
                     return SlashResult::Handled;
                 };
-                ctx.show_response("Starting Work…".to_string());
-                SlashResult::StartWork(Box::new(WorkStartRequest {
+                ctx.show_response("Saving Work progress…".to_string());
+                SlashResult::background_read(SlashBackgroundRead::WorkRecoveryPointCapture {
                     api: ctx.api.clone(),
                     profile: ctx.profile.map(str::to_owned),
                     session_id,
+                    request_id: format!("tui-recovery-{}", uuid::Uuid::new_v4().simple()),
+                })
+            }
+            WorkCommandRoute::MissingGoal => {
+                ctx.show_info(
+                    "Start a tracked task in this TUI. Example: `/work start Fix the flaky API test`"
+                        .to_string(),
+                );
+                SlashResult::Handled
+            }
+            WorkCommandRoute::Start(goal) => {
+                ctx.show_response("Starting tracked Work…".to_string());
+                SlashResult::StartWork(Box::new(WorkStartRequest {
+                    api: ctx.api.clone(),
+                    profile: ctx.profile.map(str::to_owned),
+                    session_id: ctx
+                        .state
+                        .session_id
+                        .as_deref()
+                        .filter(|session_id| !session_id.is_empty())
+                        .map(str::to_owned),
+                    attachment_epoch: ctx.state.session_attachment_epoch,
                     goal,
                 }))
             }
+            WorkCommandRoute::Continue { work_id, message } => {
+                let operation_id = uuid::Uuid::now_v7().simple().to_string();
+                let request_id = format!("tui-work-turn-{operation_id}");
+                let attachment_request_id = format!("tui-work-attach-{operation_id}");
+                ctx.pending_work_retries.insert(
+                    request_id.clone(),
+                    PendingWorkContinue {
+                        work_id: work_id.clone(),
+                        branch_id: None,
+                        message: message.clone(),
+                        request_id: request_id.clone(),
+                        attachment_request_id: attachment_request_id.clone(),
+                    },
+                );
+                ctx.show_response("Continuing Work…".to_string());
+                SlashResult::background_read(SlashBackgroundRead::WorkContinue {
+                    api: ctx.api.clone(),
+                    profile: ctx.profile.map(str::to_owned),
+                    work_id,
+                    branch_id: None,
+                    message,
+                    client_id: ctx.client_id.to_owned(),
+                    request_id,
+                    attachment_request_id,
+                })
+            }
+            WorkCommandRoute::Retry(request_id) => {
+                let Some(pending) = ctx.pending_work_retries.get(&request_id).cloned() else {
+                    ctx.show_error(format!(
+                        "No pending Work request `{request_id}`. Open `/work` to inspect the current state."
+                    ));
+                    return SlashResult::Handled;
+                };
+                ctx.show_response(format!("Retrying Work request {request_id}…"));
+                SlashResult::background_read(SlashBackgroundRead::WorkContinue {
+                    api: ctx.api.clone(),
+                    profile: ctx.profile.map(str::to_owned),
+                    work_id: pending.work_id,
+                    branch_id: pending.branch_id,
+                    message: pending.message,
+                    client_id: ctx.client_id.to_owned(),
+                    request_id: pending.request_id,
+                    attachment_request_id: pending.attachment_request_id,
+                })
+            }
+            WorkCommandRoute::MissingContinueInput => {
+                ctx.show_error("Usage: /work continue <work-id> <message>".to_string());
+                SlashResult::Handled
+            }
+            WorkCommandRoute::MissingRetryInput => {
+                ctx.show_error("Usage: /work retry <request-id>".to_string());
+                SlashResult::Handled
+            }
             WorkCommandRoute::Unsupported => {
-                ctx.show_error("Usage: /work [status | execution | start <goal>]".to_string());
+                ctx.show_error(
+                    "Usage: /work [start <goal> | list | status | continue <work-id> <message> | execution | save | retry <request-id>]".to_string(),
+                );
+                SlashResult::Handled
+            }
+        },
+
+        "/tasks" => match background_tasks_command_route(args) {
+            BackgroundTasksCommandRoute::Open => {
+                ctx.show_response("Opened background tasks".to_string());
+                SlashResult::OpenBackgroundTasks
+            }
+            BackgroundTasksCommandRoute::Unsupported => {
+                ctx.show_error("Usage: /tasks".to_string());
                 SlashResult::Handled
             }
         },
@@ -648,19 +832,31 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
         // ── Explain ─────────────────────────────────────────────────
         "/explain" => {
-            ctx.state.explain = match ctx.state.explain {
-                ExplainMode::Off => ExplainMode::On,
-                ExplainMode::On => ExplainMode::Verbose,
-                ExplainMode::Verbose => ExplainMode::Off,
+            let command = match explain_command_for_command(args) {
+                Ok(command) => command,
+                Err(error) => {
+                    ctx.show_error(error);
+                    return SlashResult::Handled;
+                }
             };
+            if let Some(mode) = command.mode {
+                ctx.state.explain = mode;
+                ctx.chat_widget
+                    .set_explain_verbose(matches!(mode, ExplainMode::Verbose));
+            }
+            if let Some(format) = command.report_format {
+                ctx.state.set_explain_report_format_override(format);
+                ctx.chat_widget.set_explain_report_format(format);
+            }
             let label = match ctx.state.explain {
                 ExplainMode::Off => "off",
                 ExplainMode::On => "on",
                 ExplainMode::Verbose => "verbose",
             };
-            ctx.chat_widget
-                .set_explain_verbose(matches!(ctx.state.explain, ExplainMode::Verbose));
-            ctx.show_response(format!("Explain mode: {label}"));
+            ctx.show_response(format!(
+                "Explain mode: {label} · report: {}",
+                ctx.state.runtime_config.explain.effective_report_format()
+            ));
             SlashResult::Handled
         }
 
@@ -700,7 +896,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             use crate::tui::bottom_pane::context_panel_view::ContextPanelView;
             use crate::tui::context_panel::ContextSnapshot;
             use crate::tui::context_panel::model::{
-                ActiveSkill, RequestContextEvidence, RequestContextScope, SessionSummary,
+                RequestContextEvidence, RequestContextScope, SessionSummary,
             };
 
             // Collect human-readable previews the trace doesn't carry:
@@ -711,18 +907,6 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             snap.model = ctx.state.model.as_deref();
             (snap.cwd, snap.git_branch) = context_environment_from_footer(&ctx.bottom_pane.footer);
 
-            // Loaded system skills.  Surfaced as a Skills-section
-            // fallback when the trace is silent (common for CLI
-            // sessions where edge_profile.active_skills isn't set).
-            snap.active_skills = ctx
-                .state
-                .active_system_skills
-                .iter()
-                .map(|s| ActiveSkill {
-                    name: s.name.clone(),
-                    description: s.description.clone(),
-                })
-                .collect();
             snap.selected_skills = ctx
                 .state
                 .last_turn_event
@@ -735,7 +919,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             snap.session = Some(SessionSummary {
                 session_id: ctx.state.session_id.clone().unwrap_or_default(),
                 turn: ctx.state.turn,
-                model: ctx.state.model.clone(),
+                model: ctx.state.model.as_deref().map(str::to_string),
                 total_cost: ctx.state.total_session_cost,
                 prompt_tokens: ctx.state.total_prompt_tokens,
                 completion_tokens: ctx.state.total_completion_tokens,
@@ -869,8 +1053,8 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         // drift / errors / trace / verify / adaptive / switch) used
         // to live here too, but they duplicate functionality that
         // already exists elsewhere (diag tooling, /resume for
-        // switch) and their output is text-only, so they fall
-        // through to the line-mode printer instead.
+        // switch). Unsupported subcommands are rejected by this
+        // native dispatcher; there is no console fallback.
         //
         //   /session                 → session hub (current overview)
         //   /session list            → session picker
@@ -957,13 +1141,6 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             let perm = ctx.state.perm_manager.mode().chip_text().to_owned();
             let skills = ctx.state.unified_skill_registry.len();
             let version = env!("CARGO_PKG_VERSION");
-            let pending = ctx
-                .state
-                .skill_improvement_tracker
-                .pending_proposal
-                .as_ref()
-                .map(|p| p.skill_name.clone())
-                .unwrap_or_else(|| "<none>".into());
             let recent_tools = if ctx.state.recent_tools.is_empty() {
                 "<none>".to_string()
             } else {
@@ -983,7 +1160,6 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 ("permission", perm),
                 ("skills loaded", skills.to_string()),
                 ("turn", ctx.state.turn.to_string()),
-                ("pending improve", pending),
                 ("recent tools", recent_tools),
                 ("context width", format!("{} cols", ctx.width)),
             ];
@@ -1230,7 +1406,7 @@ fn context_breakdown_for_panel(
     }
 
     if let Some(trace) = state.latest_context_assembly_trace.as_ref() {
-        return ContextBreakdown::from_trace_with(trace, snapshot);
+        return ContextBreakdown::from_trace_with(&trace.trace, snapshot);
     }
 
     let Some(session) = state.observability_session.as_ref() else {
@@ -1351,12 +1527,23 @@ pub(crate) fn permission_mode_feedback(
     crate::cli::permission_command::permission_mode_feedback(mode)
 }
 
+pub(crate) fn next_permission_mode_for_cycle(
+    current: crate::cli::permission_manager::PermissionMode,
+) -> crate::cli::permission_manager::PermissionMode {
+    crate::cli::permission_command::next_permission_mode_for_cycle(current)
+}
+
 pub(crate) fn apply_permission_mode_selection(
     state: &mut SessionState,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut crate::tui::chat_widget::ChatWidget,
     mode: crate::cli::permission_manager::PermissionMode,
 ) {
+    // Applying a mode is the ownership boundary for any active-turn staged
+    // intent. Clear both the queue and its status-line projection before
+    // publishing the new live policy so one frame cannot show stale pending
+    // state after settlement.
+    bottom_pane.clear_staged_permission_mode();
     state.perm_manager.set_mode(mode);
     crate::cli::plan::plan_lifecycle::clear_pending_local_plan_entry_if_inactive(state);
     let released = bottom_pane.reevaluate_approvals_for_mode(mode);
@@ -1390,7 +1577,31 @@ pub(crate) fn looks_like_session_id(s: &str) -> bool {
     s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
 }
 
-/// Handle a ViewCompleted result from a BottomPaneView.
+/// Interpret typed view intent; root admission still owns execution authority.
+/// Apply display/composer actions without borrowing an executing session.
+pub(crate) fn handle_display_view_result(result: ViewResult, bottom_pane: &mut BottomPane) {
+    match result {
+        ViewResult::Memory(memory) => {
+            use crate::tui::bottom_pane::info_view::InfoView;
+            bottom_pane.push_view(Box::new(
+                InfoView::from_plain(
+                    "Memory detail",
+                    vec![
+                        format!("id: {}", memory.memory_id),
+                        String::new(),
+                        memory.content,
+                    ],
+                )
+                .with_reopen("/memory"),
+            ));
+        }
+        ViewResult::InsertCommand(command) => {
+            bottom_pane.composer.set_text(&format!("{command} "));
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn handle_view_result(
     result: ViewResult,
     state: &mut SessionState,
@@ -1454,22 +1665,8 @@ pub(crate) fn handle_view_result(
         ViewResult::PermissionConfirmation {
             confirmed: false, ..
         } => {}
-        ViewResult::Memory(memory) => {
-            use crate::tui::bottom_pane::info_view::InfoView;
-            bottom_pane.push_view(Box::new(
-                InfoView::from_plain(
-                    "Memory detail",
-                    vec![
-                        format!("id: {}", memory.memory_id),
-                        String::new(),
-                        memory.content,
-                    ],
-                )
-                .with_reopen("/memory"),
-            ));
-        }
-        ViewResult::InsertCommand(command) => {
-            bottom_pane.composer.set_text(&format!("{command} "));
+        result @ (ViewResult::Memory(_) | ViewResult::InsertCommand(_)) => {
+            handle_display_view_result(result, bottom_pane);
         }
         // These results have async or state-transition handling in the event
         // loop. Keeping them explicit prevents a future picker from silently
@@ -1480,7 +1677,10 @@ pub(crate) fn handle_view_result(
         | ViewResult::Model { .. }
         | ViewResult::ModelThinking { .. }
         | ViewResult::Session { .. }
-        | ViewResult::WorkspaceTrust(_) => {}
+        | ViewResult::WorkspaceTrust(_)
+        | ViewResult::WorkCatalogNextPage { .. }
+        | ViewResult::WorkSelection { .. }
+        | ViewResult::WorkAction { .. } => {}
     }
 }
 
@@ -1496,7 +1696,11 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
                 ("session", short_sid.to_string()),
                 (
                     "model",
-                    state.model.clone().unwrap_or_else(|| "<unset>".into()),
+                    state
+                        .model
+                        .as_deref()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "<unset>".into()),
                 ),
                 ("turns", state.turn.to_string()),
                 (
@@ -1506,7 +1710,12 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
                         state.total_prompt_tokens, state.total_completion_tokens
                     ),
                 ),
-                ("cost", format!("${:.4}", state.total_session_cost)),
+                (
+                    "cost",
+                    crate::cli::session::session_stats_scan::format_optional_cost(
+                        state.total_session_cost,
+                    ),
+                ),
             ];
             if !sid.is_empty() {
                 match crate::cli::session::session_stats_scan::read_session_journal_for_stats(&sid)
@@ -1626,101 +1835,18 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
         }
 
         "cost" => {
-            let pricing = &state.cached_pricing;
-            let cost = crate::cli::slash::slash_stats::cost_for_tokens(
-                state.total_prompt_tokens,
-                state.total_completion_tokens,
-                state.total_cache_read_tokens,
-                state.total_cache_creation_tokens,
-                pricing,
-            );
-            let mut pairs: Vec<(&str, String)> = vec![
-                (
-                    "model",
-                    state.model.clone().unwrap_or_else(|| "<unset>".into()),
-                ),
-                (
-                    "rates",
-                    format!(
-                        "${:.3}/1M prompt, ${:.3}/1M completion",
-                        pricing.prompt * 1_000_000.0,
-                        pricing.completion * 1_000_000.0
-                    ),
-                ),
-                (
-                    "prompt",
-                    format!(
-                        "{} ({})",
-                        state.total_prompt_tokens,
-                        crate::cli::slash::slash_stats::format_cost(
-                            state.total_prompt_tokens as f64 * pricing.prompt
-                        )
-                    ),
-                ),
-                (
-                    "completion",
-                    format!(
-                        "{} ({})",
-                        state.total_completion_tokens,
-                        crate::cli::slash::slash_stats::format_cost(
-                            state.total_completion_tokens as f64 * pricing.completion
-                        )
-                    ),
-                ),
-            ];
-            if state.total_cache_read_tokens > 0 {
-                let rate = pricing.cache_read.unwrap_or(pricing.prompt);
-                pairs.push((
-                    "cache read",
-                    format!(
-                        "{} ({})",
-                        state.total_cache_read_tokens,
-                        crate::cli::slash::slash_stats::format_cost(
-                            state.total_cache_read_tokens as f64 * rate
-                        )
-                    ),
-                ));
-            }
-            pairs.push(("total", crate::cli::slash::slash_stats::format_cost(cost)));
-            if state.turn > 0 {
-                pairs.push((
-                    "avg/turn",
-                    crate::cli::slash::slash_stats::format_cost(cost / state.turn as f64),
-                ));
-            }
+            let pairs = crate::cli::session::session_stats_scan::current_rate_cost_rows(state);
             bottom_pane.push_view(Box::new(
-                InfoView::from_key_value("Session Cost", pairs).with_reopen("/stats"),
+                InfoView::from_key_value("Current-rate Cost Scenario", pairs).with_reopen("/stats"),
             ));
         }
 
         "learn" => {
             let mut pairs: Vec<(&str, String)> = Vec::new();
-            // Entity graph + pattern library panes removed along with the
-            // self-evolution subsystem. Skill quality + drift metrics remain.
-            pairs.push((
-                "skills tracked",
-                state.skill_quality_tracker.all_entries().len().to_string(),
-            ));
-            if !state.drift_user_corrections.is_empty() {
-                pairs.push((
-                    "corrections",
-                    state.drift_user_corrections.len().to_string(),
-                ));
-            }
-            if !state.drift_compressed_turns.is_empty() {
-                pairs.push((
-                    "compactions",
-                    state.drift_compressed_turns.len().to_string(),
-                ));
-            }
             if let Some(ref q) = state.drift_original_query {
                 let short: String = q.chars().take(50).collect();
                 pairs.push(("original query", short));
             }
-            pairs.push((
-                "discovered skills",
-                state.discovered_skills.len().to_string(),
-            ));
             if pairs.is_empty() {
                 pairs.push(("status", "No learning data yet.".into()));
             }
@@ -1844,10 +1970,208 @@ fn split_sub(text: &str) -> (&str, &str) {
     }
 }
 
-fn handle_mcp_dispatch(args: &str, ctx: &mut DispatchContext<'_>) -> SlashResult {
-    use crate::cli::slash::slash_mcp::ParsedMcpCommand as Cmd;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParsedMcpCommand<'a> {
+    Help,
+    Overview,
+    Servers,
+    Tools(Option<&'a str>),
+    Prompts,
+    Resources,
+    Read(Option<&'a str>),
+    History,
+    Inspect(Option<&'a str>),
+    Add(Option<&'a str>),
+    Remove(Option<&'a str>),
+    Subscribe(Option<&'a str>),
+    Unsubscribe(Option<&'a str>),
+    LogLevel(Option<&'a str>),
+    Prompt(Option<&'a str>),
+    Complete(Option<&'a str>),
+    Ping(Option<&'a str>),
+    Unknown(&'a str),
+}
 
-    let action = match crate::cli::slash::slash_mcp::parse_mcp_command(args) {
+fn split_mcp_subcommand(text: &str) -> (&str, &str) {
+    let trimmed = text.trim();
+    match trimmed.find(char::is_whitespace) {
+        Some(pos) => (&trimmed[..pos], trimmed[pos..].trim()),
+        None => (trimmed, ""),
+    }
+}
+
+pub(crate) fn parse_mcp_command(arg: &str) -> ParsedMcpCommand<'_> {
+    let trimmed = arg.trim();
+    if trimmed.is_empty() {
+        return ParsedMcpCommand::Help;
+    }
+
+    let (sub, rest) = split_mcp_subcommand(trimmed);
+    match sub {
+        "help" => ParsedMcpCommand::Help,
+        "status" => ParsedMcpCommand::Overview,
+        "list" => {
+            if rest.is_empty() {
+                ParsedMcpCommand::Overview
+            } else {
+                let (category, tail) = split_mcp_subcommand(rest);
+                match category {
+                    "status" => ParsedMcpCommand::Overview,
+                    "servers" => {
+                        if tail.is_empty() {
+                            ParsedMcpCommand::Servers
+                        } else {
+                            ParsedMcpCommand::Unknown(trimmed)
+                        }
+                    }
+                    "tools" => ParsedMcpCommand::Tools((!tail.is_empty()).then_some(tail)),
+                    "prompts" => {
+                        if tail.is_empty() {
+                            ParsedMcpCommand::Prompts
+                        } else {
+                            ParsedMcpCommand::Unknown(trimmed)
+                        }
+                    }
+                    "resources" => {
+                        if tail.is_empty() {
+                            ParsedMcpCommand::Resources
+                        } else {
+                            ParsedMcpCommand::Unknown(trimmed)
+                        }
+                    }
+                    _ => ParsedMcpCommand::Unknown(trimmed),
+                }
+            }
+        }
+        "servers" => ParsedMcpCommand::Servers,
+        "tools" => ParsedMcpCommand::Tools((!rest.is_empty()).then_some(rest)),
+        "prompts" => ParsedMcpCommand::Prompts,
+        "resources" => ParsedMcpCommand::Resources,
+        "resource" | "read" => ParsedMcpCommand::Read((!rest.is_empty()).then_some(rest)),
+        "history" => ParsedMcpCommand::History,
+        "inspect" => ParsedMcpCommand::Inspect((!rest.is_empty()).then_some(rest)),
+        "add" => ParsedMcpCommand::Add((!rest.is_empty()).then_some(rest)),
+        "remove" => ParsedMcpCommand::Remove((!rest.is_empty()).then_some(rest)),
+        "subscribe" => ParsedMcpCommand::Subscribe((!rest.is_empty()).then_some(rest)),
+        "unsubscribe" => ParsedMcpCommand::Unsubscribe((!rest.is_empty()).then_some(rest)),
+        "log-level" => ParsedMcpCommand::LogLevel((!rest.is_empty()).then_some(rest)),
+        "prompt" => ParsedMcpCommand::Prompt((!rest.is_empty()).then_some(rest)),
+        "complete" => ParsedMcpCommand::Complete((!rest.is_empty()).then_some(rest)),
+        "ping" => ParsedMcpCommand::Ping((!rest.is_empty()).then_some(rest)),
+        _ => ParsedMcpCommand::Unknown(trimmed),
+    }
+}
+
+/// Build dynamic subcommand completions for `/mcp` from the live MCP manager.
+///
+/// Returns `(subcommand_suffix, description)` pairs that are injected into the
+/// slash menu's `extra_subcommands` so the user gets real server/tool names
+/// when they type `/mcp ` and press Tab. For example:
+///
+///   `("inspect github:list_prs",  "github · list_prs")`
+///   `("tools github",             "Tools on github")`
+///   `("ping github",              "Ping github")`
+///
+/// This feeds the interactive workbench, so it only lists operations that
+/// the TUI can actually carry out. Configuration mutations unsupported by the workbench are
+/// intentionally absent instead of leading users into an unavailable action.
+pub(crate) fn build_mcp_extra_subcommands(
+    manager: &crate::mcp_client::McpClientManager,
+) -> Vec<(String, String)> {
+    let servers: Vec<&str> = manager.connected_servers();
+    let mut items = workbench_server_completions(servers);
+
+    // Per tool: inspect <server>:<tool>
+    for (server, tool) in manager.all_tools() {
+        items.push((
+            format!("inspect {server}:{}", tool.name),
+            format!("{server} · {}", tool.name),
+        ));
+    }
+
+    items
+}
+
+fn workbench_server_completions<'a>(
+    servers: impl IntoIterator<Item = &'a str>,
+) -> Vec<(String, String)> {
+    let mut items = Vec::new();
+    for server in servers {
+        items.push((format!("tools {server}"), format!("Tools on {server}")));
+        items.push((format!("ping {server}"), format!("Ping {server}")));
+    }
+    items
+}
+
+pub(crate) fn resolve_protocol_tool_query<'a>(
+    manager: &'a crate::mcp_client::McpClientManager,
+    query: &str,
+) -> Result<(&'a str, &'a rmcp::model::Tool), String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("Usage: /mcp inspect <server>:<tool>  ·  try `/mcp tools` first.".into());
+    }
+
+    if let Some((server, tool_name)) = query.split_once(':') {
+        if let Some((resolved_server, tool)) = manager
+            .all_tools()
+            .into_iter()
+            .find(|(resolved_server, tool)| *resolved_server == server && tool.name == tool_name)
+        {
+            return Ok((resolved_server, tool));
+        }
+        if manager.get(server).is_none() {
+            return Err(format!(
+                "Server '{server}' not found. Try `/mcp list` or `/mcp servers`."
+            ));
+        }
+        return Err(format!(
+            "Tool '{tool_name}' not found on server '{server}'. Try `/mcp tools {server}`."
+        ));
+    }
+
+    let exact: Vec<(&str, &rmcp::model::Tool)> = manager
+        .all_tools()
+        .into_iter()
+        .filter(|(_, tool)| tool.name == query)
+        .collect();
+    match exact.len() {
+        1 => return Ok(exact[0]),
+        n if n > 1 => {
+            let locations = exact
+                .iter()
+                .map(|(server, _)| (*server).to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "Tool '{query}' exists on multiple servers ({locations}). Use `/mcp inspect <server>:<tool>`."
+            ));
+        }
+        _ => {}
+    }
+
+    let sanitized: Vec<(&str, &rmcp::model::Tool)> = manager
+        .all_tools()
+        .into_iter()
+        .filter(|(server, tool)| {
+            crate::mcp_client::sanitize_tool_name(&format!("mcp__{server}__{}", tool.name)) == query
+        })
+        .collect();
+    match sanitized.len() {
+        1 => Ok(sanitized[0]),
+        n if n > 1 => Err(format!(
+            "Tool id '{query}' is ambiguous across {n} servers. Use `/mcp inspect <server>:<tool>`."
+        )),
+        _ => Err(format!(
+            "Tool '{query}' not found. Try `/mcp tools` or `/mcp tools <server>`."
+        )),
+    }
+}
+
+fn handle_mcp_dispatch(args: &str, ctx: &mut DispatchContext<'_>) -> SlashResult {
+    use ParsedMcpCommand as Cmd;
+
+    let action = match parse_mcp_command(args) {
         Cmd::Help => McpReadAction::Help,
         Cmd::Overview => McpReadAction::Overview,
         Cmd::Servers => McpReadAction::Servers,
@@ -2348,7 +2672,7 @@ fn mcp_builtin_tool_text(meta: &astra_turn_core::tool::registry::meta::ToolMeta)
 
 async fn mcp_inspect_text(manager: &McpManagerHandle, query: &str) -> String {
     let manager = manager.read().await;
-    match crate::cli::slash::slash_mcp::resolve_protocol_tool_query(&manager, query) {
+    match resolve_protocol_tool_query(&manager, query) {
         Ok((server, tool)) => mcp_protocol_tool_text(server, tool),
         Err(protocol_error) => {
             for meta in astra_turn_core::tool::registry::meta::TOOL_CATALOG {
@@ -2358,6 +2682,59 @@ async fn mcp_inspect_text(manager: &McpManagerHandle, query: &str) -> String {
             }
             protocol_error
         }
+    }
+}
+
+#[cfg(test)]
+mod mcp_command_tests {
+    use super::{ParsedMcpCommand, parse_mcp_command, workbench_server_completions};
+
+    #[test]
+    fn parse_mcp_command_defaults_to_help() {
+        assert_eq!(parse_mcp_command(""), ParsedMcpCommand::Help);
+        assert_eq!(parse_mcp_command("help"), ParsedMcpCommand::Help);
+    }
+
+    #[test]
+    fn parse_mcp_command_supports_list_aliases() {
+        assert_eq!(parse_mcp_command("list"), ParsedMcpCommand::Overview);
+        assert_eq!(parse_mcp_command("status"), ParsedMcpCommand::Overview);
+        assert_eq!(
+            parse_mcp_command("list tools github"),
+            ParsedMcpCommand::Tools(Some("github"))
+        );
+        assert_eq!(parse_mcp_command("list prompts"), ParsedMcpCommand::Prompts);
+        assert_eq!(
+            parse_mcp_command("list resources"),
+            ParsedMcpCommand::Resources
+        );
+    }
+
+    #[test]
+    fn parse_mcp_command_supports_read_alias() {
+        assert_eq!(
+            parse_mcp_command("read github:file:///README.md"),
+            ParsedMcpCommand::Read(Some("github:file:///README.md"))
+        );
+        assert_eq!(
+            parse_mcp_command("resource github:file:///README.md"),
+            ParsedMcpCommand::Read(Some("github:file:///README.md"))
+        );
+    }
+
+    #[test]
+    fn workbench_completions_only_offer_supported_server_actions() {
+        let entries = workbench_server_completions(["github"]);
+        let names = entries
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["tools github", "ping github"]);
+        assert!(
+            !names
+                .iter()
+                .any(|name| matches!(*name, "remove github" | "log-level github"))
+        );
     }
 }
 
@@ -2520,7 +2897,11 @@ fn keyboard_shortcut_pairs() -> Vec<(&'static str, String)> {
     vec![
         (
             "Enter",
-            "send a message or run the selected slash action".into(),
+            "send a message; guide the active run when admission permits; run the selected slash action".into(),
+        ),
+        (
+            "Ctrl+Q",
+            "queue conversational input for the next turn while working; send normally when idle".into(),
         ),
         ("Shift+Enter", "insert a newline in the composer".into()),
         (
@@ -2602,7 +2983,7 @@ pub(crate) fn is_model_picker_request(text: &str) -> bool {
 /// Build the model picker view from a fetched model list and push it.
 ///
 /// This is deliberately a synchronous UI projection: networking belongs to
-/// [`load_model_catalog`], so callers never have to hold the TUI loop while
+/// the captured auth transport, so callers never have to hold the TUI loop while
 /// waiting for a remote catalog.
 pub(crate) fn push_model_picker(
     state: &SessionState,
@@ -2613,7 +2994,11 @@ pub(crate) fn push_model_picker(
     // Strip any `-thinking:*` suffix from the cached model when
     // highlighting the current row — the picker shows base names only,
     // and the suffix is re-applied by the thinking stage.
-    let current_raw = state.model.clone().unwrap_or_default();
+    let current_raw = state
+        .model
+        .as_deref()
+        .map(str::to_string)
+        .unwrap_or_default();
     let current_base = current_raw
         .split_once("-thinking:")
         .map(|(b, _)| b.to_string())
@@ -2647,74 +3032,102 @@ pub(crate) fn push_model_picker(
     }
 }
 
-fn model_catalog_error_message(
-    error: &crate::cli::slash::slash_router::ModelCatalogError,
-) -> String {
-    if error.is_authentication_failure() {
-        "Not authorized — try /login first".into()
-    } else if error.is_transport_failure() {
-        "Cannot reach server — check connection".into()
-    } else {
-        format!(
-            "Failed to fetch models: {}",
-            error.to_string().lines().next().unwrap_or("unknown error")
-        )
-    }
-}
-
-/// Fetch the full active model catalog, including provider and thinking
-/// metadata. The caller owns scheduling; this function is free of TUI
-/// references so it can run outside the input event loop.
-pub(crate) async fn load_model_catalog(
-    api: astra_thin_client::ThinClient,
-    profile: Option<String>,
-) -> Result<Vec<crate::cli::slash::slash_router::ModelCatalogEntry>, String> {
-    let token =
-        crate::cli::session::session_runtime::fresh_access_token(&api, profile.as_deref()).await;
-    match crate::cli::slash::slash_router::fetch_model_catalog(&api, token.as_deref()).await {
-        Ok(models) => Ok(models),
-        Err(error) => {
-            if !error.is_authentication_failure() {
-                return Err(model_catalog_error_message(&error));
-            }
-
-            if crate::cli::session::session_runtime::attempt_token_refresh(&api, profile.as_deref())
-                .await
-            {
-                let refreshed =
-                    crate::cli::session::session_runtime::current_access_token(profile.as_deref());
-                match crate::cli::slash::slash_router::fetch_model_catalog(
-                    &api,
-                    refreshed.as_deref(),
-                )
-                .await
-                {
-                    Ok(models) => return Ok(models),
-                    Err(retry_error) => {
-                        if !retry_error.is_authentication_failure() {
-                            return Err(model_catalog_error_message(&retry_error));
-                        }
-                    }
-                }
-            }
-            Err("Not authorized — try /login first".into())
+/// Consume both picker stages against the current authorized snapshot.
+/// `Some(true)` keeps a thinking picker open; `Some(false)` settles the modal.
+pub(crate) fn apply_model_picker_result(
+    result: &ViewResult,
+    state: &mut SessionState,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut crate::tui::chat_widget::ChatWidget,
+) -> Option<bool> {
+    let (base_model, config) = match result {
+        ViewResult::Model { name } => (name, None),
+        ViewResult::ModelThinking { base_model, config } => (base_model, Some(config)),
+        _ => return None,
+    };
+    let entry = crate::cli::session::session_runtime::find_model_entry_by_name(
+        bottom_pane.current_model_catalog(),
+        base_model,
+    );
+    let resolved = entry.and_then(|entry| {
+        crate::cli::session::session_runtime::model_selection_from_list_entry(entry)
+            .map(|selection| (entry, selection))
+    });
+    let Some((entry, mut selection)) = resolved else {
+        chat_widget.commit_system(SystemCell::error(
+            "Selected model is no longer available in this account's catalog. Reopen /model.",
+        ));
+        return Some(false);
+    };
+    let opts = astra_turn_core::thinking_config::thinking_options(
+        (!entry.provider.trim().is_empty()).then_some(entry.provider.trim()),
+        entry.thinking_capability.map(|value| value.as_str()),
+        entry.thinking_protocol.unwrap_or_default(),
+    );
+    if let Some(config) = config {
+        if !opts.iter().any(|option| &option.config == config) {
+            chat_widget.commit_system(SystemCell::error(
+                "Selected thinking mode is no longer supported. Reopen /model.",
+            ));
+            return Some(false);
         }
+    } else if !opts.is_empty() {
+        let items = opts
+            .iter()
+            .map(|option| SelectionItem {
+                name: option.label.into(),
+                description: None,
+                is_current: option.is_default,
+            })
+            .collect();
+        bottom_pane.push_view(Box::new(
+            ListSelectionView::new(
+                items,
+                Some(format!("Select thinking mode for {base_model}:")),
+            )
+            .with_footer_hint(MODEL_THINKING_PICKER_FOOTER_HINT)
+            .with_results(
+                opts.into_iter()
+                    .map(|option| ViewResult::ModelThinking {
+                        base_model: base_model.clone(),
+                        config: option.config,
+                    })
+                    .collect(),
+            ),
+        ));
+        return Some(true);
     }
+    let suffix = config
+        .map(astra_turn_core::thinking_config::thinking_suffix_for)
+        .unwrap_or_default();
+    let name = format!("{base_model}{suffix}");
+    selection.name = name.clone();
+    state.cli_context.select_model(Some(&name));
+    state.model = Some(crate::cli::session::session_state::SessionModelChoice::Selected(selection));
+    bottom_pane.footer.model = Some(name.clone());
+    chat_widget.commit_system(SystemCell::response(format!("Set model to {name}")));
+    Some(false)
 }
 
 async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
-    match load_model_catalog(ctx.api.clone(), ctx.profile.map(str::to_string)).await {
+    let Some(token) =
+        crate::cli::session::session_runtime::fresh_access_token(ctx.api, ctx.profile).await
+    else {
+        ctx.show_error("Not logged in. Use /login.".into());
+        return SlashResult::Handled;
+    };
+    match crate::cli::session::session_runtime::fetch_model_catalog(ctx.api, Some(&token)).await {
         Ok(models) => {
             let names = models
                 .iter()
-                .filter_map(crate::cli::slash::slash_router::entry_model_name)
+                .filter_map(crate::cli::session::session_runtime::model_list_entry_name)
                 .map(ToOwned::to_owned)
                 .collect();
             if push_model_picker(ctx.state, ctx.bottom_pane, ctx.chat_widget, names) {
                 return SlashResult::Deferred;
             }
         }
-        Err(error) => ctx.show_error(error),
+        Err(error) => ctx.show_error(error.to_string()),
     }
     SlashResult::Handled
 }
@@ -2727,16 +3140,14 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
         return;
     }
     let Some(name) = crate::cli::cli_config::cli_utils::normalize_model_override(Some(name)) else {
+        ctx.state.cli_context.select_model(None);
         ctx.state.model = None;
-        crate::cli::slash::slash_config::set_active_model_for_display(None);
-        crate::cli::slash::slash_config::set_active_offering_id_for_request(None);
         ctx.bottom_pane.footer.model = None;
         ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
         return;
     };
-    ctx.state.model = Some(name.to_string());
-    crate::cli::slash::slash_config::set_active_model_for_display(Some(name.to_string()));
-    crate::cli::slash::slash_config::set_active_offering_id_for_request(None);
+    ctx.state.cli_context.select_model(Some(name));
+    ctx.state.model = Some((name.to_string()).into());
     ctx.bottom_pane.footer.model = Some(name.to_string());
     ctx.show_response(format!("Set model to {name}"));
 }
@@ -2744,9 +3155,8 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
 /// `/model clear` — unset the session model. Reports the change to
 /// scrollback so the user sees the footer switch.
 async fn handle_model_clear(ctx: &mut DispatchContext<'_>) -> SlashResult {
+    ctx.state.cli_context.select_model(None);
     ctx.state.model = None;
-    crate::cli::slash::slash_config::set_active_model_for_display(None);
-    crate::cli::slash::slash_config::set_active_offering_id_for_request(None);
     ctx.bottom_pane.footer.model = None;
     ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
     SlashResult::Handled
@@ -2759,7 +3169,7 @@ async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashRes
     use crate::tui::bottom_pane::info_view::InfoView;
 
     let target = if arg.is_empty() {
-        ctx.state.model.clone()
+        ctx.state.model.as_deref().map(str::to_string)
     } else {
         Some(arg.trim().to_string())
     };
@@ -2771,23 +3181,57 @@ async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashRes
     // Prefer the cached pricing the session already carries so
     // `/model info` is instant — live refetch happens when the user
     // explicitly opens the `/model` picker.
-    let pricing = &ctx.state.cached_pricing;
-    let prompt_usd = if pricing.prompt > 0.0 {
-        format!("${:.3} / 1M tokens", pricing.prompt * 1_000_000.0)
+    let selection = if ctx.state.model.as_deref() == Some(name.as_str()) {
+        ctx.state.model.as_ref().and_then(|model| match model {
+            crate::cli::session::session_state::SessionModelChoice::Selected(selection) => {
+                Some(selection.clone())
+            }
+            _ => None,
+        })
+    } else {
+        None
+    };
+    let selection = match selection {
+        Some(selection) => Some(selection),
+        None => {
+            match crate::cli::session::session_runtime::fresh_access_token(ctx.api, ctx.profile)
+                .await
+            {
+                Some(token) => {
+                    crate::cli::session::session_runtime::fetch_model_catalog(ctx.api, Some(&token))
+                        .await
+                        .ok()
+                        .and_then(|models| {
+                            crate::cli::session::session_runtime::find_model_entry_by_name(
+                    &models,
+                    astra_turn_core::thinking_config::resolve_model_thinking(&name).0,
+                )
+                .and_then(crate::cli::session::session_runtime::model_selection_from_list_entry)
+                        })
+                }
+                None => None,
+            }
+        }
+    };
+    let pricing = selection
+        .as_ref()
+        .and_then(|selection| selection.pricing.as_ref());
+    let prompt_usd = if let Some(price) = pricing {
+        format!("${:.3} / 1M tokens", price.prompt * 1_000_000.0)
     } else {
         "— (not cached)".into()
     };
-    let completion_usd = if pricing.completion > 0.0 {
-        format!("${:.3} / 1M tokens", pricing.completion * 1_000_000.0)
+    let completion_usd = if let Some(price) = pricing {
+        format!("${:.3} / 1M tokens", price.completion * 1_000_000.0)
     } else {
         "— (not cached)".into()
     };
     let cache_read = pricing
-        .cache_read
+        .and_then(|price| price.cache_read)
         .map(|v| format!("${:.3} / 1M", v * 1_000_000.0))
         .unwrap_or_else(|| "—".into());
     let cache_write = pricing
-        .cache_write
+        .and_then(|price| price.cache_write)
         .map(|v| format!("${:.3} / 1M", v * 1_000_000.0))
         .unwrap_or_else(|| "—".into());
 
@@ -2828,7 +3272,9 @@ async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashRes
         ("session total tokens", fmt_tokens(cumulative_tokens)),
         (
             "session cost",
-            format!("${:.4}", ctx.state.total_session_cost),
+            crate::cli::session::session_stats_scan::format_optional_cost(
+                ctx.state.total_session_cost,
+            ),
         ),
     ];
     ctx.open_view(
@@ -2862,7 +3308,7 @@ pub(crate) struct SessionHubSnapshot {
     pending_recovery: Option<String>,
     turn: u32,
     model: String,
-    total_cost: f64,
+    total_cost: Option<f64>,
     prompt_tokens: u64,
     completion_tokens: u64,
     cache_read_tokens: u64,
@@ -2891,7 +3337,11 @@ pub(crate) fn session_hub_snapshot(state: &SessionState) -> SessionHubSnapshot {
         session_id: state.session_id.clone().unwrap_or_default(),
         pending_recovery: state.pending_recovery.clone(),
         turn: state.turn,
-        model: state.model.clone().unwrap_or_else(|| "—".into()),
+        model: state
+            .model
+            .as_deref()
+            .map(str::to_string)
+            .unwrap_or_else(|| "—".into()),
         total_cost: state.total_session_cost,
         prompt_tokens: state.total_prompt_tokens,
         completion_tokens: state.total_completion_tokens,
@@ -2927,9 +3377,19 @@ pub(crate) fn active_run_concurrent_read(
     text: &str,
     session_snapshot: &SessionHubSnapshot,
 ) -> Option<SlashBackgroundRead> {
-    (text.trim() == "/session").then(|| SlashBackgroundRead::SessionHub {
-        snapshot: Box::new(session_snapshot.clone()),
-    })
+    match text.trim() {
+        "/session" => Some(SlashBackgroundRead::SessionHub {
+            snapshot: Box::new(session_snapshot.clone()),
+        }),
+        _ => None,
+    }
+}
+
+/// `/tasks` is a local navigation action and remains safe while a model turn
+/// is active. The event loop opens the already-owned registry directly so a
+/// user never has to send a control command as model guidance.
+pub(crate) fn active_run_opens_background_tasks(text: &str) -> bool {
+    text.trim() == "/tasks"
 }
 
 /// Build the session hub after its workspace read finishes. All live state was
@@ -3008,7 +3468,10 @@ pub(crate) fn session_hub_view(
     }
 
     // Live state
-    pairs.push(("cost", format!("${:.4}", snapshot.total_cost)));
+    pairs.push((
+        "cost",
+        crate::cli::session::session_stats_scan::format_optional_cost(snapshot.total_cost),
+    ));
     pairs.push(("prompt tokens", fmt_tokens(snapshot.prompt_tokens)));
     pairs.push(("completion tokens", fmt_tokens(snapshot.completion_tokens)));
     pairs.push(("cache-read tokens", fmt_tokens(snapshot.cache_read_tokens)));
@@ -3345,7 +3808,7 @@ fn handle_inspect_dispatch(args: &str, ctx: &mut DispatchContext<'_>) -> SlashRe
     }
 
     use crate::tui::bottom_pane::info_view::InfoView;
-    let inspection = crate::cli::slash::slash_inspect::inspect_workbench(ctx.state);
+    let inspection = crate::tui::inspection::inspect_workbench(ctx.state);
     ctx.open_view(
         "Opened runtime inspector",
         Box::new(
@@ -3398,14 +3861,16 @@ fn handle_reflect_dispatch(args: &str, ctx: &mut DispatchContext<'_>) -> SlashRe
 #[cfg(test)]
 mod routing_tests {
     use super::{
-        CONTEXT_USAGE_MESSAGE, ConfigCommandRoute, HelpCommandRoute, HistoryCommandRoute,
-        MODEL_PICKER_FOOTER_HINT, MODEL_THINKING_PICKER_FOOTER_HINT, MemoryCommandRoute,
-        SkillCommandRoute, WorkCommandRoute, config_command_route, context_breakdown_for_panel,
-        context_dump_argument, help_command_route, history_command_route, is_model_picker_request,
-        keyboard_shortcut_pairs, memory_command_route, skill_command_route, work_command_route,
+        BackgroundTasksCommandRoute, CONTEXT_USAGE_MESSAGE, ConfigCommandRoute, HelpCommandRoute,
+        HistoryCommandRoute, MODEL_PICKER_FOOTER_HINT, MODEL_THINKING_PICKER_FOOTER_HINT,
+        MemoryCommandRoute, SkillCommandRoute, WorkCommandRoute, background_tasks_command_route,
+        config_command_route, context_breakdown_for_panel, context_dump_argument,
+        explain_command_for_command, explain_mode_for_command, help_command_route,
+        history_command_route, is_model_picker_request, keyboard_shortcut_pairs,
+        memory_command_route, skill_command_route, work_command_route,
     };
     use crate::cli::command_registry;
-    use crate::cli::session::session_state::SessionState;
+    use crate::cli::session::session_state::{ExplainMode, SessionState};
     use crate::tui::context_panel::{
         ContextSnapshot,
         model::{SessionSummary, VisibleConversationItem},
@@ -3446,6 +3911,9 @@ mod routing_tests {
         );
 
         let bindings = keyboard_shortcut_pairs();
+        assert!(bindings.iter().any(|(key, hint)| {
+            *key == "Ctrl+Q" && hint.contains("next turn") && hint.contains("idle")
+        }));
         assert!(bindings.iter().any(|(key, _)| *key == "Ctrl+O"));
         assert!(bindings.iter().any(|(key, _)| *key == "Ctrl+G"));
         assert!(bindings.iter().any(|(key, _)| *key == "Ctrl+E"));
@@ -3526,12 +3994,18 @@ mod routing_tests {
     }
 
     #[test]
-    fn work_route_has_one_explicit_read_only_execution_surface() {
-        assert_eq!(work_command_route(""), WorkCommandRoute::Tasks);
+    fn work_route_separates_catalog_from_current_session_tasks() {
+        assert_eq!(work_command_route(""), WorkCommandRoute::Catalog);
+        assert_eq!(work_command_route("list"), WorkCommandRoute::Catalog);
         assert_eq!(work_command_route("status"), WorkCommandRoute::Tasks);
         assert_eq!(
             work_command_route(" execution "),
             WorkCommandRoute::Execution
+        );
+        assert_eq!(work_command_route("save"), WorkCommandRoute::SaveProgress);
+        assert_eq!(
+            work_command_route(" checkpoint "),
+            WorkCommandRoute::SaveProgress
         );
         assert_eq!(
             work_command_route("start ship the durable flow"),
@@ -3539,13 +4013,65 @@ mod routing_tests {
         );
         assert_eq!(work_command_route("start"), WorkCommandRoute::MissingGoal);
         assert_eq!(
+            work_command_route("continue work-1 ship the next step"),
+            WorkCommandRoute::Continue {
+                work_id: "work-1".into(),
+                message: "ship the next step".into(),
+            }
+        );
+        assert_eq!(
+            work_command_route("continue work-1"),
+            WorkCommandRoute::MissingContinueInput
+        );
+        assert_eq!(
+            work_command_route("continue"),
+            WorkCommandRoute::MissingContinueInput
+        );
+        assert_eq!(
+            work_command_route("retry"),
+            WorkCommandRoute::MissingRetryInput
+        );
+        assert_eq!(
+            work_command_route("retry tui-work-turn-1"),
+            WorkCommandRoute::Retry("tui-work-turn-1".into())
+        );
+        assert_eq!(
             work_command_route("execution extra"),
             WorkCommandRoute::Unsupported
         );
+    }
+
+    #[test]
+    fn explain_route_matches_the_shared_slash_contract() {
+        assert_eq!(explain_mode_for_command(""), Ok(ExplainMode::On));
+        assert_eq!(explain_mode_for_command("on"), Ok(ExplainMode::On));
         assert_eq!(
-            work_command_route("list"),
-            WorkCommandRoute::Unsupported,
-            "the old list alias adds no distinct TUI behavior"
+            explain_mode_for_command("verbose"),
+            Ok(ExplainMode::Verbose)
+        );
+        assert_eq!(explain_mode_for_command("off"), Ok(ExplainMode::Off));
+        assert!(explain_mode_for_command("typo").is_err());
+        let command = explain_command_for_command("--format html").unwrap();
+        assert_eq!(command.mode, None);
+        assert_eq!(
+            command.report_format,
+            Some(astra_config::runtime_config::ExplainReportFormat::Html)
+        );
+    }
+
+    #[test]
+    fn tasks_route_only_accepts_the_root_form() {
+        assert_eq!(
+            background_tasks_command_route(""),
+            BackgroundTasksCommandRoute::Open
+        );
+        assert_eq!(
+            background_tasks_command_route("   "),
+            BackgroundTasksCommandRoute::Open
+        );
+        assert_eq!(
+            background_tasks_command_route("list"),
+            BackgroundTasksCommandRoute::Unsupported
         );
     }
 
@@ -3587,19 +4113,24 @@ mod routing_tests {
     #[test]
     fn context_panel_uses_committed_trace_when_observability_ring_is_empty() {
         let mut state = SessionState::default();
-        state.latest_context_assembly_trace = Some(ContextAssemblyTrace {
-            turn_id: "turn-7".into(),
-            token_budget: astra_turn_core::context_assembly_trace::TokenBudgetTrace {
-                max_tokens: 100_000,
-                system_prompt_tokens: 5_000,
-                history_tokens: 12_000,
-                tool_schema_tokens: 3_000,
-                user_message_tokens: 200,
-                total_used: 20_200,
-                ..Default::default()
+        state.latest_context_assembly_trace = Some(
+            crate::cli::session::session_state::LocalContextAssemblyTrace {
+                local_turn: 7,
+                trace: ContextAssemblyTrace {
+                    turn_id: "turn-7".into(),
+                    token_budget: astra_turn_core::context_assembly_trace::TokenBudgetTrace {
+                        max_tokens: 100_000,
+                        system_prompt_tokens: 5_000,
+                        history_tokens: 12_000,
+                        tool_schema_tokens: 3_000,
+                        user_message_tokens: 200,
+                        total_used: 20_200,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
             },
-            ..Default::default()
-        });
+        );
         let mut snapshot = ContextSnapshot::default();
 
         let breakdown = context_breakdown_for_panel(&state, &mut snapshot);
@@ -3627,7 +4158,7 @@ mod routing_tests {
             session_id: "session-context".into(),
             turn: 3,
             model: Some("model-x".into()),
-            total_cost: 0.01,
+            total_cost: Some(0.01),
             prompt_tokens: 1_200,
             completion_tokens: 600,
             cache_read_tokens: 0,
@@ -3650,7 +4181,7 @@ mod routing_tests {
         assert_eq!(breakdown.limit, 0, "do not fabricate a prompt budget");
         assert!(breakdown.categories.is_empty());
         assert!(breakdown.session_summary.is_some());
-        assert_eq!(breakdown.history.retained, 1);
+        assert_eq!(breakdown.history.turns.len(), 1);
         assert_eq!(breakdown.history.turns[0].preview, "first request");
         assert!(breakdown.has_observable_data());
     }
@@ -3722,6 +4253,7 @@ mod context_history_tests {
                 ts: None,
                 level: SystemLevel::Info,
                 text: "system note should not appear in context history".into(),
+                link: None,
             },
             TurnEvent::Assistant {
                 ts: None,
@@ -4005,7 +4537,7 @@ mod view_result_tests {
     #[test]
     fn memory_selection_opens_the_observed_record_without_mutating_model() {
         let mut state = SessionState::default();
-        state.model = Some("deepseek-v4-pro".to_string());
+        state.model = Some(("deepseek-v4-pro".to_string()).into());
         let mut bottom_pane = BottomPane::new();
         bottom_pane.footer.model = Some("deepseek-v4-pro".to_string());
         let mut chat_widget = ChatWidget::new("");
@@ -4201,14 +4733,32 @@ mod stats_view_tests {
 
 #[cfg(test)]
 mod model_catalog_loading_tests {
-    use super::load_model_catalog;
     use crate::cli::cli_config::cli_utils::{
-        CredentialsFile, Profile, load_credentials, save_credentials,
+        CredentialsFile, Profile, cli_owner_auth_snapshot, install_cli_profile_identity_for_test,
+        load_credentials, save_credentials,
     };
+    use crate::cli::session::session_runtime::{ModelCatalogError, fetch_owner_model_catalog};
     use crate::test_utils::ProcessEnvGuard;
     use crate::tests::isolate_credentials;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[derive(Debug)]
+    struct UnrelatedBearer;
+
+    impl astra_thin_client::client::BearerProvider for UnrelatedBearer {
+        fn token(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<String, astra_thin_client::ThinClientError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { panic!("catalog must use its captured credential owner") })
+        }
+    }
 
     fn save_profile(access_token: &str, refresh_token: &str) {
         let mut credentials = CredentialsFile {
@@ -4233,6 +4783,29 @@ mod model_catalog_loading_tests {
         let _credentials = isolate_credentials();
         let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
         save_profile("stale-access", "refresh-old");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("user-id-1"),
+        )
+        .unwrap();
+        let owner = cli_owner_auth_snapshot();
+
+        // A queued catalog retains its owner when selection and environment
+        // credentials change before the worker starts.
+        let mut credentials = load_credentials();
+        credentials.current_profile = Some("other".into());
+        let other = Profile {
+            account_id: Some("other-user".into()),
+            access_token: Some("other-access".into()),
+            refresh_token: Some("other-refresh".into()),
+            ..Default::default()
+        };
+        credentials.profiles.insert("other".into(), other.clone());
+        save_credentials(&credentials).unwrap();
+        let _selected = install_cli_profile_identity_for_test("other", Some("other-user")).unwrap();
+        unsafe {
+            std::env::set_var("ASTRA_ACCESS_TOKEN", "unrelated-env-access");
+        }
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -4244,6 +4817,9 @@ mod model_catalog_loading_tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/auth/refresh"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "refresh_token": "refresh-old"
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "user_id": "user-id-1",
                 "access_token": "fresh-access",
@@ -4279,9 +4855,11 @@ mod model_catalog_loading_tests {
             .expect(1)
             .mount(&server)
             .await;
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None)
+            .unwrap()
+            .with_bearer_provider(std::sync::Arc::new(UnrelatedBearer));
 
-        let models = load_model_catalog(api, None)
+        let models = fetch_owner_model_catalog(&api, &owner)
             .await
             .expect("refreshed catalog");
 
@@ -4291,6 +4869,159 @@ mod model_catalog_loading_tests {
         let profile = credentials.profiles.get("default").unwrap();
         assert_eq!(profile.access_token.as_deref(), Some("fresh-access"));
         assert_eq!(profile.refresh_token.as_deref(), Some("refresh-new"));
+        assert_eq!(credentials.current_profile.as_deref(), Some("other"));
+        let saved_other = &credentials.profiles["other"];
+        assert_eq!(saved_other.account_id, other.account_id);
+        assert_eq!(saved_other.access_token, other.access_token);
+        assert_eq!(saved_other.refresh_token, other.refresh_token);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| (request.method.as_str(), request.url.path()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("GET", "/models"),
+                ("POST", "/auth/refresh"),
+                ("GET", "/models")
+            ]
+        );
+        server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn model_catalog_retries_only_http_401_and_only_once() {
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        for status in [401, 403, 500] {
+            save_profile("stale-access", "refresh-old");
+            let _identity =
+                install_cli_profile_identity_for_test("default", Some("user-id-1")).unwrap();
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/models"))
+                .and(header("authorization", "Bearer stale-access"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("401 expired"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/auth/refresh"))
+                .and(wiremock::matchers::body_json(serde_json::json!({
+                    "refresh_token": "refresh-old"
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user_id": "user-id-1",
+                    "access_token": "fresh-access",
+                    "refresh_token": "refresh-new"
+                })))
+                .expect(u64::from(status == 401))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/models"))
+                .and(header("authorization", "Bearer fresh-access"))
+                .respond_with(ResponseTemplate::new(401))
+                .expect(u64::from(status == 401))
+                .mount(&server)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+            let error = fetch_owner_model_catalog(&api, &cli_owner_auth_snapshot())
+                .await
+                .expect_err("catalog failure must remain visible");
+            assert!(matches!(
+                error,
+                ModelCatalogError::Request(astra_thin_client::ThinClientError::Api {
+                    status: actual,
+                    ..
+                }) if actual.as_u16() == status
+            ));
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                if status == 401 { 3 } else { 1 }
+            );
+            server.verify().await;
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn model_catalog_401_never_borrows_a_replacement_login() {
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        // Re-login with identical account/tokens still replaces the generation.
+        for account in ["user-id-1", "replacement-user"] {
+            save_profile("stale-access", "refresh-old");
+            let _identity =
+                install_cli_profile_identity_for_test("default", Some("user-id-1")).unwrap();
+            let owner = cli_owner_auth_snapshot();
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/models"))
+                .and(header("authorization", "Bearer stale-access"))
+                .respond_with(move |_request: &wiremock::Request| {
+                    crate::cli::auth_flow::save_profile_auth_tokens(
+                        Some("default"),
+                        "replacement-login",
+                        &crate::cli::auth_flow::AuthTokenPayload {
+                            user_id: account.into(),
+                            access_token: "stale-access".into(),
+                            refresh_token: "refresh-old".into(),
+                        },
+                    )
+                    .unwrap();
+                    ResponseTemplate::new(401)
+                })
+                .expect(1)
+                .mount(&server)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+            let error = fetch_owner_model_catalog(&api, &owner)
+                .await
+                .expect_err("replaced login must not authorize catalog retry");
+            assert!(matches!(error, ModelCatalogError::NotAuthenticated));
+            assert!(!owner.legacy_binding.as_ref().unwrap().is_active());
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            let credentials = load_credentials();
+            let saved = &credentials.profiles["default"];
+            assert_eq!(saved.account_id.as_deref(), Some(account));
+            assert_eq!(saved.access_token.as_deref(), Some("stale-access"));
+            assert_eq!(saved.refresh_token.as_deref(), Some("refresh-old"));
+            server.verify().await;
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn model_catalog_deadline_bounds_credential_wait_before_dispatch() {
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        save_profile("valid-access", "refresh-unused");
+        let _identity =
+            install_cli_profile_identity_for_test("default", Some("user-id-1")).unwrap();
+        let owner = cli_owner_auth_snapshot();
+        let _pending_rotation = owner.legacy_binding.as_ref().unwrap().pair.lock().await;
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let catalog = fetch_owner_model_catalog(&api, &owner);
+        tokio::pin!(catalog);
+        tokio::select! {
+            biased;
+            result = &mut catalog => panic!("catalog escaped pending rotation: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        tokio::time::pause();
+        tokio::time::advance(
+            astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT + std::time::Duration::from_secs(1),
+        )
+        .await;
+        let error = catalog.await.expect_err("credential wait must be bounded");
+        tokio::time::resume();
+        assert!(matches!(error, ModelCatalogError::TimedOut));
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[serial_test::serial]
@@ -4299,6 +5030,11 @@ mod model_catalog_loading_tests {
         let _credentials = isolate_credentials();
         let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
         save_profile("valid-access", "refresh-unused");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("user-id-1"),
+        )
+        .unwrap();
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -4312,9 +5048,11 @@ mod model_catalog_loading_tests {
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
-        load_model_catalog(api, None)
+        let error = fetch_owner_model_catalog(&api, &cli_owner_auth_snapshot())
             .await
             .expect_err("invalid catalog shape must fail visibly");
+        assert!(matches!(error, ModelCatalogError::InvalidJson(_)));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
         assert_eq!(
             load_credentials()
                 .profiles
@@ -4322,6 +5060,7 @@ mod model_catalog_loading_tests {
                 .and_then(|profile| profile.access_token.as_deref()),
             Some("valid-access")
         );
+        server.verify().await;
     }
 }
 
@@ -4341,7 +5080,10 @@ mod fmt_tokens_tests {
 
 #[cfg(test)]
 mod session_hub_tests {
-    use super::{SlashBackgroundRead, active_run_concurrent_read, session_hub_persistence_error};
+    use super::{
+        SlashBackgroundRead, active_run_concurrent_read, active_run_opens_background_tasks,
+        session_hub_persistence_error,
+    };
     use crate::cli::session::session_state::SessionState;
     use astra_services::session_workspace::WorkspaceMetadata;
 
@@ -4372,7 +5114,7 @@ mod session_hub_tests {
     }
 
     #[test]
-    fn active_run_executes_only_snapshot_safe_session_overview() {
+    fn active_run_executes_only_snapshot_safe_local_reads() {
         let state = SessionState::default();
         let snapshot = super::session_hub_snapshot(&state);
         assert!(matches!(
@@ -4384,6 +5126,7 @@ mod session_hub_tests {
             "/session history",
             "/session export",
             "/model",
+            "show the current work",
             "/unknown",
         ] {
             assert!(
@@ -4391,5 +5134,12 @@ mod session_hub_tests {
                 "stateful or unknown commands must wait for idle dispatch: {command}"
             );
         }
+    }
+
+    #[test]
+    fn active_run_opens_background_tasks_without_sending_guidance() {
+        assert!(active_run_opens_background_tasks(" /tasks "));
+        assert!(!active_run_opens_background_tasks("/tasks list"));
+        assert!(!active_run_opens_background_tasks("show my tasks"));
     }
 }

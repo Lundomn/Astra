@@ -2,7 +2,7 @@
 
 TypeScript SDK for the Astra agent runtime: JWT auth, sessions, runs, **run list**, **multi-agent delegation**, **session lifecycle** (update / close / resume / cancel / activity), **reflect** and **decision-trace**, **events** (session timeline and causal chains), **edge connection status**, memory, **§5.5** edge callbacks, **SSE** (`POST /chat/stream`), and **WebSocket** (`/chat/ws`).
 
-Supported paths match the currently registered Rust runtime routes and [`astra-thin-client`](../../crates/astra-thin-client/src/paths.rs) (no `/api` prefix by default). Use `pathPrefix` if your gateway mounts the API under a prefix (for example `/api` → `https://host/api/auth/login`). Legacy task/plan/agent-job helpers remain in the clients for source compatibility with older servers, but the current runtime intentionally returns `404` for those routes and they are not runtime capabilities.
+Supported paths match the currently registered Rust runtime routes and [`astra-thin-client`](../../crates/astra-thin-client/src/paths.rs) (no `/api` prefix by default). Use `pathPrefix` if your gateway mounts the API under a prefix (for example `/api` → `https://host/api/auth/login`). Work and Run APIs use the current Server-owned lifecycle. Retired task-lease, task-plan, and agent-job routes are unavailable and are not exposed by this SDK.
 
 **Distribution:** This package is versioned in the Astra monorepo and configured
 as a public scoped npm package. Publishing remains an explicit release action;
@@ -41,7 +41,18 @@ const run = await client.createRun({
 
 `register(username, password, { email?, displayName? })` sends `email`; if omitted, a placeholder `{username}@users.local.astra` is used so the server’s required field is satisfied.
 
+Custom HTTP headers are merged case-insensitively. The current access token
+replaces a configured Authorization header for REST and SSE requests; explicit
+per-request headers retain their override precedence. SSE POST requests preserve
+a custom Content-Type regardless of its casing.
+
 ### Runs, delegation, and session observability
+
+For HTTP chat streaming, `modelSelection: "auto"` opts into the Server's
+configured model-routing policy. Explicit `{ offeringId: "..." }` selection
+keeps its existing behavior. Auto requires a qualified Server-catalog pair;
+provider model gateways and WebSocket chat continue to use explicit Offerings.
+See [model routing](../../docs/design/model-routing.md#deterministic-auto-selection-stage-3).
 
 ```typescript
 // List durable runs (GET /runs)
@@ -73,6 +84,13 @@ await client.updateSession(sessionId, { title: 'Renamed' });
 await client.closeSession(sessionId);
 const activity = await client.getSessionActivity(sessionId, { limit: 50 });
 
+// Cancel execution without deleting history. A pending response is not success:
+// keep showing "Stopping" and repeat this operation until executionSettled.
+const cancellation = await client.cancelSession(sessionId);
+if (!cancellation.executionSettled) {
+  console.log('Stopping; execution is not yet confirmed idle', cancellation.runs);
+}
+
 // Reflect / tool-selection evidence (GET /chat/session/.../reflect | decision-trace)
 const report = await client.getSessionReflect(sessionId, { focus: 'auto', last_n: 20, question: '' });
 
@@ -88,6 +106,14 @@ const { edges } = await client.getEdgesStatus();
 Delegation requires a configured **delegation engine** on the server; otherwise the API returns **503** — the SDK forwards errors as `AstraApiError`.
 
 ### Streaming (SSE)
+
+Calling `SSEClient.close()` or aborting its external signal interrupts a pending
+retry delay and settles `connect()` without another fetch attempt. Explicitly
+calling `connect()` again can reopen a closed client if its external signal has
+not been aborted.
+Heartbeat timeouts abort the stalled fetch and use the same bounded retry
+budget as transport failures. Each timeout emits one error whose `retryable`
+flag reflects the remaining budget; user cancellation still interrupts backoff.
 
 `streamChat` uses **`POST /chat/stream`** with a **JSON body** (the Web
 dashboard's typed BFF integration lives in
@@ -124,6 +150,14 @@ await ws.connect();
 ws.on('text_delta', (event) => console.log(event.content));
 ws.sendMessage('Build a REST API', { sessionId: 'sess-1' });
 ```
+
+Concurrent calls to `connect()` share one connection attempt. It resolves after
+authentication and any active run's reattachment, before success callbacks run.
+`close()` rejects unfinished attempts, stops automatic reconnection, and closes
+the local transport without cancelling the server run. State and event callbacks
+may reconnect synchronously; callback exceptions are isolated from the transport.
+Closing or reconnecting in a stream callback does not interrupt delivery of an
+already accepted frame to other subscribed callbacks.
 
 ### Browser apps and the BFF pattern
 
@@ -206,7 +240,9 @@ audit or visualization needs. Integration boundaries such as
 `agentBinding`, `runtimeProfile`, `executionBudget`, `capabilities`, `explain`,
 `context`, `allowSkills`, `allowTools`, `workspaceBinding`, and
 `executorBinding` are passed through the same typed chat request rather than
-being flattened into prompt text.
+being flattened into prompt text. `workspaceBinding` uses the canonical request
+shape (`kind` plus optional `display_name`, `root`, `source`, and `authority`);
+the workspace object observed in runtime events is a separate response shape.
 
 ## §5.5 Edge protocol (from TypeScript)
 
@@ -218,7 +254,6 @@ When a **local edge** runs tools, use the same routes as `astra-thin-client`:
 | Approval | `postApprovalRespond(body)` | `POST /approval/respond` |
 | Register edge | `registerEdge(body, { edgeTransportId })` | `POST /agents/edge` |
 | Heartbeat | `postEdgeHeartbeat(body, { edgeTransportId })` | `POST /agents/edge/heartbeat` |
-| Legacy task lease helpers | `getTaskLease`, `postTaskLeaseClaim` / `Release` / `Renew` | `/tasks/{id}/lease/...` (not registered by the current runtime) |
 
 Constants and path helpers are exported from `@astra/sdk` (for example `PATH_CHAT_STREAM`, `joinApiPath`, `ASTRA_EDGE_ID_HEADER`).
 
@@ -257,6 +292,15 @@ Constants and path helpers are exported from `@astra/sdk` (for example `PATH_CHA
 | `approveToolCall` | Tool approval |
 
 ### Utilities
+
+Both live streams and `parseSseDataEvents` accept LF, CRLF, and CR line endings.
+Live parsing preserves events across split line endings and UTF-8 byte chunks;
+multiple `data:` lines are joined with a newline. The SDK retains its tolerance
+for a final JSON event without a trailing blank line.
+The shared parser removes exactly one leading BOM for direct text, buffered
+HTTP, and live streams. Raw-line callbacks include blank event separators.
+Terminal events parsed during the final flush also suppress trailing socket
+errors and reconnect attempts.
 
 | Export | Description |
 |--------|-------------|

@@ -30,6 +30,341 @@ use tokio_tungstenite::{
 
 // ── Stubs ────────────────────────────────────────────────────────────
 
+#[derive(Default)]
+struct CapacityTestRegistry {
+    record: Mutex<Option<astra_services::multi_agent::EdgeAgentRecord>>,
+    unavailable: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl astra_services::multi_agent::EdgeRegistryService for CapacityTestRegistry {
+    async fn register_or_update(
+        &self,
+        user: &str,
+        agent: &str,
+        socket: &str,
+        hostname: Option<&str>,
+        worktree: Option<&str>,
+        capabilities: Option<serde_json::Value>,
+        workspace: Option<&str>,
+    ) -> Result<astra_services::multi_agent::EdgeAgentRecord, String> {
+        use astra_services::multi_agent::UnconfiguredEdgeRegistryService;
+        let record = UnconfiguredEdgeRegistryService
+            .register_or_update(
+                user,
+                agent,
+                socket,
+                hostname,
+                worktree,
+                capabilities,
+                workspace,
+            )
+            .await?;
+        *self.record.lock().unwrap() = Some(record.clone());
+        Ok(record)
+    }
+    async fn find_by_agent_id_and_workspace(
+        &self,
+        agent: &str,
+        workspace: Option<&str>,
+    ) -> Result<Option<astra_services::multi_agent::EdgeAgentRecord>, String> {
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err("test registry unavailable".into());
+        }
+        Ok(self
+            .record
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|row| row.edge_agent_id == agent && row.workspace_id.as_deref() == workspace))
+    }
+    async fn list_by_user(
+        &self,
+        user: &str,
+    ) -> Result<Vec<astra_services::multi_agent::EdgeAgentRecord>, String> {
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err("test registry unavailable".into());
+        }
+        Ok(self
+            .record
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|row| row.user_id == user)
+            .into_iter()
+            .collect())
+    }
+    async fn heartbeat(
+        &self,
+        user: &str,
+        agent: &str,
+        socket: &str,
+        _claim: Option<&str>,
+    ) -> Result<(), astra_services::multi_agent::HeartbeatError> {
+        if self.record.lock().unwrap().as_ref().is_some_and(|row| {
+            row.user_id == user && row.edge_agent_id == agent && row.edge_id == socket
+        }) {
+            Ok(())
+        } else {
+            Err(astra_services::multi_agent::HeartbeatError::Superseded)
+        }
+    }
+    async fn unregister_generation(
+        &self,
+        user: &str,
+        agent: &str,
+        socket: &str,
+    ) -> Result<bool, String> {
+        let mut record = self.record.lock().unwrap();
+        if record.as_ref().is_some_and(|row| {
+            row.user_id == user && row.edge_agent_id == agent && row.edge_id == socket
+        }) {
+            *record = None;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+async fn spawn_capacity_node(
+    registry: Arc<CapacityTestRegistry>,
+    configured_origin: bool,
+) -> (std::net::SocketAddr, AppState, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+        .with_auth_service(Arc::new(BindingAuthService {
+            binding: astra_services::EdgeTokenBinding::Bound {
+                edge_agent_id: "capacity-edge".into(),
+                workspace_id: "test-workspace".into(),
+            },
+        }))
+        .with_edge_registry_service(registry);
+    if configured_origin {
+        state = state
+            .with_edge_capacity_relay_origin(format!("http://{addr}"))
+            .unwrap();
+    }
+    let app = build_app(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, state, server)
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn capacity_real_handshake_cross_node_routing_reconnect_and_no_replay() {
+    use base64::Engine;
+    let previous_key = std::env::var_os("ASTRA_BACKEND_SERVICE_KEY");
+    // This is the only service-capacity test in this executable; ordinary
+    // Edge tests do not consume this service-only setting.
+    unsafe {
+        std::env::set_var("ASTRA_BACKEND_SERVICE_KEY", "capacity-test-key");
+    }
+    let registry = Arc::new(CapacityTestRegistry::default());
+    let (node_a, state_a, server_a) = spawn_capacity_node(registry.clone(), true).await;
+    let (node_b, state_b, server_b) = spawn_capacity_node(registry.clone(), true).await;
+    let public = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7; 32]);
+    let mut advertisement = edge_capabilities("capacity-edge");
+    advertisement["capacity_rpc_v1"] = json!([{"id":"approved", "public_key":public}]);
+    advertisement["capacity_relay_v1"] = json!({"origin":"http://attacker.invalid"});
+    let auth = json!({"type":"edge_auth", "edge_agent_id":"capacity-edge", "materialization_id":"capacity-device",
+        "interaction_api_major":astra_server_types::AGENT_INTERACTION_API_MAJOR, "capabilities":advertisement});
+    let (mut edge_a, _) = connect_async(ws_request(node_a, "test-edge-token"))
+        .await
+        .unwrap();
+    edge_a
+        .send(Message::Text(auth.to_string().into()))
+        .await
+        .unwrap();
+    let ack: serde_json::Value =
+        serde_json::from_str(&edge_a.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+    assert_eq!(ack["type"], "edge_auth_ok");
+    let http = reqwest::Client::new();
+    let route = json!({"user_id":"test-user-1", "workspace_id":"test-workspace", "edge_id":"capacity-edge", "provider_id":"approved"});
+    let endpoint_a = format!("http://{node_a}/service/edges/capacity");
+    let endpoint_b = format!("http://{node_b}/service/edges/capacity");
+    let info: serde_json::Value = http
+        .get(&endpoint_b)
+        .bearer_auth("capacity-test-key")
+        .query(&route)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info["provider"]["public_key"], public);
+    let first_id = info["generation"].as_str().unwrap().to_owned();
+    assert_eq!(
+        registry
+            .record
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .capabilities
+            .as_ref()
+            .unwrap()["capacity_relay_v1"]["origin"],
+        format!("http://{node_a}")
+    );
+    let request =
+        json!({"route":route, "generation":first_id, "timeout_secs":5, "payload":"c2VhbGVk"});
+    let outbound = http
+        .post(&endpoint_b)
+        .bearer_auth("capacity-test-key")
+        .json(&request);
+    let call = tokio::spawn(async move { outbound.send().await.unwrap() });
+    let frame: serde_json::Value =
+        serde_json::from_str(&edge_a.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+    assert_eq!(frame["type"], "edge_capacity_request");
+    assert_eq!(frame["payload"], "c2VhbGVk");
+    edge_a
+        .send(Message::Text(
+            json!({"type":"edge_capacity_result", "request_id":frame["request_id"],
+        "connection_generation":frame["connection_generation"], "result":{"Ok":"cmVzdWx0"}})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let response = call.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.json::<String>().await.unwrap(), "cmVzdWx0");
+
+    // Node B starts its pool counter at one too. The global socket identity,
+    // not that repeated counter, rejects a lease prepared on node A.
+    let (mut edge_b, _) = connect_async(ws_request(node_b, "test-edge-token"))
+        .await
+        .unwrap();
+    edge_b
+        .send(Message::Text(auth.to_string().into()))
+        .await
+        .unwrap();
+    let ack: serde_json::Value =
+        serde_json::from_str(&edge_b.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+    assert_eq!(ack["type"], "edge_auth_ok");
+    assert_eq!(
+        state_a
+            .edge_connection_pool
+            .find_user_edge_by_agent_and_workspace(
+                "test-user-1",
+                "capacity-edge",
+                Some("test-workspace")
+            )
+            .unwrap()
+            .generation,
+        state_b
+            .edge_connection_pool
+            .find_user_edge_by_agent_and_workspace(
+                "test-user-1",
+                "capacity-edge",
+                Some("test-workspace")
+            )
+            .unwrap()
+            .generation
+    );
+    let stale = http
+        .post(&endpoint_a)
+        .bearer_auth("capacity-test-key")
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        stale.json::<serde_json::Value>().await.unwrap()["error_code"],
+        "CAPACITY_RPC_BINDING_CHANGED"
+    );
+    let info: serde_json::Value = http
+        .get(&endpoint_a)
+        .bearer_auth("capacity-test-key")
+        .query(&route)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_ne!(info["generation"], first_id);
+    let request = json!({"route":route, "generation":info["generation"], "timeout_secs":5, "payload":"c2VhbGVk"});
+    let outbound = http
+        .post(&endpoint_a)
+        .bearer_auth("capacity-test-key")
+        .json(&request);
+    let call = tokio::spawn(async move { outbound.send().await.unwrap() });
+    let frame: serde_json::Value =
+        serde_json::from_str(&edge_b.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+    assert_eq!(frame["type"], "edge_capacity_request");
+    // Disconnect after dispatch is unknown, never another-node replay.
+    edge_b.close(None).await.unwrap();
+    let response = call.await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["error_code"],
+        "CAPACITY_RPC_OUTCOME_UNKNOWN"
+    );
+    registry.unavailable.store(true, Ordering::SeqCst);
+    let unavailable = http
+        .get(&endpoint_a)
+        .bearer_auth("capacity-test-key")
+        .query(&route)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    // A configured registry outage cannot select the still-local predecessor.
+    registry.unavailable.store(false, Ordering::SeqCst);
+    let mut wrong = route.clone();
+    wrong["workspace_id"] = json!("other");
+    assert_eq!(
+        http.get(&endpoint_a)
+            .bearer_auth("capacity-test-key")
+            .query(&wrong)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        http.get(&endpoint_a)
+            .bearer_auth("wrong-key")
+            .query(&route)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let (unconfigured, _, unconfigured_server) = spawn_capacity_node(registry, false).await;
+    let (mut edge, _) = connect_async(ws_request(unconfigured, "test-edge-token"))
+        .await
+        .unwrap();
+    edge.send(Message::Text(auth.to_string().into()))
+        .await
+        .unwrap();
+    let rejected: serde_json::Value =
+        serde_json::from_str(&edge.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+    assert_eq!(rejected["type"], "edge_auth_error");
+    edge_a.close(None).await.ok();
+    server_a.abort();
+    server_b.abort();
+    unconfigured_server.abort();
+    unsafe {
+        match previous_key {
+            Some(key) => std::env::set_var("ASTRA_BACKEND_SERVICE_KEY", key),
+            None => std::env::remove_var("ASTRA_BACKEND_SERVICE_KEY"),
+        }
+    }
+}
+
 struct StubHealthChecker;
 
 #[async_trait]
@@ -266,9 +601,9 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
     async fn wait_result(
         &self,
         identity: &EdgeDispatchIdentity,
-        timeout: std::time::Duration,
+        timeout: Option<std::time::Duration>,
     ) -> Result<Option<String>, String> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
         loop {
             {
                 let rows = self.rows.lock().expect("test edge dispatch rows");
@@ -281,7 +616,12 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
             }
             tokio::select! {
                 _ = self.terminal.notified() => {}
-                _ = tokio::time::sleep_until(deadline) => return Ok(None),
+                _ = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => return Ok(None),
             }
         }
     }
@@ -393,6 +733,12 @@ async fn ws_auth(
         "edge authentication failed: {resp_json}"
     );
     assert_eq!(resp_json["user_id"], "test-user-1");
+    assert!(
+        resp_json["edge_id"]
+            .as_str()
+            .is_some_and(|edge_id| edge_id.starts_with("ws-")),
+        "successful authentication must return the server-owned registry identity: {resp_json}"
+    );
 
     ws
 }
@@ -404,7 +750,12 @@ async fn spawn_admitted_pool_invocation(
     tool: &str,
     args: serde_json::Value,
     call_id: &str,
-) -> tokio::task::JoinHandle<Option<astra_runtime::server::edge_connection_pool::EdgeToolResult>> {
+) -> tokio::task::JoinHandle<
+    Result<
+        astra_runtime::server::edge_connection_pool::EdgeToolResult,
+        astra_runtime::server::edge_connection_pool::EdgeInvocationDeliveryError,
+    >,
+> {
     let identity = astra_turn_types::ToolInvocationIdentity::new(
         "test-user-1",
         "direct-session",
@@ -576,6 +927,78 @@ async fn edge_ws_tool_request_roundtrip() {
     server.abort();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn queued_cancellation_never_precedes_its_request_on_the_real_socket() {
+    use std::{future::Future, task::Poll};
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    let (addr, state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let mut socket = ws_auth(addr, "edge-order", "tool-host").await;
+    let identity = astra_turn_types::ToolInvocationIdentity::new(
+        "test-user-1",
+        "direct-session",
+        "direct-run",
+        "direct-turn",
+        "queued-cancel",
+    )
+    .unwrap();
+    let durable_identity = EdgeDispatchIdentity::new(
+        &identity.user_id,
+        &identity.session_id,
+        &identity.run_id,
+        &identity.turn_chain_id,
+        identity.storage_key(),
+    );
+    dispatch
+        .insert_dispatch(&durable_identity, "edge-order", "{}")
+        .await
+        .unwrap();
+    assert!(
+        dispatch
+            .claim_direct_dispatch(&durable_identity, "edge-order")
+            .await
+            .unwrap()
+    );
+    let arguments = json!({"command":"echo pending"});
+    let mut invocation = Box::pin(
+        state
+            .edge_connection_pool
+            .execute_durably_admitted_invocation_with_cancel(
+                &identity,
+                "edge-order",
+                "bash",
+                &arguments,
+                None,
+            ),
+    );
+    // Poll queue admission without yielding to the socket forwarder, then
+    // cancel its owner. Both request and cancellation are ready together.
+    std::future::poll_fn(|cx| {
+        assert!(invocation.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(invocation);
+    let frames = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut frames = Vec::new();
+        for _ in 0..2 {
+            let frame = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
+        }
+        frames
+    })
+    .await
+    .expect("queued cancellation must reach the real Edge socket");
+    assert_eq!(frames[0]["type"], "edge_tool_request");
+    assert_eq!(frames[1]["type"], "edge_tool_cancel");
+    assert_eq!(frames[0]["request_id"], frames[1]["request_id"]);
+    assert_eq!(
+        frames[0]["delivery_generation"],
+        frames[1]["delivery_generation"]
+    );
+    socket.close(None).await.unwrap();
+    server.abort();
+}
+
 #[tokio::test]
 async fn edge_ws_relay_strips_legacy_boundary_and_preserves_inflight_dispatch() {
     let dispatch = Arc::new(TestEdgeDispatch::default());
@@ -604,9 +1027,13 @@ async fn edge_ws_relay_strips_legacy_boundary_and_preserves_inflight_dispatch() 
         delivery_generation: 1,
         tool: "bash".to_string(),
         args: json!({"command": "sleep 30"}),
+        execution_ceiling: None,
         runtime_process_authorization: None,
         runtime_process_authorization_required: false,
-        timeout_secs: 30,
+        timeout_secs: Some(30),
+        execution_deadline_unix_ms: None,
+        execution_timeout_ms: None,
+        command_timeout_cap_ms: None,
     };
     dispatch
         .insert_dispatch(
@@ -664,9 +1091,13 @@ async fn edge_ws_replayed_result_after_reconnect_is_durably_accepted_and_acked()
         delivery_generation: 9,
         tool: "bash".to_string(),
         args: json!({"command": "effect"}),
+        execution_ceiling: None,
         runtime_process_authorization: None,
         runtime_process_authorization_required: false,
-        timeout_secs: 30,
+        timeout_secs: Some(30),
+        execution_deadline_unix_ms: None,
+        execution_timeout_ms: None,
+        command_timeout_cap_ms: None,
     };
     dispatch
         .insert_dispatch(
@@ -857,7 +1288,10 @@ async fn edge_tool_disconnect_during_request_returns_none() {
         .expect("task should complete within 10s")
         .expect("task should not panic");
 
-    assert!(result.is_none(), "disconnected edge should return None");
+    assert!(
+        result.is_err(),
+        "disconnected edge must not claim a completion"
+    );
 
     server.abort();
 }
@@ -1162,9 +1596,11 @@ async fn edge_ws_rejects_runtime_token_without_binding() {
 // ── B2: DB registration failure rejects WS connection ────────────────
 
 struct BlockingLeaseEdgeRegistry {
+    finalization_outcome: Result<bool, String>,
     registration_started: Notify,
     release_registration: Notify,
     claim_release_started: Notify,
+    claim_release_dropped: Notify,
     claim_release_gate: Notify,
     rollback_count: AtomicUsize,
     release_attempts: AtomicUsize,
@@ -1179,11 +1615,12 @@ struct BlockingLeaseEdgeRegistry {
     unregister_completed: Notify,
 }
 
-struct ReleaseDropSentinel<'a>(&'a AtomicUsize);
+struct ReleaseDropSentinel<'a>(&'a AtomicUsize, &'a Notify);
 
 impl Drop for ReleaseDropSentinel<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+        self.1.notify_one();
     }
 }
 
@@ -1211,9 +1648,11 @@ impl BlockingLeaseEdgeRegistry {
         block_first_release: bool,
     ) -> Self {
         Self {
+            finalization_outcome: Ok(true),
             registration_started: Notify::new(),
             release_registration: Notify::new(),
             claim_release_started: Notify::new(),
+            claim_release_dropped: Notify::new(),
             claim_release_gate: Notify::new(),
             rollback_count: AtomicUsize::new(0),
             release_attempts: AtomicUsize::new(0),
@@ -1285,6 +1724,13 @@ impl astra_services::multi_agent::EdgeRegistryService for BlockingLeaseEdgeRegis
         Ok(true)
     }
 
+    async fn finalize_registration(
+        &self,
+        _lease: &astra_services::multi_agent::EdgeRegistrationLease,
+    ) -> Result<bool, String> {
+        self.finalization_outcome.clone()
+    }
+
     async fn release_registration(
         &self,
         _lease: &astra_services::multi_agent::EdgeRegistrationLease,
@@ -1296,7 +1742,7 @@ impl astra_services::multi_agent::EdgeRegistryService for BlockingLeaseEdgeRegis
             None => None,
         };
         self.active_releases.fetch_add(1, Ordering::SeqCst);
-        let _sentinel = ReleaseDropSentinel(&self.active_releases);
+        let _sentinel = ReleaseDropSentinel(&self.active_releases, &self.claim_release_dropped);
         self.claim_release_started.notify_one();
         if self.block_every_release || (self.block_first_release && attempt == 0) {
             self.claim_release_gate.notified().await;
@@ -1557,7 +2003,16 @@ async fn pending_release_disconnect(wait_for_heartbeat: bool, live_pool: Option<
         // fresh pending publication attempt just before heartbeat is due.
         tokio::time::pause();
         tokio::time::advance(std::time::Duration::from_secs(5)).await;
-        tokio::task::yield_now().await;
+        // Advancing the clock only wakes timers; one yield does not guarantee
+        // that the publication task has processed its timeout. Observe its
+        // drop before jumping again, or the retry delay can start at t=29 and
+        // race the heartbeat instead of holding the resource ahead of it.
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            registry.claim_release_dropped.notified(),
+        )
+        .await
+        .expect("first publication attempt timed out before advancing to retry");
         tokio::time::advance(std::time::Duration::from_secs(24)).await;
         tokio::time::timeout(
             std::time::Duration::from_millis(100),
@@ -1724,7 +2179,7 @@ impl astra_services::multi_agent::EdgeRegistryService for FailingEdgeRegistry {
 }
 
 #[tokio::test]
-async fn edge_ws_rejects_connection_when_db_registration_fails() {
+async fn edge_ws_closes_unavailable_when_db_registration_fails() {
     let state = AppState::new(
         ServiceInfo::new("edge-b2-test", "0.0.0-test", ""),
         Arc::new(StubHealthChecker),
@@ -1757,12 +2212,17 @@ async fn edge_ws_rejects_connection_when_db_registration_fails() {
     .await
     .unwrap();
 
-    let resp: serde_json::Value =
-        serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+    let response = ws.next().await.unwrap().unwrap();
+    let Message::Close(Some(close)) = response else {
+        panic!(
+            "DB unavailability must close without permanently rejecting credentials: {response:?}"
+        );
+    };
     assert_eq!(
-        resp["type"], "edge_auth_error",
-        "DB failure must reject the connection: {resp}"
+        close.code,
+        tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Again
     );
+    assert_eq!(close.reason, "edge registry unavailable");
     assert!(
         !state_clone
             .edge_connection_pool
@@ -1770,6 +2230,63 @@ async fn edge_ws_rejects_connection_when_db_registration_fails() {
     );
 
     server.abort();
+}
+
+#[tokio::test]
+async fn edge_ws_closes_unavailable_and_rolls_back_failed_finalization() {
+    for outcome in [Err("private storage failure".to_string()), Ok(false)] {
+        let mut registry = BlockingLeaseEdgeRegistry::new();
+        registry.finalization_outcome = outcome;
+        let registry = Arc::new(registry);
+        let state = AppState::new(
+            ServiceInfo::new("edge-finalize-failure", "0.0.0-test", ""),
+            Arc::new(StubHealthChecker),
+        )
+        .with_auth_service(Arc::new(StubAuthService))
+        .with_edge_registry_service(registry.clone());
+        let observed = state.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, astra_runtime::build_app(state))
+                .await
+                .unwrap()
+        });
+        let (mut ws, _) = connect_async(ws_request(addr, "test-edge-token"))
+            .await
+            .unwrap();
+        ws.send(Message::Text(
+            json!({
+                "type": "edge_auth",
+                "edge_agent_id": "edge-finalize-failure",
+                "materialization_id": "materialization-test",
+                "interaction_api_major": astra_server_types::AGENT_INTERACTION_API_MAJOR,
+                "capabilities": edge_capabilities("edge-finalize-failure")
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        registry.registration_started.notified().await;
+        registry.release_registration.notify_one();
+        let response = ws.next().await.unwrap().unwrap();
+        let Message::Close(Some(close)) = response else {
+            panic!("setup failure must close without a credential rejection: {response:?}");
+        };
+        assert_eq!(
+            close.code,
+            tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Again
+        );
+        assert_eq!(close.reason, "edge registry unavailable");
+        assert_eq!(registry.rollback_count.load(Ordering::SeqCst), 1);
+        assert!(
+            !observed
+                .edge_connection_pool
+                .has_connected_edge("test-user-1")
+        );
+        server.abort();
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

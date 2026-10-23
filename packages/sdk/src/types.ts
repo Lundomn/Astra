@@ -56,6 +56,8 @@ export type StreamEventType =
   | "agent_interrupted"
   | "task_board_snapshot"
   | "tool_approval_request"
+  | "approval_required"
+  | "user_prompt_required"
   | "ping"
   | "device_revoked"
   | "device_lease_expired"
@@ -116,6 +118,9 @@ export type RunResumedEvent = {
 export type RunFinishedEvent = {
   type: "run_finished";
   run_id?: string;
+  owner_generation?: number;
+  /** Original Server journal fact; clients must not re-evaluate partial tool events. */
+  turn_evaluation?: Record<string, unknown> | null;
   status?: string;
   error?: string | null;
   interrupted?: boolean;
@@ -143,6 +148,7 @@ export type RunErrorEvent = {
   error?: string;
   code?: string;
   error_kind?: string;
+  error_code?: string;
 };
 
 export type RunInterruptedEvent = {
@@ -198,6 +204,41 @@ export type WorkspaceBinding = {
   cwd?: string | null;
   authority?: "read_only" | "read_write" | string;
   fallback_policy?: "disabled";
+};
+
+/**
+ * Workspace boundary accepted on chat/run requests.
+ *
+ * This is intentionally separate from `WorkspaceBinding`, which describes the
+ * workspace observed in runtime events. Requests use the server's canonical
+ * `root`/`source` fields; event-only fields such as `cwd` and
+ * `fallback_policy` must never be sent back to the runtime.
+ */
+export type WorkspaceSourceRequest =
+  | { kind: "edge_path"; path: string }
+  | {
+      kind: "uploaded_snapshot";
+      artifact_id: string;
+      root?: string;
+    }
+  | {
+      kind: "git_checkout";
+      repository: string;
+      reference?: string;
+    }
+  | { kind: "template"; template_id: string }
+  | { kind: "dataset_bundle"; dataset_id: string }
+  | { kind: "artifact_bundle"; artifact_id: string }
+  | { kind: "scratch" }
+  | { kind: "persistent_volume"; volume_id: string };
+
+/** Canonical workspace boundary accepted by the runtime request schema. */
+export type WorkspaceBindingRequest = {
+  kind: "server_sandbox" | "edge_workspace" | "cloud_workspace" | "none";
+  display_name?: string;
+  root?: string;
+  source?: WorkspaceSourceRequest;
+  authority?: "read_only" | "read_write" | "none";
 };
 
 export type ExecutorBinding = {
@@ -317,6 +358,7 @@ export type ExplainAnalyzeNodeKindV1 =
   | "admission"
   | "preparation"
   | "context_assembly"
+  | "judgment"
   | "model_round"
   | "provider_attempt"
   | "tool_batch"
@@ -361,8 +403,7 @@ export type ExplainAnalyzeUsageV1 = {
 export type ExplainAnalyzeContextSourceKindV1 =
   | "identity" | "self_model" | "project_context" | "deferred_tools"
   | "available_skills" | "memory" | "working_memory" | "history" | "constraints"
-  | "skills" | "runtime_identity" | "runtime_volatile" | "emergent_skills"
-  | "emergent_memory" | "emergent_summary";
+  | "skills" | "runtime_identity" | "runtime_volatile";
 
 export type ExplainAnalyzeContextBudgetV1 = {
   basis: "pre_provider_estimate";
@@ -385,6 +426,30 @@ export type ExplainAnalyzeContextSourceV1 = {
 export type ExplainAnalyzeContextAssemblyV1 = {
   basis: "runtime_text_estimate";
   sources: ExplainAnalyzeContextSourceV1[];
+  edge_memory_selection?: MemorySelectionReport[];
+};
+
+/** CLI/Edge selection facts plus runtime-owned final prompt projection. Indices are batch-local. */
+export type MemorySelectionReport = {
+  session_id: string;
+  turn: number;
+  operation: "relevance" | "dismissal" | "reuse";
+  method: "model" | "lexical" | "none" | "reuse";
+  reason: "completed" | "no_candidates" | "no_selector" | "call_unavailable" | "invalid_response" | "retrieval_unavailable" | "retrieval_timeout" | "reused";
+  model: string | null;
+  candidates: Array<{ index: number; selected: boolean; probability_bps: number | null }>;
+  selection_order: number[];
+  elapsed_ms: number;
+  candidate_coverage?: {
+    source_items: number;
+    evaluated_candidates: number;
+    truncated: boolean;
+  };
+  prompt_projection?: {
+    selected_candidates: number;
+    /** null means final inclusion could not be proven. */
+    included_candidates: number | null;
+  };
 };
 
 /** Assembly observations and final request estimates have different scopes.
@@ -396,6 +461,131 @@ export type ExplainAnalyzeContextMetricsV1 = {
 
 /** One versioned, bounded execution fact. Missing token lanes are unavailable,
  * not zero; indexes are explicit and are never parsed from labels. */
+export type ExplainAnalyzeAuxiliaryUsageV1 = {
+  available: boolean;
+  /** Captured counts and sums are lower bounds when physical rows were omitted. */
+  truncated?: boolean;
+  attempts: {
+    attempt_id: string; usage_status: "provider_exact" | "provider_partial" | "unavailable"; provider: string; offering_id: string; model_name: string;
+    purpose: string; operation_id: string; usage?: ExplainAnalyzeUsageV1;
+  }[];
+};
+
+export type ExplainAnalyzeAuxiliaryCallV1 = {
+  call_id: string;
+  operation_id: string;
+  stage: string;
+  start_elapsed_ms: number;
+  duration_ms: number;
+  outcome: ExplainAnalyzeOutcomeV1;
+};
+
+export type ExplainAnalyzeRequestJudgmentFieldV1 =
+  | "required"
+  | "defer"
+  | "mutation.read_only"
+  | "mutation.may_mutate"
+  | "mutation.must_mutate"
+  | "scope.workspace"
+  | "scope.external"
+  | "scope.mixed"
+  | "scope.unknown"
+  | "domain.none"
+  | "domain.github"
+  | "domain.git"
+  | "domain.code"
+  | "domain.memory"
+  | "domain.web"
+  | "domain.system"
+  | "domain.database"
+  | "parallel_subruns"
+  | "capability.web";
+
+export type ExplainAnalyzeRequestJudgmentResultV1 =
+  | {
+      result: "decided";
+      classification: {
+        work_required: boolean;
+        activation_deferred: boolean;
+        domain: "github" | "git" | "code" | "memory" | "web" | "system" | "database" | null;
+        mutation: "read_only" | "may_mutate" | "must_mutate";
+        scope: "workspace" | "external" | "mixed" | "unknown";
+        parallel_subruns: boolean;
+        capabilities: Array<"web" | "agent_spawner">;
+      };
+    }
+  | {
+      result: "abstained";
+      uncertain_fields: ExplainAnalyzeRequestJudgmentFieldV1[];
+      assessment: {
+        provenance: "provider_probability" | "discrete_decision";
+        fields: Array<{
+          field: ExplainAnalyzeRequestJudgmentFieldV1;
+          score: number;
+        }>;
+      };
+    }
+  | {
+      result: "conflicting";
+      fields: ExplainAnalyzeRequestJudgmentFieldV1[];
+    }
+  | {
+      result: "invalid";
+      reason: "malformed_json" | "invalid_contract" | "unsupported_combination";
+    }
+  | {
+      result: "not_dispatched";
+      reason:
+        | "no_offering"
+        | "capacity_pressure"
+        | "invalid_request"
+        | "output_budget"
+        | "route_unavailable"
+        | "durable_material_unavailable"
+        | "preparation_deadline"
+        | "cancelled";
+    }
+  | {
+      result: "unavailable";
+      reason:
+        | "execution_error"
+        | "deadline"
+        | "cancelled"
+        | "provider_ptl_error"
+        | "unexpected_finish";
+      delivery: "unresolved" | "response_received";
+    };
+
+export type ExplainAnalyzeAdmissionSettlementV1 = {
+  status: "accepted" | "rejected" | "unavailable" | "not_dispatched";
+  reason:
+    | { kind: "accepted" }
+    | { kind: "classifier_uncertain" }
+    | { kind: "classifier_conflicting" }
+    | { kind: "invalid_classifier_response" }
+    | { kind: "provider_rejected" }
+    | { kind: "planning_rejected" }
+    | { kind: "reconciliation_rejected" }
+    | { kind: "unavailable"; reason: "execution_error" | "deadline" | "cancelled" | "provider_ptl_error" | "unexpected_finish" }
+    | { kind: "not_dispatched"; reason: "no_offering" | "capacity_pressure" | "invalid_request" | "output_budget" | "route_unavailable" | "durable_material_unavailable" | "preparation_deadline" | "cancelled" };
+  classification?: ExplainAnalyzeRequestJudgmentResultV1;
+  decision?: ExplainAnalyzeRequestJudgmentResultV1;
+};
+
+/** Local auxiliary timing and typed admission facts on a terminal turn. */
+export type ExplainAnalyzeAuxiliaryDetailsV1 = {
+  /** Omitted by Rust when no auxiliary call interval was captured. */
+  calls?: ExplainAnalyzeAuxiliaryCallV1[];
+  truncated?: boolean;
+  admission?: ExplainAnalyzeAdmissionSettlementV1;
+};
+
+export type ExplainAnalyzeDecisionDetailV1 = {
+  kind: "delegation_catalog_resolution";
+  requirement_index: number;
+  match_count: number;
+};
+
 export type ExplainAnalyzeEventV1 = {
   type: "explain_analyze";
   schema_version: 1;
@@ -416,7 +606,10 @@ export type ExplainAnalyzeEventV1 = {
   start_elapsed_ms?: number;
   duration_ms?: number;
   outcome?: ExplainAnalyzeOutcomeV1;
+  decision_detail?: ExplainAnalyzeDecisionDetailV1;
   usage?: ExplainAnalyzeUsageV1;
+  auxiliary_usage?: ExplainAnalyzeAuxiliaryUsageV1;
+  auxiliary_details?: ExplainAnalyzeAuxiliaryDetailsV1;
   context?: ExplainAnalyzeContextMetricsV1;
   coverage_gaps?: ExplainAnalyzeCoverageGapV1[];
 };
@@ -728,6 +921,29 @@ export type ToolApprovalRequestEvent = {
   args: Record<string, unknown>;
 };
 
+/** A durable approval gate projected onto a Work stream.  The public Work
+ * surface intentionally omits the backing Session identity; `request_id`
+ * plus the public Work branch identifies the interaction. */
+export type ApprovalRequiredEvent = {
+  type: "approval_required";
+  request_id: string;
+  tool: string;
+  approval_kind: "standard" | "explicit";
+  path?: string;
+  detail?: string;
+  display_label?: string;
+  run_id?: string;
+};
+
+/** A durable ask-user gate projected onto a Work stream.  The prompt is kept
+ * as an opaque canonical payload and validated by the server when answered. */
+export type UserPromptRequiredEvent = {
+  type: "user_prompt_required";
+  request_id: string;
+  prompt: unknown;
+  run_id?: string;
+};
+
 export type PingEvent = {
   type: "ping";
   run_id?: string;
@@ -816,6 +1032,8 @@ export type StreamEvent = (
   | ToolTransportFailedEvent
   | RunBlockedEvent
   | ToolApprovalRequestEvent
+  | ApprovalRequiredEvent
+  | UserPromptRequiredEvent
   | PingEvent
   | DeviceLeaseEndedEvent
   | ToolExecutionStartedEvent
@@ -965,7 +1183,7 @@ export type ChatConfig = {
   /** Catalog surfacing — sent as `skill_search` (snake_case fields on the wire). */
   skillSearch?: SkillSearchSettings;
   /** Optional explicit workspace boundary for direct SDK integrations. */
-  workspaceBinding?: WorkspaceBinding;
+  workspaceBinding?: WorkspaceBindingRequest;
   /** Optional explicit executor boundary for direct SDK integrations. */
   executorBinding?: ExecutorBinding;
 };
@@ -1020,8 +1238,24 @@ export type WorkBinding = {
   branchId: string;
 };
 
+/** Verification obligations, executed through ordinary tool admission. */
+export type CompletionCheckDeclarations = {
+  stop: CompletionCheck[];
+  task_completed: CompletionCheck[];
+};
+
+export type CompletionCheck = {
+  label: string;
+  command: string;
+  working_dir: string | null;
+  depends_on: string[];
+  timeout_secs: number | null;
+  authoritative: boolean;
+};
+
 export type ChatRequest = {
   message: string;
+  completionChecks?: CompletionCheckDeclarations;
   parts?: unknown[];
   attachments?: unknown[];
   sessionId?: string;
@@ -1030,7 +1264,7 @@ export type ChatRequest = {
   agentId?: string;
   modelSelection: {
     offeringId: string;
-  };
+  } | "auto";
   agentBinding?: AgentBindingSelection;
   runtimeAuth?: {
     authorization: string;
@@ -1052,7 +1286,7 @@ export type ChatRequest = {
    * array intentionally disables all user-selectable optional tools. */
   enabledTools?: string[];
   skillSearch?: SkillSearchSettings;
-  workspaceBinding?: WorkspaceBinding;
+  workspaceBinding?: WorkspaceBindingRequest;
   executorBinding?: ExecutorBinding;
 };
 
@@ -1201,6 +1435,19 @@ export type SessionInfo = {
 
 // ─── Runtime wire response DTOs ───────────────────────────────────
 
+/** A cancellation request is complete only when executionSettled is true. */
+export type SessionCancellationResult = SessionInfo & {
+  executionSettled: boolean;
+  executionBlocker?: string | null;
+  runs: Array<{ runId: string; status: string; executionSettled: boolean }>;
+};
+
+export type RuntimeSessionCancellationResponse = RuntimeSessionResponse & {
+  execution_settled: boolean;
+  execution_blocker?: string | null;
+  runs: Array<{ run_id: string; status: string; execution_settled: boolean }>;
+};
+
 export type RuntimeChatResponse = {
   session_id: string;
   run_id: string;
@@ -1276,13 +1523,26 @@ export type RuntimeTranscriptParams = {
 
 export type RuntimeModelAccessKind =
   | "astra_cloud"
+  | "cloud_byok"
   | "workspace"
   | "this_device"
   | "self_hosted";
 
 export type RuntimeModelExecutionPlacement = "server" | "edge";
 
+export type RuntimeModelCatalogPricing = {
+  currency: "USD";
+  unit: "per_token";
+  source: "configured";
+  prompt: number;
+  completion: number;
+  cache_read: number | null;
+  cache_write: number | null;
+  configuration_updated_at: string;
+};
+
 export type RuntimeModelListItem = {
+  thinking_protocol: "unknown" | "enable_thinking" | "thinking_object" | "reasoning_effort" | "moonshot" | null;
   offering_id: string;
   access_id: string;
   access_kind: RuntimeModelAccessKind;
@@ -1296,6 +1556,7 @@ export type RuntimeModelListItem = {
   max_completion_tokens: number | null;
   architecture: unknown | null;
   thinking_capability: "both" | "effort_only" | "native_only" | "none" | null;
+  pricing: RuntimeModelCatalogPricing | null;
 };
 
 export type RuntimeModelCatalogCursor = {
@@ -1528,13 +1789,37 @@ export type SessionActivity = {
   details: Record<string, unknown>;
 };
 
-/** `GET /sessions/{id}/audit/summary` — matches `SessionAuditSummary` in the services crate. */
+/** Known sum and physical attempts that observed it; unknown is not zero. */
+export type ObservedTokenLane = {
+  known_tokens: number | null;
+  observed_attempts: number;
+};
+
+export type SessionRequestUsageSummary = {
+  scope: "session_all_runs";
+  request_count: number;
+  nonterminal_attempt_count: number;
+  fresh_input_tokens: ObservedTokenLane;
+  cache_read_tokens: ObservedTokenLane;
+  cache_creation_tokens: ObservedTokenLane;
+  output_tokens: ObservedTokenLane;
+};
+
+/** Admission-rate estimate for retained physical attempts, not a provider bill. */
+export type SessionCostSummary = {
+  estimated_cost_usd?: number;
+  unavailable_reason?: "historical_attempt_coverage_incomplete";
+};
+
+/** `GET /sessions/{id}/audit/summary` — matches the services response. */
 export type SessionAuditSummary = {
   session_id: string;
   status: string;
   turn_count: number;
   tokens_in: number;
   tokens_out: number;
+  request_usage: SessionRequestUsageSummary;
+  cost: SessionCostSummary;
   tool_calls_total: number;
   tool_calls_failed: number;
   error_count: number;
@@ -1749,11 +2034,6 @@ export type EdgeHeartbeatRequestBody = {
   edge_agent_id: string;
 };
 
-export type TaskLeaseMutationRequestBody = {
-  edge_agent_id: string;
-  ttl_sec?: number;
-};
-
 // ─── Work-first public contract ────────────────────────────────────
 
 export type WorkCreateCriterion =
@@ -1789,6 +2069,64 @@ export type WorkTurnInput = {
   /** Durable read attachment that may claim idle conversation control. */
   attachmentId: string;
   message: string;
+};
+
+export type WorkInteractionKindV1 = "approval" | "user_prompt";
+export type WorkApprovalDecisionV1 = "allow" | "deny";
+
+export type WorkBranchInteractionV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  run_id: string;
+  request_id: string;
+  kind: WorkInteractionKindV1;
+  tool?: string;
+  approval_kind?: "standard" | "explicit" | string;
+  path?: string;
+  detail?: string;
+  display_label?: string;
+  prompt?: unknown;
+};
+
+export type WorkBranchInteractionPageV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  interactions: WorkBranchInteractionV1[];
+};
+
+export type WorkBranchInteractionResponseInputV1 = {
+  attachmentId: string;
+  runId: string;
+  requestId: string;
+  response:
+    | {
+        kind: "approval";
+        decision: WorkApprovalDecisionV1;
+        reason?: string;
+      }
+    | {
+        kind: "user_prompt";
+        cancelled: boolean;
+        answers?: unknown;
+      };
+};
+
+export type WorkInteractionResolutionOutcomeV1 =
+  | "resolved"
+  | "idempotent"
+  | "queued"
+  | "authority_lost"
+  | "superseded";
+
+export type WorkBranchInteractionReceiptV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  run_id: string;
+  request_id: string;
+  outcome: WorkInteractionResolutionOutcomeV1;
 };
 
 export type WorkContentHash = `sha256:${string}`;
@@ -2024,6 +2362,198 @@ export type WorkExecutionSwitchOperationV1 = {
   failure_code: string | null;
 };
 
+export type WorkRecoveryPointReasonV1 =
+  | "user_requested"
+  | "before_environment_change"
+  | "run_settled"
+  | "safe_boundary";
+
+export type WorkRecoveryPointStatusV1 =
+  | "preparing"
+  | "captured"
+  | "ready"
+  | "failed"
+  | "aborted";
+
+export type WorkRecoveryPointCoverageV1 = {
+  session_state: boolean;
+  work_state: boolean;
+  workspace: boolean;
+  run_frontier: boolean;
+  artifacts: boolean;
+};
+
+export type WorkRecoveryPointCapabilitiesV1 = {
+  can_restore_conversation: boolean;
+  can_continue_in_original_environment: boolean;
+  has_portable_workspace: boolean;
+  requires_target_environment_check: boolean;
+  requires_effect_review: boolean;
+};
+
+export type WorkRecoveryPointSessionCursorV1 = {
+  completed_turn: number;
+  journal_event_seq: number;
+  conversation_seq: number;
+  canonical_root_hash: string;
+  compaction_generation: number;
+};
+
+export type WorkRecoveryPointExecutionV1 = {
+  placement: WorkExecutionPlacementV1;
+  executor_id: string;
+  binding_generation: number;
+};
+
+export type WorkRecoveryPointWorkspaceV1 = {
+  snapshot_id: string;
+  logical_workspace_id: string;
+  manifest_hash: WorkContentHash;
+  content_root: WorkContentHash;
+  byte_size: number;
+  complete: boolean;
+  artifact_id: string;
+  artifact_type: string;
+  content_digest: WorkContentHash;
+};
+
+export type WorkRecoveryPointArtifactV1 = {
+  artifact_id: string;
+  artifact_type: string;
+  digest: WorkContentHash;
+  location_ref: string | null;
+};
+
+export type WorkRecoveryPointV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  recovery_point_id: string;
+  request_id: string;
+  status: WorkRecoveryPointStatusV1;
+  reason: WorkRecoveryPointReasonV1;
+  created_at: string;
+  updated_at: string;
+  manifest_hash: WorkContentHash;
+  work_revision: number;
+  branch_revision: number;
+  graph_revision: number;
+  goal_revision: number;
+  criteria_set_revision: number;
+  session_cursor: WorkRecoveryPointSessionCursorV1;
+  execution: WorkRecoveryPointExecutionV1;
+  workspace: WorkRecoveryPointWorkspaceV1 | null;
+  artifacts: WorkRecoveryPointArtifactV1[];
+  coverage: WorkRecoveryPointCoverageV1;
+  capabilities: WorkRecoveryPointCapabilitiesV1;
+};
+
+export type WorkRecoveryPointCaptureInputV1 = {
+  requestId: string;
+  expectedWorkRevision: number;
+  expectedBranchRevision: number;
+  reason?: WorkRecoveryPointReasonV1;
+  workspaceArtifactId?: string;
+};
+
+export type WorkWorkspaceRecoveryBasisExpectationV1 = {
+  work_revision: number;
+  branch_revision: number;
+  graph_revision: number;
+  context_head_hash: WorkContentHash;
+  execution_binding_hash: WorkContentHash;
+};
+
+export type WorkWorkspaceRecoveryBasisV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  logical_workspace_id: string;
+  work_revision: number;
+  branch_revision: number;
+  graph_revision: number;
+  context_head_hash: WorkContentHash;
+  execution_binding_hash: WorkContentHash;
+  session_cursor: WorkRecoveryPointSessionCursorV1;
+};
+
+export type WorkWorkspaceRecoveryArtifactBeginInputV1 = {
+  requestId: string;
+  basis: WorkWorkspaceRecoveryBasisExpectationV1;
+  snapshotManifest: Record<string, unknown>;
+  contentDigest: WorkContentHash;
+  byteSize: number;
+  chunkCount: number;
+};
+
+export type WorkWorkspaceRecoveryChunkV1 = {
+  chunk_index: number;
+  digest: WorkContentHash;
+  byte_size: number;
+};
+
+export type WorkWorkspaceRecoveryArtifactSealInputV1 = {
+  chunks: WorkWorkspaceRecoveryChunkV1[];
+};
+
+export type WorkWorkspaceRecoveryArtifactV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  artifact_id: string;
+  sealed: boolean;
+  verified: boolean;
+  snapshot_id: string;
+  manifest_hash: WorkContentHash;
+  content_root: WorkContentHash;
+  content_digest: WorkContentHash;
+  byte_size: number;
+  chunk_count: number;
+  snapshot_manifest: Record<string, unknown>;
+  blobs: WorkWorkspaceRecoveryBlobV1[];
+};
+
+export type WorkWorkspaceRecoveryPackageV1 = {
+  artifact: WorkWorkspaceRecoveryArtifactV1;
+  blobs: Array<WorkWorkspaceRecoveryBlobV1 & { bytes: Uint8Array }>;
+};
+
+/** Controls cold workspace package downloads without flooding the runtime. */
+export type WorkWorkspaceRecoveryDownloadOptionsV1 = {
+  /** Maximum number of blob requests in flight. Defaults to four. */
+  concurrency?: number;
+  /** Abort queued and in-flight blob requests. */
+  signal?: AbortSignal;
+};
+
+export type WorkWorkspaceRecoveryChunkReceiptV1 = {
+  schema_version: 1;
+  artifact_id: string;
+  digest: WorkContentHash;
+  byte_size: number;
+  inserted: boolean;
+};
+
+export type WorkWorkspaceRecoveryBlobV1 = {
+  chunk_index: number;
+  blob_ref: string;
+  digest: WorkContentHash;
+  byte_size: number;
+};
+
+export type WorkRecoveryPointCursorV1 = {
+  created_at: string;
+  recovery_point_id: string;
+};
+
+export type WorkRecoveryPointPageV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  points: WorkRecoveryPointV1[];
+  next_cursor: WorkRecoveryPointCursorV1 | null;
+};
+
 export type WorkCatalogCursorV1 = {
   created_at: string;
   work_id: string;
@@ -2108,6 +2638,14 @@ export type WorkBranchAttachmentV1 = {
   attached_at: string;
   expires_at: string;
 };
+
+export type WorkAttachmentSurface =
+  | "cli"
+  | "tui"
+  | "web"
+  | "app"
+  | "server"
+  | "edge";
 
 export type WorkBranchControlBasisV1 = {
   writer_epoch: number;
@@ -2555,7 +3093,6 @@ export type WorkReadCursorReceiptV1 = {
 
 export type WorkEventKind =
   | "work_created"
-  | "goal_revised"
   | "criteria_accepted"
   | "branch_basis_adopted"
   | "graph_replaced"
@@ -2573,6 +3110,7 @@ export type WorkEventKind =
   | "run_delegated"
   | "run_failed"
   | "run_cancelled"
+  | "recovery_point_captured"
   | "runtime_events_expired";
 
 export type WorkEventRecordV1 = {
@@ -2921,6 +3459,36 @@ export type WorkApiErrorV1 = {
     | "work_attachment_capacity"
     | "attachment_fenced"
     | "attachment_in_use"
+    | "invalid_recovery_point_request"
+    | "invalid_recovery_point_query"
+    | "invalid_recovery_point_cursor"
+    | "invalid_recovery_point_id"
+    | "recovery_point_unavailable"
+    | "recovery_point_not_found"
+    | "recovery_point_request_conflict"
+    | "recovery_point_identity_conflict"
+    | "recovery_point_session_unavailable"
+    | "recovery_point_repair_required"
+    | "recovery_point_run_active"
+    | "recovery_point_turn_active"
+    | "recovery_point_effect_unresolved"
+    | "recovery_point_execution_changing"
+    | "recovery_point_basis_changed"
+    | "recovery_point_verification_unavailable"
+    | "invalid_workspace_recovery_artifact"
+    | "invalid_workspace_recovery_artifact_id"
+    | "invalid_workspace_recovery_artifact_request"
+    | "invalid_workspace_recovery_chunk"
+    | "invalid_workspace_recovery_seal_request"
+    | "invalid_workspace_snapshot_manifest"
+    | "workspace_recovery_artifact_conflict"
+    | "workspace_recovery_artifact_not_found"
+    | "workspace_recovery_artifact_not_sealed"
+    | "workspace_recovery_artifact_unavailable"
+    | "workspace_recovery_basis_mismatch"
+    | "workspace_recovery_basis_unavailable"
+    | "workspace_recovery_chunk_not_found"
+    | "workspace_recovery_package_invalid"
     | "control_operation_terminal"
     | "control_operation_not_found"
     | "control_operation_unavailable"
@@ -2940,6 +3508,7 @@ export type WorkApiErrorV1 = {
     | "retry_read"
     | "retry_write"
     | "retry_attach"
+    | "review_effects"
   )[];
   request_id?: string;
 };

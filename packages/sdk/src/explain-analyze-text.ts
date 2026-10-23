@@ -1,12 +1,16 @@
 import {
   explainAnalyzeCoverageGapLabel,
+  explainAnalyzeAuxiliaryUsageLines,
+  explainAnalyzeAuxiliaryDetailsLines,
   formatMs,
+  memorySelectionLines,
   reduceExplainAnalyzeEvents,
 } from "./explain-analyze";
 import type { ExplainAnalyzeNodeV1 } from "./explain-analyze";
 import type {
   ExplainAnalyzeContextMetricsV1,
   ExplainAnalyzeContextSourceKindV1,
+  ExplainAnalyzeDecisionDetailV1,
   ExplainAnalyzeOutcomeV1,
   ExplainAnalyzeUsageV1,
 } from "./types";
@@ -66,6 +70,9 @@ export function renderExplainAnalyzeText(
       state,
     );
   }
+
+  for (const line of explainAnalyzeAuxiliaryUsageLines(graph)) appendLine(lines, cleanText(line), state);
+  for (const line of explainAnalyzeAuxiliaryDetailsLines(graph)) appendLine(lines, cleanText(line), state);
 
   if (graph.nodes.length === 0) {
     appendLine(lines, "", state);
@@ -210,6 +217,14 @@ function renderNode(
   if (state.truncated) return;
 
   const detailPrefix = detailConnector(frame);
+  if (node.decisionDetail) {
+    appendLine(
+      lines,
+      `${detailPrefix}${explainAnalyzeDecisionDetailLine(node.decisionDetail)}`,
+      state,
+    );
+    if (state.truncated) return;
+  }
   for (const dependencyId of node.dependencyNodeIds.slice(0, MAX_RENDERED_DEPENDENCIES)) {
     const dependency = nodeById.get(dependencyId);
     appendLine(
@@ -244,6 +259,16 @@ function renderNode(
       state,
     );
   }
+}
+
+export function explainAnalyzeDecisionDetailLine(
+  detail: ExplainAnalyzeDecisionDetailV1,
+): string {
+  const requirement = detail.requirement_index + 1;
+  if (detail.match_count === 0) {
+    return `Requested model requirement ${requirement}: no active authorized Chat-capable model exactly matched in the current catalog snapshot; no child was started.`;
+  }
+  return `Requested model requirement ${requirement}: ${detail.match_count} active authorized Chat-capable catalog entries matched exactly; selection was ambiguous, so no child was started.`;
 }
 
 function renderUsage(
@@ -306,6 +331,12 @@ function renderContext(
   if (state.truncated || !context.assembly) return;
 
   const assembly = context.assembly;
+  for (const report of assembly.edge_memory_selection ?? []) {
+    for (const line of memorySelectionLines(report)) {
+      appendLine(lines, `${detailPrefix}${line}`, state);
+      if (state.truncated) return;
+    }
+  }
   appendLine(lines, `${detailPrefix}· context estimate (runtime_text_estimate):`, state);
   if (state.truncated) return;
   for (const source of assembly.sources) {
@@ -398,9 +429,6 @@ function contextSourceLabel(kind: ExplainAnalyzeContextSourceKindV1): string {
     skills: "Active skills",
     runtime_identity: "Runtime context",
     runtime_volatile: "Turn instructions",
-    emergent_skills: "Discovered skills",
-    emergent_memory: "Prefetched memory",
-    emergent_summary: "Tool summaries",
   };
   return labels[kind];
 }

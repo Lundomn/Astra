@@ -42,7 +42,37 @@ pub(crate) enum ViewResult {
         confirmed: bool,
     },
     Memory(MemorySelection),
+    /// Select a durable Work from the owner catalog for read-only observation.
+    /// This carries canonical ids rather than a rendered row label so a
+    /// filtered picker cannot attach the wrong Work.
+    WorkSelection {
+        work_id: String,
+        branch_id: String,
+        goal: String,
+        graph_revision: u64,
+    },
+    /// Explicit action chosen after selecting a Work. Observation never
+    /// changes the current Session; continuation is routed through the
+    /// canonical Work turn endpoint by the event loop.
+    WorkAction {
+        work_id: String,
+        branch_id: String,
+        goal: String,
+        graph_revision: u64,
+        action: WorkSelectionAction,
+    },
+    /// Continue the owner-scoped Work catalog without changing the current
+    /// conversation or selecting a Work implicitly.
+    WorkCatalogNextPage {
+        cursor: astra_thin_client::WorkCatalogCursorV1,
+    },
     InsertCommand(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkSelectionAction {
+    Observe,
+    Continue,
 }
 
 /// The only terminal outcomes of the config editor. The editor's internal
@@ -110,10 +140,6 @@ pub(crate) struct ViewCompletion {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BottomPaneViewAction {
-    /// Open the root conversation in the same transcript browser used for
-    /// delegated runs. The run navigator owns selection only; it never
-    /// substitutes its summary for this conversation.
-    OpenRootTranscript,
     /// Return from a focused conversation to the run navigator while keeping
     /// the conversation tab alive. If no navigator exists, the dispatcher
     /// closes the current transcript instead of inventing a parent surface.
@@ -130,16 +156,16 @@ pub(crate) enum BottomPaneViewAction {
         action: astra_thin_client::SessionRunAction,
     },
     BeginAgentGuide {
-        agent_id: String,
         agent_name: String,
         run_id: String,
         target: AgentControlTarget,
     },
     SubmitAgentGuide {
-        agent_id: String,
-        agent_name: String,
-        run_id: String,
-        target: AgentControlTarget,
+        target: crate::tui::event_loop::AgentGuideTarget,
+        content: String,
+    },
+    SubmitSessionContinuation {
+        target: crate::tui::event_loop::SessionContinuationTarget,
         content: String,
     },
     LoadAgentTranscript {
@@ -210,6 +236,13 @@ pub(crate) trait BottomPaneView: Send {
         false
     }
 
+    /// Whether a leading `/` should return focus to the composer and open the
+    /// global command palette. Text-entry views keep the slash for their own
+    /// input; read-only result views may opt in.
+    fn slash_reclaims_focus(&self) -> bool {
+        false
+    }
+
     fn dismiss_after_child_accept(&self) -> bool {
         false
     }
@@ -225,18 +258,6 @@ pub(crate) trait BottomPaneView: Send {
     }
 
     fn pre_draw_tick(&mut self, _now: std::time::Instant) {}
-
-    fn refresh_task_cell(
-        &mut self,
-        _id: &str,
-        _cell: &crate::tui::history_cell::task::TaskCell,
-    ) -> bool {
-        false
-    }
-
-    fn live_task_id(&self) -> Option<&str> {
-        None
-    }
 
     fn refresh_agent_monitor(
         &mut self,
@@ -270,10 +291,11 @@ pub(crate) trait BottomPaneView: Send {
     }
 
     /// Refresh the current local root suffix without promoting it to durable
-    /// history. Only the durable root transcript browser consumes this; the
-    /// local fallback browser already receives the full live snapshot.
+    /// history. The whole-session browser and exact-run tabs consume the same
+    /// update; exact-run tabs require its matching session/run binding.
     fn refresh_root_transcript_live(
         &mut self,
+        _binding: Option<(&str, &str)>,
         _item: Option<crate::tui::bottom_pane::transcript_view::TranscriptItem>,
     ) -> bool {
         false

@@ -38,57 +38,50 @@ criteria:
     code: 0
   - type: tool_called
     name: start_work
-  - type: journal_tool_call_count
+  - type: execution_tool_count
     name: start_work
     min: 1
     max: 1
-  - type: journal_tool_json
+    root_only: true
+  - type: execution_tool_count
     name: start_work
-    document: arguments
-    path: /activation
-    equals: defer
-  - type: journal_tool_json
-    name: start_work
-    document: result
-    path: /status
-    equals: started
-  - type: journal_tool_json
-    name: start_work
-    document: result
-    path: /initial_item_count
-    equals: 2
-  - type: journal_tool_json
-    name: start_work
-    document: result
-    path: /next_action
-    equals: await_explicit_continuation
-  - type: journal_tool_json
-    name: start_work
-    document: result
-    path: /initial_task
-    equals: null
-  - type: journal_tool_json
-    name: start_work
-    document: result
-    path: /task_board_update/schema_version
-    equals: 1
-  - type: journal_tool_call_count
+    min: 1
+    max: 1
+    root_only: true
+    ok: true
+    predicates:
+      - {document: arguments, path: /activation, equals: defer}
+      - {document: result, path: /status, equals: started}
+      - {document: result, path: /initial_item_count, equals: 2}
+      - {document: result, path: /next_action, equals: await_explicit_continuation}
+      - {document: result, path: /initial_task, equals: null}
+      - {document: result, path: /task_board_update/schema_version, equals: 1}
+  - type: execution_tool_count
     name: run_next_work_item
     min: 0
     max: 0
-  # Keep the stable admitted prefix intact even on the defer path.  Wrapping
-  # this quality signal in all_of makes it a hard journey contract without
-  # imposing a provider-specific cache-token floor.
+  - type: execution_child_count
+    min: 0
+    max: 0
+  # Require actual provider cache-read evidence, including a measured zero.
+  # Exact creation usage is optional on prefix-cache APIs; its absence must
+  # not invalidate a known cache-read count or silently become zero creation.
   - type: all_of
     criteria:
+      - type: prompt_cache_tokens
+        min_read: 0
+        min_creation: 0
       - type: pipeline_alert_count
         rule: prompt_cache_break
         max: 0
-  - type: journal_tool_call_count
+  - type: provider_stable_prefix_cache_coverage
+    min: 0.0
+    min_observations: 1
+  - type: execution_tool_count
     name: ask_user
     min: 0
     max: 0
-  - type: journal_tool_call_count
+  - type: execution_tool_count
     name: enter_plan_mode
     min: 0
     max: 0

@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::CancellationSafePoolConnection;
 use astra_core::SharedPool;
 use astra_turn_types::{
     DEFAULT_CONVERSATION_BRANCH_ID, DispatchCertainty, SessionKeyV1,
@@ -83,9 +84,64 @@ pub struct DatabaseToolInvocationLedger {
     pool: SharedPool,
 }
 
+/// A missing hot row is only an observation, never a reservation or dispatch
+/// grant. The later transactional insert/re-read still decides races.
+#[derive(Clone, Debug)]
+pub struct MissingToolInvocationPreparation {
+    identity: ToolInvocationIdentity,
+    tool: astra_turn_types::DurableToolReference,
+    canonical_arguments_hash: String,
+}
+
+impl MissingToolInvocationPreparation {
+    pub fn identity(&self) -> &ToolInvocationIdentity {
+        &self.identity
+    }
+
+    pub fn matches_tool_and_arguments(&self, fingerprint: &ToolInvocationFingerprint) -> bool {
+        self.tool == fingerprint.tool
+            && self.canonical_arguments_hash == fingerprint.canonical_arguments_hash
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum ToolInvocationPreparationProbe {
+    Existing(Box<ToolInvocationRecord>),
+    Missing(Box<MissingToolInvocationPreparation>),
+}
+
 impl DatabaseToolInvocationLedger {
     pub fn new(pool: SharedPool) -> Self {
         Self { pool }
+    }
+
+    /// Reuse the original hot-ledger point read before semantic admission.
+    /// The connection is released before judgment. A missing identity can
+    /// still be archived; transactional continuation resolves that case.
+    pub async fn probe_for_prepare(
+        &self,
+        identity: &ToolInvocationIdentity,
+        fingerprint: &ToolInvocationFingerprint,
+    ) -> Result<ToolInvocationPreparationProbe, ToolInvocationLedgerStoreError> {
+        let row = select_record_query(identity)
+            .fetch_optional(self.pool.get())
+            .await?;
+        if let Some(row) = row {
+            let record = decode_record(&row, identity)?;
+            if !record.fingerprint.same_tool_and_arguments(fingerprint) {
+                return Err(ToolInvocationLedgerStoreError::IdentityConflict {
+                    identity: Box::new(identity.clone()),
+                });
+            }
+            return Ok(ToolInvocationPreparationProbe::Existing(Box::new(record)));
+        }
+        Ok(ToolInvocationPreparationProbe::Missing(Box::new(
+            MissingToolInvocationPreparation {
+                identity: identity.clone(),
+                tool: fingerprint.tool.clone(),
+                canonical_arguments_hash: fingerprint.canonical_arguments_hash.clone(),
+            },
+        )))
     }
 
     /// Return an existing identity or insert `Prepared` idempotently.
@@ -100,7 +156,32 @@ impl DatabaseToolInvocationLedger {
         fingerprint: &ToolInvocationFingerprint,
         decision: &ToolInvocationDecision,
     ) -> Result<ToolInvocationPrepareOutcome, ToolInvocationLedgerStoreError> {
-        let fingerprint_json = serde_json::to_string(fingerprint).map_err(|source| {
+        self.prepare_internal(identity, fingerprint, decision, false)
+            .await
+    }
+
+    pub async fn finish_prepare_after_miss(
+        &self,
+        missing: Box<MissingToolInvocationPreparation>,
+        decision: &ToolInvocationDecision,
+    ) -> Result<ToolInvocationPrepareOutcome, ToolInvocationLedgerStoreError> {
+        let fingerprint = ToolInvocationFingerprint {
+            tool: missing.tool.clone(),
+            canonical_arguments_hash: missing.canonical_arguments_hash.clone(),
+            policy_decision_id: decision.decision_id.clone(),
+        };
+        self.prepare_internal(&missing.identity, &fingerprint, decision, true)
+            .await
+    }
+
+    async fn prepare_internal(
+        &self,
+        identity: &ToolInvocationIdentity,
+        fingerprint: &ToolInvocationFingerprint,
+        decision: &ToolInvocationDecision,
+        initial_hot_lookup_already_missed: bool,
+    ) -> Result<ToolInvocationPrepareOutcome, ToolInvocationLedgerStoreError> {
+        let fingerprint_json = serde_json::to_string(&fingerprint).map_err(|source| {
             ToolInvocationLedgerStoreError::Serialization {
                 field: "fingerprint_json",
                 source,
@@ -112,19 +193,58 @@ impl DatabaseToolInvocationLedger {
                 source,
             }
         })?;
-        let mut tx = self.pool.get().begin().await?;
-        if let Some(record) = load_record_in_tx(&mut tx, identity).await? {
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.begin().await?;
+        if !initial_hot_lookup_already_missed
+            && let Some(record) = load_record_in_tx(&mut tx, identity).await?
+        {
             if !record.fingerprint.same_tool_and_arguments(fingerprint) {
-                rollback(tx, "prepare identity conflict").await;
+                if rollback(tx, "prepare identity conflict").await.is_ok() {
+                    connection.release();
+                }
                 return Err(ToolInvocationLedgerStoreError::IdentityConflict {
                     identity: Box::new(identity.clone()),
                 });
             }
             tx.commit().await?;
+            connection.release();
             return Ok(ToolInvocationPrepareOutcome::Existing(record));
         }
         if let Err(error) = lock_executable_run(&mut tx, identity).await {
-            rollback(tx, "prepare run admission denied").await;
+            // Another worker may have inserted this identity and closed the
+            // run during semantic admission after our missing probe. Check
+            // the hot winner before falling back to archived recovery.
+            if initial_hot_lookup_already_missed
+                && matches!(
+                    error,
+                    ToolInvocationLedgerStoreError::RunNotExecutable { .. }
+                        | ToolInvocationLedgerStoreError::RunNotFound { .. }
+                )
+                && let Some(record) = load_record_in_tx(&mut tx, identity).await?
+            {
+                if !record.fingerprint.same_tool_and_arguments(fingerprint) {
+                    if rollback(tx, "prepare raced identity conflict")
+                        .await
+                        .is_ok()
+                    {
+                        connection.release();
+                    }
+                    return Err(ToolInvocationLedgerStoreError::IdentityConflict {
+                        identity: Box::new(identity.clone()),
+                    });
+                }
+                tx.commit().await?;
+                connection.release();
+                return Ok(ToolInvocationPrepareOutcome::Existing(record));
+            }
+            if rollback(tx, "prepare run admission denied").await.is_ok() {
+                connection.release();
+            } else {
+                // Archive recovery needs another checkout. A failed rollback
+                // leaves this physical connection untrusted, so close it
+                // before starting that independent read.
+                drop(connection);
+            }
             if matches!(
                 &error,
                 ToolInvocationLedgerStoreError::RunNotExecutable { .. }
@@ -175,12 +295,15 @@ impl DatabaseToolInvocationLedger {
             }
         })?;
         if !record.fingerprint.same_tool_and_arguments(fingerprint) {
-            rollback(tx, "prepare identity conflict").await;
+            if rollback(tx, "prepare identity conflict").await.is_ok() {
+                connection.release();
+            }
             return Err(ToolInvocationLedgerStoreError::IdentityConflict {
                 identity: Box::new(identity.clone()),
             });
         }
         tx.commit().await?;
+        connection.release();
 
         Ok(if inserted {
             ToolInvocationPrepareOutcome::Prepared(record)
@@ -395,7 +518,12 @@ impl DatabaseToolInvocationLedger {
         session_id: &str,
         run_id: &str,
     ) -> Result<ToolInvocationRunReconciliationOutcome, ToolInvocationLedgerStoreError> {
-        let mut tx = self.pool.get().begin().await?;
+        // Tool lifecycle work can be cancelled with its owning run. The
+        // physical checkout must remain guarded after the session fence is
+        // acquired so an aborted task cannot strand that fence in the shared
+        // pool.
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.begin().await?;
         crate::storage::admit_session_event_write(&mut tx, session_id, user_id, false).await?;
         let run_status = lock_terminal_run(&mut tx, user_id, session_id, run_id).await?;
         let completion_source = ToolInvocationCompletionSource::run_closure(&run_status)?;
@@ -505,28 +633,37 @@ impl DatabaseToolInvocationLedger {
             || expired_dispatches_unknown > 0
         {
             let event_id = Uuid::new_v4().to_string();
+            let content = format!(
+                "terminal run invocation reconciliation: prepared_rejected={prepared_rejected}, inconsistent_prepared_unknown={inconsistent_prepared_unknown}, expired_dispatches_unknown={expired_dispatches_unknown}, active_dispatches_remaining={active_dispatches_remaining}"
+            );
+            let metadata = serde_json::json!({
+                "run_status": &run_status,
+                "prepared_rejected": prepared_rejected,
+                "inconsistent_prepared_unknown": inconsistent_prepared_unknown,
+                "expired_dispatches_unknown": expired_dispatches_unknown,
+                "active_dispatches_remaining": active_dispatches_remaining,
+            });
+            let payload_hash = crate::observation_capture::canonical_observation_payload_hash(
+                crate::observation_capture::ObservationPayloadDomain::AgentEvent,
+                &serde_json::json!({
+                    "event_id": event_id, "session_id": session_id, "user_id": user_id,
+                    "run_id": run_id, "event_type": "tool_invocation_run_reconciled",
+                    "content": content, "metadata": metadata,
+                }),
+            );
             let insert = sqlx::query(
                 "INSERT INTO agent_events
-                 (event_id, session_id, user_id, run_id, event_type, content, metadata, created_at)
-                 VALUES (?, ?, ?, ?, 'tool_invocation_run_reconciled', ?, ?, NOW(6))",
+                 (event_id, session_id, user_id, run_id, event_type, content, metadata, payload_hash, ingestion_write_id, created_at)
+                 VALUES (?, ?, ?, ?, 'tool_invocation_run_reconciled', ?, ?, ?, ?, NOW(6))",
             )
             .bind(&event_id)
             .bind(session_id)
             .bind(user_id)
             .bind(run_id)
-            .bind(format!(
-                "terminal run invocation reconciliation: prepared_rejected={prepared_rejected}, inconsistent_prepared_unknown={inconsistent_prepared_unknown}, expired_dispatches_unknown={expired_dispatches_unknown}, active_dispatches_remaining={active_dispatches_remaining}"
-            ))
-            .bind(
-                serde_json::json!({
-                    "run_status": &run_status,
-                    "prepared_rejected": prepared_rejected,
-                    "inconsistent_prepared_unknown": inconsistent_prepared_unknown,
-                    "expired_dispatches_unknown": expired_dispatches_unknown,
-                    "active_dispatches_remaining": active_dispatches_remaining,
-                })
-                .to_string(),
-            )
+            .bind(content)
+            .bind(metadata.to_string())
+            .bind(payload_hash)
+            .bind(Uuid::new_v4().to_string())
             .execute(&mut *tx)
             .await?;
             let inserted_events = crate::storage::rows_affected_to_i64(
@@ -539,8 +676,8 @@ impl DatabaseToolInvocationLedger {
                 )
                 .into());
             }
-            crate::storage::add_agent_session_event_count_or_create(
-                &mut tx,
+            crate::storage::bump_agent_session_event_count(
+                &mut *tx,
                 session_id,
                 user_id,
                 inserted_events,
@@ -560,30 +697,39 @@ impl DatabaseToolInvocationLedger {
             .fetch_optional(&mut *tx)
             .await?;
             if already_recorded.is_none() {
+                let content = format!(
+                    "terminal run retains {active_dispatches_remaining} actively leased tool invocation(s)"
+                );
+                let metadata = serde_json::json!({
+                    "run_status": &run_status,
+                    "active_dispatches_remaining": active_dispatches_remaining,
+                    "resolution": "wait_for_completion_or_lease_expiry",
+                });
+                let payload_hash = crate::observation_capture::canonical_observation_payload_hash(
+                    crate::observation_capture::ObservationPayloadDomain::AgentEvent,
+                    &serde_json::json!({
+                        "event_id": event_id, "session_id": session_id, "user_id": user_id,
+                        "run_id": run_id, "event_type": "tool_invocation_compaction_deferred",
+                        "content": content, "metadata": metadata,
+                    }),
+                );
                 sqlx::query(
                     "INSERT INTO agent_events
-                     (event_id, session_id, user_id, run_id, event_type, content, metadata, created_at)
-                     VALUES (?, ?, ?, ?, 'tool_invocation_compaction_deferred', ?, ?, NOW(6))",
+                     (event_id, session_id, user_id, run_id, event_type, content, metadata, payload_hash, ingestion_write_id, created_at)
+                     VALUES (?, ?, ?, ?, 'tool_invocation_compaction_deferred', ?, ?, ?, ?, NOW(6))",
                 )
                 .bind(&event_id)
                 .bind(session_id)
                 .bind(user_id)
                 .bind(run_id)
-                .bind(format!(
-                    "terminal run retains {active_dispatches_remaining} actively leased tool invocation(s)"
-                ))
-                .bind(
-                    serde_json::json!({
-                        "run_status": &run_status,
-                        "active_dispatches_remaining": active_dispatches_remaining,
-                        "resolution": "wait_for_completion_or_lease_expiry",
-                    })
-                    .to_string(),
-                )
+                .bind(content)
+                .bind(metadata.to_string())
+                .bind(payload_hash)
+                .bind(Uuid::new_v4().to_string())
                 .execute(&mut *tx)
                 .await?;
-                crate::storage::add_agent_session_event_count_or_create(
-                    &mut tx,
+                crate::storage::bump_agent_session_event_count(
+                    &mut *tx,
                     session_id,
                     user_id,
                     1,
@@ -593,6 +739,7 @@ impl DatabaseToolInvocationLedger {
             }
         }
         tx.commit().await?;
+        connection.release();
         Ok(ToolInvocationRunReconciliationOutcome {
             prepared_rejected,
             inconsistent_prepared_unknown,
@@ -610,7 +757,8 @@ impl DatabaseToolInvocationLedger {
         session_id: &str,
         run_id: &str,
     ) -> Result<ToolInvocationCompactionOutcome, ToolInvocationLedgerStoreError> {
-        let mut tx = self.pool.get().begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.begin().await?;
         let _run_status = lock_terminal_run(&mut tx, user_id, session_id, run_id).await?;
         let non_terminal_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tool_invocation_ledger
@@ -632,6 +780,12 @@ impl DatabaseToolInvocationLedger {
             });
         }
 
+        // An `outcome_unknown` row is a live safety fact: the provider boundary
+        // may have been crossed, but no terminal outcome is authoritative yet.
+        // Keep it in the hot ledger so Session admission can continue to see
+        // the unresolved effect after compaction. Archiving it would make a
+        // later recovery capture look quiescent even though replay still needs
+        // human/provider reconciliation.
         let rows = sqlx::query(
             "SELECT turn_chain_id, invocation_id, identity_key,
                     JSON_UNQUOTE(fingerprint_json) AS fingerprint_json,
@@ -643,6 +797,7 @@ impl DatabaseToolInvocationLedger {
                         AS dispatch_lease_expires_at_epoch_ms
              FROM tool_invocation_ledger
              WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND state <> 'outcome_unknown'
              ORDER BY identity_key
              LIMIT ? FOR UPDATE",
         )
@@ -653,10 +808,22 @@ impl DatabaseToolInvocationLedger {
         .fetch_all(&mut *tx)
         .await?;
         if rows.is_empty() {
+            let remaining_records: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM tool_invocation_ledger
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .bind(run_id)
+            .fetch_one(&mut *tx)
+            .await?;
             tx.commit().await?;
+            connection.release();
             return Ok(ToolInvocationCompactionOutcome {
                 archived_records: 0,
-                remaining_records: 0,
+                remaining_records: u64::try_from(remaining_records).map_err(|_| {
+                    ToolInvocationLedgerStoreError::InvalidCompactionCount(remaining_records)
+                })?,
                 artifact_id: None,
             });
         }
@@ -840,6 +1007,7 @@ impl DatabaseToolInvocationLedger {
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
+        connection.release();
         Ok(ToolInvocationCompactionOutcome {
             archived_records: chunk.records.len(),
             remaining_records: u64::try_from(remaining_records).map_err(|_| {
@@ -943,7 +1111,8 @@ impl DatabaseToolInvocationLedger {
     ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
         validate_lease_input(owner_id, lease_duration_ms)?;
         let lease_duration_us = lease_duration_us(lease_duration_ms)?;
-        let mut tx = self.pool.get().begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.begin().await?;
         // Check Work's provider generation before granting Run action
         // authority. Provider switching must first clear the active Session
         // slot and unresolved invocation ledger, so a live dispatch cannot be
@@ -971,7 +1140,12 @@ impl DatabaseToolInvocationLedger {
         let admission_outcome = match admission_outcome {
             Ok(outcome) => outcome,
             Err(reason) => {
-                rollback(tx, "tool dispatch action admission failed").await;
+                if rollback(tx, "tool dispatch action admission failed")
+                    .await
+                    .is_ok()
+                {
+                    connection.release();
+                }
                 return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
                     identity: Box::new(identity.clone()),
                     reason,
@@ -981,7 +1155,12 @@ impl DatabaseToolInvocationLedger {
         match admission_outcome {
             crate::runs::TransactionalRunActionAdmission::Granted { .. } => {}
             crate::runs::TransactionalRunActionAdmission::AlreadyStarted { event_index } => {
-                rollback(tx, "tool dispatch action was already started").await;
+                if rollback(tx, "tool dispatch action was already started")
+                    .await
+                    .is_ok()
+                {
+                    connection.release();
+                }
                 return Err(ToolInvocationLedgerStoreError::ActionAlreadyStarted {
                     identity: Box::new(identity.clone()),
                     event_index,
@@ -1063,7 +1242,12 @@ impl DatabaseToolInvocationLedger {
                             identity: identity.clone(),
                         }
                     })?;
-                    rollback(tx, "superseded tool dispatch closure mismatch").await;
+                    if rollback(tx, "superseded tool dispatch closure mismatch")
+                        .await
+                        .is_ok()
+                    {
+                        connection.release();
+                    }
                     if is_exact_guidance_rejection(&actual, &outcome, &completion_source) {
                         return Err(ToolInvocationLedgerStoreError::ActionSuperseded {
                             identity: Box::new(identity.clone()),
@@ -1079,6 +1263,7 @@ impl DatabaseToolInvocationLedger {
                     });
                 }
                 if let Err(source) = tx.commit().await {
+                    drop(connection);
                     if matches!(
                         self.get(identity).await,
                         Ok(Some(record))
@@ -1098,13 +1283,16 @@ impl DatabaseToolInvocationLedger {
                         reason: format!("commit superseded not-dispatched closure: {source}"),
                     });
                 }
+                connection.release();
                 return Err(ToolInvocationLedgerStoreError::ActionSuperseded {
                     identity: Box::new(identity.clone()),
                     user_intent_event_index,
                 });
             }
             crate::runs::TransactionalRunActionAdmission::Inactive { status } => {
-                rollback(tx, "tool dispatch run inactive").await;
+                if rollback(tx, "tool dispatch run inactive").await.is_ok() {
+                    connection.release();
+                }
                 return Err(ToolInvocationLedgerStoreError::RunNotExecutable {
                     run_id: identity.run_id.clone(),
                     status,
@@ -1113,7 +1301,12 @@ impl DatabaseToolInvocationLedger {
             crate::runs::TransactionalRunActionAdmission::OwnerGenerationMismatch {
                 actual_owner_generation,
             } => {
-                rollback(tx, "tool dispatch owner generation changed").await;
+                if rollback(tx, "tool dispatch owner generation changed")
+                    .await
+                    .is_ok()
+                {
+                    connection.release();
+                }
                 return Err(ToolInvocationLedgerStoreError::RunOwnerGenerationMismatch {
                     run_id: identity.run_id.clone(),
                     expected_owner_generation: admission.expected_owner_generation,
@@ -1123,7 +1316,12 @@ impl DatabaseToolInvocationLedger {
             crate::runs::TransactionalRunActionAdmission::OwnerMismatch {
                 actual_owner_pod_id,
             } => {
-                rollback(tx, "tool dispatch owner pod changed").await;
+                if rollback(tx, "tool dispatch owner pod changed")
+                    .await
+                    .is_ok()
+                {
+                    connection.release();
+                }
                 return Err(ToolInvocationLedgerStoreError::RunOwnerMismatch {
                     run_id: identity.run_id.clone(),
                     expected_owner_pod_id: admission.expected_owner_pod_id.clone(),
@@ -1131,7 +1329,9 @@ impl DatabaseToolInvocationLedger {
                 });
             }
             crate::runs::TransactionalRunActionAdmission::Missing => {
-                rollback(tx, "tool dispatch run missing").await;
+                if rollback(tx, "tool dispatch run missing").await.is_ok() {
+                    connection.release();
+                }
                 return Err(ToolInvocationLedgerStoreError::RunNotFound {
                     user_id: identity.user_id.clone(),
                     run_id: identity.run_id.clone(),
@@ -1160,7 +1360,9 @@ impl DatabaseToolInvocationLedger {
 
         let record = load_record_in_tx(&mut tx, identity).await?;
         if updated != 1 {
-            rollback(tx, "claim-dispatch mismatch").await;
+            if rollback(tx, "claim-dispatch mismatch").await.is_ok() {
+                connection.release();
+            }
             return match record {
                 Some(actual) => Err(ToolInvocationLedgerStoreError::StateMismatch {
                     identity: identity.clone(),
@@ -1176,6 +1378,7 @@ impl DatabaseToolInvocationLedger {
             identity: identity.clone(),
         })?;
         if let Err(source) = tx.commit().await {
+            drop(connection);
             // COMMIT acknowledgement loss is not evidence that the claim
             // rolled back. The provider boundary has not been crossed yet,
             // so this same owner may proceed only when an authoritative
@@ -1191,6 +1394,7 @@ impl DatabaseToolInvocationLedger {
                 )
                 .await;
         }
+        connection.release();
         Ok(record)
     }
 
@@ -1202,7 +1406,8 @@ impl DatabaseToolInvocationLedger {
         admission: &ToolInvocationDispatchAdmission,
         original_commit_error: sqlx::Error,
     ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
-        let mut tx = self.pool.get().begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.begin().await?;
         validate_execution_binding_generation_in_tx(
             &mut tx,
             identity,
@@ -1275,11 +1480,15 @@ impl DatabaseToolInvocationLedger {
             .await?
             .rows_affected(),
             other => {
-                rollback(
+                if rollback(
                     tx,
                     "dispatch commit acknowledgement lost execution authority",
                 )
-                .await;
+                .await
+                .is_ok()
+                {
+                    connection.release();
+                }
                 return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
                     identity: Box::new(identity.clone()),
                     reason: format!(
@@ -1293,7 +1502,12 @@ impl DatabaseToolInvocationLedger {
             updated == 1
                 && dispatch_claim_shape_matches_after_db_lease_renewal(record, identity, owner_id)
         }) else {
-            rollback(tx, "dispatch commit acknowledgement recovery mismatch").await;
+            if rollback(tx, "dispatch commit acknowledgement recovery mismatch")
+                .await
+                .is_ok()
+            {
+                connection.release();
+            }
             return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
                 identity: Box::new(identity.clone()),
                 reason: format!(
@@ -1301,14 +1515,16 @@ impl DatabaseToolInvocationLedger {
                 ),
             });
         };
-        tx.commit().await.map_err(|recovery_error| {
-            ToolInvocationLedgerStoreError::ActionAdmissionFailed {
+        if let Err(recovery_error) = tx.commit().await {
+            drop(connection);
+            return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
                 identity: Box::new(identity.clone()),
                 reason: format!(
                     "dispatch commit acknowledgement recovery commit failed after {original_commit_error}: {recovery_error}"
                 ),
-            }
-        })?;
+            });
+        }
+        connection.release();
         Ok(recovered)
     }
 
@@ -1320,7 +1536,8 @@ impl DatabaseToolInvocationLedger {
     ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
         validate_lease_input(owner_id, lease_duration_ms)?;
         let lease_duration_us = lease_duration_us(lease_duration_ms)?;
-        let mut tx = self.pool.get().begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.begin().await?;
         sqlx::query(
             "UPDATE tool_invocation_ledger
              SET dispatch_lease_expires_at =
@@ -1346,6 +1563,7 @@ impl DatabaseToolInvocationLedger {
         })?;
         ensure_dispatched_owner(identity, &record, owner_id)?;
         tx.commit().await?;
+        connection.release();
         Ok(record)
     }
 
@@ -1356,7 +1574,8 @@ impl DatabaseToolInvocationLedger {
         &self,
         identity: &ToolInvocationIdentity,
     ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
-        let mut tx = self.pool.get().begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.begin().await?;
         sqlx::query(
             "UPDATE tool_invocation_ledger
              SET state = 'outcome_unknown', dispatch_certainty = 'unknown',
@@ -1379,6 +1598,7 @@ impl DatabaseToolInvocationLedger {
             }
         })?;
         tx.commit().await?;
+        connection.release();
         Ok(record)
     }
 
@@ -1388,7 +1608,8 @@ impl DatabaseToolInvocationLedger {
         owner_id: &str,
     ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
         ToolInvocationDispatchLease::new(owner_id, 1)?;
-        let mut tx = self.pool.get().begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.begin().await?;
         let updated = sqlx::query(
             "UPDATE tool_invocation_ledger
              SET state = 'outcome_unknown', dispatch_certainty = 'unknown',
@@ -1412,7 +1633,9 @@ impl DatabaseToolInvocationLedger {
             }
         })?;
         if updated != 1 {
-            rollback(tx, "mark-outcome-unknown mismatch").await;
+            if rollback(tx, "mark-outcome-unknown mismatch").await.is_ok() {
+                connection.release();
+            }
             ensure_dispatched_owner(identity, &record, owner_id)?;
             return Err(ToolInvocationLedgerStoreError::StateMismatch {
                 identity: identity.clone(),
@@ -1421,6 +1644,7 @@ impl DatabaseToolInvocationLedger {
             });
         }
         tx.commit().await?;
+        connection.release();
         Ok(record)
     }
 
@@ -1448,7 +1672,8 @@ impl DatabaseToolInvocationLedger {
                 source,
             }
         })?;
-        let mut tx = self.pool.get().begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.begin().await?;
         let (owner_predicate, owner_id) = completion_owner(expected, owner_id, identity)?;
         let query = format!(
             "UPDATE tool_invocation_ledger
@@ -1458,7 +1683,7 @@ impl DatabaseToolInvocationLedger {
              WHERE user_id = ? AND session_id = ? AND run_id = ?
                AND turn_chain_id = ? AND invocation_id = ? AND state = ?{owner_predicate}"
         );
-        let mut query = sqlx::query(&query)
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(query))
             .bind(state_label(next))
             .bind(outcome_json)
             .bind(&identity.user_id)
@@ -1498,13 +1723,16 @@ impl DatabaseToolInvocationLedger {
                     identity: identity.clone(),
                 },
             };
-            rollback(tx, "compare-and-complete mismatch").await;
+            if rollback(tx, "compare-and-complete mismatch").await.is_ok() {
+                connection.release();
+            }
             return Err(mismatch);
         }
         let record = record.ok_or_else(|| ToolInvocationLedgerStoreError::NotFound {
             identity: identity.clone(),
         })?;
         tx.commit().await?;
+        connection.release();
         Ok(record)
     }
 
@@ -1535,7 +1763,8 @@ impl DatabaseToolInvocationLedger {
                     source,
                 }
             })?;
-        let mut tx = self.pool.get().begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.begin().await?;
         let updated = sqlx::query(
             "UPDATE tool_invocation_ledger
              SET state = 'succeeded', dispatch_certainty = 'not_dispatched',
@@ -1568,13 +1797,19 @@ impl DatabaseToolInvocationLedger {
                     identity: identity.clone(),
                 },
             };
-            rollback(tx, "semantic-cache-completion mismatch").await;
+            if rollback(tx, "semantic-cache-completion mismatch")
+                .await
+                .is_ok()
+            {
+                connection.release();
+            }
             return Err(error);
         }
         let record = record.ok_or_else(|| ToolInvocationLedgerStoreError::NotFound {
             identity: identity.clone(),
         })?;
         tx.commit().await?;
+        connection.release();
         Ok(record)
     }
 }
@@ -1782,10 +2017,14 @@ fn decode_record(
     Ok(record)
 }
 
-async fn rollback(tx: Transaction<'_, MySql>, context: &'static str) {
-    if let Err(error) = tx.rollback().await {
+/// Returns success only when the checkout is synchronized and safe to reuse.
+/// Callers using `CancellationSafePoolConnection` must keep its close-on-drop
+/// guard armed when this returns an error.
+async fn rollback(tx: Transaction<'_, MySql>, context: &'static str) -> Result<(), sqlx::Error> {
+    tx.rollback().await.map_err(|error| {
         tracing::warn!(context, %error, "tool invocation ledger rollback failed");
-    }
+        error
+    })
 }
 
 /// Validate immutable dispatch shape after the caller has renewed both the
@@ -1887,22 +2126,11 @@ async fn validate_execution_binding_generation_in_tx(
             binding.state,
         ));
     }
-    // Claim creation belongs to binding/admission transactions. Dispatch is a
-    // hot path and must not INSERT/DELETE/lock the claim for every tool call;
-    // observe the already-established owner mapping instead.
-    crate::session_context_coordinator::verify_execution_workspace_claim_in_tx(tx, &key, &binding)
-        .await
-        .map_err(|error| match error {
-            crate::SessionContextCoordinatorError::ExecutionBindingBusy => {
-                ToolInvocationLedgerStoreError::ExecutionBindingBusy
-            }
-            crate::SessionContextCoordinatorError::ExecutionWorkspaceClaimed { .. } => {
-                ToolInvocationLedgerStoreError::ExecutionBindingInvalid(
-                    "execution workspace claim changed owner during tool dispatch".to_string(),
-                )
-            }
-            other => ToolInvocationLedgerStoreError::ExecutionBindingInvalid(other.to_string()),
-        })?;
+    // The binding row and generation are the Session-scoped authority. The
+    // physical workspace is deliberately not represented by a Session-wide
+    // database claim; its executor serializes actual observations and writes
+    // with the workspace mutation lease. Omitting the old claim lookup keeps
+    // parallel tool dispatch on the database-only binding fence.
     Ok(())
 }
 
@@ -2072,7 +2300,7 @@ pub enum ToolInvocationLedgerStoreError {
     ExecutionBindingNotReady(crate::SessionExecutionBindingStateV1),
     #[error("stored Session execution binding is invalid: {0}")]
     ExecutionBindingInvalid(String),
-    #[error("Session execution binding is busy with another physical workspace claim")]
+    #[error("Session execution binding is occupied by active session execution state")]
     ExecutionBindingBusy,
     #[error(
         "tool invocation action was superseded by user intent at event {user_intent_event_index}: {identity:?}"

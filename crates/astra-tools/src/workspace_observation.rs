@@ -10,7 +10,7 @@
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, OnceLock, mpsc};
@@ -32,7 +32,6 @@ const MAX_STATUS_ENTRIES: usize = 8_192;
 const MAX_IGNORED_ENTRIES: usize = 2_048;
 const MAX_IGNORED_CONTENT_BYTES: usize = 8 * 1024 * 1024;
 const FINGERPRINT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-const DEFAULT_LEASE_WAIT: Duration = Duration::from_secs(120);
 #[cfg(target_os = "linux")]
 const MAX_ACTIVE_GENERATION_WATCH_PATHS: usize = 16_384;
 #[cfg(target_os = "linux")]
@@ -43,6 +42,11 @@ const TRUSTED_GIT_PATH: &str = "/usr/bin:/bin";
 #[cfg(windows)]
 const TRUSTED_GIT_PATH: &str = r"C:\Windows\System32";
 
+fn is_executor_owned_fingerprint_path(path: &Path) -> bool {
+    matches!(path.components().next(), Some(Component::Normal(name))
+        if name == ".astra" || name == crate::shell_output_capture::CAPTURE_DIRECTORY_NAME)
+}
+
 /// Metadata keys carried in a `ToolResult` and projected into the lossless
 /// `ToolCallRecord`.  The scope value is intentionally explicit so a future
 /// executor cannot accidentally turn an external/scratch observation into a
@@ -50,6 +54,10 @@ const TRUSTED_GIT_PATH: &str = r"C:\Windows\System32";
 pub const OBSERVED_FIELD: &str = "workspace_mutation_observed";
 pub const SCOPE_FIELD: &str = "workspace_mutation_scope";
 pub const RECEIPT_FIELD: &str = "workspace_mutation_receipt";
+/// A direct typed writer committed inside the bound workspace, but later
+/// workspace attribution is unavailable. This is not a mutation or observer
+/// receipt and must never be used to certify current file contents.
+pub const WRITER_APPLIED_BOUND_FIELD: &str = "workspace_writer_applied_bound";
 pub const OWNERSHIP_FIELD: &str = "workspace_mutation_ownership";
 pub const BOUND_WORKSPACE_SCOPE: &str = "bound_workspace";
 pub const INVOCATION_CGROUP_OWNERSHIP: &str = "invocation_cgroup";
@@ -75,19 +83,6 @@ static DESIRED_STATE_MARKER_REGISTRY: OnceLock<
 const MAX_LIVE_DESIRED_STATE_MARKERS: usize = 4096;
 pub const OBSERVATION_RECEIPT_FIELD: &str = "workspace_observation_receipt";
 pub const OBSERVATION_SCOPE_FIELD: &str = "workspace_observation_scope";
-/// Structured Bash argument naming the bounded external state roots whose
-/// exact pre/post state the executor must observe.
-pub const EXTERNAL_STATE_PATHS_FIELD: &str = "external_state_paths";
-pub const EXTERNAL_EFFECT_OBSERVED_FIELD: &str = "external_effect_observed";
-pub const EXTERNAL_EFFECT_SCOPE_FIELD: &str = "external_effect_scope";
-pub const EXTERNAL_EFFECT_RECEIPT_FIELD: &str = "external_effect_receipt";
-pub const DECLARED_EXTERNAL_STATE_SCOPE: &str = "declared_external_state";
-/// Ownership marker for non-filesystem tools that return an executor-owned
-/// external mutation receipt.  This is intentionally distinct from the
-/// invocation/fingerprint owners above: a typed service operation proves its
-/// own durable mutation and does not expose a filesystem observation window.
-pub const TYPED_EXTERNAL_TOOL_OWNERSHIP: &str = "typed_external_tool";
-const MAX_EXTERNAL_STATE_PATHS: usize = 16;
 /// Minimal path for the only external helper allowed in a detached command
 /// (`sleep`). Builtins do not consult PATH, and clearing the inherited
 /// environment removes BASH_ENV, exported functions, LD_PRELOAD, and user
@@ -163,10 +158,6 @@ static WRITER_EPOCHS: OnceLock<
 static QUARANTINED_WRITER_STATES: OnceLock<
     std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Arc<WriterEpochState>>>,
 > = OnceLock::new();
-
-// Fingerprinting can walk a bounded but still non-trivial tree.  Keep it off
-// runtime workers and bound concurrent postimages under multi-session load.
-static EXTERNAL_POSTIMAGE_PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 fn recover_mutex<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     match mutex.lock() {
@@ -250,6 +241,7 @@ fn writer_epoch_state(workspace_root: &Path) -> Option<Arc<WriterEpochState>> {
         QUARANTINED_WRITER_STATES.get_or_init(|| std::sync::Mutex::new(Default::default()));
     let map = recover_mutex(quarantine_map);
     if let Some(state) = lookup_keys.iter().find_map(|key| map.get(key).cloned()) {
+        hydrate_persistent_ownership_quarantine(&state, &lookup_keys);
         return Some(state);
     }
     let epochs = WRITER_EPOCHS.get_or_init(|| std::sync::Mutex::new(Default::default()));
@@ -259,14 +251,90 @@ fn writer_epoch_state(workspace_root: &Path) -> Option<Arc<WriterEpochState>> {
         .iter()
         .find_map(|key| map.get(key).and_then(std::sync::Weak::upgrade))
     {
+        hydrate_persistent_ownership_quarantine(&state, &lookup_keys);
         return Some(state);
     }
     let state = Arc::new(WriterEpochState::default());
     let weak = Arc::downgrade(&state);
-    for key in lookup_keys {
-        map.insert(key, weak.clone());
+    for key in &lookup_keys {
+        map.insert(key.clone(), weak.clone());
     }
+    // A previous process may have left an unresolved descendant behind. The
+    // persistent marker is the cross-process part of the same sticky fence;
+    // hydrate it before any fingerprint or lease caller can observe a clean
+    // in-process state.
+    hydrate_persistent_ownership_quarantine(&state, &lookup_keys);
     Some(state)
+}
+
+fn effective_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() }
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+fn ownership_unsettled_marker_path(key: &Path) -> Option<PathBuf> {
+    let root = stable_coordination_root()?;
+    let digest = coordination_key_digest(key);
+    Some(root.join(format!(
+        ".astra-workspace-{digest}-observation-uid-{}.unsettled",
+        effective_uid()
+    )))
+}
+
+fn ownership_unsettled_marker_exists(key: &Path) -> bool {
+    ownership_unsettled_marker_path(key).is_some_and(|path| path.is_file())
+}
+
+fn hydrate_persistent_ownership_quarantine(state: &Arc<WriterEpochState>, keys: &[PathBuf]) {
+    if keys
+        .iter()
+        .any(|key| ownership_unsettled_marker_exists(key))
+    {
+        state
+            .quarantined
+            .store(true, std::sync::atomic::Ordering::Release);
+        state
+            .ownership_unsettled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Install a restart- and process-stable ownership fence. The marker contains
+/// no workspace path or user data; its digest is only a coordination key. It
+/// is deliberately never removed automatically because no process can prove
+/// that the delayed provider-side writer has stopped after a lost ACK.
+fn persist_ownership_unsettled_markers(keys: &[PathBuf]) -> bool {
+    let mut all_persisted = true;
+    for key in keys {
+        let Some(path) = ownership_unsettled_marker_path(key) else {
+            all_persisted = false;
+            continue;
+        };
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        match options.open(&path) {
+            Ok(mut file) => {
+                if file
+                    .write_all(b"astra workspace ownership unsettled\n")
+                    .and_then(|_| file.sync_all())
+                    .is_err()
+                {
+                    all_persisted = false;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => all_persisted = false,
+        }
+    }
+    all_persisted
 }
 
 /// Resolve a stable binding key even when an invocation has removed or
@@ -320,6 +388,7 @@ pub fn mark_workspace_observation_unsettled(workspace_root: &Path) -> bool {
 
 /// Retain the admitted observation state across root renames or retargeting.
 /// This handle carries attribution state only; it does not acquire a writer lease.
+#[derive(Clone)]
 pub struct WorkspaceAttributionState {
     state: Arc<WriterEpochState>,
     aliases: Vec<PathBuf>,
@@ -356,17 +425,36 @@ fn quarantine_observation_state(
     mut aliases: Vec<PathBuf>,
     ownership_unsettled: bool,
 ) {
-    state
+    let was_quarantined = state
         .quarantined
-        .store(true, std::sync::atomic::Ordering::Release);
-    if ownership_unsettled {
-        state
+        .swap(true, std::sync::atomic::Ordering::AcqRel);
+    let newly_unsettled = if ownership_unsettled {
+        !state
             .ownership_unsettled
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-    state
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+    } else {
+        false
+    };
+    let epoch = state
         .epoch
-        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+        .wrapping_add(1);
+    if !was_quarantined || newly_unsettled {
+        // Correlate later refusals without logging local paths or shell input.
+        let root_digest = aliases.first().map(|root| observation_root_digest(root));
+        tracing::warn!(
+            component = "workspace_observation",
+            operation = "quarantine",
+            reason = if ownership_unsettled {
+                "ownership_unsettled"
+            } else {
+                "attribution_uncertain"
+            },
+            root_digest,
+            epoch,
+            "workspace observations quarantined for the lifetime of this executor process"
+        );
+    }
     // Preserve every alias that was registered while the invocation still
     // held the state. This closes the symlink/rebind race: a terminal path
     // lookup must quarantine the pre-existing state, not create a new clean
@@ -383,6 +471,13 @@ fn quarantine_observation_state(
                 aliases.push(alias.clone());
             }
         }
+    }
+    if ownership_unsettled && !persist_ownership_unsettled_markers(&aliases) {
+        tracing::error!(
+            component = "workspace_observation",
+            operation = "persistent_quarantine",
+            "could not install the cross-process ownership fence; keeping the local fence and rejecting further workspace work"
+        );
     }
     let quarantine_map =
         QUARANTINED_WRITER_STATES.get_or_init(|| std::sync::Mutex::new(Default::default()));
@@ -423,11 +518,74 @@ pub fn workspace_ownership_is_unsettled(workspace_root: &Path) -> Option<bool> {
     )
 }
 
-/// Mark an executor-owned writer that may recursively invoke other tools.
-/// The epoch changes at both admission and completion, making overlap visible
-/// even when the writer itself returns to a clean workspace state.
-pub fn begin_workspace_writer(workspace_root: &Path) -> Option<WorkspaceWriterGuard> {
-    begin_workspace_writer_sync_with_options(workspace_root, None, DEFAULT_LEASE_WAIT)
+/// Why a workspace lease could not be admitted.  This is intentionally a
+/// small classification: callers must distinguish a safe retry after
+/// contention from a binding that needs repair or ownership that must never
+/// be replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceLeaseFailure {
+    OwnershipUnsettled,
+    BindingUnavailable,
+    CoordinationHostUnsupported,
+    Contended,
+    Cancelled,
+    WatcherUnavailable,
+    WatcherCapacity {
+        active: usize,
+        requested: usize,
+        limit: usize,
+    },
+}
+
+impl std::fmt::Display for WorkspaceLeaseFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CoordinationHostUnsupported => formatter.write_str(
+                "Local workspace execution requires a root-owned, sticky, world-writable temporary directory (/tmp on Linux, /private/tmp on macOS). This host does not provide the trusted coordination root; use a supported host or ask its administrator to provision it. Workspace rebinding and cache overrides cannot repair this host prerequisite.",
+            ),
+            Self::WatcherCapacity {
+                active,
+                requested,
+                limit,
+            } => write!(
+                formatter,
+                "macOS workspace watcher capacity exceeded (active_descriptors={active}, requested_descriptors={requested}, limit={limit}); no receipt authority was granted"
+            ),
+            other => write!(formatter, "workspace lease admission failed: {other:?}"),
+        }
+    }
+}
+
+impl std::error::Error for WorkspaceLeaseFailure {}
+
+impl WorkspaceLeaseFailure {
+    fn from_watch_error(error: &std::io::Error) -> Self {
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<Self>())
+            .copied()
+            .unwrap_or(if error.kind() == std::io::ErrorKind::Interrupted {
+                Self::Cancelled
+            } else {
+                Self::WatcherUnavailable
+            })
+    }
+
+    fn transient_capacity(self) -> bool {
+        matches!(self, Self::WatcherCapacity { requested, limit, .. } if requested <= limit && limit > 0)
+    }
+}
+
+pub fn classify_workspace_lease_failure(workspace_root: &Path) -> WorkspaceLeaseFailure {
+    if workspace_ownership_is_unsettled(workspace_root) == Some(true) {
+        WorkspaceLeaseFailure::OwnershipUnsettled
+    } else if !workspace_root.exists() {
+        WorkspaceLeaseFailure::BindingUnavailable
+    } else if validate_workspace_coordination_host().is_err() {
+        WorkspaceLeaseFailure::CoordinationHostUnsupported
+    } else {
+        WorkspaceLeaseFailure::Contended
+    }
 }
 
 /// Admit a recursively-dispatched writer without blocking an async runtime.
@@ -441,21 +599,12 @@ pub async fn begin_workspace_writer_with_options(
     workspace_root: &Path,
     cancel_token: Option<&CancellationToken>,
     max_wait: Duration,
-) -> Option<WorkspaceWriterGuard> {
+) -> Result<WorkspaceWriterGuard, WorkspaceLeaseFailure> {
     let lease =
         acquire_workspace_mutation_lease_with_options(workspace_root, cancel_token, max_wait)
             .await?;
     begin_workspace_writer_after_lease(workspace_root, lease)
-}
-
-fn begin_workspace_writer_sync_with_options(
-    workspace_root: &Path,
-    cancel_token: Option<&CancellationToken>,
-    max_wait: Duration,
-) -> Option<WorkspaceWriterGuard> {
-    let lease =
-        acquire_workspace_mutation_lease_sync_with_options(workspace_root, cancel_token, max_wait)?;
-    begin_workspace_writer_after_lease(workspace_root, lease)
+        .ok_or(WorkspaceLeaseFailure::BindingUnavailable)
 }
 
 fn begin_workspace_writer_after_lease(
@@ -530,11 +679,73 @@ struct GenerationTamperWatch {
 }
 
 #[cfg(target_os = "macos")]
+const MAX_MACOS_WATCH_DESCRIPTORS: usize = 1_024;
+#[cfg(target_os = "macos")]
+const MACOS_WATCH_DESCRIPTOR_HEADROOM: usize = 64;
+#[cfg(target_os = "macos")]
+static MACOS_WATCH_DESCRIPTORS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(target_os = "macos")]
+fn macos_watch_descriptor_limit(soft_limit: usize) -> usize {
+    MAX_MACOS_WATCH_DESCRIPTORS
+        .min(soft_limit / 4)
+        .min(soft_limit.saturating_sub(MACOS_WATCH_DESCRIPTOR_HEADROOM))
+}
+
+/// Account for the kqueue and every retained vnode description before opening
+/// any of them. This is a process resource budget, not workspace authority.
+#[cfg(target_os = "macos")]
+struct MacOsWatchDescriptorReservation {
+    descriptors: usize,
+}
+
+#[cfg(target_os = "macos")]
+impl MacOsWatchDescriptorReservation {
+    fn reserve(descriptors: usize) -> std::io::Result<Self> {
+        let mut resource_limit = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut resource_limit) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let limit = macos_watch_descriptor_limit(
+            usize::try_from(resource_limit.rlim_cur).unwrap_or(usize::MAX),
+        );
+        MACOS_WATCH_DESCRIPTORS
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |active| {
+                    active
+                        .checked_add(descriptors)
+                        .filter(|next| *next <= limit)
+                },
+            )
+            .map_err(|active| {
+                std::io::Error::other(WorkspaceLeaseFailure::WatcherCapacity {
+                    active,
+                    requested: descriptors,
+                    limit,
+                })
+            })?;
+        Ok(Self { descriptors })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacOsWatchDescriptorReservation {
+    fn drop(&mut self) {
+        MACOS_WATCH_DESCRIPTORS.fetch_sub(self.descriptors, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+#[cfg(target_os = "macos")]
 struct MacOsGenerationTamperWatch {
     kqueue: std::os::fd::OwnedFd,
     _watched_paths: Vec<std::fs::File>,
     tampered: std::sync::atomic::AtomicBool,
     poll_gate: std::sync::Mutex<()>,
+    // Last field: close all descriptors before making the capacity reusable.
+    _descriptor_reservation: MacOsWatchDescriptorReservation,
 }
 
 #[cfg(target_os = "macos")]
@@ -555,6 +766,21 @@ impl MacOsGenerationTamperWatch {
     ) -> std::io::Result<Self> {
         use std::os::fd::{AsRawFd, FromRawFd};
 
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "workspace generation watch registration was cancelled",
+            ));
+        }
+        let binding_paths = binding_paths.into_iter().collect::<Vec<_>>();
+        let requested = locks
+            .len()
+            .checked_add(binding_paths.len())
+            .and_then(|paths| paths.checked_add(1))
+            .ok_or_else(|| std::io::Error::other("macOS workspace watcher size overflow"))?;
+        // Declare the reservation before owned descriptors so every error path
+        // closes partial registrations before refunding their capacity.
+        let descriptor_reservation = MacOsWatchDescriptorReservation::reserve(requested)?;
         let lock_mask = libc::NOTE_ATTRIB
             | libc::NOTE_DELETE
             | libc::NOTE_EXTEND
@@ -633,6 +859,7 @@ impl MacOsGenerationTamperWatch {
             _watched_paths: watched_paths,
             tampered: std::sync::atomic::AtomicBool::new(false),
             poll_gate: std::sync::Mutex::new(()),
+            _descriptor_reservation: descriptor_reservation,
         })
     }
 
@@ -1603,6 +1830,15 @@ fn trusted_sticky_coordination_root(metadata: &fs::Metadata) -> bool {
         && metadata.mode() & 0o002 != 0
 }
 
+/// Check the host prerequisite for local workspace execution without acquiring
+/// authority or creating state. Admission still validates the root again, so
+/// this early diagnostic never replaces the execution-time trust boundary.
+pub fn validate_workspace_coordination_host() -> Result<(), WorkspaceLeaseFailure> {
+    stable_coordination_root()
+        .map(|_| ())
+        .ok_or(WorkspaceLeaseFailure::CoordinationHostUnsupported)
+}
+
 fn stable_coordination_root() -> Option<PathBuf> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -2064,68 +2300,14 @@ async fn acquire_cross_process_lock_async(
     }
 }
 
-fn acquire_cross_process_lock_sync(
-    specification: CoordinationLockSpec,
-    mode: CrossProcessLockMode,
-    cancel_token: Option<&CancellationToken>,
-    max_wait: Duration,
-) -> Option<CrossProcessFileLock> {
-    let deadline = Instant::now() + max_wait;
-    let kernel_namespace = loop {
-        if cancel_token.is_some_and(CancellationToken::is_cancelled) || Instant::now() >= deadline {
-            return None;
-        }
-        match try_acquire_kernel_coordination_namespace(&specification.kernel_namespace_key) {
-            Ok(Some(namespace)) => break namespace,
-            Ok(None) => {}
-            Err(_) => return None,
-        }
-        thread::sleep(kernel_coordination_retry_delay());
-    };
-    let file = open_coordination_lock(&specification.witness_path)?;
-    loop {
-        if cancel_token.is_some_and(CancellationToken::is_cancelled) || Instant::now() >= deadline {
-            return None;
-        }
-        match try_lock_coordination_file(&file, mode) {
-            Ok(true) => {
-                if cancel_token.is_some_and(CancellationToken::is_cancelled)
-                    || Instant::now() >= deadline
-                {
-                    let _ = fs2::FileExt::unlock(&file);
-                    return None;
-                }
-                return locked_coordination_file(
-                    file,
-                    specification.witness_path,
-                    kernel_namespace,
-                );
-            }
-            Ok(false) => {}
-            Err(_) => return None,
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-}
-
-/// Serialize one pre→execute→post observation window per bound workspace.
-/// Different workspaces remain concurrent; overlapping calls on the same
-/// workspace cannot attribute one caller's delta to another caller.
-pub async fn acquire_workspace_observation_lease(
-    workspace_root: &Path,
-) -> Option<WorkspaceObservationLease> {
-    acquire_workspace_observation_lease_with_options(workspace_root, None, DEFAULT_LEASE_WAIT).await
-}
-
 /// Acquire the per-workspace lease without allowing queueing to outlive the
-/// caller's cancellation/deadline. `None` means the workspace could not be
-/// canonicalized, the wait expired, or cancellation won; callers must return
-/// an error rather than executing unobserved.
+/// caller's cancellation/deadline. Failures retain their typed admission reason;
+/// callers must return an error rather than executing unobserved.
 pub async fn acquire_workspace_observation_lease_with_options(
     workspace_root: &Path,
     cancel_token: Option<&CancellationToken>,
     max_wait: Duration,
-) -> Option<WorkspaceObservationLease> {
+) -> Result<WorkspaceObservationLease, WorkspaceLeaseFailure> {
     acquire_workspace_lease_async(workspace_root, cancel_token, max_wait).await
 }
 
@@ -2139,41 +2321,108 @@ pub async fn acquire_workspace_mutation_lease_with_options(
     workspace_root: &Path,
     cancel_token: Option<&CancellationToken>,
     max_wait: Duration,
-) -> Option<WorkspaceObservationLease> {
+) -> Result<WorkspaceObservationLease, WorkspaceLeaseFailure> {
     acquire_workspace_lease_async(workspace_root, cancel_token, max_wait).await
-}
-
-/// Synchronous counterpart used by blocking shell adapters.
-pub fn acquire_workspace_mutation_lease_sync_with_options(
-    workspace_root: &Path,
-    cancel_token: Option<&CancellationToken>,
-    max_wait: Duration,
-) -> Option<WorkspaceObservationLease> {
-    acquire_workspace_lease_sync(workspace_root, cancel_token, max_wait)
 }
 
 async fn acquire_workspace_lease_async(
     workspace_root: &Path,
     cancel_token: Option<&CancellationToken>,
     max_wait: Duration,
-) -> Option<WorkspaceObservationLease> {
+) -> Result<WorkspaceObservationLease, WorkspaceLeaseFailure> {
     let deadline = tokio::time::Instant::now() + max_wait;
-    let writer_state = writer_epoch_state(workspace_root)?;
+    wait_for_workspace_lease_capacity(workspace_root, cancel_token, deadline, || {
+        acquire_workspace_lease_attempt(workspace_root, cancel_token, deadline)
+    })
+    .await
+}
+
+/// Keep the most recent observed capacity refusal while a bounded retry is
+/// pending. A later deadline-only contention classification is not new
+/// evidence that workspace contention caused the original admission failure.
+async fn wait_for_workspace_lease_capacity<T, F, Fut>(
+    workspace_root: &Path,
+    cancel_token: Option<&CancellationToken>,
+    deadline: tokio::time::Instant,
+    mut attempt: F,
+) -> Result<T, WorkspaceLeaseFailure>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, WorkspaceLeaseFailure>>,
+{
+    let mut last_capacity_failure = None;
+    loop {
+        let failure = match attempt().await {
+            Ok(lease) => return Ok(lease),
+            Err(WorkspaceLeaseFailure::Contended) if tokio::time::Instant::now() >= deadline => {
+                last_capacity_failure.unwrap_or(WorkspaceLeaseFailure::Contended)
+            }
+            Err(failure) => failure,
+        };
+        if !failure.transient_capacity() || tokio::time::Instant::now() >= deadline {
+            if matches!(failure, WorkspaceLeaseFailure::WatcherCapacity { .. }) {
+                tracing::warn!(workspace_root = %workspace_root.display(), %failure,
+                    "workspace watcher capacity refused receipt authority after admission wait");
+            }
+            return Err(failure);
+        }
+        last_capacity_failure = Some(failure);
+        // An attempt has already released its locks and gate. Capacity may
+        // belong to another workspace; wait within this same caller budget.
+        let delay = tokio::time::sleep(
+            deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(Duration::from_millis(5)),
+        );
+        tokio::pin!(delay);
+        if let Some(cancel) = cancel_token {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(WorkspaceLeaseFailure::Cancelled),
+                _ = &mut delay => {},
+            }
+        } else {
+            delay.await;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(workspace_root = %workspace_root.display(), %failure,
+                "workspace watcher capacity refused receipt authority after admission wait");
+            return Err(failure);
+        }
+    }
+}
+
+async fn acquire_workspace_lease_attempt(
+    workspace_root: &Path,
+    cancel_token: Option<&CancellationToken>,
+    deadline: tokio::time::Instant,
+) -> Result<WorkspaceObservationLease, WorkspaceLeaseFailure> {
+    validate_workspace_coordination_host()?;
+    let writer_state =
+        writer_epoch_state(workspace_root).ok_or(WorkspaceLeaseFailure::BindingUnavailable)?;
     if writer_state
         .ownership_unsettled
         .load(std::sync::atomic::Ordering::Acquire)
     {
-        return None;
+        return Err(WorkspaceLeaseFailure::OwnershipUnsettled);
     }
     let (lock_specifications, binding_identity) =
-        workspace_coordination_lock_specs(workspace_root, CoordinationLockKind::Observation)?;
-    let trusted_coordination_root = stable_coordination_root()?;
-    let gate = observation_gate(workspace_root)?;
+        workspace_coordination_lock_specs(workspace_root, CoordinationLockKind::Observation)
+            .ok_or(WorkspaceLeaseFailure::BindingUnavailable)?;
+    let trusted_coordination_root =
+        stable_coordination_root().ok_or(WorkspaceLeaseFailure::CoordinationHostUnsupported)?;
+    let gate = observation_gate(workspace_root).ok_or(WorkspaceLeaseFailure::BindingUnavailable)?;
     loop {
         if cancel_token.is_some_and(CancellationToken::is_cancelled)
             || tokio::time::Instant::now() >= deadline
         {
-            return None;
+            return Err(
+                if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+                    WorkspaceLeaseFailure::Cancelled
+                } else {
+                    classify_workspace_lease_failure(workspace_root)
+                },
+            );
         }
         if gate
             .compare_exchange(
@@ -2192,12 +2441,24 @@ async fn acquire_workspace_lease_async(
                 || tokio::time::Instant::now() >= deadline
             {
                 gate.store(false, std::sync::atomic::Ordering::Release);
-                return None;
+                return Err(
+                    if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+                        WorkspaceLeaseFailure::Cancelled
+                    } else {
+                        classify_workspace_lease_failure(workspace_root)
+                    },
+                );
             }
             break;
         }
         if tokio::time::Instant::now() >= deadline {
-            return None;
+            return Err(
+                if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+                    WorkspaceLeaseFailure::Cancelled
+                } else {
+                    classify_workspace_lease_failure(workspace_root)
+                },
+            );
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let delay = tokio::time::sleep(remaining.min(Duration::from_millis(5)));
@@ -2205,7 +2466,7 @@ async fn acquire_workspace_lease_async(
         if let Some(cancel_token) = cancel_token {
             tokio::select! {
                 biased;
-                _ = cancel_token.cancelled() => return None,
+                _ = cancel_token.cancelled() => return Err(WorkspaceLeaseFailure::Cancelled),
                 _ = &mut delay => {},
             }
         } else {
@@ -2223,7 +2484,13 @@ async fn acquire_workspace_lease_async(
         .await;
         let Some(lock) = lock else {
             gate.store(false, std::sync::atomic::Ordering::Release);
-            return None;
+            return Err(
+                if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+                    WorkspaceLeaseFailure::Cancelled
+                } else {
+                    classify_workspace_lease_failure(workspace_root)
+                },
+            );
         };
         locks.push(lock);
     }
@@ -2251,13 +2518,16 @@ async fn acquire_workspace_lease_async(
     let (tamper_watch, locks) = match tamper_watch {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => {
-            tracing::warn!(
+            let failure = WorkspaceLeaseFailure::from_watch_error(&error);
+            if !failure.transient_capacity() {
+                tracing::warn!(
                 workspace_root = %workspace_root.display(),
                 error = %error,
                 "workspace generation watcher refused receipt authority"
-            );
+                );
+            }
             gate.store(false, std::sync::atomic::Ordering::Release);
-            return None;
+            return Err(failure);
         }
         Err(error) => {
             tracing::warn!(
@@ -2266,7 +2536,7 @@ async fn acquire_workspace_lease_async(
                 "workspace generation watcher worker join failed; no receipt authority granted"
             );
             gate.store(false, std::sync::atomic::Ordering::Release);
-            return None;
+            return Err(WorkspaceLeaseFailure::WatcherUnavailable);
         }
     };
     let binding_unchanged = binding_identity.is_unchanged();
@@ -2278,126 +2548,13 @@ async fn acquire_workspace_lease_async(
         .load(std::sync::atomic::Ordering::Acquire);
     if !binding_unchanged || !tamper_untampered || ownership_unsettled {
         gate.store(false, std::sync::atomic::Ordering::Release);
-        return None;
+        return Err(if ownership_unsettled {
+            WorkspaceLeaseFailure::OwnershipUnsettled
+        } else {
+            WorkspaceLeaseFailure::BindingUnavailable
+        });
     }
-    Some(WorkspaceObservationLease {
-        gate,
-        locks,
-        binding_identity,
-        writer_state,
-        tamper_watch,
-    })
-}
-
-/// Synchronous counterpart for legacy edge paths that run on a blocking
-/// worker. It uses the same atomic gate as async callers, so the two routes
-/// cannot overlap one workspace observation window.
-pub fn acquire_workspace_observation_lease_sync(
-    workspace_root: &Path,
-    max_wait: Duration,
-) -> Option<WorkspaceObservationLease> {
-    acquire_workspace_observation_lease_sync_with_options(workspace_root, None, max_wait)
-}
-
-/// Blocking counterpart with the same cancellation contract as the async
-/// acquisition path.  The caller is already on a blocking worker, so a
-/// short polling interval keeps cancellation responsive without parking a
-/// Tokio task or holding a runtime mutex.
-pub fn acquire_workspace_observation_lease_sync_with_options(
-    workspace_root: &Path,
-    cancel_token: Option<&CancellationToken>,
-    max_wait: Duration,
-) -> Option<WorkspaceObservationLease> {
-    acquire_workspace_lease_sync(workspace_root, cancel_token, max_wait)
-}
-
-fn acquire_workspace_lease_sync(
-    workspace_root: &Path,
-    cancel_token: Option<&CancellationToken>,
-    max_wait: Duration,
-) -> Option<WorkspaceObservationLease> {
-    let deadline = Instant::now() + max_wait;
-    let writer_state = writer_epoch_state(workspace_root)?;
-    if writer_state
-        .ownership_unsettled
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
-        return None;
-    }
-    let (lock_specifications, binding_identity) =
-        workspace_coordination_lock_specs(workspace_root, CoordinationLockKind::Observation)?;
-    let trusted_coordination_root = stable_coordination_root()?;
-    let gate = observation_gate(workspace_root)?;
-    loop {
-        if cancel_token.is_some_and(CancellationToken::is_cancelled) || Instant::now() >= deadline {
-            return None;
-        }
-        if gate
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            if cancel_token.is_some_and(CancellationToken::is_cancelled)
-                || Instant::now() >= deadline
-            {
-                gate.store(false, std::sync::atomic::Ordering::Release);
-                return None;
-            }
-            break;
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    let mut locks = Vec::with_capacity(lock_specifications.len());
-    for specification in lock_specifications {
-        let Some(lock) = acquire_cross_process_lock_sync(
-            specification,
-            CrossProcessLockMode::Exclusive,
-            cancel_token,
-            deadline.saturating_duration_since(Instant::now()),
-        ) else {
-            gate.store(false, std::sync::atomic::Ordering::Release);
-            return None;
-        };
-        locks.push(lock);
-    }
-    let tamper_watch = GenerationTamperWatch::arm(
-        &locks,
-        binding_identity
-            .path_components
-            .iter()
-            .filter(|identity| !trusted_coordination_root.starts_with(&identity.path))
-            .cloned(),
-        cancel_token,
-    );
-    let tamper_watch = match tamper_watch {
-        Ok(tamper_watch) => tamper_watch,
-        Err(error) => {
-            tracing::warn!(
-                workspace_root = %workspace_root.display(),
-                error = %error,
-                "workspace generation watcher refused receipt authority"
-            );
-            gate.store(false, std::sync::atomic::Ordering::Release);
-            return None;
-        }
-    };
-    let binding_unchanged = binding_identity.is_unchanged();
-    let tamper_untampered = tamper_watch.is_untampered();
-    let ownership_unsettled = writer_state
-        .ownership_unsettled
-        .load(std::sync::atomic::Ordering::Acquire);
-    if !binding_unchanged || !tamper_untampered || ownership_unsettled {
-        gate.store(false, std::sync::atomic::Ordering::Release);
-        return None;
-    }
-    Some(WorkspaceObservationLease {
+    Ok(WorkspaceObservationLease {
         gate,
         locks,
         binding_identity,
@@ -2459,427 +2616,21 @@ pub struct WorkspaceFingerprint {
     writer_active: usize,
 }
 
-/// Executor-owned preimage for an explicit, bounded set of external state
-/// roots.  This is intentionally opt-in: scanning arbitrary host state is
-/// neither attributable nor affordable, while inferring paths from shell text
-/// would make model wording a completion authority.
-#[derive(Debug, Clone)]
-pub struct ExternalEffectFingerprint {
-    targets: Vec<ExternalObservedTarget>,
-    target_set_digest: String,
+/// Result of comparing two executor-owned workspace snapshots.
+///
+/// `Unknown` is intentionally distinct from `Unchanged`: a missing postimage,
+/// a different writer state, or an epoch transition means the interval cannot
+/// be attributed to the invocation that captured the snapshots. Callers that
+/// mint a no-change receipt must accept only `Unchanged`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceFingerprintComparison {
+    Changed,
+    Unchanged,
+    Unknown,
 }
 
-#[derive(Debug, Clone)]
-struct ExternalObservedTarget {
-    declared_path: PathBuf,
-    observation_root: PathBuf,
-    root_before: WorkspaceFingerprint,
-    /// Files and not-yet-created paths use an exact-path conjunct so a
-    /// sibling change in their observation parent cannot manufacture proof.
-    /// Directories are already their own exact observation root.
-    leaf_before: Option<u64>,
-}
-
-/// Cross-process leases covering every canonical external observation root.
-/// They are held from preimage through postimage so another session cannot
-/// donate its mutation to this invocation's receipt.
-pub struct ExternalEffectObservationLease {
-    leases: Vec<WorkspaceObservationLease>,
-}
-
-impl ExternalEffectObservationLease {
-    pub fn coordination_integrity_valid(&self) -> bool {
-        self.leases
-            .iter()
-            .all(WorkspaceObservationLease::coordination_integrity_valid)
-    }
-
-    pub fn receipt_authority_valid(&self) -> bool {
-        self.leases
-            .iter()
-            .all(WorkspaceObservationLease::receipt_authority_valid)
-    }
-
-    pub fn integrity_valid(&self) -> bool {
-        self.receipt_authority_valid()
-    }
-}
-
-pub async fn acquire_external_effect_observation_lease_with_options(
-    args: &serde_json::Value,
-    workspace_root: &Path,
-    cancel_token: Option<&CancellationToken>,
-    max_wait: Duration,
-) -> Result<Option<ExternalEffectObservationLease>, String> {
-    let Some(roots) = external_effect_observation_roots(args, workspace_root)? else {
-        return Ok(None);
-    };
-    let deadline = tokio::time::Instant::now() + max_wait;
-    let mut leases = Vec::with_capacity(roots.len());
-    for root in roots {
-        let Some(lease) = acquire_workspace_observation_lease_with_options(
-            &root,
-            cancel_token,
-            deadline.saturating_duration_since(tokio::time::Instant::now()),
-        )
-        .await
-        else {
-            return Ok(None);
-        };
-        leases.push(lease);
-    }
-    Ok(Some(ExternalEffectObservationLease { leases }))
-}
-
-pub fn acquire_external_effect_observation_lease_sync_with_options(
-    args: &serde_json::Value,
-    workspace_root: &Path,
-    cancel_token: Option<&CancellationToken>,
-    max_wait: Duration,
-) -> Result<Option<ExternalEffectObservationLease>, String> {
-    let Some(roots) = external_effect_observation_roots(args, workspace_root)? else {
-        return Ok(None);
-    };
-    let deadline = Instant::now() + max_wait;
-    let mut leases = Vec::with_capacity(roots.len());
-    for root in roots {
-        let Some(lease) = acquire_workspace_observation_lease_sync_with_options(
-            &root,
-            cancel_token,
-            deadline.saturating_duration_since(Instant::now()),
-        ) else {
-            return Ok(None);
-        };
-        leases.push(lease);
-    }
-    Ok(Some(ExternalEffectObservationLease { leases }))
-}
-
-fn external_effect_observation_roots(
-    args: &serde_json::Value,
-    workspace_root: &Path,
-) -> Result<Option<Vec<PathBuf>>, String> {
-    let Some(raw_paths) = args.get(EXTERNAL_STATE_PATHS_FIELD) else {
-        return Ok(None);
-    };
-    let paths = raw_paths.as_array().ok_or_else(|| {
-        format!("{EXTERNAL_STATE_PATHS_FIELD} must be an array of absolute paths")
-    })?;
-    if paths.is_empty() || paths.len() > MAX_EXTERNAL_STATE_PATHS {
-        return Err(format!(
-            "{EXTERNAL_STATE_PATHS_FIELD} must contain 1..={MAX_EXTERNAL_STATE_PATHS} paths"
-        ));
-    }
-    let workspace = workspace_root
-        .canonicalize()
-        .map_err(|e| format!("bound workspace cannot be resolved: {e}"))?;
-    let mut roots = Vec::with_capacity(paths.len());
-    for raw in paths {
-        let raw = raw
-            .as_str()
-            .ok_or_else(|| format!("{EXTERNAL_STATE_PATHS_FIELD} entries must be strings"))?;
-        let target = PathBuf::from(raw);
-        if !target.is_absolute()
-            || target
-                .components()
-                .any(|c| matches!(c, Component::ParentDir))
-        {
-            return Err(format!(
-                "external state path must be absolute and traversal-free: {raw}"
-            ));
-        }
-        let root = external_observation_root(&target)
-            .ok_or_else(|| format!("external state path has no observable existing root: {raw}"))?;
-        let root = root.canonicalize().map_err(|e| {
-            format!("external state observation root cannot be resolved for {raw}: {e}")
-        })?;
-        if root.starts_with(&workspace) || workspace.starts_with(&root) {
-            return Err(format!(
-                "external state path overlaps the bound workspace and cannot issue an external receipt: {raw}"
-            ));
-        }
-        roots.push(root);
-    }
-    roots.sort();
-    roots.dedup();
-    Ok(Some(roots))
-}
-
-impl ExternalEffectFingerprint {
-    /// Stable identity for the declared external target set. This contains no
-    /// host observation and is safe to retain as the correlation key between
-    /// a started cancellation and a later executor-owned receipt. The receipt
-    /// remains the authority for the observed mutation.
-    pub fn declared_target_set_digest_from_args(args: &serde_json::Value) -> Option<String> {
-        let raw_paths = args.get(EXTERNAL_STATE_PATHS_FIELD)?.as_array()?;
-        if raw_paths.is_empty() || raw_paths.len() > MAX_EXTERNAL_STATE_PATHS {
-            return None;
-        }
-        let mut paths = raw_paths
-            .iter()
-            .map(|raw| raw.as_str().map(PathBuf::from))
-            .collect::<Option<Vec<_>>>()?;
-        if paths.iter().any(|path| {
-            !path.is_absolute()
-                || path
-                    .components()
-                    .any(|component| matches!(component, Component::ParentDir))
-        }) {
-            return None;
-        }
-        paths.sort();
-        paths.dedup();
-        let mut hasher = Sha256::new();
-        for path in paths {
-            hasher.update(path.as_os_str().as_encoded_bytes());
-            hasher.update([0]);
-        }
-        Some(hex::encode(hasher.finalize()))
-    }
-
-    /// Validate and capture an explicit external-state observation contract.
-    ///
-    /// Every path must be absolute, traversal-free, outside the bound
-    /// workspace, and narrow enough for the existing bounded fingerprint. An
-    /// explicit but unobservable target is rejected before execution rather
-    /// than silently degrading into exit-status inference.
-    pub fn capture_from_args(
-        args: &serde_json::Value,
-        workspace_root: &Path,
-    ) -> Result<Option<Self>, String> {
-        let Some(raw_paths) = args.get(EXTERNAL_STATE_PATHS_FIELD) else {
-            return Ok(None);
-        };
-        let paths = raw_paths.as_array().ok_or_else(|| {
-            format!("{EXTERNAL_STATE_PATHS_FIELD} must be an array of absolute paths")
-        })?;
-        if paths.is_empty() || paths.len() > MAX_EXTERNAL_STATE_PATHS {
-            return Err(format!(
-                "{EXTERNAL_STATE_PATHS_FIELD} must contain 1..={MAX_EXTERNAL_STATE_PATHS} paths"
-            ));
-        }
-        let workspace = workspace_root
-            .canonicalize()
-            .map_err(|error| format!("bound workspace cannot be resolved: {error}"))?;
-        let mut targets = Vec::with_capacity(paths.len());
-        for raw in paths {
-            let raw = raw
-                .as_str()
-                .ok_or_else(|| format!("{EXTERNAL_STATE_PATHS_FIELD} entries must be strings"))?;
-            let target = PathBuf::from(raw);
-            if !target.is_absolute()
-                || target
-                    .components()
-                    .any(|component| matches!(component, Component::ParentDir))
-            {
-                return Err(format!(
-                    "external state path must be absolute and traversal-free: {raw}"
-                ));
-            }
-            let observation_root = external_observation_root(&target).ok_or_else(|| {
-                format!("external state path has no observable existing root: {raw}")
-            })?;
-            let canonical = observation_root.canonicalize().map_err(|error| {
-                format!("external state observation root cannot be resolved for {raw}: {error}")
-            })?;
-            if canonical.starts_with(&workspace) || workspace.starts_with(&canonical) {
-                return Err(format!(
-                    "external state path overlaps the bound workspace and cannot issue an external receipt: {raw}"
-                ));
-            }
-            targets.push((target, canonical));
-        }
-        targets.sort_by(|left, right| left.0.cmp(&right.0));
-        targets.dedup_by(|left, right| left.0 == right.0);
-        let mut target_hasher = Sha256::new();
-        let targets = targets
-            .iter()
-            .map(|(declared_path, observation_root)| {
-                target_hasher.update(declared_path.as_os_str().as_encoded_bytes());
-                target_hasher.update([0]);
-                let root_before = WorkspaceFingerprint::capture(observation_root).ok_or_else(|| {
-                    format!(
-                        "external state root is unavailable, ambiguous, or exceeds observation bounds: {}",
-                        observation_root.display()
-                    )
-                })?;
-                let leaf_before = (!declared_path.is_dir())
-                    .then(|| external_leaf_fingerprint(declared_path))
-                    .transpose()?;
-                Ok::<_, String>(ExternalObservedTarget {
-                    declared_path: declared_path.clone(),
-                    observation_root: observation_root.clone(),
-                    root_before,
-                    leaf_before,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Some(Self {
-            targets,
-            target_set_digest: hex::encode(target_hasher.finalize()),
-        }))
-    }
-
-    /// Produce a receipt only for an observed delta owned by an authoritative
-    /// invocation boundary. Failure to capture any postimage is unknown, not
-    /// unchanged and never success evidence.
-    pub fn changed_receipt(
-        &self,
-        ownership: Option<&str>,
-    ) -> Option<serde_json::Map<String, serde_json::Value>> {
-        if !matches!(
-            ownership,
-            Some(INVOCATION_CGROUP_OWNERSHIP | INVOCATION_SUPERVISOR_OWNERSHIP)
-        ) {
-            return None;
-        }
-        let mut changed = false;
-        for target in &self.targets {
-            let root_after = WorkspaceFingerprint::capture(&target.observation_root)?;
-            let root_changed = target.root_before.changed_from(Some(root_after));
-            let leaf_changed = match target.leaf_before {
-                Some(before) => external_leaf_fingerprint(&target.declared_path).ok()? != before,
-                None => true,
-            };
-            changed |= root_changed && leaf_changed;
-        }
-        changed.then(|| {
-            external_effect_changed_receipt(
-                ownership.expect("authoritative ownership matched"),
-                &self.target_set_digest,
-                self.targets.len(),
-            )
-        })
-    }
-
-    /// Async callers must use this path: no recursive fingerprint work runs
-    /// on a Tokio worker, and a shared cap prevents a burst of sessions from
-    /// saturating the blocking pool.
-    pub async fn changed_receipt_async(
-        &self,
-        ownership: Option<&str>,
-    ) -> Option<serde_json::Map<String, serde_json::Value>> {
-        let permit = EXTERNAL_POSTIMAGE_PERMITS
-            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(8)))
-            .clone()
-            .acquire_owned()
-            .await
-            .ok()?;
-        let fingerprint = self.clone();
-        let ownership = ownership.map(str::to_owned);
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            fingerprint.changed_receipt(ownership.as_deref())
-        })
-        .await
-        .ok()
-        .flatten()
-    }
-}
-
-fn external_leaf_fingerprint(path: &Path) -> Result<u64, String> {
-    let mut hasher = DefaultHasher::new();
-    let mut content_bytes = 0usize;
-    hash_path_state(path, &mut hasher, &mut content_bytes).ok_or_else(|| {
-        format!(
-            "external state path cannot be fingerprinted: {}",
-            path.display()
-        )
-    })?;
-    Ok(hasher.finish())
-}
-
-fn external_observation_root(target: &Path) -> Option<PathBuf> {
-    if target.is_dir() {
-        return Some(target.to_path_buf());
-    }
-    let mut candidate = target.parent()?.to_path_buf();
-    while !candidate.exists() {
-        candidate = candidate.parent()?.to_path_buf();
-    }
-    Some(candidate)
-}
-
-fn external_effect_changed_receipt(
-    ownership: &str,
-    target_set_digest: &str,
-    observed_roots: usize,
-) -> serde_json::Map<String, serde_json::Value> {
-    serde_json::Map::from_iter([
-        (
-            EXTERNAL_EFFECT_OBSERVED_FIELD.to_string(),
-            serde_json::Value::Bool(true),
-        ),
-        (
-            EXTERNAL_EFFECT_SCOPE_FIELD.to_string(),
-            serde_json::Value::String(DECLARED_EXTERNAL_STATE_SCOPE.to_string()),
-        ),
-        (
-            EXTERNAL_EFFECT_RECEIPT_FIELD.to_string(),
-            serde_json::json!({
-                "schema": "external_effect_receipt.v1",
-                "source": "post_execution_fingerprint",
-                "scope": DECLARED_EXTERNAL_STATE_SCOPE,
-                "changed": true,
-                "ownership": ownership,
-                "target_set_digest": target_set_digest,
-                "observed_roots": observed_roots,
-            }),
-        ),
-    ])
-}
-
-/// Validate the durable projection of an executor-owned external delta.
-pub fn is_authoritative_external_effect_receipt(receipt: &serde_json::Value) -> bool {
-    let common = receipt.get("schema").and_then(serde_json::Value::as_str)
-        == Some("external_effect_receipt.v1")
-        && receipt.get("scope").and_then(serde_json::Value::as_str)
-            == Some(DECLARED_EXTERNAL_STATE_SCOPE)
-        && receipt.get("changed").and_then(serde_json::Value::as_bool) == Some(true);
-    if !common {
-        return false;
-    }
-
-    let fingerprint_receipt = receipt.get("source").and_then(serde_json::Value::as_str)
-        == Some("post_execution_fingerprint")
-        && matches!(
-            receipt.get("ownership").and_then(serde_json::Value::as_str),
-            Some(INVOCATION_CGROUP_OWNERSHIP | INVOCATION_SUPERVISOR_OWNERSHIP)
-        )
-        && receipt
-            .get("target_set_digest")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|digest| {
-                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
-        && receipt
-            .get("observed_roots")
-            .and_then(serde_json::Value::as_u64)
-            .is_some_and(|count| (1..=MAX_EXTERNAL_STATE_PATHS as u64).contains(&count));
-    if fingerprint_receipt {
-        return true;
-    }
-
-    // Typed service mutations (for example Memoria remember/forget/update)
-    // have no filesystem target to fingerprint.  They are accepted only when
-    // the owning executor stamps the narrow typed-tool shape, including a
-    // bounded operation digest and a known mutation action.  The runtime also
-    // binds this receipt to the canonical tool record before using it as
-    // completion evidence.
-    receipt.get("source").and_then(serde_json::Value::as_str) == Some("typed_external_tool")
-        && receipt.get("ownership").and_then(serde_json::Value::as_str)
-            == Some(TYPED_EXTERNAL_TOOL_OWNERSHIP)
-        && receipt.get("tool").and_then(serde_json::Value::as_str) == Some("memory")
-        && matches!(
-            receipt.get("action").and_then(serde_json::Value::as_str),
-            Some("remember" | "forget" | "update" | "feedback")
-        )
-        && receipt
-            .get("operation_digest")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|digest| {
-                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
+fn observation_root_digest(root: &Path) -> String {
+    hex::encode(Sha256::digest(root.as_os_str().as_encoded_bytes()))
 }
 
 impl WorkspaceFingerprint {
@@ -2888,7 +2639,7 @@ impl WorkspaceFingerprint {
     /// Git status is the fast path and reports tracked/untracked workspace
     /// changes without walking file contents.  Non-git workspaces use a
     /// bounded metadata manifest.  If the manifest exceeds its bound or any
-    /// required metadata cannot be read, return `None` so callers fail closed.
+    /// required metadata cannot be read, return `None`.
     pub fn capture(root: &Path) -> Option<Self> {
         let root = root.canonicalize().ok()?;
         let writer_state = writer_epoch_state(&root)?;
@@ -2904,7 +2655,10 @@ impl WorkspaceFingerprint {
         // A recursive/typed writer already in flight makes the snapshot
         // ambiguous.  Do not sample a half-written tree and later attribute
         // it to the surrounding Bash call.
-        if active_before != 0 || quarantined_before {
+        if quarantined_before {
+            return None;
+        }
+        if active_before != 0 {
             return None;
         }
         let digest = match git_status_fingerprint(&root) {
@@ -2927,11 +2681,10 @@ impl WorkspaceFingerprint {
         // The writer may have started and finished while the bounded probe
         // was running.  An epoch or active-count change makes this sample
         // un-attributable; fail closed instead of producing a false receipt.
-        if epoch_before != epoch_after
-            || active_before != active_after
-            || active_after != 0
-            || quarantined_after
-        {
+        if quarantined_after {
+            return None;
+        }
+        if epoch_before != epoch_after || active_before != active_after || active_after != 0 {
             return None;
         }
         Some(Self {
@@ -2942,9 +2695,9 @@ impl WorkspaceFingerprint {
         })
     }
 
-    pub fn changed_from(&self, after: Option<Self>) -> bool {
+    pub fn compare_with(&self, after: Option<&Self>) -> WorkspaceFingerprintComparison {
         let Some(after) = after else {
-            return false;
+            return WorkspaceFingerprintComparison::Unknown;
         };
         // A recursive writer may change bytes and then restore them, so a
         // generation mismatch is not positive evidence for Bash.  The
@@ -2955,9 +2708,20 @@ impl WorkspaceFingerprint {
             || after.writer_active != 0
             || self.writer_epoch != after.writer_epoch
         {
-            return false;
+            return WorkspaceFingerprintComparison::Unknown;
         }
-        self.digest != after.digest
+        if self.digest == after.digest {
+            WorkspaceFingerprintComparison::Unchanged
+        } else {
+            WorkspaceFingerprintComparison::Changed
+        }
+    }
+
+    pub fn changed_from(&self, after: Option<Self>) -> bool {
+        matches!(
+            self.compare_with(after.as_ref()),
+            WorkspaceFingerprintComparison::Changed
+        )
     }
 }
 
@@ -3152,6 +2916,17 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
     let Some(mut status_command) = hardened_git_command(root) else {
         return GitFingerprint::UseManifest;
     };
+    let capture_path = relative_root.join(crate::shell_output_capture::CAPTURE_DIRECTORY_NAME);
+    let Some(capture_path) = capture_path.to_str() else {
+        return GitFingerprint::Unknown;
+    };
+    // Exclude the workspace's exact top-level output directory in Git, before
+    // the bounded status probe counts bytes or entries. A nested directory
+    // with the same name remains within the observed workspace.
+    let capture_exclusion = format!(
+        ":(top,exclude,literal){}/",
+        capture_path.replace(std::path::MAIN_SEPARATOR, "/")
+    );
     status_command.args([
         "status",
         "--porcelain=v1",
@@ -3164,6 +2939,7 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
         "--ignored=matching",
         "--",
         ".",
+        &capture_exclusion,
     ]);
     let Some(output) = run_bounded_probe(
         status_command,
@@ -3238,16 +3014,10 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
                 return GitFingerprint::Unknown;
             }
         };
-        // `.astra` is executor/session coordination state, not a user
-        // deliverable. The manifest fallback already excludes this exact
-        // top-level directory; Git-backed observation must use the same
-        // scope so creating or locking workspace coordination files cannot
-        // manufacture a mutation delta.
-        if path_from_workspace
-            .components()
-            .next()
-            .is_some_and(|component| component.as_os_str() == ".astra")
-        {
+        // Executor-owned coordination and Bash capture files must not
+        // manufacture a user-workspace mutation receipt. Only their exact
+        // top-level directories are excluded; nested names remain observable.
+        if is_executor_owned_fingerprint_path(path_from_workspace) {
             continue;
         }
         status.hash(&mut hasher);
@@ -3541,14 +3311,16 @@ fn walk_manifest(
     children.sort_by_key(|entry| entry.file_name());
 
     for entry in children {
-        let name = entry.file_name();
-        if name == ".git" || name == ".astra" {
+        if entry.file_name() == ".git" {
             continue;
         }
         let path = entry.path();
         let Some(relative) = path.strip_prefix(root).ok() else {
             return false;
         };
+        if is_executor_owned_fingerprint_path(relative) {
+            continue;
+        }
         relative.to_string_lossy().hash(hasher);
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             return false;
@@ -3646,6 +3418,51 @@ pub fn changed_receipt_with_ownership(
     ])
 }
 
+/// Build an executor-owned observation receipt for a Bash invocation whose
+/// bounded pre/post fingerprints were equal.  This is deliberately a
+/// different source from a typed read observer and from a mutation receipt:
+/// it proves only that the bound workspace was unchanged while the owner held
+/// the observation lease.  The runtime may use it to avoid inventing a
+/// mutation barrier for a failed diagnostic command; it never proves that a
+/// requested validation or task completed.
+pub fn unchanged_bash_observation_receipt_with_ownership(
+    ownership: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::Map::from_iter([
+        (
+            OBSERVATION_SCOPE_FIELD.to_string(),
+            serde_json::Value::String(BOUND_WORKSPACE_SCOPE.to_string()),
+        ),
+        (
+            OBSERVATION_RECEIPT_FIELD.to_string(),
+            serde_json::json!({
+                "schema": "workspace_observation_receipt.v1",
+                "source": "executor_bash_fingerprint",
+                "scope": BOUND_WORKSPACE_SCOPE,
+                "changed": false,
+                "ownership": ownership,
+            }),
+        ),
+    ])
+}
+
+/// Validate an unchanged Bash fingerprint receipt.  Only invocation-owned
+/// process boundaries are durable proof: a foreground process group can leave
+/// a descendant behind after the leader exits, so that result remains a weak
+/// quarantine and cannot clear a workspace freshness barrier.
+pub fn is_authoritative_unchanged_bash_observation_receipt(receipt: &serde_json::Value) -> bool {
+    receipt.get("schema").and_then(serde_json::Value::as_str)
+        == Some("workspace_observation_receipt.v1")
+        && receipt.get("source").and_then(serde_json::Value::as_str)
+            == Some("executor_bash_fingerprint")
+        && receipt.get("scope").and_then(serde_json::Value::as_str) == Some(BOUND_WORKSPACE_SCOPE)
+        && receipt.get("changed").and_then(serde_json::Value::as_bool) == Some(false)
+        && matches!(
+            receipt.get("ownership").and_then(serde_json::Value::as_str),
+            Some(INVOCATION_CGROUP_OWNERSHIP | INVOCATION_SUPERVISOR_OWNERSHIP)
+        )
+}
+
 /// Build a compact receipt for a successful, structured workspace writer.
 ///
 /// The tool contract and the owner executor already performed path and
@@ -3690,6 +3507,19 @@ pub fn typed_workspace_tool_receipt_for_applied(
     is_error: bool,
     applied: bool,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
+    typed_workspace_tool_applied_bound(name, args, workspace_root, is_error, applied)
+        .then(typed_workspace_tool_receipt)
+}
+
+/// Validate a direct writer's applied fact against its original bound target.
+/// The caller must obtain `applied` from the executor, never from tool prose.
+pub fn typed_workspace_tool_applied_bound(
+    name: &str,
+    args: &serde_json::Value,
+    workspace_root: &Path,
+    is_error: bool,
+    applied: bool,
+) -> bool {
     // `rename_symbol` and the LSP contract are preview-first: omitted
     // `dry_run` means preview, not an applied mutation.  Do not infer a
     // changed receipt merely because the tool is in the mutation family.
@@ -3697,15 +3527,11 @@ pub fn typed_workspace_tool_receipt_for_applied(
         .get("dry_run")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(matches!(name, "rename_symbol" | "lsp"));
-    if is_error
+    !(is_error
         || !applied
         || dry_run
         || !crate::executor::is_workspace_mutation_tool(name, args)
-        || !structured_targets_are_bound(name, args, workspace_root)
-    {
-        return None;
-    }
-    Some(typed_workspace_tool_receipt())
+        || !structured_targets_are_bound(name, args, workspace_root))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -4730,8 +4556,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cross_process_workspace_observation_lease_helper() {
+    #[tokio::test]
+    async fn cross_process_workspace_observation_lease_helper() {
         let Some(root) = std::env::var_os(CROSS_PROCESS_LEASE_HELPER_ENV) else {
             return;
         };
@@ -4741,30 +4567,33 @@ mod tests {
             .unwrap_or_else(|_| "observation".to_string());
         match mode.as_str() {
             "observation" => {
-                let _lease = acquire_workspace_observation_lease_sync(
+                let _lease = acquire_workspace_observation_lease_with_options(
                     Path::new(&root),
+                    None,
                     Duration::from_secs(5),
                 )
+                .await
                 .expect("child acquires observation lease");
                 fs::write(marker, "owned by observation").expect("child write");
             }
             "mutation" => {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_time()
-                    .build()
-                    .expect("child runtime");
-                let _lease = runtime
-                    .block_on(acquire_workspace_mutation_lease_with_options(
-                        Path::new(&root),
-                        None,
-                        Duration::from_secs(5),
-                    ))
-                    .expect("child acquires mutation lease");
+                let _lease = acquire_workspace_mutation_lease_with_options(
+                    Path::new(&root),
+                    None,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("child acquires mutation lease");
                 fs::write(marker, "owned by mutation").expect("child write");
             }
             "recursive-writer" => {
-                let _writer = begin_workspace_writer(Path::new(&root))
-                    .expect("child acquires recursive writer barrier");
+                let _writer = begin_workspace_writer_with_options(
+                    Path::new(&root),
+                    None,
+                    Duration::from_secs(120),
+                )
+                .await
+                .expect("child acquires recursive writer barrier");
                 fs::write(marker, "owned by recursive writer").expect("child write");
             }
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -4846,10 +4675,12 @@ mod tests {
                 }
                 assert!(start.exists(), "contender start signal timed out");
 
-                let lease = acquire_workspace_observation_lease_sync(
+                let lease = acquire_workspace_observation_lease_with_options(
                     Path::new(&root),
+                    None,
                     Duration::from_secs(5),
                 )
+                .await
                 .expect("simultaneous contender eventually acquires lease");
                 let owns_sentinel = fs::OpenOptions::new()
                     .create_new(true)
@@ -4866,91 +4697,6 @@ mod tests {
             }
             other => panic!("unknown helper mode: {other}"),
         }
-    }
-
-    #[test]
-    fn external_effect_receipt_requires_observed_delta_and_authoritative_ownership() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let external = tempfile::tempdir().expect("external state");
-        let target = external.path().join("managed.conf");
-        fs::write(&target, "before").expect("external fixture");
-        let args = serde_json::json!({
-            EXTERNAL_STATE_PATHS_FIELD: [target],
-        });
-
-        let unchanged = ExternalEffectFingerprint::capture_from_args(&args, workspace.path())
-            .expect("valid observation contract")
-            .expect("external preimage");
-        fs::write(external.path().join("unrelated.conf"), "sibling change")
-            .expect("external sibling fixture");
-        assert!(
-            unchanged
-                .changed_receipt(Some(INVOCATION_CGROUP_OWNERSHIP))
-                .is_none(),
-            "a sibling delta cannot satisfy the exact declared file target"
-        );
-
-        let before = ExternalEffectFingerprint::capture_from_args(&args, workspace.path())
-            .expect("valid observation contract")
-            .expect("external preimage");
-        fs::write(&target, "after").expect("external mutation");
-        assert!(before.changed_receipt(Some("model_claim")).is_none());
-        let fields = before
-            .changed_receipt(Some(INVOCATION_SUPERVISOR_OWNERSHIP))
-            .expect("authoritative observed delta");
-        assert_eq!(
-            fields.get(EXTERNAL_EFFECT_OBSERVED_FIELD),
-            Some(&serde_json::Value::Bool(true))
-        );
-        assert!(
-            fields
-                .get(EXTERNAL_EFFECT_RECEIPT_FIELD)
-                .is_some_and(is_authoritative_external_effect_receipt)
-        );
-    }
-
-    #[test]
-    fn external_effect_observation_rejects_workspace_overlap_and_bad_paths() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        for args in [
-            serde_json::json!({EXTERNAL_STATE_PATHS_FIELD: [workspace.path()]}),
-            serde_json::json!({EXTERNAL_STATE_PATHS_FIELD: ["relative/path"]}),
-            serde_json::json!({EXTERNAL_STATE_PATHS_FIELD: []}),
-        ] {
-            assert!(ExternalEffectFingerprint::capture_from_args(&args, workspace.path()).is_err());
-        }
-    }
-
-    #[tokio::test]
-    async fn external_effect_lease_excludes_competing_observation_window() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let external = tempfile::tempdir().expect("external state");
-        let target = external.path().join("managed.conf");
-        fs::write(&target, "before").expect("external fixture");
-        let args = serde_json::json!({ EXTERNAL_STATE_PATHS_FIELD: [target] });
-
-        let first = acquire_external_effect_observation_lease_with_options(
-            &args,
-            workspace.path(),
-            None,
-            Duration::from_secs(2),
-        )
-        .await
-        .expect("valid external contract")
-        .expect("first external window admitted");
-        let second = acquire_external_effect_observation_lease_with_options(
-            &args,
-            workspace.path(),
-            None,
-            Duration::ZERO,
-        )
-        .await
-        .expect("same valid external contract");
-        assert!(
-            second.is_none(),
-            "a competing session cannot observe the same external root"
-        );
-        assert!(first.integrity_valid());
     }
 
     fn typed_workspace_tool_receipt_for(
@@ -5050,6 +4796,84 @@ mod tests {
         ));
         assert!(is_typed_workspace_observer("read_file"));
         assert!(!is_typed_workspace_observer("bash"));
+    }
+
+    #[test]
+    fn unchanged_bash_receipt_requires_authoritative_owner() {
+        let receipt =
+            unchanged_bash_observation_receipt_with_ownership(INVOCATION_CGROUP_OWNERSHIP);
+        assert_eq!(receipt[OBSERVATION_SCOPE_FIELD], BOUND_WORKSPACE_SCOPE);
+        assert_eq!(
+            receipt[OBSERVATION_RECEIPT_FIELD]["source"],
+            "executor_bash_fingerprint"
+        );
+        assert!(is_authoritative_unchanged_bash_observation_receipt(
+            &receipt[OBSERVATION_RECEIPT_FIELD]
+        ));
+
+        let weak =
+            unchanged_bash_observation_receipt_with_ownership(FOREGROUND_PROCESS_GROUP_OWNERSHIP);
+        assert!(!is_authoritative_unchanged_bash_observation_receipt(
+            &weak[OBSERVATION_RECEIPT_FIELD]
+        ));
+        assert!(!is_authoritative_unchanged_bash_observation_receipt(
+            &serde_json::json!({
+                "schema": "workspace_observation_receipt.v1",
+                "source": "executor_bash_fingerprint",
+                "scope": BOUND_WORKSPACE_SCOPE,
+                "changed": true,
+                "ownership": INVOCATION_CGROUP_OWNERSHIP
+            })
+        ));
+    }
+
+    #[test]
+    fn applied_bound_fact_requires_a_successful_direct_writer_and_all_bound_targets() {
+        let workspace = tempfile::tempdir().unwrap();
+        let valid =
+            serde_json::json!({"path": "target.txt", "old_str": "before", "new_str": "after"});
+        assert!(typed_workspace_tool_applied_bound(
+            "str_replace",
+            &valid,
+            workspace.path(),
+            false,
+            true
+        ));
+        assert!(!typed_workspace_tool_applied_bound(
+            "str_replace",
+            &valid,
+            workspace.path(),
+            false,
+            false
+        ));
+        assert!(!typed_workspace_tool_applied_bound(
+            "str_replace",
+            &valid,
+            workspace.path(),
+            true,
+            true
+        ));
+        assert!(!typed_workspace_tool_applied_bound(
+            "bash",
+            &valid,
+            workspace.path(),
+            false,
+            true
+        ));
+        assert!(!typed_workspace_tool_applied_bound(
+            "str_replace",
+            &serde_json::json!({"path": "../outside.txt", "old_str": "before", "new_str": "after"}),
+            workspace.path(),
+            false,
+            true
+        ));
+        assert!(!typed_workspace_tool_applied_bound(
+            "multi_edit",
+            &serde_json::json!({"edits": [{"path": "target.txt"}, {"path": "../outside.txt"}]}),
+            workspace.path(),
+            false,
+            true
+        ));
     }
 
     #[test]
@@ -5693,12 +5517,15 @@ mod tests {
         assert!(before.changed_from(Some(after)));
     }
 
-    #[test]
-    fn writer_epoch_marks_a_recursive_writer_even_when_bytes_are_restored() {
+    #[tokio::test]
+    async fn writer_epoch_marks_a_recursive_writer_even_when_bytes_are_restored() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(temp.path().join("stable"), "same").unwrap();
         let before = WorkspaceFingerprint::capture(temp.path()).expect("fingerprint");
-        let writer = begin_workspace_writer(temp.path()).expect("writer registration");
+        let writer =
+            begin_workspace_writer_with_options(temp.path(), None, Duration::from_secs(120))
+                .await
+                .expect("writer registration");
         let during = WorkspaceFingerprint::capture(temp.path());
         drop(writer);
         let after = WorkspaceFingerprint::capture(temp.path()).expect("fingerprint");
@@ -5706,11 +5533,16 @@ mod tests {
         // is intentionally not attributed to the surrounding Bash window,
         // even if bytes happen to be restored before the post snapshot.
         assert!(during.is_none());
+        assert_eq!(
+            before.compare_with(Some(&after)),
+            WorkspaceFingerprintComparison::Unknown,
+            "an epoch transition is not authoritative unchanged evidence"
+        );
         assert!(!before.changed_from(Some(after)));
     }
 
-    #[test]
-    fn unsettled_writer_quarantines_future_fingerprints() {
+    #[tokio::test]
+    async fn unsettled_writer_quarantines_future_fingerprints() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(temp.path().join("stable"), "same").unwrap();
         let before = WorkspaceFingerprint::capture(temp.path()).expect("fingerprint");
@@ -5727,13 +5559,59 @@ mod tests {
             "an unowned descendant must make later observations fail closed"
         );
         assert!(
-            acquire_workspace_observation_lease_sync(temp.path(), Duration::from_secs(1)).is_none(),
+            acquire_workspace_observation_lease_with_options(
+                temp.path(),
+                None,
+                Duration::from_secs(1)
+            )
+            .await
+            .is_err(),
             "a writer whose descendants may still run must block later work admission"
         );
     }
 
+    #[tokio::test]
+    async fn persistent_ownership_marker_hydrates_a_fresh_process_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key = workspace_binding_key(temp.path()).expect("workspace key");
+        let marker = ownership_unsettled_marker_path(&key).expect("marker path");
+        let _ = fs::remove_file(&marker);
+        assert!(persist_ownership_unsettled_markers(std::slice::from_ref(
+            &key
+        )));
+
+        // A fresh process has no in-memory WriterEpochState. Reading the
+        // binding must still hydrate the same sticky fence before a lease or
+        // fingerprint can be admitted.
+        let state = writer_epoch_state(temp.path()).expect("writer state");
+        assert!(state.quarantined.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            state
+                .ownership_unsettled
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert!(WorkspaceFingerprint::capture(temp.path()).is_none());
+        assert!(
+            acquire_workspace_observation_lease_with_options(
+                temp.path(),
+                None,
+                Duration::from_millis(20)
+            )
+            .await
+            .is_err()
+        );
+
+        fs::remove_file(marker).expect("remove test marker");
+    }
+
     #[test]
-    fn foreground_receipt_quarantines_attribution_without_blocking_completion() {
+    fn missing_root_has_no_fingerprint() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(WorkspaceFingerprint::capture(&root.path().join("missing")).is_none());
+    }
+
+    #[tokio::test]
+    async fn foreground_receipt_quarantines_attribution_without_blocking_completion() {
         let temp = tempfile::tempdir().unwrap();
         assert!(quarantine_after_weak_receipt(
             temp.path(),
@@ -5748,8 +5626,13 @@ mod tests {
             WorkspaceFingerprint::capture(temp.path()).is_none(),
             "later calls must not receive a potentially misattributed fingerprint"
         );
-        let lease = acquire_workspace_observation_lease_sync(temp.path(), Duration::from_secs(1))
-            .expect("attribution quarantine must not disable workspace coordination");
+        let lease = acquire_workspace_observation_lease_with_options(
+            temp.path(),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("attribution quarantine must not disable workspace coordination");
         assert!(
             lease.coordination_integrity_valid(),
             "the workspace lock remains a valid serialization authority"
@@ -5765,13 +5648,15 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn unsettled_writer_keeps_quarantine_when_bound_root_disappears() {
+    #[tokio::test]
+    async fn unsettled_writer_keeps_quarantine_when_bound_root_disappears() {
         let parent = tempfile::tempdir().expect("parent tempdir");
         let root = parent.path().join("workspace");
         fs::create_dir(&root).expect("workspace");
         let other = tempfile::tempdir().expect("other tempdir");
-        let writer = begin_workspace_writer(&root).expect("writer registration");
+        let writer = begin_workspace_writer_with_options(&root, None, Duration::from_secs(120))
+            .await
+            .expect("writer registration");
 
         fs::remove_dir_all(&root).expect("remove workspace during invocation");
         assert!(mark_workspace_observation_unsettled(&root));
@@ -5786,8 +5671,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn unsettled_writer_keeps_identity_when_symlink_binding_is_repointed() {
+    #[tokio::test]
+    async fn unsettled_writer_keeps_identity_when_symlink_binding_is_repointed() {
         use std::os::unix::fs::symlink;
 
         let parent = tempfile::tempdir().expect("parent tempdir");
@@ -5797,7 +5682,9 @@ mod tests {
         fs::create_dir(&first).expect("first workspace");
         fs::create_dir(&second).expect("second workspace");
         symlink(&first, &link).expect("initial binding");
-        let writer = begin_workspace_writer(&link).expect("writer registration");
+        let writer = begin_workspace_writer_with_options(&link, None, Duration::from_secs(120))
+            .await
+            .expect("writer registration");
 
         fs::remove_file(&link).expect("remove old binding");
         symlink(&second, &link).expect("repoint binding");
@@ -5812,9 +5699,13 @@ mod tests {
     #[tokio::test]
     async fn lease_wait_honors_cancellation_and_can_be_reacquired() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let first = acquire_workspace_observation_lease(temp.path())
-            .await
-            .expect("first lease");
+        let first = acquire_workspace_observation_lease_with_options(
+            temp.path(),
+            None,
+            Duration::from_secs(120),
+        )
+        .await
+        .expect("first lease");
         let cancel = CancellationToken::new();
         let root = temp.path().to_path_buf();
         let waiter_cancel = cancel.clone();
@@ -5825,7 +5716,7 @@ mod tests {
                 Duration::from_secs(30),
             )
             .await
-            .is_some()
+            .is_ok()
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
         cancel.cancel();
@@ -5846,39 +5737,22 @@ mod tests {
             )
             .await
             .expect("lease reacquisition timeout")
-            .is_some()
+            .is_ok()
         );
     }
 
-    #[test]
-    fn blocking_lease_wait_honors_cancellation() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let first = acquire_workspace_observation_lease_sync(temp.path(), Duration::from_secs(1))
-            .expect("first lease");
-        let cancel = CancellationToken::new();
-        let waiter_cancel = cancel.clone();
-        let root = temp.path().to_path_buf();
-        let waiter = std::thread::spawn(move || {
-            acquire_workspace_observation_lease_sync_with_options(
-                &root,
-                Some(&waiter_cancel),
-                Duration::from_secs(30),
-            )
-            .is_some()
-        });
-        std::thread::sleep(Duration::from_millis(20));
-        cancel.cancel();
-        assert!(!waiter.join().expect("blocking waiter"));
-        drop(first);
-    }
-
-    #[test]
-    fn workspace_observation_lease_serializes_other_astra_process_writers() {
+    #[tokio::test]
+    async fn workspace_observation_lease_serializes_other_astra_process_writers() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mutation_marker = temp.path().join("typed-writer");
         let recursive_marker = temp.path().join("recursive-writer");
-        let lease = acquire_workspace_observation_lease_sync(temp.path(), Duration::from_secs(1))
-            .expect("parent lease");
+        let lease = acquire_workspace_observation_lease_with_options(
+            temp.path(),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("parent lease");
 
         let spawn_helper = |mode: &str, marker: &Path| {
             Command::new(std::env::current_exe().expect("current test executable"))
@@ -5928,14 +5802,19 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn same_uid_lock_replacement_cannot_admit_a_second_process_generation() {
+    #[tokio::test]
+    async fn same_uid_lock_replacement_cannot_admit_a_second_process_generation() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().expect("tempdir");
         let marker = temp.path().join("second-generation-writer");
-        let lease = acquire_workspace_observation_lease_sync(temp.path(), Duration::from_secs(1))
-            .expect("first generation");
+        let lease = acquire_workspace_observation_lease_with_options(
+            temp.path(),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("first generation");
         let lock_path = lease.locks[0].path.clone();
         fs::remove_file(&lock_path).unwrap();
         let replacement = fs::OpenOptions::new()
@@ -5995,7 +5874,7 @@ mod tests {
                 Duration::from_secs(30),
             )
             .await
-            .is_none(),
+            .is_err(),
             "an existing kernel name is only contention and never trusted authority"
         );
         drop(blocker);
@@ -6006,14 +5885,14 @@ mod tests {
                 Duration::from_secs(1),
             )
             .await
-            .is_some(),
+            .is_ok(),
             "cancellation must release the in-process gate for a later clean acquisition"
         );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn kernel_namespace_is_released_by_holder_crash_and_restart() {
+    #[tokio::test]
+    async fn kernel_namespace_is_released_by_holder_crash_and_restart() {
         let temp = tempfile::tempdir().expect("tempdir");
         let marker = temp.path().join("kernel-holder-ready");
         let mut child = Command::new(std::env::current_exe().unwrap())
@@ -6031,14 +5910,25 @@ mod tests {
         }
         assert!(marker.exists(), "holder did not bind its kernel namespace");
         assert!(
-            acquire_workspace_observation_lease_sync(temp.path(), Duration::from_millis(50))
-                .is_none()
+            acquire_workspace_observation_lease_with_options(
+                temp.path(),
+                None,
+                Duration::from_millis(50)
+            )
+            .await
+            .is_err()
         );
 
         child.kill().unwrap();
         let _ = child.wait().unwrap();
         assert!(
-            acquire_workspace_observation_lease_sync(temp.path(), Duration::from_secs(1)).is_some(),
+            acquire_workspace_observation_lease_with_options(
+                temp.path(),
+                None,
+                Duration::from_secs(1)
+            )
+            .await
+            .is_ok(),
             "kernel-owned names must disappear when a holder crashes"
         );
     }
@@ -6056,13 +5946,13 @@ mod tests {
         )
         .await;
         assert!(
-            nested.is_none(),
+            nested.is_err(),
             "only the authenticated task-local RPC route may reuse an opaque writer lease"
         );
         assert!(
             begin_workspace_writer_with_options(temp.path(), None, Duration::from_millis(50),)
                 .await
-                .is_none(),
+                .is_err(),
             "two top-level run_script writers must mutually exclude"
         );
 
@@ -6076,7 +5966,7 @@ mod tests {
                 Duration::from_secs(30),
             )
             .await
-            .is_some()
+            .is_ok()
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
         cancel.cancel();
@@ -6089,12 +5979,17 @@ mod tests {
         drop(writer);
     }
 
-    #[test]
-    fn coordination_files_are_stable_external_and_do_not_create_a_manifest_delta() {
+    #[tokio::test]
+    async fn coordination_files_are_stable_external_and_do_not_create_a_manifest_delta() {
         let temp = tempfile::tempdir().expect("tempdir");
         let before = WorkspaceFingerprint::capture(temp.path()).expect("before fingerprint");
-        let lease = acquire_workspace_observation_lease_sync(temp.path(), Duration::from_secs(1))
-            .expect("stable external lease");
+        let lease = acquire_workspace_observation_lease_with_options(
+            temp.path(),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("stable external lease");
 
         assert!(!temp.path().join(".astra").exists());
         assert!(!lease.locks.is_empty());
@@ -6118,12 +6013,16 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn unrelated_sticky_root_activity_does_not_revoke_generation() {
+    #[tokio::test]
+    async fn unrelated_sticky_root_activity_does_not_revoke_generation() {
         let workspace = tempfile::tempdir().expect("workspace");
-        let lease =
-            acquire_workspace_observation_lease_sync(workspace.path(), Duration::from_secs(1))
-                .expect("lease");
+        let lease = acquire_workspace_observation_lease_with_options(
+            workspace.path(),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("lease");
 
         let unrelated =
             tempfile::tempdir_in(stable_coordination_root().expect("stable coordination root"))
@@ -6138,12 +6037,16 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn ordinary_workspace_write_preserves_generation_integrity() {
+    #[tokio::test]
+    async fn ordinary_workspace_write_preserves_generation_integrity() {
         let workspace = tempfile::tempdir().expect("workspace");
-        let lease =
-            acquire_workspace_observation_lease_sync(workspace.path(), Duration::from_secs(1))
-                .expect("lease");
+        let lease = acquire_workspace_observation_lease_with_options(
+            workspace.path(),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("lease");
 
         fs::write(workspace.path().join("result.txt"), "committed").unwrap();
 
@@ -6193,7 +6096,7 @@ mod tests {
         let started = Instant::now();
         let mut leases = Vec::with_capacity(roots.len());
         while let Some(result) = acquisitions.join_next().await {
-            if let Some(lease) = result.expect("concurrent lease task must not panic") {
+            if let Ok(lease) = result.expect("concurrent lease task must not panic") {
                 leases.push(lease);
             }
         }
@@ -6417,8 +6320,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn git_fingerprint_excludes_workspace_coordination_files() {
+    #[tokio::test]
+    async fn git_fingerprint_excludes_workspace_coordination_files() {
         let temp = tempfile::tempdir().expect("tempdir");
         let run = |args: &[&str]| {
             assert!(
@@ -6438,17 +6341,134 @@ mod tests {
         run(&["commit", "-qm", "initial"]);
 
         let before = WorkspaceFingerprint::capture(temp.path()).expect("before fingerprint");
-        let _lease = acquire_workspace_observation_lease_sync(temp.path(), Duration::from_secs(1))
-            .expect("workspace-local lease");
+        let _lease = acquire_workspace_observation_lease_with_options(
+            temp.path(),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("workspace-local lease");
         let after = WorkspaceFingerprint::capture(temp.path()).expect("after fingerprint");
         assert!(!before.changed_from(Some(after)));
+
+        let capture_directory = temp.path().join("astra-bash-outputs");
+        fs::create_dir(&capture_directory).expect("capture directory");
+        fs::write(capture_directory.join("capture.stdout"), "generated").expect("capture");
+        let after_capture = WorkspaceFingerprint::capture(temp.path()).expect("after capture");
+        assert!(!before.changed_from(Some(after_capture.clone())));
+
+        let nested = temp.path().join("user-data/astra-bash-outputs");
+        fs::create_dir_all(&nested).expect("user directory");
+        fs::write(nested.join("notes.txt"), "user content").expect("user content");
+        let after_user = WorkspaceFingerprint::capture(temp.path()).expect("after user change");
+        assert!(after_capture.changed_from(Some(after_user)));
     }
 
     #[test]
-    fn replaced_coordination_file_revokes_lease_integrity() {
+    fn capture_output_does_not_mask_other_workspace_changes_in_manifest() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let lease = acquire_workspace_observation_lease_sync(temp.path(), Duration::from_secs(1))
-            .expect("lease");
+        let before = WorkspaceFingerprint::capture(temp.path()).expect("baseline");
+        let capture_directory = temp.path().join("astra-bash-outputs");
+        fs::create_dir(&capture_directory).expect("capture directory");
+        fs::write(capture_directory.join("capture.stdout"), "generated").expect("capture");
+        let after_capture = WorkspaceFingerprint::capture(temp.path()).expect("after capture");
+        assert!(!before.changed_from(Some(after_capture.clone())));
+
+        let nested = temp.path().join("user-data/astra-bash-outputs");
+        fs::create_dir_all(&nested).expect("user directory");
+        fs::write(nested.join("notes.txt"), "user content").expect("user content");
+        let after_user = WorkspaceFingerprint::capture(temp.path()).expect("after user change");
+        assert!(after_capture.changed_from(Some(after_user)));
+    }
+
+    #[test]
+    fn manifest_ignores_nested_git_objects_but_observes_repo_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let nested_repo = temp.path().join("nested-repo");
+        fs::create_dir(&nested_repo).expect("nested repo directory");
+        assert!(
+            Command::new("git")
+                .args(["-C", nested_repo.to_str().unwrap(), "init", "-q"])
+                .status()
+                .expect("git available")
+                .success()
+        );
+        let large_object = fs::File::create(nested_repo.join(".git/objects/large"))
+            .expect("large nested Git object");
+        large_object
+            .set_len((MAX_STATUS_CONTENT_BYTES + 1) as u64)
+            .expect("large nested Git object size");
+        let user_file = nested_repo.join("notes.txt");
+        fs::write(&user_file, "before").expect("initial user file");
+
+        let before = WorkspaceFingerprint::capture(temp.path())
+            .expect("nested Git internals must not exhaust manifest budget");
+        fs::write(&user_file, "after").expect("updated user file");
+        let after = WorkspaceFingerprint::capture(temp.path()).expect("after user change");
+        assert!(before.changed_from(Some(after)));
+    }
+
+    #[test]
+    fn git_fingerprint_excludes_capture_files_before_status_limits() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert!(
+            Command::new("git")
+                .args(["-C", temp.path().to_str().unwrap(), "init", "-q"])
+                .status()
+                .expect("git available")
+                .success()
+        );
+        let before = WorkspaceFingerprint::capture(temp.path()).expect("baseline");
+        let capture_directory = temp.path().join("astra-bash-outputs");
+        fs::create_dir(&capture_directory).expect("capture directory");
+        for index in 0..=MAX_STATUS_ENTRIES {
+            fs::File::create(capture_directory.join(format!("{index:05}.stdout")))
+                .expect("capture file");
+        }
+        let after = WorkspaceFingerprint::capture(temp.path())
+            .expect("capture files must not consume Git status limits");
+        assert!(!before.changed_from(Some(after.clone())));
+        fs::write(temp.path().join("user.txt"), "user content").expect("user file");
+        let after_user = WorkspaceFingerprint::capture(temp.path()).expect("after user change");
+        assert!(after.changed_from(Some(after_user)));
+    }
+
+    #[test]
+    fn git_fingerprint_excludes_only_capture_directory_of_nested_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert!(
+            Command::new("git")
+                .args(["-C", temp.path().to_str().unwrap(), "init", "-q"])
+                .status()
+                .expect("git available")
+                .success()
+        );
+        let workspace = temp.path().join("nested/workspace");
+        fs::create_dir_all(&workspace).expect("nested workspace");
+        let before = WorkspaceFingerprint::capture(&workspace).expect("baseline");
+        let capture_directory = workspace.join("astra-bash-outputs");
+        fs::create_dir(&capture_directory).expect("capture directory");
+        fs::write(capture_directory.join("generated.stdout"), "generated").expect("capture file");
+        let after_capture = WorkspaceFingerprint::capture(&workspace).expect("after capture");
+        assert!(!before.changed_from(Some(after_capture.clone())));
+
+        let user_directory = workspace.join("user/astra-bash-outputs");
+        fs::create_dir_all(&user_directory).expect("user directory");
+        fs::write(user_directory.join("notes.txt"), "user content").expect("user file");
+        let after_user = WorkspaceFingerprint::capture(&workspace).expect("after user change");
+        assert!(after_capture.changed_from(Some(after_user)));
+    }
+
+    #[tokio::test]
+    async fn replaced_coordination_file_revokes_lease_integrity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lease = acquire_workspace_observation_lease_with_options(
+            temp.path(),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("lease");
         let observation = lease.locks[0].path.clone();
         fs::remove_file(&observation).expect("remove locked path");
         let replacement = fs::OpenOptions::new()
@@ -6465,11 +6485,16 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn transient_lock_generation_split_is_sticky_even_after_inode_restore() {
+    #[tokio::test]
+    async fn transient_lock_generation_split_is_sticky_even_after_inode_restore() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let lease = acquire_workspace_observation_lease_sync(temp.path(), Duration::from_secs(1))
-            .expect("lease");
+        let lease = acquire_workspace_observation_lease_with_options(
+            temp.path(),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("lease");
         let lock_path = lease.locks[0].path.clone();
         let saved = lock_path.with_extension("saved-by-integrity-test");
         if saved.exists() {
@@ -6497,14 +6522,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn typed_commit_after_generation_change_has_zero_durable_receipt() {
+    #[tokio::test]
+    async fn typed_commit_after_generation_change_has_zero_durable_receipt() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let lease = acquire_workspace_mutation_lease_sync_with_options(
+        let lease = acquire_workspace_mutation_lease_with_options(
             temp.path(),
             None,
             Duration::from_secs(1),
         )
+        .await
         .expect("typed writer lease");
         let target = temp.path().join("answer.txt");
         fs::write(&target, "committed").expect("typed commit");
@@ -6535,8 +6561,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn lexical_symlink_and_target_share_lock_and_repoint_revokes_generation() {
+    #[tokio::test]
+    async fn lexical_symlink_and_target_share_lock_and_repoint_revokes_generation() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -6547,10 +6573,21 @@ mod tests {
         fs::create_dir(&second).unwrap();
         symlink(&first, &binding).unwrap();
 
-        let lease = acquire_workspace_observation_lease_sync(&binding, Duration::from_secs(1))
-            .expect("symlink binding lease");
+        let lease = acquire_workspace_observation_lease_with_options(
+            &binding,
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("symlink binding lease");
         assert!(
-            acquire_workspace_observation_lease_sync(&first, Duration::from_millis(50)).is_none(),
+            acquire_workspace_observation_lease_with_options(
+                &first,
+                None,
+                Duration::from_millis(50)
+            )
+            .await
+            .is_err(),
             "canonical target must share a lock with its lexical symlink binding"
         );
         fs::remove_file(&binding).unwrap();
@@ -6561,14 +6598,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn root_and_parent_replacement_revoke_generation() {
+    #[tokio::test]
+    async fn root_and_parent_replacement_revoke_generation() {
         let temp = tempfile::tempdir().expect("tempdir");
         let parent = temp.path().join("parent");
         let root = parent.join("workspace");
         fs::create_dir_all(&root).unwrap();
-        let lease = acquire_workspace_observation_lease_sync(&root, Duration::from_secs(1))
-            .expect("binding lease");
+        let lease =
+            acquire_workspace_observation_lease_with_options(&root, None, Duration::from_secs(1))
+                .await
+                .expect("binding lease");
 
         fs::rename(&parent, temp.path().join("old-parent")).unwrap();
         fs::create_dir_all(&root).unwrap();
@@ -6579,15 +6618,17 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn transient_parent_replacement_is_detected_after_original_is_restored() {
+    #[tokio::test]
+    async fn transient_parent_replacement_is_detected_after_original_is_restored() {
         let temp = tempfile::tempdir().expect("tempdir");
         let parent = temp.path().join("parent");
         let root = parent.join("workspace");
         let saved = temp.path().join("saved-parent");
         fs::create_dir_all(&root).unwrap();
-        let lease = acquire_workspace_observation_lease_sync(&root, Duration::from_secs(1))
-            .expect("binding lease");
+        let lease =
+            acquire_workspace_observation_lease_with_options(&root, None, Duration::from_secs(1))
+                .await
+                .expect("binding lease");
 
         fs::rename(&parent, &saved).unwrap();
         fs::create_dir_all(&root).unwrap();
@@ -6601,8 +6642,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn foreign_or_insecure_precreation_is_rejected() {
+    #[tokio::test]
+    async fn foreign_or_insecure_precreation_is_rejected() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -6623,8 +6664,13 @@ mod tests {
                 .unwrap();
         }
         assert!(
-            acquire_workspace_observation_lease_sync(temp.path(), Duration::from_millis(50))
-                .is_none(),
+            acquire_workspace_observation_lease_with_options(
+                temp.path(),
+                None,
+                Duration::from_millis(50)
+            )
+            .await
+            .is_err(),
             "a permissive/foreign-shaped predictable inode must be rejected, never trusted"
         );
     }
@@ -6652,8 +6698,8 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn sequential_cross_uid_generations_share_global_mutex_not_integrity_witness() {
+    #[tokio::test]
+    async fn sequential_cross_uid_generations_share_global_mutex_not_integrity_witness() {
         let workspace = tempfile::tempdir().expect("workspace");
         let uid_a = unsafe { libc::geteuid() };
         let uid_b = uid_a.wrapping_add(1);
@@ -6696,73 +6742,502 @@ mod tests {
             );
         }
 
-        let first = acquire_cross_process_lock_sync(
+        let first = acquire_cross_process_lock_async(
             specifications_a[0].clone(),
             CrossProcessLockMode::Exclusive,
             None,
             Duration::from_secs(1),
         )
+        .await
         .expect("UID A modeled generation");
         assert!(
-            acquire_cross_process_lock_sync(
+            acquire_cross_process_lock_async(
                 specifications_b[0].clone(),
                 CrossProcessLockMode::Exclusive,
                 None,
-                Duration::from_millis(25),
+                Duration::from_millis(25)
             )
+            .await
             .is_none(),
             "a different UID witness must not bypass the global kernel mutex"
         );
         drop(first);
-        let second = acquire_cross_process_lock_sync(
+        let second = acquire_cross_process_lock_async(
             specifications_b[0].clone(),
             CrossProcessLockMode::Exclusive,
             None,
             Duration::from_secs(1),
         )
+        .await
         .expect("UID B must proceed after UID A releases the global generation");
         assert!(second.path_identity_is_unchanged());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn missing_workspace_cannot_create_a_coordination_authority() {
+    fn coordination_host_keeps_the_root_owned_sticky_directory_requirement() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        // Even a root-owned directory must provide sticky world-writable
+        // semantics. Never modify the real host namespace for this test.
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!trusted_sticky_coordination_root(
+            &fs::symlink_metadata(root.path()).unwrap()
+        ));
+        let link = root.path().join("tmp-link");
+        std::os::unix::fs::symlink(root.path(), &link).unwrap();
+        assert!(!trusted_sticky_coordination_root(
+            &fs::symlink_metadata(link).unwrap()
+        ));
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o1777)).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(root.path()).unwrap();
+        assert_eq!(
+            trusted_sticky_coordination_root(&metadata),
+            metadata.uid() == 0
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_coordination_host_is_not_a_missing_workspace_binding() {
+        if validate_workspace_coordination_host().is_ok() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            acquire_workspace_mutation_lease_with_options(
+                root.path(),
+                None,
+                Duration::from_millis(20)
+            )
+            .await
+            .err(),
+            Some(WorkspaceLeaseFailure::CoordinationHostUnsupported)
+        );
+        assert_eq!(
+            classify_workspace_lease_failure(root.path()),
+            WorkspaceLeaseFailure::CoordinationHostUnsupported
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_workspace_cannot_create_a_coordination_authority() {
         let temp = tempfile::tempdir().expect("tempdir");
         let missing = temp.path().join("missing");
         assert!(
-            acquire_workspace_observation_lease_sync(&missing, Duration::from_millis(20)).is_none()
+            acquire_workspace_observation_lease_with_options(
+                &missing,
+                None,
+                Duration::from_millis(20)
+            )
+            .await
+            .is_err()
         );
         assert!(!missing.join(".astra").exists());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn capacity_wait_keeps_observed_failure_when_reacquisition_uses_remaining_deadline() {
+        let capacity = WorkspaceLeaseFailure::WatcherCapacity {
+            active: 64,
+            requested: 23,
+            limit: 64,
+        };
+        for final_failure in [
+            WorkspaceLeaseFailure::Contended,
+            WorkspaceLeaseFailure::Cancelled,
+            WorkspaceLeaseFailure::BindingUnavailable,
+            WorkspaceLeaseFailure::OwnershipUnsettled,
+            WorkspaceLeaseFailure::WatcherUnavailable,
+        ] {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+            let mut attempts = 0;
+            let result: Result<(), WorkspaceLeaseFailure> = wait_for_workspace_lease_capacity(
+                Path::new("unused-capacity-test-workspace"),
+                None,
+                deadline,
+                || {
+                    attempts += 1;
+                    let first_attempt = attempts == 1;
+                    async move {
+                        if first_attempt {
+                            return Err(capacity);
+                        }
+                        tokio::time::sleep_until(deadline).await;
+                        Err(final_failure)
+                    }
+                },
+            )
+            .await;
+            let expected = if final_failure == WorkspaceLeaseFailure::Contended {
+                capacity
+            } else {
+                final_failure
+            };
+            assert_eq!(
+                attempts, 2,
+                "must exercise deadline exhaustion during retry"
+            );
+            assert_eq!(result, Err(expected));
+        }
+
+        // No capacity refusal was observed: ordinary contention stays contention.
+        let result: Result<(), WorkspaceLeaseFailure> = wait_for_workspace_lease_capacity(
+            Path::new("unused-capacity-test-workspace"),
+            None,
+            tokio::time::Instant::now(),
+            || async { Err(WorkspaceLeaseFailure::Contended) },
+        )
+        .await;
+        assert_eq!(result, Err(WorkspaceLeaseFailure::Contended));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_coordination_supports_independent_workspace_generations() {
+    fn macos_watch_budget_preserves_headroom_at_small_limits() {
+        assert_eq!(macos_watch_descriptor_limit(32), 0);
+        assert_eq!(macos_watch_descriptor_limit(64), 0);
+        assert_eq!(macos_watch_descriptor_limit(80), 16);
+        assert_eq!(macos_watch_descriptor_limit(256), 64);
+        assert_eq!(macos_watch_descriptor_limit(4_096), 1_024);
+        assert_eq!(macos_watch_descriptor_limit(usize::MAX), 1_024);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_watch_budget_runs_with_a_low_fd_limit_in_an_isolated_process() {
+        let output = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("workspace_observation::tests::macos_watch_budget_low_fd_helper")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("ASTRA_TEST_MACOS_WATCH_BUDGET", "1")
+            .output()
+            .expect("run isolated descriptor-budget regression");
+        assert!(
+            output.status.success(),
+            "low-FD child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("ASTRA_MACOS_WATCH_BUDGET_VERIFIED"),
+            "the child must positively confirm every regression assertion ran"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_watch_budget_low_fd_helper() {
+        use std::sync::atomic::Ordering;
+
+        if std::env::var_os("ASTRA_TEST_MACOS_WATCH_BUDGET").is_none() {
+            return;
+        }
+        // Only this child changes the process limit. Parallel parent tests
+        // must keep their own descriptor limits and reservations intact.
+        let mut resource_limit = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut resource_limit) },
+            0
+        );
+        assert!(
+            resource_limit.rlim_max >= 256,
+            "regression requires a hard limit of at least 256"
+        );
+        resource_limit.rlim_cur = 256;
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const resource_limit) },
+            0
+        );
+        let soft_limit = usize::try_from(resource_limit.rlim_cur).unwrap();
+        let limit = macos_watch_descriptor_limit(soft_limit);
+        let fd_count = || {
+            (0..soft_limit)
+                .filter(|fd| unsafe { libc::fcntl(*fd as i32, libc::F_GETFD) } >= 0)
+                .count()
+        };
+        let parent = tempfile::tempdir().expect("workspace parent");
+        let roots = (0..64)
+            .map(|index| {
+                let root = parent.path().join(format!("workspace-{index}/a/b/c/d"));
+                fs::create_dir_all(&root).expect("deep workspace");
+                root
+            })
+            .collect::<Vec<_>>();
+        let baseline = fd_count();
+        let mut leases = Vec::new();
+        let mut refused_root = None;
+        for root in &roots {
+            match acquire_workspace_observation_lease_with_options(
+                root,
+                None,
+                Duration::from_millis(100),
+            )
+            .await
+            {
+                Ok(lease) => leases.push(lease),
+                Err(WorkspaceLeaseFailure::WatcherCapacity { .. }) => {
+                    refused_root = Some(root.clone())
+                }
+                Err(other) => panic!("unexpected admission refusal: {other}"),
+            }
+            assert!(MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire) <= limit);
+            assert!(
+                fd_count() < soft_limit.saturating_sub(32),
+                "watch admission must leave descriptors for unrelated operations"
+            );
+        }
+        assert!(
+            leases.len() >= 2,
+            "the low-FD budget must admit at least two independent deep workspace generations, got {}",
+            leases.len()
+        );
+        let refused_root = refused_root.expect("64 live generations exceed the watcher budget");
+        assert!(
+            leases
+                .iter()
+                .all(WorkspaceObservationLease::integrity_valid)
+        );
+
+        // Saturating the resource budget is independent of workspace authority.
+        // A direct overflow refuses before invoking the registration hook.
+        let error = MacOsGenerationTamperWatch::arm_before_register(
+            &leases[0].locks,
+            std::iter::repeat_n(leases[0].binding_identity.path_components[0].clone(), limit),
+            None,
+            || panic!("capacity overflow must not register a watch"),
+        )
+        .err()
+        .expect("oversized registration must fail closed");
+        assert!(error.to_string().contains("watcher capacity exceeded"));
+        let active = MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire);
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(
+            MacOsGenerationTamperWatch::arm(&leases[0].locks, Vec::new(), Some(&cancelled))
+                .is_err()
+        );
+        assert_eq!(MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire), active);
+
+        // A tampered generation stays independently revoked under saturation.
+        fs::write(&leases[0].locks[0].path, "tamper").unwrap();
+        assert!(!leases[0].integrity_valid());
+        assert!(!leases[0].integrity_valid());
+        assert!(
+            leases
+                .iter()
+                .skip(1)
+                .all(WorkspaceObservationLease::integrity_valid)
+        );
+        drop(leases);
+        assert_eq!(MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire), 0);
+        assert_eq!(
+            fd_count(),
+            baseline,
+            "lease teardown must close all descriptors"
+        );
+
+        // Hold every successful reservation until all contenders have tried.
+        // Capacity must be shared atomically across independent callers.
+        let barrier = std::sync::Barrier::new(17);
+        let release = std::sync::Barrier::new(17);
+        let mut reserved_at_barrier = 0;
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let barrier = &barrier;
+                let release = &release;
+                scope.spawn(move || {
+                    let reservation = MacOsWatchDescriptorReservation::reserve(limit / 8).ok();
+                    barrier.wait();
+                    release.wait();
+                    drop(reservation);
+                });
+            }
+            barrier.wait();
+            reserved_at_barrier = MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire);
+            release.wait();
+        });
+        assert_eq!(reserved_at_barrier, limit);
+        assert_eq!(MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire), 0);
+
+        let fresh = acquire_workspace_observation_lease_with_options(
+            &refused_root,
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("refused workspace can reacquire after capacity is released");
+        assert!(fresh.integrity_valid());
+        let mut missing = WorkspacePathIdentity::capture(refused_root.clone()).unwrap();
+        missing.path = refused_root.join("missing-binding");
+        let before_failure = MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire);
+        assert!(MacOsGenerationTamperWatch::arm(&fresh.locks, [missing], None).is_err());
+        assert_eq!(
+            MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire),
+            before_failure
+        );
+        let cancel_during_registration = CancellationToken::new();
+        let error = MacOsGenerationTamperWatch::arm_before_register(
+            &fresh.locks,
+            Vec::new(),
+            Some(&cancel_during_registration),
+            || cancel_during_registration.cancel(),
+        )
+        .err()
+        .expect("registration cancellation must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(
+            MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire),
+            before_failure
+        );
+        drop(fresh);
+        assert_eq!(MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire), 0);
+        assert_eq!(
+            fd_count(),
+            baseline,
+            "failed admission must not leak descriptors"
+        );
+
+        // A transient process-wide shortage consumes the caller's wait and
+        // retains the observed capacity facts at the tool boundary.
+        let occupied = MacOsWatchDescriptorReservation::reserve(limit).unwrap();
+        let started = tokio::time::Instant::now();
+        let failure = acquire_workspace_observation_lease_with_options(
+            &refused_root,
+            None,
+            Duration::from_millis(50),
+        )
+        .await
+        .err()
+        .expect("full budget must reject after waiting");
+        assert!(tokio::time::Instant::now() - started >= Duration::from_millis(50));
+        assert!(
+            matches!(failure, WorkspaceLeaseFailure::WatcherCapacity { active, requested, limit: actual_limit }
+            if active == limit && requested <= limit && actual_limit == limit)
+        );
+        let result = crate::workspace_lease_failure_tool_result("bash", failure);
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["reason"],
+            "watcher_capacity"
+        );
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["watcher_descriptors"]["active"],
+            limit
+        );
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["next_action"],
+            "wait_for_process_watcher_capacity"
+        );
+
+        let cancel = CancellationToken::new();
+        let cancelled_wait = acquire_workspace_observation_lease_with_options(
+            &refused_root,
+            Some(&cancel),
+            Duration::from_secs(1),
+        );
+        tokio::pin!(cancelled_wait);
+        tokio::select! {
+            _ = &mut cancelled_wait => panic!("capacity shortage must wait within the caller budget"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {},
+        }
+        cancel.cancel();
+        assert!(matches!(
+            cancelled_wait.await,
+            Err(WorkspaceLeaseFailure::Cancelled)
+        ));
+        assert_eq!(MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire), limit);
+
+        let waiting = acquire_workspace_mutation_lease_with_options(
+            &refused_root,
+            None,
+            Duration::from_secs(1),
+        );
+        tokio::pin!(waiting);
+        tokio::select! {
+            _ = &mut waiting => panic!("another workspace's budget must cause a bounded wait"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {},
+        }
+        drop(occupied);
+        let admitted = waiting
+            .await
+            .expect("capacity release must admit the waiting writer");
+        assert!(admitted.integrity_valid());
+        drop(admitted);
+        assert_eq!(MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire), 0);
+        assert_eq!(fd_count(), baseline);
+
+        // A limit that cannot fit any watcher is a repairable configuration
+        // failure, never advice to retry the same workspace forever.
+        resource_limit.rlim_cur = 64;
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const resource_limit) },
+            0
+        );
+        let failure = tokio::time::timeout(
+            Duration::from_millis(100),
+            acquire_workspace_observation_lease_with_options(
+                &refused_root,
+                None,
+                Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("a zero budget must not consume a transient wait")
+        .err()
+        .expect("zero budget refuses admission");
+        assert!(matches!(
+            failure,
+            WorkspaceLeaseFailure::WatcherCapacity { limit: 0, .. }
+        ));
+        let result = crate::workspace_lease_failure_tool_result("bash", failure);
+        assert_eq!(result.metadata.as_ref().unwrap()["retryable"], false);
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["next_action"],
+            "repair_process_watcher_capacity"
+        );
+        assert_eq!(MACOS_WATCH_DESCRIPTORS.load(Ordering::Acquire), 0);
+        println!("ASTRA_MACOS_WATCH_BUDGET_VERIFIED");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_coordination_supports_independent_workspace_generations() {
         let root = stable_coordination_root().expect("trusted macOS coordination root");
         assert_eq!(root, Path::new("/private/tmp"));
 
         let first_workspace = tempfile::tempdir().expect("first workspace");
         let second_workspace = tempfile::tempdir().expect("second workspace");
-        let first = acquire_workspace_observation_lease_sync(
+        let first = acquire_workspace_observation_lease_with_options(
             first_workspace.path(),
+            None,
             Duration::from_secs(1),
         )
+        .await
         .expect("first workspace generation");
-        let second = acquire_workspace_observation_lease_sync(
+        let second = acquire_workspace_observation_lease_with_options(
             second_workspace.path(),
+            None,
             Duration::from_secs(1),
         )
+        .await
         .expect("independent workspace generation");
         assert!(first.integrity_valid());
         assert!(second.integrity_valid());
     }
 
     #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_witness_watch_retains_admitted_inode_across_path_substitution() {
+    #[tokio::test]
+    async fn macos_witness_watch_retains_admitted_inode_across_path_substitution() {
         let workspace = tempfile::tempdir().unwrap();
-        let lease =
-            acquire_workspace_observation_lease_sync(workspace.path(), Duration::from_secs(2))
-                .unwrap();
+        let lease = acquire_workspace_observation_lease_with_options(
+            workspace.path(),
+            None,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
         let witness = &lease.locks[0].path;
         let aside = witness.with_extension("review-original");
         let substitute = witness.with_extension("review-substitute");
@@ -6802,12 +7277,16 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_concurrent_validators_keep_event_revocation_sticky() {
+    #[tokio::test]
+    async fn macos_concurrent_validators_keep_event_revocation_sticky() {
         let workspace = tempfile::tempdir().unwrap();
-        let lease =
-            acquire_workspace_observation_lease_sync(workspace.path(), Duration::from_secs(2))
-                .unwrap();
+        let lease = acquire_workspace_observation_lease_with_options(
+            workspace.path(),
+            None,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
         let watch = &lease.tamper_watch.watcher;
         let witness = &lease.locks[0].path;
         fs::write(witness, "tamper").unwrap();
@@ -6837,8 +7316,8 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_parent_directory_flock_does_not_block_workspace_admission() {
+    #[tokio::test]
+    async fn macos_parent_directory_flock_does_not_block_workspace_admission() {
         let workspace = tempfile::tempdir().expect("workspace");
         let marker = workspace.path().join("parent-flock-ready");
         let mut child = Command::new(std::env::current_exe().expect("current test executable"))
@@ -6856,19 +7335,23 @@ mod tests {
         }
         assert!(marker.exists(), "parent-flock holder did not become ready");
 
-        let lease =
-            acquire_workspace_observation_lease_sync(workspace.path(), Duration::from_secs(1));
+        let lease = acquire_workspace_observation_lease_with_options(
+            workspace.path(),
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
         child.kill().expect("stop parent-flock holder");
         let _ = child.wait().expect("reap parent-flock holder");
         assert!(
-            lease.is_some(),
+            lease.is_ok(),
             "an unrelated flock on /private must not block every workspace namespace"
         );
     }
 
     #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_raw_record_lock_is_workspace_scoped_and_released_on_crash() {
+    #[tokio::test]
+    async fn macos_raw_record_lock_is_workspace_scoped_and_released_on_crash() {
         let workspace = tempfile::tempdir().expect("contended workspace");
         let independent = tempfile::tempdir().expect("independent workspace");
         let marker = workspace.path().join("raw-record-lock-ready");
@@ -6891,21 +7374,35 @@ mod tests {
         );
 
         assert!(
-            acquire_workspace_observation_lease_sync(workspace.path(), Duration::from_millis(50),)
-                .is_none(),
+            acquire_workspace_observation_lease_with_options(
+                workspace.path(),
+                None,
+                Duration::from_millis(50)
+            )
+            .await
+            .is_err(),
             "an externally held namespace byte must reject a second generation"
         );
-        let independent_lease =
-            acquire_workspace_observation_lease_sync(independent.path(), Duration::from_secs(1));
+        let independent_lease = acquire_workspace_observation_lease_with_options(
+            independent.path(),
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
         child.kill().expect("crash raw record-lock holder");
         let _ = child.wait().expect("reap raw record-lock holder");
         assert!(
-            independent_lease.is_some(),
+            independent_lease.is_ok(),
             "a record lock must contend only its derived workspace byte"
         );
         assert!(
-            acquire_workspace_observation_lease_sync(workspace.path(), Duration::from_secs(1),)
-                .is_some(),
+            acquire_workspace_observation_lease_with_options(
+                workspace.path(),
+                None,
+                Duration::from_secs(1)
+            )
+            .await
+            .is_ok(),
             "the raw record lock must disappear when its holder crashes"
         );
     }
@@ -6965,13 +7462,18 @@ mod tests {
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    #[test]
-    fn platform_without_stable_tamper_watch_refuses_receipt_authority() {
+    #[tokio::test]
+    async fn platform_without_stable_tamper_watch_refuses_receipt_authority() {
         let temp = tempfile::tempdir().expect("tempdir");
         assert!(stable_coordination_root().is_none());
         assert!(
-            acquire_workspace_observation_lease_sync(temp.path(), Duration::from_millis(20))
-                .is_none(),
+            acquire_workspace_observation_lease_with_options(
+                temp.path(),
+                None,
+                Duration::from_millis(20)
+            )
+            .await
+            .is_err(),
             "unsupported platforms must reject execution instead of claiming cross-user authority"
         );
     }

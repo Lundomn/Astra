@@ -89,6 +89,26 @@ fn typing_slash_opens_menu() {
 }
 
 #[test]
+fn slash_reopens_command_palette_after_a_completed_work_view() {
+    let mut bp = fresh();
+    bp.push_view(Box::new(
+        crate::tui::bottom_pane::info_view::InfoView::from_plain(
+            "Work hub",
+            vec!["Read-only Work catalog".into()],
+        ),
+    ));
+
+    let _ = bp.handle_key(key('/'));
+    assert!(
+        !bp.has_active_view(),
+        "slash should return focus to the composer"
+    );
+    assert!(bp.slash_menu_is_open());
+    type_string(&mut bp, "m");
+    assert_eq!(bp.slash_menu_selected_name(), Some("/model"));
+}
+
+#[test]
 fn slash_menu_opens_after_due_paste_burst_flush() {
     let mut bp = fresh();
     let now = std::time::Instant::now();
@@ -258,6 +278,71 @@ fn enter_submits_selected_command() {
     }
     assert!(!bp.slash_menu_is_open());
     assert!(bp.composer.is_empty(), "composer cleared after submit");
+}
+
+#[test]
+fn command_arguments_are_submitted_unchanged() {
+    for text in [
+        "/resume 01234567-89ab-4cde-8123-456789abcdef",
+        "/model 5.2",
+        "/unknown 123",
+        "/help \"中文 arguments\"",
+        "/help topic\nsecond line",
+        "/mcp inspect 123",
+        "/mcp inspect github:list_prs 123 \"quoted argument\"",
+    ] {
+        for paste in [false, true] {
+            let mut bp = fresh();
+            bp.set_slash_items(vec![
+                SlashItem {
+                    name: "/mcp".into(),
+                    subcommands: &[("inspect", "Inspect server")],
+                    extra_subcommands: vec![("inspect github:list_prs".into(), "List PRs".into())],
+                    ..Default::default()
+                },
+                SlashItem::simple("/resume", "Resume"),
+                SlashItem::simple("/model", "Model"),
+                SlashItem::simple("/help", "Help"),
+            ]);
+            if paste {
+                bp.handle_paste(text);
+            } else {
+                for c in text.chars() {
+                    let event = if c == '\n' {
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+                    } else {
+                        key(c)
+                    };
+                    let _ = bp.handle_key(event);
+                }
+            }
+            assert!(!bp.slash_menu_is_open(), "{text:?}, paste={paste}");
+            match bp.handle_key(special(KeyCode::Enter)) {
+                BottomPaneAction::SubmitInput(actual) => assert_eq!(actual, text),
+                other => panic!("expected unchanged submission, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn multiword_subcommand_completion_remains_available() {
+    for text in ["/mcp ", "/mcp inspect ", "/mcp inspect git"] {
+        let mut bp = fresh();
+        bp.set_slash_items(vec![SlashItem {
+            name: "/mcp".into(),
+            extra_subcommands: vec![("inspect github:list_prs".into(), "List PRs".into())],
+            ..Default::default()
+        }]);
+        type_string(&mut bp, text);
+        assert!(bp.slash_menu_is_open(), "{text:?}");
+        match bp.handle_key(special(KeyCode::Enter)) {
+            BottomPaneAction::SubmitInput(actual) => {
+                assert_eq!(actual, "/mcp inspect github:list_prs")
+            }
+            other => panic!("expected completion, got {other:?}"),
+        }
+    }
 }
 
 #[test]

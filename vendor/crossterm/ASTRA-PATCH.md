@@ -50,6 +50,18 @@ enters quarantine after 500 ms; response storage is limited to 256 bytes. Bracke
 contents are never interpreted as query responses. Querying is startup-only;
 callers own terminal modes and must not run an EventStream concurrently.
 
+`query_startup_attributes` also writes `CSI ?u` immediately before its existing
+`CSI c`, and `StartupAttributes.keyboard_enhancement_flags` carries any reply.
+This reuses DA1 as the completion sentinel the Kitty keyboard-protocol spec
+recommends: a supporting terminal answers `?u` at or before DA1, so a still-missing
+flags reply once DA1 arrives means the terminal does not support the protocol,
+with no second query. Do not call crossterm's own upstream
+`supports_keyboard_enhancement`/`query_keyboard_enhancement_flags` during Astra's
+startup window for this reason -- their independent `CSI ?u CSI c` write is a
+competing query outside this bounded round trip, which
+`pty_late_da1_is_unknown_until_reply` asserts against (exactly one `CSI c` in
+the child's output).
+
 Also fixes filtered-read FIFO order and preserving skipped events on input errors.
 No public Event variants or Windows input behavior are changed.
 
@@ -105,3 +117,47 @@ inside the real 300 ms product budget on a loaded hosted runner. The assertion
 uses the recorded parent timestamps to prove that the delay actually occurred.
 It intentionally does not use wall-clock scheduling to test behavior close to
 the timeout boundary.
+
+## Bounded cursor queries during resize
+
+`query_cursor_position(timeout)` uses the same Unix reader after Astra pauses
+its EventStream. It discards stale CPR replies, issues DSR, and retains keyboard
+and paste events in FIFO order. Missing replies are bounded by the supplied
+budget (150 ms in Astra); no second terminal reader is opened. `EventStream::pause`
+waits for an acknowledgement from its reusable worker before handing off the
+reader. The query cannot consume the wake byte before the worker acknowledges
+the pause. Astra runs the pause/query on the blocking pool, then resumes the
+same stream without spawning another wake thread. Replies carry the dimensions sampled at query
+time. A resize arriving during the query leaves its event queued and interrupts
+the result, so Astra retries before painting with an obsolete cursor anchor. The startup PTY suite covers resize replies and
+timeouts on both reader backends. No new public Event variants are introduced.
+
+The resize PTY fixture splits CPR inside a recognized CSI without sleeping
+after a bare ESC. A hosted runner can overshoot that ambiguous ESC's 40 ms
+lookahead window; every CPR split boundary is instead covered directly by the
+parser unit test. The PTY assertion still rejects all extra keyboard/paste
+events and reports both the unexpected event and the collected input.
+
+Cursor requests have no nonce. The shared reader therefore retains an outstanding
+DSR across its deadline; a later query returns the missing-reply result until
+that request's late CPR has been consumed. It then issues one fresh DSR. This
+keeps input responsive without attributing an expired reply to new geometry.
+Nonblocking filtered polls inspect all already-ready input while preserving the
+unrelated FIFO. Both Unix backends service zero-timeout reads; the Mio backend
+drains pending WINCH before returning buffered terminal input, even when its
+readiness batch also contained a TTY event.
+
+The xterm reflow journey holds a cursor reply past the actual deadline, verifies
+no overlapping query, accepts paste while the reply is outstanding, then releases
+the expired reply and verifies a fresh resize. Its history, composer, footer and
+scrollback assertions remain unchanged.
+
+## Plain styled content
+
+The existing effective color policy also controls `PrintStyledContent`: when
+disabled, it writes the original content without foreground, background,
+underline-color, attribute or reset wrappers. Presence of `NO_COLOR`, including
+an empty value, disables styling. The existing `force_color_output` override
+retains precedence. This covers Astra tool descriptions, status icons, durations,
+summaries and spinner frames without separate renderer state. Cursor commands
+and control bytes already present in content remain unchanged.

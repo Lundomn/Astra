@@ -14,7 +14,7 @@ use astra_test_harness::judger::{
     AstraCliJudger, ExternalCmdJudger, Judger, JudgerConfig, QuorumAgg, QuorumJudger,
     warn_if_same_family,
 };
-use astra_test_harness::preflight::run_preflight;
+use astra_test_harness::preflight::{run_preflight, validate_revision_bound_cases};
 use astra_test_harness::report::{Format, render};
 use astra_test_harness::runner::{RunnerConfig, resolve_models, resolve_runner_profile_owner};
 use astra_test_harness::suite::{
@@ -27,6 +27,8 @@ use astra_test_harness::suite::{
     about = "Declarative CLI test harness for astra: cases × models × agent judger."
 )]
 struct Args {
+    #[command(subcommand)]
+    command: Option<astra_test_harness::router_offline::RouterCommand>,
     /// Directory containing case YAML files.
     /// Optional when --live-dashboard is used (auto-detected).
     #[arg(long, value_name = "DIR")]
@@ -169,6 +171,10 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     report_file: Option<PathBuf>,
 
+    /// Write secret-free lifecycle/results JSONL incrementally, including on interruption.
+    #[arg(long, value_name = "PATH", conflicts_with = "live_dashboard")]
+    progress_file: Option<PathBuf>,
+
     /// Save the structured evaluation report (capability scores, runtime
     /// health, efficiency metrics) to a JSON file.
     #[arg(long, value_name = "PATH")]
@@ -200,6 +206,26 @@ fn collect_judger_models(
             _ => {}
         }
     }
+}
+
+fn collect_preflight_models(
+    cases: &[Case],
+    fallback: &[String],
+    judge: &str,
+    include_advisory: bool,
+) -> Vec<String> {
+    let mut models = Vec::new();
+    for case in cases {
+        models.extend(case.models.as_deref().unwrap_or(fallback).iter().cloned());
+        models.extend(case.required_models.iter().cloned());
+        collect_judger_models(&case.criteria, judge, include_advisory, &mut models);
+        for step in &case.steps {
+            collect_judger_models(&step.criteria, judge, include_advisory, &mut models);
+        }
+    }
+    models.sort();
+    models.dedup();
+    models
 }
 
 fn resolve_suite_dir(explicit: &std::path::Path, astra_bin: &std::path::Path) -> PathBuf {
@@ -318,9 +344,77 @@ fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
     )
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> Result<()> {
-    let args = Args::parse();
+fn main() -> Result<()> {
+    if astra_core::build_info::write_json_if_requested()
+        .map_err(|error| anyhow::anyhow!("build identity: {error}"))?
+    {
+        return Ok(());
+    }
+    let mut args = Args::parse();
+    if let Some(command) = args.command.take() {
+        return command.run();
+    }
+    initialize_execution_environment()?;
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()?
+        .block_on(run(args))
+}
+
+fn initialize_execution_environment() -> Result<()> {
+    use astra_core::config::{
+        ASTRA_CONFIG_SOURCE_ENV, ASTRA_CONFIG_SOURCE_EXPLICIT_ENV, explicit_env_config_requested,
+    };
+    if !explicit_env_config_requested()? {
+        dotenvy::dotenv().ok();
+    }
+    // Validate again: the startup dotenv may itself select a source.
+    explicit_env_config_requested()?;
+    if std::env::var_os("ASTRA_EXPECTED_BUILD_GIT_SHA").is_some() {
+        // SAFETY: startup runs before application threads are created. Tests
+        // exercise this only in an isolated subprocess with one selected test.
+        unsafe { std::env::set_var(ASTRA_CONFIG_SOURCE_ENV, ASTRA_CONFIG_SOURCE_EXPLICIT_ENV) };
+    }
+    Ok(())
+}
+
+async fn wait_for_suite_interrupt() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
+}
+
+async fn run(args: Args) -> Result<()> {
+    let progress_file = args
+        .progress_file
+        .as_ref()
+        .map(|path| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+        })
+        .transpose()
+        .context("create fresh harness progress file")?;
+    if args.skip_preflight && std::env::var_os("ASTRA_EXPECTED_BUILD_GIT_SHA").is_some() {
+        anyhow::bail!("--skip-preflight cannot bypass ASTRA_EXPECTED_BUILD_GIT_SHA verification");
+    }
+    if std::env::var_os("ASTRA_EXPECTED_BUILD_GIT_SHA").is_some()
+        && (args.live_dashboard.is_some() || args.executor_cmd.is_some())
+    {
+        anyhow::bail!(
+            "revision verification requires the built-in CLI executor without --live-dashboard"
+        );
+    }
     if !args.no_judger && args.judger_cmd.is_none() {
         astra_test_harness::judger::validate_builtin_judger_timeout(args.judger_timeout)
             .map_err(anyhow::Error::msg)?;
@@ -348,7 +442,9 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let astra_bin = resolve_astra_bin(args.astra_bin.clone())?;
+    // All consumers must execute the same artifact, even after changing CWD.
+    let astra_bin = std::fs::canonicalize(resolve_astra_bin(args.astra_bin.clone())?)
+        .context("resolve absolute astra binary path")?;
 
     // ── Dashboard-only mode ─────────────────────────────────────────
     // When --live-dashboard is passed without a full CLI run config,
@@ -417,6 +513,10 @@ async fn main() -> Result<()> {
         eprintln!("[astra-test] filter matched {} case(s)", cases.len());
     }
 
+    if std::env::var_os("ASTRA_EXPECTED_BUILD_GIT_SHA").is_some() {
+        validate_revision_bound_cases(&cases)?;
+    }
+
     // Apply --force-model: override case-level models
     if let Some(ref forced) = args.force_model {
         for case in &mut cases {
@@ -434,54 +534,35 @@ async fn main() -> Result<()> {
 
     // Pre-flight checks — verify all unique models in the matrix, not just the first.
     if !args.skip_preflight {
-        let mut preflight_models: Vec<String> = if let Some(ref forced) = args.force_model {
-            vec![forced.clone()]
-        } else {
-            let mut all_models: Vec<String> = Vec::new();
-            for case in &cases {
-                if let Some(ref ms) = case.models {
-                    all_models.extend(ms.iter().cloned());
-                }
-            }
-            if all_models.is_empty() {
-                all_models = fallback_models.clone();
-            }
-            all_models
-        };
-        for case in &cases {
-            collect_judger_models(
-                &case.criteria,
-                &args.judger_model,
-                !args.no_judger,
-                &mut preflight_models,
-            );
-            for step in &case.steps {
-                collect_judger_models(
-                    &step.criteria,
-                    &args.judger_model,
-                    !args.no_judger,
-                    &mut preflight_models,
-                );
-            }
-        }
-        preflight_models.sort();
-        preflight_models.dedup();
+        let preflight_models = collect_preflight_models(
+            &cases,
+            &fallback_models,
+            &args.judger_model,
+            !args.no_judger,
+        );
         let require_memoria = cases.iter().any(Case::requires_memoria);
-        match run_preflight(
+        let preflight = run_preflight(
             &astra_bin,
             &preflight_models,
             args.profile.as_deref(),
             require_memoria,
         )
-        .await
-        {
+        .await;
+        if let Err(error) = astra_test_harness::preflight::write_preflight_result(
+            args.report_file.as_deref(),
+            &preflight_models,
+            &preflight,
+        ) {
+            eprintln!("[astra-test] WARNING: could not persist safe preflight facts: {error}");
+        }
+        match preflight {
             Ok(effective_profile) => {
                 if effective_profile.is_some() {
                     runner_profile = effective_profile;
                 }
             }
             Err(e) => {
-                anyhow::bail!("pre-flight check failed: {e}\n  (use --skip-preflight to bypass)");
+                anyhow::bail!("pre-flight check failed: {e}");
             }
         }
     }
@@ -494,10 +575,13 @@ async fn main() -> Result<()> {
     let mut runner_cfg = RunnerConfig::new(astra_bin.clone())
         .with_fallback_models(fallback_models.clone())
         .with_required_memoria_subsystem_health();
+    let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    runner_cfg.cancel_flag = Some(cancel_flag.clone());
     runner_cfg.working_dir = args.working_dir.clone();
     runner_cfg.profile = runner_profile.clone();
     runner_cfg.artifact_owner_scopes = runner_identity.artifact_owner_scopes.clone();
     runner_cfg.cleanup_created_sessions = true;
+    runner_cfg.artifacts_dir = args.artifacts_dir.clone();
 
     let judger_cfg = JudgerConfig {
         astra_bin: astra_bin.clone(),
@@ -589,6 +673,17 @@ async fn main() -> Result<()> {
         runs: args.runs.max(1),
     };
 
+    let (progress_tx, progress_task) = if let Some(file) = progress_file {
+        let (tx, rx) = tokio::sync::broadcast::channel(4096);
+        let task = tokio::spawn(astra_test_harness::progress::observe(
+            file,
+            rx,
+            cancel_flag.clone(),
+        ));
+        (Some(tx), Some(task))
+    } else {
+        (None, None)
+    };
     let runner = SuiteRunner {
         executor: executor.as_ref(),
         judger: judger.as_ref(),
@@ -598,12 +693,37 @@ async fn main() -> Result<()> {
         no_judger: args.no_judger,
         session_mode,
         suite_cfg,
-        dashboard_tx: None,
+        dashboard_tx: progress_tx.clone(),
         run_id: String::from("cli"),
-        cancel_flag: None,
+        cancel_flag: Some(cancel_flag.clone()),
     };
 
-    let suite = runner.run_all(&cases).await;
+    // Register only for the suite: preflight retains its normal signal
+    // behavior, while an active case gets time to kill its process group and
+    // settle the exact observed Session before this process exits.
+    let interrupt_task = tokio::spawn(async move {
+        if wait_for_suite_interrupt().await.is_ok() {
+            eprintln!(
+                "[astra-test] interrupt received; cancelling active case and settling its session"
+            );
+            cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    tokio::task::yield_now().await;
+    let suite = std::sync::Arc::new(runner.run_all(&cases).await);
+    interrupt_task.abort();
+    if let Some(tx) = progress_tx {
+        let _ = tx.send(
+            astra_test_harness::dashboard::DashboardEvent::SuiteCompleted {
+                run_id: "cli".into(),
+                report: suite.clone(),
+                sequence: astra_test_harness::dashboard::next_dashboard_event_sequence(),
+            },
+        );
+    }
+    if let Some(task) = progress_task {
+        task.await.context("join harness progress observer")??;
+    }
 
     // Persist artifacts if requested.
     if let Some(ref dir) = args.artifacts_dir {
@@ -696,10 +816,192 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cli_progress_drains_before_nonzero_exit_without_a_provider() {
+        use clap::Parser;
+        const CHILD: &str = "ASTRA_PROGRESS_CLI_CHILD";
+        if let Ok(mode) = std::env::var(CHILD) {
+            let root = std::path::PathBuf::from(std::env::var("ASTRA_PROGRESS_CLI_ROOT").unwrap());
+            let _guard = astra_credentials::set_test_credentials_dir(root.join("credentials"));
+            astra_credentials::CredentialStore::new()
+                .mutate(|credentials| {
+                    credentials.current_profile = Some("progress".into());
+                    credentials.profiles.insert(
+                        "progress".into(),
+                        astra_credentials::Profile {
+                            account_id: Some("account-progress".into()),
+                            ..Default::default()
+                        },
+                    );
+                })
+                .unwrap();
+            let args = super::Args::parse_from([
+                "astra-test",
+                "--suite",
+                root.to_str().unwrap(),
+                "--astra-bin",
+                "/bin/true",
+                "--models",
+                if mode == "unavailable" { "" } else { "m" },
+                "--skip-preflight",
+                "--no-judger",
+                "--no-digest-on-fail",
+                "--executor-cmd",
+                "printf '{}'; exit 42",
+                "--progress-file",
+                root.join("progress.jsonl").to_str().unwrap(),
+            ]);
+            super::run(args).await.unwrap();
+            panic!("nonpassing suite must exit nonzero");
+        }
+        for mode in ["unavailable", "failed"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("case.yaml"),
+                "name: cli-case\nprompt: private-sentinel\n",
+            )
+            .unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::cli_progress_drains_before_nonzero_exit_without_a_provider",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, mode)
+                .env("ASTRA_PROGRESS_CLI_ROOT", dir.path())
+                .env("ASTRA_CONFIG_SOURCE", "explicit-env")
+                .env_remove("ASTRA_EXPECTED_BUILD_GIT_SHA")
+                .output()
+                .unwrap();
+            assert_eq!(result.status.code(), Some(1), "{result:?}");
+            let lines = std::fs::read_to_string(dir.path().join("progress.jsonl")).unwrap();
+            assert!(!lines.contains("private-sentinel"));
+            let events: Vec<serde_json::Value> = lines
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(events.last().unwrap()["type"], "suite_completed");
+            let row = events
+                .iter()
+                .find(|e| e["type"] == "case_completed")
+                .unwrap();
+            assert_eq!(row["row"]["status"], mode);
+        }
+    }
+
+    #[test]
+    fn selected_case_prerequisites_survive_forced_parent_and_include_fallback() {
+        let suite = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cases");
+        let mut child = astra_test_harness::case::Case::from_path(
+            &suite.join("multi_turn_delegation_followup.yaml"),
+        )
+        .unwrap();
+        child.models = Some(vec!["glm-5.3".into()]);
+        assert!(child.required_models.is_empty());
+        assert_eq!(
+            super::collect_preflight_models(std::slice::from_ref(&child), &[], "glm-5.3", true),
+            ["glm-5.3"]
+        );
+        // A genuinely cross-model case still keeps its explicit prerequisites.
+        child.required_models = vec!["glm-5.2".into()];
+        let smoke =
+            astra_test_harness::case::Case::from_path(&suite.join("hello_text_contains.yaml"))
+                .unwrap();
+        let fallback = vec!["fallback-parent".into()];
+        assert_eq!(
+            super::collect_preflight_models(&[child, smoke.clone()], &fallback, "glm-5.3", true),
+            ["fallback-parent", "glm-5.2", "glm-5.3"]
+        );
+        // Filtering happens before collection: unrelated cases cannot require
+        // the child model, and an advisory-off run cannot omit hard prerequisites.
+        assert_eq!(
+            super::collect_preflight_models(&[smoke], &fallback, "glm-5.3", false),
+            ["fallback-parent"]
+        );
+    }
+
     use super::resolve_workspace_astra_bin;
     use astra_test_harness::runner::resolve_runner_profile_owner;
     use std::fs;
     use std::time::Duration;
+
+    #[test]
+    fn revision_environment_is_inherited_without_loading_case_dotenv() {
+        const CHILD: &str = "ASTRA_TEST_REVISION_ENV_CHILD";
+        match std::env::var(CHILD).as_deref() {
+            Ok("case") => {
+                // Exercise the actual shared configuration loader used by
+                // CLI AppSettings, not a second implementation of dotenv.
+                let _ = astra_core::AppSettings::from_env();
+                assert!(std::env::var_os("ASTRA_API_URL").is_none());
+                assert!(astra_core::config::explicit_env_config_requested().unwrap());
+                return;
+            }
+            Ok("startup") => {
+                super::initialize_execution_environment().unwrap();
+                assert_eq!(
+                    std::env::var_os("ASTRA_TRACE").is_some(),
+                    std::env::var("ASTRA_TEST_LOAD_STARTUP_DOTENV").unwrap() == "true",
+                );
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::revision_environment_is_inherited_without_loading_case_dotenv",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD, "case")
+                    .current_dir(std::env::var_os("ASTRA_TEST_CASE_DIRECTORY").unwrap())
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+                return;
+            }
+            _ => {}
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let case = directory.path().join("case");
+        fs::create_dir(&case).unwrap();
+        fs::write(
+            directory.path().join(".env"),
+            "ASTRA_TRACE=startup-marker\n",
+        )
+        .unwrap();
+        fs::write(
+            case.join(".env"),
+            "ASTRA_API_URL=http://different-case-server.invalid\n",
+        )
+        .unwrap();
+        for already_explicit in [false, true] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "tests::revision_environment_is_inherited_without_loading_case_dotenv",
+                    "--test-threads=1",
+                ])
+                .current_dir(directory.path())
+                .env(CHILD, "startup")
+                .env("ASTRA_TEST_CASE_DIRECTORY", &case)
+                .env(
+                    "ASTRA_TEST_LOAD_STARTUP_DOTENV",
+                    (!already_explicit).to_string(),
+                )
+                .env(
+                    "ASTRA_EXPECTED_BUILD_GIT_SHA",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )
+                .env_remove("ASTRA_TRACE")
+                .env_remove("ASTRA_API_URL")
+                .env_remove("ASTRA_SERVER_CONFIG")
+                .env_remove("ASTRA_CONFIG_SOURCE");
+            if already_explicit {
+                command.env("ASTRA_CONFIG_SOURCE", "explicit-env");
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+    }
 
     #[test]
     fn workspace_bin_prefers_only_available_debug_binary() {

@@ -8,8 +8,8 @@
 //!
 //! ## Sync Flow
 //!
-//! - **Preferences**: [`try_cloud_pull_preferences`] / [`try_cloud_push_preferences`].
-//!   Both go through [`crate::preferences_client`] now.
+//! - **Preferences**: [`try_cloud_pull_preferences`].
+//!   Pulls go through [`crate::preferences_client`] now.
 
 use astra_core::sync_poison::recover_mutex_lock;
 use astra_services::session_journal;
@@ -938,12 +938,10 @@ fn parse_bool_pref(value: &str, default: bool) -> bool {
 }
 
 /// Resolve the astra server base URL. Returns `None` when no server
-/// is configured (offline mode). Reads `ASTRA_API_URL`.
+/// is configured (offline mode). Native auth owns its endpoint; legacy profiles
+/// retain `ASTRA_API_URL` selection.
 fn resolve_cloud_base() -> Option<String> {
-    std::env::var("ASTRA_API_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim_end_matches('/').to_string())
+    session_runtime::resolve_cloud_base()
 }
 
 /// Check whether the cloud preference endpoint is reachable.
@@ -1051,73 +1049,6 @@ pub(crate) async fn try_cloud_pull_preferences(state: &mut SessionState) -> Vec<
     keys
 }
 
-/// Push user preferences to cloud at session end.
-pub(crate) async fn try_cloud_push_preferences(state: &SessionState) {
-    let Some(cloud_base) = resolve_cloud_base() else {
-        return;
-    };
-    let token = session_runtime::current_access_token(None);
-
-    let blocked: Vec<String> = state
-        .tool_health_entries
-        .iter()
-        .filter(|e| e.failure_rate >= 1.0)
-        .map(|e| e.name.clone())
-        .collect();
-    let blocked_json = serde_json::to_string(&blocked).unwrap_or_else(|_| "[]".to_string());
-
-    let prefs = [
-        (pref_keys::EXPLAIN_MODE, state.explain.to_string()),
-        (pref_keys::BLOCKED_TOOLS, blocked_json),
-        (
-            pref_keys::AUTO_MEMORY_ENABLED,
-            state.auto_memory_enabled.to_string(),
-        ),
-        (
-            pref_keys::NOTIFICATIONS_ENABLED,
-            state.notifications_enabled.to_string(),
-        ),
-        (
-            pref_keys::NOTIFICATION_METHOD,
-            state.notification_method.to_string(),
-        ),
-        (
-            pref_keys::NOTIFICATION_THRESHOLD_SECS,
-            state.notification_threshold_secs.to_string(),
-        ),
-    ];
-    for (key, value) in &prefs {
-        if let Err(e) = crate::cli::preferences_client::push_preference(
-            &cloud_base,
-            token.as_deref(),
-            key,
-            value,
-        )
-        .await
-        {
-            tracing::warn!(
-                target: "astra_cli::cloud_sync",
-                error = %e,
-                key = %key,
-                "preference push failed"
-            );
-        }
-    }
-    let report = try_drain_sync_outbox(SYNC_OUTBOX_DRAIN_LIMIT).await;
-    if report.is_incomplete() {
-        tracing::warn!(
-            target: "astra_cli::cloud_sync",
-            attempted = report.attempted,
-            acked = report.acked,
-            failed = report.failed,
-            terminal = report.terminal,
-            remaining_ready = report.remaining_ready,
-            blocker = ?report.blocker,
-            "sync outbox drain did not fully converge"
-        );
-    }
-}
-
 pub(crate) async fn try_drain_sync_outbox(limit: usize) -> SyncOutboxDrainReport {
     let auth_snapshot = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
     try_drain_sync_outbox_for_snapshot(limit, &auth_snapshot).await
@@ -1127,7 +1058,19 @@ async fn try_drain_sync_outbox_for_snapshot(
     limit: usize,
     auth_snapshot: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
 ) -> SyncOutboxDrainReport {
-    let Some(cloud_base) = resolve_cloud_base() else {
+    if auth_snapshot.native_binding.is_none() && crate::cli::native_auth::active().is_some() {
+        return SyncOutboxDrainReport {
+            cloud_configured: true,
+            blocker: Some(SyncOutboxDrainBlocker::MissingAccessToken),
+            ..Default::default()
+        };
+    }
+    let Some(cloud_base) = auth_snapshot
+        .native_binding
+        .as_ref()
+        .map(|binding| binding.endpoint().to_owned())
+        .or_else(resolve_cloud_base)
+    else {
         return SyncOutboxDrainReport::default();
     };
     let mut report = SyncOutboxDrainReport {
@@ -1165,7 +1108,12 @@ async fn try_drain_sync_outbox_for_snapshot(
             return report;
         }
     }
-    let Some(token) = auth_snapshot.access_token.clone() else {
+    let token = if let Some(binding) = &auth_snapshot.native_binding {
+        binding.access_token().await.ok()
+    } else {
+        auth_snapshot.access_token().await
+    };
+    let Some(token) = token else {
         report.blocker = Some(SyncOutboxDrainBlocker::MissingAccessToken);
         tracing::debug!(
             target: "astra_cli::cloud_sync",
@@ -1174,7 +1122,10 @@ async fn try_drain_sync_outbox_for_snapshot(
         return report;
     };
     let client = match astra_thin_client::ThinClient::new(&cloud_base, Some(token.clone())) {
-        Ok(client) => client,
+        Ok(client) => match &auth_snapshot.native_binding {
+            Some(binding) => client.with_bearer_provider(binding.clone()),
+            None => client,
+        },
         Err(error) => {
             report.blocker = Some(SyncOutboxDrainBlocker::InvalidCloudBaseUrl);
             tracing::warn!(

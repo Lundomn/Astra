@@ -67,20 +67,9 @@ pub struct ContextTraceMemorySignal {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextTraceHistorySignal {
-    #[serde(default)]
-    pub total_turns_available: u32,
-    #[serde(default)]
-    pub retained_turns: usize,
-    #[serde(default)]
-    pub compressed_turns: usize,
-    #[serde(default)]
-    pub dropped_turns: usize,
-    #[serde(default)]
-    pub compression_ratio: f64,
-    #[serde(default)]
-    pub tokens_before: u32,
-    #[serde(default)]
-    pub tokens_after: u32,
+    /// Observed CLI admission input groups, not canonical session turns.
+    pub retained_groups: usize,
+    pub total_tokens: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -128,8 +117,6 @@ pub struct ContextTraceSignal {
     pub budget: Option<ContextTraceBudgetSignal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<ContextTraceTimingSignal>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub explanations: Vec<String>,
 }
 
 impl ContextTraceSignal {
@@ -174,18 +161,11 @@ impl ContextTraceSignal {
                 ));
             }
         }
-        if let Some(history) = self.history.as_ref()
-            && history.compressed_turns > 0
-        {
-            if history.compression_ratio > 0.0 {
-                parts.push(format!(
-                    "history: {} compressed (ratio {ratio:.2})",
-                    history.compressed_turns,
-                    ratio = history.compression_ratio
-                ));
-            } else {
-                parts.push(format!("history: {} compressed", history.compressed_turns));
-            }
+        if let Some(history) = self.history.as_ref() {
+            parts.push(format!(
+                "admission history: {} groups (~{} tokens)",
+                history.retained_groups, history.total_tokens
+            ));
         }
         if let Some(budget) = self.budget.as_ref()
             && (budget.max_tokens > 0 || budget.total_used > 0)
@@ -198,14 +178,7 @@ impl ContextTraceSignal {
         {
             parts.push(format!("time: {}ms", timing.total_ms));
         }
-        if let Some(explanation) = self.explanations.first() {
-            let preview: String = explanation.chars().take(96).collect();
-            if explanation.chars().count() > 96 {
-                parts.push(format!("note: {preview}..."));
-            } else {
-                parts.push(format!("note: {preview}"));
-            }
-        }
+
         parts.join(" | ")
     }
 }
@@ -362,22 +335,7 @@ pub struct WorkspaceMetadata {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deprioritized_tools: Vec<String>,
 
-    // ─── Adaptive engine state (for resume without oscillation) ───
-    /// Last turn where a scenario change occurred (anti-flap cooldown).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_scenario_change_turn: Option<u32>,
-    /// Direction of the last token-budget change: +1 (increase), -1 (decrease), 0 (none).
-    #[serde(default)]
-    pub last_token_budget_direction: i8,
-    /// Turn where the last token-budget direction change occurred.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_token_budget_change_turn: Option<u32>,
-    /// Active A/B experiment ID (if enrolled in an experiment).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_experiment_id: Option<String>,
-    /// Active A/B experiment variant (if enrolled).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_variant: Option<String>,
+    // ─── Explicit runtime configuration (for resume) ───
     /// RuntimeConfig override snapshot (JSON) persisted for local resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tuned_config_json: Option<String>,
@@ -504,11 +462,6 @@ impl WorkspaceMetadata {
             discovered_skills: Vec::new(),
             pinned_tools: Vec::new(),
             deprioritized_tools: Vec::new(),
-            last_scenario_change_turn: None,
-            last_token_budget_direction: 0,
-            last_token_budget_change_turn: None,
-            active_experiment_id: None,
-            active_variant: None,
             tuned_config_json: None,
             projection_revision: 0,
             config_mutation_revision: 0,
@@ -552,11 +505,6 @@ impl WorkspaceMetadata {
             discovered_skills: Vec::new(),
             pinned_tools: Vec::new(),
             deprioritized_tools: Vec::new(),
-            last_scenario_change_turn: None,
-            last_token_budget_direction: 0,
-            last_token_budget_change_turn: None,
-            active_experiment_id: None,
-            active_variant: None,
             tuned_config_json: None,
             projection_revision: 0,
             config_mutation_revision: 0,
@@ -638,8 +586,11 @@ pub async fn persist_remote_workspace(
 }
 
 pub fn read_workspace(session_id: &str) -> std::io::Result<WorkspaceMetadata> {
-    let path = workspace_file_path(session_id)?;
-    let metadata = std::fs::metadata(&path)?;
+    read_workspace_at_path(session_id, &workspace_file_path(session_id)?)
+}
+
+fn read_workspace_at_path(session_id: &str, path: &Path) -> std::io::Result<WorkspaceMetadata> {
+    let metadata = std::fs::metadata(path)?;
     const MAX_WORKSPACE_YAML_SIZE: u64 = 1024 * 1024; // 1 MB
     if metadata.len() > MAX_WORKSPACE_YAML_SIZE {
         return Err(std::io::Error::new(
@@ -651,7 +602,7 @@ pub fn read_workspace(session_id: &str) -> std::io::Result<WorkspaceMetadata> {
             ),
         ));
     }
-    let content = std::fs::read_to_string(&path)?;
+    let content = std::fs::read_to_string(path)?;
     let metadata: WorkspaceMetadata = serde_yaml_ng::from_str(&content)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     validate_workspace_identity(session_id, &metadata)?;
@@ -684,21 +635,40 @@ pub fn update_workspace(
     initialize: impl FnOnce() -> WorkspaceMetadata,
     update: impl FnOnce(&mut WorkspaceMetadata),
 ) -> std::io::Result<()> {
-    let dir = validated_workspace_dir(session_id)?;
+    update_workspace_for_owner(
+        &crate::OwnerScope::local_user(),
+        session_id,
+        initialize,
+        update,
+    )
+}
+
+/// Apply the same atomic workspace update in an explicitly captured owner scope.
+pub fn update_workspace_for_owner(
+    owner_scope: &crate::OwnerScope,
+    session_id: &str,
+    initialize: impl FnOnce() -> WorkspaceMetadata,
+    update: impl FnOnce(&mut WorkspaceMetadata),
+) -> std::io::Result<()> {
+    let dir = crate::local_session_artifact_store()
+        .session_dir_for_owner(owner_scope, session_id)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     std::fs::create_dir_all(&dir)?;
     sync_parent_dir(&dir)?;
     let _lock = lock_workspace(&dir)?;
-    let (mut metadata, existing_config) = match read_workspace_optional(session_id)? {
-        Some(metadata) => {
-            let config = (
-                metadata.tuned_config_json.clone(),
-                metadata.config_mutation_revision,
-                metadata.projection_revision,
-            );
-            (metadata, Some(config))
-        }
-        None => (initialize(), None),
-    };
+    let (mut metadata, existing_config) =
+        match read_workspace_at_path(session_id, &dir.join("workspace.yaml")) {
+            Ok(metadata) => {
+                let config = (
+                    metadata.tuned_config_json.clone(),
+                    metadata.config_mutation_revision,
+                    metadata.projection_revision,
+                );
+                (metadata, Some(config))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (initialize(), None),
+            Err(error) => return Err(error),
+        };
     validate_workspace_identity(session_id, &metadata)?;
     update(&mut metadata);
     if let Some((tuned_config_json, revision, projection_revision)) = existing_config {
@@ -1301,41 +1271,15 @@ pub fn format_project_context(summaries: &[ProjectSessionSummary]) -> String {
 
 /// Finalize workspace at session end: extract summary from journal and mark completed.
 /// Returns the summary string if one was found.
-pub fn finalize_workspace_on_end(session_id: &str) -> Option<String> {
-    // Validate the current workspace and bail if it does not exist. The actual
-    // mutation below re-reads it under the workspace lock.
-    match read_workspace_optional(session_id) {
-        Ok(Some(_)) => {}
-        Ok(None) => return None,
-        Err(error) => {
-            eprintln!("[knowledge-backflow] Failed to read workspace on end: {error}");
-            return None;
-        }
+pub fn finalize_workspace_on_end(session_id: &str) -> std::io::Result<Option<String>> {
+    if read_workspace_optional(session_id)?.is_none() {
+        return Ok(None);
     }
-
-    // Extract summary from the last compact event's metadata
-    let summary = match extract_last_compact_summary(session_id) {
-        Ok(summary) => summary,
-        Err(error) => {
-            eprintln!(
-                "[knowledge-backflow] Failed to read compact summary from journal on end: {error}"
-            );
-            None
-        }
-    };
-
-    let summary_for_update = summary.clone();
-    match update_existing_workspace(session_id, |workspace| {
-        workspace.mark_completed(summary_for_update.as_deref());
-    }) {
-        Ok(Some(_)) => {}
-        Ok(None) => return None,
-        Err(error) => {
-            eprintln!("[knowledge-backflow] Failed to update workspace on end: {error}");
-        }
-    }
-
-    summary
+    let summary = extract_last_compact_summary(session_id)?;
+    update_existing_workspace(session_id, |workspace| {
+        workspace.mark_completed(summary.as_deref());
+    })?;
+    Ok(summary)
 }
 
 /// Extract the summary from the last Compact journal event that has compact_summary metadata.
@@ -1359,6 +1303,56 @@ fn extract_last_compact_summary(session_id: &str) -> std::io::Result<Option<Stri
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[serial_test::serial]
+    fn explicit_owner_workspace_update_reads_and_writes_only_the_captured_namespace() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let _guard = crate::session_journal::JournalDirGuard::new(root.path());
+        let sid = "workspace-explicit-owner-update";
+        let owner = crate::OwnerScope::user("captured-workspace-owner").unwrap();
+        assert_ne!(owner, crate::OwnerScope::local_user());
+        update_workspace_for_owner(
+            &owner,
+            sid,
+            || WorkspaceMetadata::new(sid, "default"),
+            |workspace| {
+                workspace.turn_count = 3;
+                workspace.summary = Some("captured owner evidence".into());
+            },
+        )
+        .unwrap();
+        update_workspace(
+            sid,
+            || WorkspaceMetadata::new(sid, "default"),
+            |workspace| workspace.turn_count = 20,
+        )
+        .unwrap();
+        update_workspace_for_owner(
+            &owner,
+            sid,
+            || panic!("existing captured workspace must be read"),
+            |workspace| {
+                assert_eq!(workspace.turn_count, 3);
+                workspace.turn_count = 4;
+                workspace.discovered_skills.push("captured-skill".into());
+            },
+        )
+        .unwrap();
+        assert_eq!(read_workspace(sid).unwrap().turn_count, 20);
+        let path = crate::local_session_artifact_store()
+            .session_dir_for_owner(&owner, sid)
+            .unwrap()
+            .join("workspace.yaml");
+        let captured = read_workspace_at_path(sid, &path).unwrap();
+        assert_eq!(captured.turn_count, 4);
+        assert_eq!(captured.summary.as_deref(), Some("captured owner evidence"));
+        assert_eq!(
+            captured.discovered_skills,
+            vec!["captured-skill".to_string()]
+        );
+    }
+
     use super::*;
     use crate::session_journal::{JournalDirGuard, ProcessJournalDirGuard};
     use async_trait::async_trait;
@@ -1647,13 +1641,8 @@ mod tests {
                 latency_ms: 9,
             }),
             history: Some(ContextTraceHistorySignal {
-                total_turns_available: 10,
-                retained_turns: 5,
-                compressed_turns: 3,
-                dropped_turns: 2,
-                compression_ratio: 0.58,
-                tokens_before: 900,
-                tokens_after: 522,
+                retained_groups: 5,
+                total_tokens: 522,
             }),
             budget: Some(ContextTraceBudgetSignal {
                 max_tokens: 20_000,
@@ -1669,7 +1658,6 @@ mod tests {
                 tool_execution_ms: 330,
                 total_ms: 1600,
             }),
-            explanations: vec!["Kept LSP because symbol-aware navigation was required.".into()],
         });
 
         let yaml = serde_yaml_ng::to_string(&ws).unwrap();
@@ -1707,7 +1695,6 @@ mod tests {
             history: None,
             budget: None,
             timing: None,
-            explanations: Vec::new(),
         });
 
         write_workspace(&ws).unwrap();
@@ -1805,7 +1792,6 @@ mod tests {
             history: None,
             budget: None,
             timing: None,
-            explanations: Vec::new(),
         };
 
         assert!(trace.preview().contains("tools[latest_round]: lsp"));
@@ -1990,7 +1976,7 @@ mod tests {
         journal.append(&evt).unwrap();
 
         // Finalize
-        let summary = finalize_workspace_on_end(sid);
+        let summary = finalize_workspace_on_end(sid).unwrap();
         assert_eq!(summary.as_deref(), Some("User implemented auth system"));
 
         // Verify workspace was updated
@@ -2011,7 +1997,7 @@ mod tests {
         write_workspace(&ws).unwrap();
 
         // Finalize: no compact events → no summary
-        let summary = finalize_workspace_on_end(sid);
+        let summary = finalize_workspace_on_end(sid).unwrap();
         assert!(summary.is_none());
 
         // Verify workspace was marked completed but has no summary
@@ -2021,7 +2007,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_workspace_on_end_ignores_invalid_workspace_without_overwriting() {
+    fn finalize_workspace_on_end_reports_invalid_workspace_without_overwriting() {
         let temp = tempfile::tempdir().unwrap();
         let sessions_dir = temp.path().join("sessions");
         std::fs::create_dir_all(&sessions_dir).unwrap();
@@ -2033,8 +2019,7 @@ mod tests {
         let workspace_path = workspace_file_path(sid).unwrap();
         std::fs::write(&workspace_path, ":\nnot-valid-yaml").unwrap();
 
-        let summary = finalize_workspace_on_end(sid);
-        assert!(summary.is_none());
+        assert!(finalize_workspace_on_end(sid).is_err());
         assert_eq!(
             std::fs::read_to_string(&workspace_path).unwrap(),
             ":\nnot-valid-yaml"
@@ -2058,24 +2043,14 @@ mod tests {
     }
 
     #[test]
-    fn workspace_adaptive_state_round_trip() {
+    fn workspace_tuned_config_round_trip() {
         let mut ws =
             WorkspaceMetadata::with_context("adapt-sess", "gpt-4", "/tmp", Some("feature-x"));
-        ws.last_scenario_change_turn = Some(12);
-        ws.last_token_budget_direction = -1;
-        ws.last_token_budget_change_turn = Some(10);
-        ws.active_experiment_id = Some("exp-001".to_string());
-        ws.active_variant = Some("treatment-a".to_string());
         ws.tuned_config_json = Some(r#"{"max_tokens":4096}"#.to_string());
 
         let yaml = serde_yaml_ng::to_string(&ws).unwrap();
         let parsed: WorkspaceMetadata = serde_yaml_ng::from_str(&yaml).unwrap();
 
-        assert_eq!(parsed.last_scenario_change_turn, Some(12));
-        assert_eq!(parsed.last_token_budget_direction, -1);
-        assert_eq!(parsed.last_token_budget_change_turn, Some(10));
-        assert_eq!(parsed.active_experiment_id.as_deref(), Some("exp-001"));
-        assert_eq!(parsed.active_variant.as_deref(), Some("treatment-a"));
         assert_eq!(
             parsed.tuned_config_json.as_deref(),
             Some(r#"{"max_tokens":4096}"#)
@@ -2083,35 +2058,17 @@ mod tests {
     }
 
     #[test]
-    fn workspace_adaptive_state_defaults_on_missing_fields() {
-        // YAML from older versions without adaptive fields should deserialize cleanly
+    fn workspace_tuned_config_defaults_on_missing_fields() {
+        // A session without an explicit override uses the configured defaults.
         let yaml = "session_id: s\ncwd: /tmp\nmodel: m\ncreated_at: '2025-01-01T00:00:00Z'\nupdated_at: '2025-01-01T00:00:00Z'\nturn_count: 5\ntotal_tokens_in: 100\ntotal_tokens_out: 50\nstatus: active\nprojection_revision: 0\nconfig_mutation_revision: 0\n";
         let ws: WorkspaceMetadata = serde_yaml_ng::from_str(yaml).unwrap();
-        assert_eq!(ws.last_scenario_change_turn, None);
-        assert_eq!(ws.last_token_budget_direction, 0);
-        assert_eq!(ws.last_token_budget_change_turn, None);
-        assert_eq!(ws.active_experiment_id, None);
-        assert_eq!(ws.active_variant, None);
         assert_eq!(ws.tuned_config_json, None);
     }
 
     #[test]
-    fn workspace_adaptive_state_omitted_when_default() {
+    fn workspace_tuned_config_omitted_when_default() {
         let ws = WorkspaceMetadata::with_context("s", "m", "/tmp", None);
         let yaml = serde_yaml_ng::to_string(&ws).unwrap();
-        assert!(
-            !yaml.contains("last_scenario_change_turn"),
-            "should omit None fields"
-        );
-        assert!(
-            !yaml.contains("last_token_budget_change_turn"),
-            "should omit None fields"
-        );
-        assert!(
-            !yaml.contains("active_experiment_id"),
-            "should omit None fields"
-        );
-        assert!(!yaml.contains("active_variant"), "should omit None fields");
         assert!(
             !yaml.contains("tuned_config_json"),
             "should omit None fields"

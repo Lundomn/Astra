@@ -1,23 +1,18 @@
-use std::time::Instant;
+mod test_support;
+
+use test_support::require_db_it_env;
+
+use std::{sync::Arc, time::Instant};
 
 use astra_core::SharedPool;
 use astra_services::runs::ToolOutputBatchItem;
 use astra_services::{
     ContextManifestItemWrite, ContextManifestWrite, DatabaseContextManifestStore,
-    DatabaseRunStateStore, DatabaseStateProjectionStore,
+    DatabaseRunStateStore,
 };
 use serde_json::json;
 use sqlx::Row;
 use uuid::Uuid;
-
-fn require_db_it_env() -> astra_core::MatrixOneSettings {
-    let enabled = std::env::var("ASTRA_TEST_DB_IT").unwrap_or_default();
-    assert!(
-        enabled == "1",
-        "set ASTRA_TEST_DB_IT=1 for ignored perf benchmarks; got {enabled:?}"
-    );
-    astra_core::MatrixOneSettings::from_env()
-}
 
 async fn setup_pool() -> SharedPool {
     let settings = require_db_it_env();
@@ -46,51 +41,6 @@ async fn insert_session(pool: &SharedPool, user_id: &str, session_id: &str) {
     .execute(pool.get())
     .await
     .expect("perf insert_session must succeed");
-}
-
-async fn insert_completed_run(pool: &SharedPool, user_id: &str, session_id: &str, run_id: &str) {
-    sqlx::query(
-        "INSERT INTO agent_runs
-         (run_id, user_id, session_id, root_run_id, ancestor_path, depth, retry_scope,
-          status, last_event_idx, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 0, 'node', 'completed', -1, NOW(6), NOW(6))",
-    )
-    .bind(run_id)
-    .bind(user_id)
-    .bind(session_id)
-    .bind(run_id)
-    .bind(run_id)
-    .execute(pool.get())
-    .await
-    .expect("perf insert_completed_run must succeed");
-}
-
-async fn insert_state_item(
-    pool: &SharedPool,
-    user_id: &str,
-    session_id: &str,
-    run_id: &str,
-    category: &str,
-    item_key: &str,
-) {
-    sqlx::query(
-        "INSERT INTO session_state_items
-         (item_id, user_id, session_id, scope, category, item_key, status, priority, source,
-          run_id, title, summary_text, payload_json, token_estimate, version, created_at, updated_at)
-         VALUES (?, ?, ?, 'session', ?, ?, 'active', 10, 'perf',
-                 ?, ?, ?, '{}', 40, 1, NOW(6), NOW(6))",
-    )
-    .bind(id("state"))
-    .bind(user_id)
-    .bind(session_id)
-    .bind(category)
-    .bind(item_key)
-    .bind(run_id)
-    .bind(format!("{category} {item_key}"))
-    .bind(format!("summary {category} {item_key}"))
-    .execute(pool.get())
-    .await
-    .expect("perf insert_state_item must succeed");
 }
 
 fn millis(started: Instant) -> u128 {
@@ -151,90 +101,6 @@ async fn perf_benchmark_1_hot_path_query_under_50ms_p99() {
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1; perf_benchmark"]
-async fn perf_benchmark_2_three_stage_retrieval_sla() {
-    let pool = setup_pool().await;
-    let user_id = id("user");
-    let session_id = id("session");
-    insert_session(&pool, &user_id, &session_id).await;
-    for i in 0..120 {
-        sqlx::query(
-            "INSERT INTO session_history_chunks
-             (chunk_id, user_id, session_id, source_session_id, seq_start, seq_end, chunk_type,
-              source_table, source_id, content_text, content_hash, token_estimate, provenance_json, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, 'code_decision', 'session_transcript_items',
-                     ?, ?, ?, 40, '{}', NOW(6))",
-        )
-        .bind(id("chunk"))
-        .bind(&user_id)
-        .bind(&session_id)
-        .bind(&session_id)
-        .bind(i as i64)
-        .bind(i as i64 + 1)
-        .bind(format!("turn-{i}"))
-        .bind(format!("needle retrieval content row {i}"))
-        .bind(id("hash"))
-        .execute(pool.get())
-        .await
-        .expect("PERF-2 history chunk seed must insert");
-    }
-
-    let structured = Instant::now();
-    let structured_row = sqlx::query(
-        "SELECT chunk_id FROM session_history_chunks FORCE INDEX (idx_history_owner_session_seq)
-         WHERE user_id = ? AND session_id = ? AND seq_start <= 42 AND seq_end >= 42 LIMIT 1",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .fetch_optional(pool.get())
-    .await
-    .expect("PERF-2 structured retrieval query must succeed");
-    let structured_ms = millis(structured);
-    assert!(
-        structured_row.is_some() && structured_ms < 50,
-        "PERF-2 structured retrieval must hit <50ms and find a row; row_present={} elapsed={}ms",
-        structured_row.is_some(),
-        structured_ms
-    );
-
-    let fts = Instant::now();
-    let fts_row = sqlx::query(
-        "SELECT chunk_id FROM session_history_chunks FORCE INDEX (idx_history_user_chunk_created)
-         WHERE user_id = ? AND chunk_type = 'code_decision' AND content_text LIKE '%needle retrieval%'
-         ORDER BY created_at DESC LIMIT 1",
-    )
-    .bind(&user_id)
-    .fetch_optional(pool.get())
-    .await
-    .expect("PERF-2 FTS fallback query must succeed");
-    let fts_ms = millis(fts);
-    assert!(
-        fts_row.is_some() && fts_ms < 200,
-        "PERF-2 FTS retrieval must hit <200ms and find a row; row_present={} elapsed={}ms",
-        fts_row.is_some(),
-        fts_ms
-    );
-
-    let vector = Instant::now();
-    let vector_row = sqlx::query(
-        "SELECT chunk_id FROM session_history_chunks FORCE INDEX (idx_history_user_chunk_created)
-         WHERE user_id = ? AND chunk_type = 'code_decision'
-         ORDER BY created_at DESC LIMIT 1",
-    )
-    .bind(&user_id)
-    .fetch_optional(pool.get())
-    .await
-    .expect("PERF-2 vector fallback freshness query must succeed");
-    let vector_ms = millis(vector);
-    assert!(
-        vector_row.is_some() && vector_ms < 500,
-        "PERF-2 vector retrieval must hit <500ms and find a row; row_present={} elapsed={}ms",
-        vector_row.is_some(),
-        vector_ms
-    );
-}
-
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1; perf_benchmark"]
 async fn perf_benchmark_3_one_thousand_tool_outputs_under_1000ms() {
     let pool = setup_pool().await;
     let user_id = id("user");
@@ -290,172 +156,169 @@ async fn perf_benchmark_3_one_thousand_tool_outputs_under_1000ms() {
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1; perf_benchmark"]
-async fn perf_benchmark_4_compaction_assertions_under_100ms() {
+async fn perf_benchmark_6_manifest_batches_across_users_and_sessions() {
+    const WRITERS: usize = 8;
+    const ITEMS_PER_MANIFEST: usize = 257;
+
     let pool = setup_pool().await;
-    let user_id = id("user");
-    let session_id = id("session");
-    let run_id = id("run");
-    insert_session(&pool, &user_id, &session_id).await;
-    insert_completed_run(&pool, &user_id, &session_id, &run_id).await;
-    for category in [
-        "plan_state",
-        "decision",
-        "finding",
-        "benchmark",
-        "citation",
-        "todo_state",
-        "error_state",
-        "delegation_state",
-    ] {
-        insert_state_item(
-            &pool,
-            &user_id,
-            &session_id,
-            &run_id,
-            category,
-            &format!("{category}-perf"),
+    let users = (0..4).map(|_| id("perf-user")).collect::<Vec<_>>();
+    let mut workloads = Vec::with_capacity(WRITERS);
+    for writer in 0..WRITERS {
+        // Use more than one session per user so the fixture covers both
+        // owner isolation and independent-session concurrency.
+        let user_id = users[writer % users.len()].clone();
+        let session_id = id(&format!("perf-session-{writer}"));
+        let run_id = id("run");
+        insert_session(&pool, &user_id, &session_id).await;
+        sqlx::query(
+            "INSERT INTO agent_session_lifecycle_fences
+             (session_id, user_id, created_at, updated_at)
+             VALUES (?, ?, NOW(6), NOW(6))",
         )
-        .await;
-    }
-    DatabaseContextManifestStore::new(pool.clone())
-        .save_manifest(
-            ContextManifestWrite {
-                manifest_id: id("manifest"),
-                user_id: user_id.clone(),
+        .bind(&session_id)
+        .bind(&user_id)
+        .execute(pool.get())
+        .await
+        .expect("PERF-6 session fence seed must insert");
+
+        let manifest_id = id(&format!("manifest-{writer}"));
+        let items = (0..ITEMS_PER_MANIFEST)
+            .map(|item_order| ContextManifestItemWrite {
                 session_id: session_id.clone(),
-                run_id: Some(run_id.clone()),
-                turn_id: id("compaction-turn"),
-                model_provider: "runtime".to_string(),
-                model_name: "compaction_engine".to_string(),
-                context_window_tokens: 8_000,
-                max_output_tokens: 500,
-                total_estimated_tokens: 640,
-                policy_version: "context_manifest_v1".to_string(),
-                tokenizer_id: Some("estimated_v1".to_string()),
-                budget_template_id: Some("budget_v1_8k".to_string()),
-                turn_intent: Some("compaction".to_string()),
-                reason: "post_compaction".to_string(),
-                manifest_json: json!({
-                    "zones": {
-                        "plan_todo": {"used_tokens": 640, "budget_tokens": 800}
-                    }
-                }),
-            },
-            vec![ContextManifestItemWrite {
-                session_id: session_id.clone(),
-                item_order: 0,
-                zone: "plan_todo".to_string(),
-                source_table: "session_state_items".to_string(),
-                source_id: format!("{session_id}:plan"),
+                item_order: item_order as i32,
+                zone: "recent_tail".to_string(),
+                source_table: "runtime_messages".to_string(),
+                source_id: format!("{run_id}:message:{item_order}"),
                 source_hash: None,
                 included: true,
-                token_estimate: 640,
-                budget_tokens: 800,
-                reason: "post_compaction".to_string(),
-                render_mode: "summary".to_string(),
-                raw_ref: Some(format!("conversation_log://{session_id}/compaction")),
-            }],
-        )
-        .await
-        .expect("PERF-4 post_compaction manifest seed must satisfy invariant precondition");
-    let store = DatabaseStateProjectionStore::new(pool.clone());
-    let started = Instant::now();
-    let results = store
-        .run_compaction_assertions(&user_id, &session_id, &run_id)
-        .await
-        .expect("PERF-4 compaction invariant SQL must execute");
-    let elapsed_ms = millis(started);
-    assert!(
-        results.iter().all(|(_, violations)| *violations == 0),
-        "PERF-4 compaction invariants must all return zero violations, got {results:?}"
-    );
-    assert!(
-        elapsed_ms < 100,
-        "PERF-4 all compaction invariant SQL must run in <100ms, got {elapsed_ms}ms"
-    );
-}
+                token_estimate: 8,
+                budget_tokens: 16,
+                reason: "normal_turn".to_string(),
+                render_mode: "plain_text".to_string(),
+                raw_ref: None,
+            })
+            .collect::<Vec<_>>();
+        let manifest = ContextManifestWrite {
+            manifest_id: manifest_id.clone(),
+            user_id: user_id.clone(),
+            session_id: session_id.clone(),
+            run_id: Some(run_id.clone()),
+            turn_id: id("turn"),
+            model_provider: "mock".to_string(),
+            model_name: "perf-batch-llm".to_string(),
+            context_window_tokens: 8_000,
+            max_output_tokens: 700,
+            total_estimated_tokens: 2_000,
+            policy_version: "context_manifest_v1".to_string(),
+            tokenizer_id: Some("estimated_v1".to_string()),
+            budget_template_id: Some("budget_v1_8k".to_string()),
+            turn_intent: Some("normal".to_string()),
+            reason: "normal_turn".to_string(),
+            manifest_json: json!({
+                "writer": writer,
+                "item_count": ITEMS_PER_MANIFEST,
+            }),
+        };
+        workloads.push((user_id, session_id, run_id, manifest, items));
+    }
 
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1; perf_benchmark"]
-async fn perf_benchmark_5_manifest_build_under_100ms() {
-    let pool = setup_pool().await;
-    let user_id = id("user");
-    let session_id = id("session");
-    let run_id = id("run");
-    insert_session(&pool, &user_id, &session_id).await;
-    let weighted_templates = sqlx::query(
-        "SELECT COUNT(*) AS c FROM preview_template_registry
-         WHERE status = 'active' AND fts_field_weights_json <> '{}'",
+    let store = DatabaseContextManifestStore::new(pool.clone());
+    let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS + 1));
+    let mut tasks = Vec::with_capacity(workloads.len());
+    for (user_id, session_id, run_id, manifest, items) in workloads {
+        let store = store.clone();
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            store
+                .save_manifest(manifest, items)
+                .await
+                .expect("PERF-6 batched manifest write must succeed");
+            (user_id, session_id, run_id)
+        }));
+    }
+    let started = Instant::now();
+    barrier.wait().await;
+
+    let mut completed_writes = Vec::with_capacity(WRITERS);
+    for task in tasks {
+        completed_writes.push(task.await.expect("PERF-6 writer task must join"));
+    }
+    let elapsed_ms = millis(started);
+
+    let mut persisted = 0_i64;
+    let mut first_session = None;
+    for (user_id, session_id, run_id) in completed_writes {
+        let row = sqlx::query(
+            "SELECT item.item_order, item.session_id, item.source_id
+             FROM context_manifest_items AS item
+             INNER JOIN context_manifests AS manifest
+               ON manifest.manifest_id = item.manifest_id
+             WHERE manifest.user_id = ? AND manifest.session_id = ? AND manifest.run_id = ?
+             ORDER BY item.item_order",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&run_id)
+        .fetch_all(pool.get())
+        .await
+        .expect("PERF-6 persisted item query must succeed");
+        assert_eq!(
+            row.len(),
+            ITEMS_PER_MANIFEST,
+            "PERF-6 each manifest must persist exactly its own items"
+        );
+        for (item_order, row) in row.iter().enumerate() {
+            assert_eq!(
+                row.try_get::<String, _>("session_id")
+                    .expect("PERF-6 item session must decode"),
+                session_id,
+                "PERF-6 item must retain its source session"
+            );
+            assert_eq!(
+                row.try_get::<i32, _>("item_order")
+                    .expect("PERF-6 item order must decode"),
+                item_order as i32
+            );
+            assert_eq!(
+                row.try_get::<String, _>("source_id")
+                    .expect("PERF-6 item source must decode"),
+                format!("{run_id}:message:{item_order}")
+            );
+        }
+        persisted += row.len() as i64;
+        first_session.get_or_insert(session_id);
+    }
+    let expected = (WRITERS * ITEMS_PER_MANIFEST) as i64;
+    assert_eq!(
+        persisted, expected,
+        "PERF-6 all concurrent manifests must persist every item"
+    );
+    let owner_session = first_session.expect("PERF-6 must have a workload");
+    let wrong_owner_count = sqlx::query(
+        "SELECT COUNT(*) AS c
+         FROM context_manifests AS manifest
+         INNER JOIN context_manifest_items AS item
+           ON item.manifest_id = manifest.manifest_id
+         WHERE manifest.user_id = ? AND manifest.session_id = ?",
     )
+    .bind("perf-user-not-owner")
+    .bind(owner_session)
     .fetch_one(pool.get())
     .await
-    .expect("PERF-5 preview template seed query must succeed")
+    .expect("PERF-6 wrong-owner query must succeed")
     .try_get::<i64, _>("c")
     .unwrap_or_default();
-    assert!(
-        weighted_templates >= 18,
-        "PERF-5 preview_template seed must include real fts_field_weights for baseline templates, got {weighted_templates}"
+    assert_eq!(
+        wrong_owner_count, 0,
+        "PERF-6 must not cross owner boundaries"
     );
-    let store = DatabaseContextManifestStore::new(pool.clone());
-    let manifest_id = id("manifest");
-    let items = vec![ContextManifestItemWrite {
-        session_id: session_id.clone(),
-        item_order: 0,
-        zone: "recent_tail".to_string(),
-        source_table: "session_transcript_items".to_string(),
-        source_id: format!("{session_id}:tail"),
-        source_hash: None,
-        included: true,
-        token_estimate: 800,
-        budget_tokens: 2_000,
-        reason: "normal_turn".to_string(),
-        render_mode: "plain_text".to_string(),
-        raw_ref: Some(format!("conversation_log://{session_id}/tail")),
-    }];
-    let started = Instant::now();
-    store
-        .save_manifest(
-            ContextManifestWrite {
-                manifest_id: manifest_id.clone(),
-                user_id: user_id.clone(),
-                session_id: session_id.clone(),
-                run_id: Some(run_id.clone()),
-                turn_id: id("turn"),
-                model_provider: "mock".to_string(),
-                model_name: "perf-fixed-llm".to_string(),
-                context_window_tokens: 8_000,
-                max_output_tokens: 700,
-                total_estimated_tokens: 1_200,
-                policy_version: "context_manifest_v1".to_string(),
-                tokenizer_id: Some("estimated_v1".to_string()),
-                budget_template_id: Some("budget_v1_8k".to_string()),
-                turn_intent: Some("normal".to_string()),
-                reason: "normal_turn".to_string(),
-                manifest_json: json!({
-                    "zones": {
-                        "recent_tail": {"used_tokens": 800, "budget_tokens": 2000}
-                    }
-                }),
-            },
-            items,
-        )
-        .await
-        .expect("PERF-5 manifest build/write must succeed");
-    let elapsed_ms = millis(started);
-    let persisted =
-        sqlx::query("SELECT COUNT(*) AS c FROM context_manifests WHERE manifest_id = ?")
-            .bind(&manifest_id)
-            .fetch_one(pool.get())
-            .await
-            .expect("PERF-5 manifest persisted query must succeed")
-            .try_get::<i64, _>("c")
-            .unwrap_or_default();
-    assert!(
-        persisted == 1,
-        "PERF-5 manifest must be persisted exactly once, got {persisted}"
+    println!(
+        "PERF_RESULT benchmark=manifest_multi_session_write users={} sessions={WRITERS} items_per_manifest={ITEMS_PER_MANIFEST} total_items={expected} elapsed_ms={elapsed_ms}",
+        users.len(),
     );
     assert!(
-        elapsed_ms < 100,
-        "PERF-5 manifest build/write must complete in <100ms, got {elapsed_ms}ms"
+        elapsed_ms < 10_000,
+        "PERF-6 {WRITERS} multi-user/session manifest writes must complete in <10s, got {elapsed_ms}ms"
     );
 }

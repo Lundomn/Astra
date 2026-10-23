@@ -6,13 +6,16 @@ import importlib.util
 import json
 import multiprocessing
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 
-MODULE_PATH = Path(__file__).with_name("fresh_database_contract.py")
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+MODULE_PATH = SCRIPT_DIR / "fresh_database_contract.py"
 SPEC = importlib.util.spec_from_file_location(
     "astra_fresh_database_contract", MODULE_PATH
 )
@@ -50,6 +53,8 @@ class FreshDatabaseContractTests(unittest.TestCase):
                 "MATRIXONE_HOST": "127.0.0.1",
                 "MATRIXONE_PORT": "6001",
                 "MATRIXONE_USER": "sys:root",
+                "ASTRA_HARNESS_CONTROL_API_URL": "http://127.0.0.1:17012",
+                "ASTRA_ACCESS_TOKEN": "test-only-token",
             },
         )
         self.database_environment.start()
@@ -58,11 +63,15 @@ class FreshDatabaseContractTests(unittest.TestCase):
         self.database_environment.stop()
 
     def test_model_state_allows_an_explicit_non_thinking_selection(self):
-        row = [["provider-neutral-model", "1", "none", "unsupported", "2026-08-28 00:00:00.000000"]]
+        row = [["offering", "provider-neutral-model", "1", "2026-08-28 00:00:00.000000"]]
         with (
             mock.patch.object(contract, "EXPECTED_MODEL", "provider-neutral-model"),
             mock.patch.object(contract, "EXPECTED_THINKING_MODE", "none"),
             mock.patch.object(contract, "_mysql_rows", return_value=row),
+            mock.patch.object(contract.benchmark_model_seed, "_request_json", return_value={
+                "model_id": "offering", "name": "provider-neutral-model", "is_active": True,
+                "thinking_capability": "none", "thinking_probe": {"error": "unsupported"},
+            }) as request,
         ):
             self.assertEqual(
                 contract._model_state("astra_tb_round5_0123456789abcdef"),
@@ -76,11 +85,42 @@ class FreshDatabaseContractTests(unittest.TestCase):
                 },
             )
 
+        self.assertEqual(request.call_args.kwargs["method"], "GET")
+        self.assertEqual(request.call_args.args[1], "http://127.0.0.1:17012/models/provider-neutral-model")
+
     def test_model_state_keeps_high_thinking_fail_closed(self):
-        row = [["deepseek-v4-flash", "1", "none", "", "2026-08-28 00:00:00.000000"]]
-        with mock.patch.object(contract, "_mysql_rows", return_value=row):
-            with self.assertRaisesRegex(contract.ContractError, "thinking:high"):
-                contract._model_state("astra_tb_round5_0123456789abcdef")
+        row = [["offering", "deepseek-v4-flash", "1", "2026-08-28 00:00:00.000000"]]
+        for capability, error, expected in [(None, None, "thinking:high"), ("none", None, "thinking:high"), ("both", "failed", "probe error")]:
+            with (
+                self.subTest(capability=capability, error=error),
+                mock.patch.object(contract, "_mysql_rows", return_value=row),
+                mock.patch.object(contract.benchmark_model_seed, "_request_json", return_value={
+                    "model_id": "offering", "name": "deepseek-v4-flash", "is_active": True,
+                    "thinking_capability": capability, "thinking_probe": {"error": error},
+                }),
+            ):
+                with self.assertRaisesRegex(contract.ContractError, expected):
+                    contract._model_state("astra_tb_round5_0123456789abcdef")
+
+    def test_model_state_checks_owned_offering_and_version_around_api_read(self):
+        row = [["offering", "deepseek-v4-flash", "1", "2026-08-28 00:00:00.000000"]]
+        valid = {"model_id": "offering", "name": "deepseek-v4-flash", "is_active": True,
+                 "thinking_capability": "both", "thinking_probe": {"error": None}}
+        for model, after, expected in [
+            (valid, row, None),
+            ({**valid, "model_id": "other-database-offering"}, row, "exact database offering"),
+            (valid, [[*row[0][:3], "2026-08-28 00:00:01.000000"]], "changed while reading"),
+        ]:
+            with (
+                self.subTest(expected=expected),
+                mock.patch.object(contract, "_mysql_rows", side_effect=[row, after]),
+                mock.patch.object(contract.benchmark_model_seed, "_request_json", return_value=model),
+            ):
+                if expected is None:
+                    self.assertEqual(contract._model_state("astra_tb_round5_0123456789abcdef")["thinking_capability"], "both")
+                else:
+                    with self.assertRaisesRegex(contract.ContractError, expected):
+                        contract._model_state("astra_tb_round5_0123456789abcdef")
 
     def test_mysql_password_is_never_put_in_argv(self):
         completed = mock.Mock(returncode=0, stdout="1\n", stderr="")
@@ -100,6 +140,7 @@ class FreshDatabaseContractTests(unittest.TestCase):
             self.assertEqual(contract._mysql_rows("SELECT 1"), [["1"]])
         argv = run.call_args.args[0]
         self.assertNotIn("secret-sentinel", json.dumps(argv))
+        self.assertFalse(any(argument.startswith("--ssl") or argument == "--skip-ssl" for argument in argv))
         self.assertEqual(run.call_args.kwargs["env"]["MYSQL_PWD"], "secret-sentinel")
 
     def test_contract_is_one_use_and_fails_on_runtime_or_model_drift(self):
@@ -279,6 +320,7 @@ class FreshDatabaseContractTests(unittest.TestCase):
                 mock.patch.object(contract, "_model_state", return_value=model),
             ):
                 contract.begin(root, database, proof)
+                model["checked_updated_at"] = contract._load_proof(proof)["begun_at"]
                 contract.seal(root, database, proof)
                 selected = contract.sealed_contract_identity(root, database, proof)
                 with mock.patch.object(contract, "datetime", AfterPreflight):
@@ -398,6 +440,7 @@ class FreshDatabaseContractTests(unittest.TestCase):
                 mock.patch.object(contract, "_model_state", return_value=model),
             ):
                 contract.begin(root, database, original)
+                model["checked_updated_at"] = contract._load_proof(original)["begun_at"]
                 contract.seal(root, database, original)
                 sealed = original.read_text()
                 first.write_text(sealed)
@@ -424,6 +467,7 @@ class FreshDatabaseContractTests(unittest.TestCase):
             self.assertEqual(outcomes.count("consumed"), 1)
             self.assertEqual(outcomes.count("rejected"), 1)
 
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux abstract Unix sockets")
     def test_two_processes_two_proof_paths_and_ports_have_one_lifecycle_winner(self):
         database = "astra_tb_round5_0123456789abcdef"
         revision = "a" * 40
@@ -455,6 +499,7 @@ class FreshDatabaseContractTests(unittest.TestCase):
                 mock.patch.object(contract, "_model_state", return_value=model),
             ):
                 contract.begin(root, database, original)
+                model["checked_updated_at"] = contract._load_proof(original)["begun_at"]
                 contract.seal(root, database, original)
                 sealed = original.read_text()
                 first.write_text(sealed)
@@ -529,6 +574,7 @@ class FreshDatabaseContractTests(unittest.TestCase):
                 mock.patch.object(contract, "_model_state", return_value=model),
             ):
                 contract.begin(root, database, proof)
+                model["checked_updated_at"] = contract._load_proof(proof)["begun_at"]
                 contract.seal(root, database, proof)
                 selected = contract.sealed_contract_identity(root, database, proof)
                 swapped = json.loads(proof.read_text())
@@ -568,6 +614,7 @@ class FreshDatabaseContractTests(unittest.TestCase):
             ):
                 contract._validated_consumption_directory(unsafe)
 
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux abstract Unix sockets")
     def test_abstract_lifecycle_lease_is_versioned_cloexec_and_path_independent(self):
         broker = broker_module
         identity = "a" * 64
@@ -591,7 +638,8 @@ class FreshDatabaseContractTests(unittest.TestCase):
     def test_schema_inventory_is_closed_and_all_non_boot_tables_are_empty(self):
         repo = MODULE_PATH.parents[2]
         canonical = contract._canonical_schema_inventory(repo)
-        registries = contract._canonical_baseline_registry_rows(repo)
+        self.assertNotIn("preview_template_registry", canonical)
+        self.assertNotIn("raw_ref_scheme_registry", canonical)
         self.assertIn("plans", canonical)
         self.assertIn("workspace_records", canonical)
         self.assertIn("session_checkpoints", canonical)
@@ -602,12 +650,7 @@ class FreshDatabaseContractTests(unittest.TestCase):
         # default user role plus the one bootstrap admin role.
         counts["auth_roles"] = 2
         counts["auth_user_roles"] = 2
-        counts["raw_ref_scheme_registry"] = len(
-            registries["raw_ref_scheme_registry"]
-        )
-        counts["preview_template_registry"] = len(
-            registries["preview_template_registry"]
-        )
+        counts["session_weighted_admission_gates"] = 16
         contract._validate_closed_schema_counts(canonical, canonical, counts)
         changed_bootstrap_auth = {**counts, "auth_users": 2}
         with self.assertRaisesRegex(contract.ContractError, "auth_users"):
@@ -642,8 +685,60 @@ class FreshDatabaseContractTests(unittest.TestCase):
     def test_distributed_admission_scope_is_source_owned(self):
         repo = MODULE_PATH.parents[2]
         self.assertEqual(
-            contract._distributed_admission_scope(repo), "canonical_turn_v1"
+            contract._distributed_admission_scopes(repo),
+            [f"canonical_turn_v2_{partition:02}" for partition in range(16)],
         )
+
+    def test_distributed_admission_scope_changes_follow_source_and_fail_closed(self):
+        source = (MODULE_PATH.parents[2] / "crates/services/src/weighted_admission.rs").read_text()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            path = repo / "crates/services/src/weighted_admission.rs"
+            path.parent.mkdir(parents=True)
+            changed = source.replace("PARTITIONS: usize = 16;", "PARTITIONS: usize = 3;").replace(
+                "canonical_turn_v2_{partition:02}", "fixture_scope_{partition:02}_gate"
+            )
+            path.write_text(changed)
+            self.assertEqual(contract._distributed_admission_scopes(repo), [
+                "fixture_scope_00_gate", "fixture_scope_01_gate", "fixture_scope_02_gate",
+            ])
+            counts = {table: 1 for table in (
+                "astra_schema_contracts", "astra_schema_table_contracts", "infra_llm_models",
+                "maintenance_sweep_cursors", "sweeper_leases",
+            )}
+            counts["session_weighted_admission_gates"] = 3
+            contract._validate_closed_schema_counts(set(counts), set(counts), counts, repo=repo)
+            for wrong_count in (0, 1, 2, 4, 16):
+                with self.subTest(count=wrong_count):
+                    with self.assertRaisesRegex(contract.ContractError, "session_weighted_admission_gates"):
+                        contract._validate_closed_schema_counts(
+                            set(counts), set(counts),
+                            {**counts, "session_weighted_admission_gates": wrong_count}, repo=repo,
+                        )
+            for invalid in (
+                changed.replace("PARTITIONS: usize = 3;", "PARTITIONS: usize = 0;"),
+                changed.replace("PARTITIONS: usize = 3;", "PARTITIONS: usize = N;"),
+                changed.replace("{partition:02}", "{partition}"),
+                changed.replace('format!("fixture_scope_{partition:02}_gate")', 'other_scope(partition)'),
+                changed + '\npub(crate) const DISTRIBUTED_ADMISSION_PARTITIONS: usize = 4;\n',
+                "",
+            ):
+                with self.subTest(source=invalid[-100:]):
+                    path.write_text(invalid)
+                    with self.assertRaisesRegex(contract.ContractError, "source-owned"):
+                        contract._distributed_admission_scopes(repo)
+
+    def test_admission_gate_rows_require_the_exact_partition_inventory(self):
+        repo = MODULE_PATH.parents[2]
+        rows = [[scope] for scope in contract._distributed_admission_scopes(repo)]
+        contract._validate_admission_gates(rows, repo)
+        for invalid in (
+            [], rows[:-1], rows + [rows[0]], rows[:-1] + [rows[0]], [["canonical_turn_v1"]],
+            rows[:-1] + [["unknown_scope"]], [[rows[0][0], "extra_column"]] + rows[1:],
+        ):
+            with self.subTest(rows=invalid):
+                with self.assertRaisesRegex(contract.ContractError, "exact source scopes"):
+                    contract._validate_admission_gates(invalid, repo)
 
     def test_default_server_schema_allows_only_source_classified_conditional_tables(
         self,
@@ -660,7 +755,6 @@ class FreshDatabaseContractTests(unittest.TestCase):
             },
         )
         actual = canonical - conditional
-        registries = contract._canonical_baseline_registry_rows(repo)
         counts = {table: 0 for table in actual}
         counts.update(
             {
@@ -668,13 +762,7 @@ class FreshDatabaseContractTests(unittest.TestCase):
                 "astra_schema_table_contracts": 1,
                 "infra_llm_models": 1,
                 "maintenance_sweep_cursors": 1,
-                "preview_template_registry": len(
-                    registries["preview_template_registry"]
-                ),
-                "raw_ref_scheme_registry": len(
-                    registries["raw_ref_scheme_registry"]
-                ),
-                "session_weighted_admission_gates": 1,
+                "session_weighted_admission_gates": 16,
                 "sweeper_leases": 1,
             }
         )
@@ -719,47 +807,6 @@ class FreshDatabaseContractTests(unittest.TestCase):
                 {**counts, "llm_provider_admission_windows": 0},
                 optional_absent=conditional,
             )
-
-    def test_production_baseline_registries_are_exact_counted_and_hashed(self):
-        repo = MODULE_PATH.parents[2]
-        expected = contract._canonical_baseline_registry_rows(repo)
-
-        def rows(sql, _database=None):
-            if "FROM raw_ref_scheme_registry" in sql:
-                return [list(row) for row in expected["raw_ref_scheme_registry"]]
-            if "FROM preview_template_registry" in sql:
-                return [list(row) for row in expected["preview_template_registry"]]
-            raise AssertionError(sql)
-
-        with mock.patch.object(contract, "_mysql_rows", side_effect=rows):
-            sealed = contract._validate_baseline_registry_rows("fresh", repo)
-        self.assertEqual(
-            sealed["raw_ref_scheme_registry_count"],
-            len(expected["raw_ref_scheme_registry"]),
-        )
-        self.assertEqual(
-            sealed["preview_template_registry_count"],
-            len(expected["preview_template_registry"]),
-        )
-        self.assertRegex(sealed["raw_ref_scheme_registry_sha256"], r"^[0-9a-f]{64}$")
-        self.assertRegex(sealed["preview_template_registry_sha256"], r"^[0-9a-f]{64}$")
-
-        mutated = {
-            table: [list(row) for row in rows] for table, rows in expected.items()
-        }
-        mutated["preview_template_registry"][0][3] = "9999"
-
-        def changed_rows(sql, _database=None):
-            table = (
-                "raw_ref_scheme_registry"
-                if "FROM raw_ref_scheme_registry" in sql
-                else "preview_template_registry"
-            )
-            return mutated[table]
-
-        with mock.patch.object(contract, "_mysql_rows", side_effect=changed_rows):
-            with self.assertRaisesRegex(contract.ContractError, "exact source-owned"):
-                contract._validate_baseline_registry_rows("fresh", repo)
 
     def test_runtime_system_baseline_is_source_owned_and_exact(self):
         repo = MODULE_PATH.parents[2]

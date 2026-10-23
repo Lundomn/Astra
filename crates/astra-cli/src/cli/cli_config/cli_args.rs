@@ -30,14 +30,7 @@ fn parse_permission_mode_arg(value: &str) -> Result<String, String> {
 fn parse_explain_mode_arg(
     value: &str,
 ) -> Result<crate::cli::session::session_state::ExplainMode, String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "on" | "true" => Ok(crate::cli::session::session_state::ExplainMode::On),
-        "off" | "false" => Ok(crate::cli::session::session_state::ExplainMode::Off),
-        "verbose" => Ok(crate::cli::session::session_state::ExplainMode::Verbose),
-        other => Err(format!(
-            "invalid explain mode `{other}` (expected on, off, or verbose)"
-        )),
-    }
+    crate::cli::session::session_state::ExplainMode::parse_cli_arg(value)
 }
 
 #[cfg(feature = "harness")]
@@ -48,6 +41,9 @@ fn parse_benchmark_profile_arg(value: &str) -> Result<astra_harness::HarnessProf
 #[derive(Parser, Debug)]
 #[command(name = "astra", version)]
 #[command(about = "AI agent CLI — run `astra` for interactive chat")]
+#[command(
+    after_help = "MOI-managed installations: astra update check | astra update | astra update --rollback"
+)]
 pub(crate) struct Cli {
     /// API server base URL [env: ASTRA_API_URL] [config: api_url] [default: http://127.0.0.1:17001]
     #[arg(long)]
@@ -114,19 +110,13 @@ pub(crate) struct Cli {
     /// Set a display name for this session
     #[arg(short = 'n', long = "name")]
     pub session_name: Option<String>,
-    /// Minimal mode: skip hooks, auto-memory, background prefetches.
-    /// Only explicitly provided context (--system-prompt, --add-dir, --mcp-config) is used.
-    #[arg(long = "bare")]
-    pub bare: bool,
     /// Disable auto-loading of .astra/instructions.md project instructions
     #[arg(long = "no-instructions")]
     pub no_instructions: bool,
-    /// Redact journal user/assistant content on disk (maps to ASTRA_JOURNAL_CONTENT_REDACT=1)
+    /// Redact local journal content (ASTRA_JOURNAL_CONTENT_REDACT=1).
+    /// One-shot results remain usable, but cannot be recovered or auto-resumed locally.
     #[arg(long = "no-journal-content")]
     pub no_journal_content: bool,
-    /// Print startup timing for each initialization phase
-    #[arg(long = "startup-trace")]
-    pub startup_trace: bool,
     /// Emit structured tracing to stderr (same as ASTRA_DIAGNOSTIC_LOG=1); hidden from --help
     #[arg(long = "diagnostic-log", hide = true)]
     pub diagnostic_log: bool,
@@ -160,6 +150,9 @@ pub(crate) enum Command {
     Register(RegisterArgs),
     /// Log in with stored credentials
     Login(LoginArgs),
+    /// Inspect the shared MOI login session (internal credential helper included)
+    #[command(subcommand)]
+    Auth(NativeAuthCommand),
     /// Show the current authenticated user
     Whoami,
     /// Refresh the current auth token
@@ -170,8 +163,6 @@ pub(crate) enum Command {
     Health,
     /// Run a one-shot chat request
     Chat(ChatArgs),
-    /// Replay a recorded session
-    Replay(ReplayArgs),
     /// Inspect and manage sessions
     #[command(alias = "sessions")]
     #[command(subcommand)]
@@ -206,9 +197,6 @@ pub(crate) enum Command {
     Completion(CompletionArgs),
     /// Diagnose installation, config, and connectivity
     Doctor,
-    /// Team orchestration and shared context management
-    #[command(alias = "teams")]
-    Team(TeamArgs),
     /// Start, inspect, and continue durable Work
     #[command(subcommand)]
     Work(WorkSubcommand),
@@ -231,14 +219,38 @@ pub(crate) enum Command {
     /// Inspect spawned agents
     #[command(alias = "agents")]
     Agent(AgentArgs),
-    /// Inspect inter-agent messaging state
-    Messaging(MessagingArgs),
     /// Dump the `/context` snapshot for a persisted session
     #[command(subcommand)]
     Context(ContextCmd),
     /// Direct message: astra "your question here"
     #[command(external_subcommand)]
     Message(Vec<String>),
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum NativeAuthCommand {
+    /// Select a MOI workspace; omit the ID to choose interactively
+    Workspace {
+        #[arg(conflicts_with = "clear")]
+        id: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Show non-secret MOI session state
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Internal pipe-only access credential protocol
+    #[command(hide = true)]
+    Credential {
+        #[arg(long, value_parser = ["moi", "astra"])]
+        target: String,
+        #[arg(long)]
+        output_fd: i32,
+        #[arg(long)]
+        generation: Option<String>,
+    },
 }
 
 impl Command {
@@ -454,101 +466,27 @@ pub(crate) struct ChatArgs {
     pub max_wall_time_seconds: Option<u64>,
 }
 
-#[derive(Args, Debug)]
-#[command(
-    after_help = "Examples:\n  astra team list\n  astra team create dev Frontend delivery team\n  astra team add-member dev planner Break work into steps\n  astra team run dev 在/tmp下实现一个登录页面"
-)]
-pub(crate) struct TeamArgs {
-    #[command(subcommand)]
-    pub command: Option<TeamSubcommand>,
-}
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum TeamSubcommand {
-    /// List defined teams
-    List,
-    /// Create a team
-    Create(TeamCreateArgs),
-    #[command(name = "add-member")]
-    /// Add a role/member to a team
-    AddMember(TeamAddMemberArgs),
-    /// Show team details
-    Info(TeamNameArgs),
-    /// Delete a team
-    Delete(TeamNameArgs),
-    /// Set shared team context
-    Context(TeamContextArgs),
-    /// Execute a task with a team
-    Run(TeamRunArgs),
-    /// Show execution history for a team
-    History(TeamNameArgs),
-    /// Save a team snapshot
-    Snapshot(TeamSnapshotArgs),
-    /// Restore a team snapshot
-    Restore(TeamRestoreArgs),
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct TeamCreateArgs {
-    /// Team name
-    pub name: String,
-    /// Optional description
-    #[arg(trailing_var_arg = true)]
-    pub description: Vec<String>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct TeamAddMemberArgs {
-    /// Team name
-    pub team: String,
-    /// Member role
-    pub role: String,
-    /// Optional description for the member
-    #[arg(trailing_var_arg = true)]
-    pub description: Vec<String>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct TeamNameArgs {
-    /// Team name
-    pub name: String,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct TeamContextArgs {
-    /// Team name
-    pub team: String,
-    /// Context key
-    pub key: String,
-    /// Context value
-    #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
-    pub value: Vec<String>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct TeamRunArgs {
-    /// Team name
-    pub team: String,
-    /// Task description
-    #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
-    pub task: Vec<String>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct TeamSnapshotArgs {
-    /// Team name
-    pub team: String,
-    /// Optional snapshot label
-    #[arg(trailing_var_arg = true)]
-    pub label: Vec<String>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct TeamRestoreArgs {
-    /// Team name
-    pub team: String,
-    /// Snapshot identifier
-    pub snapshot_id: String,
+impl ChatArgs {
+    pub(crate) fn one_shot_message(message: String) -> Self {
+        Self {
+            message: Some(message),
+            session_id: None,
+            no_resume: false,
+            model: None,
+            #[cfg(feature = "harness")]
+            benchmark_profile: None,
+            explain: None,
+            auto_approve: false,
+            permission_mode: None,
+            quiet: false,
+            json: false,
+            stdin: false,
+            no_color: false,
+            append_system_prompt: None,
+            stream_events: None,
+            max_wall_time_seconds: None,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -761,7 +699,7 @@ pub(crate) struct DebugArgs {
 
 #[derive(Args, Debug)]
 #[command(
-    after_help = "Examples:\n  astra agent list\n  astra agent status team-dev-planner\n  astra agent logs team-dev-planner"
+    after_help = "Examples:\n  astra agent list\n  astra agent status dev-planner\n  astra agent logs dev-planner"
 )]
 pub(crate) struct AgentArgs {
     #[command(subcommand)]
@@ -784,25 +722,6 @@ pub(crate) enum AgentSubcommand {
 pub(crate) struct AgentIdArgs {
     /// Agent identifier
     pub agent_id: String,
-}
-
-#[derive(Args, Debug)]
-#[command(
-    after_help = "Examples:\n  astra messaging\n  astra messaging dlq\n  astra messaging status"
-)]
-pub(crate) struct MessagingArgs {
-    #[command(subcommand)]
-    pub command: Option<MessagingSubcommand>,
-}
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum MessagingSubcommand {
-    /// Show metrics snapshot
-    Metrics,
-    /// Show dead letter queue summary
-    Dlq,
-    /// Show mailbox status
-    Status,
 }
 
 #[derive(Args, Debug)]
@@ -875,11 +794,11 @@ pub(crate) enum SessionCmd {
     /// Show session details
     Show(SessionShowArgs),
     /// Close an active session
-    Close(SessionShowArgs),
+    Close(SessionIdArgs),
     /// Cancel active runs in a session and mark it cancelled
-    Cancel(SessionShowArgs),
+    Cancel(SessionIdArgs),
     /// Delete a session record
-    Delete(SessionShowArgs),
+    Delete(SessionIdArgs),
     /// Inspect or download session-scoped LLM captures
     #[command(subcommand)]
     Capture(SessionCaptureCmd),
@@ -887,7 +806,7 @@ pub(crate) enum SessionCmd {
 
 #[derive(Args, Debug)]
 pub(crate) struct SessionJudgeArgs {
-    /// Rubric and evidence to evaluate (not an agent task to execute)
+    /// JudgmentRequest JSON with shared evidence and typed questions (no agent task)
     #[arg(short, long)]
     pub message: String,
     /// Active Server model selector
@@ -929,7 +848,7 @@ pub(crate) struct SessionCaptureDownloadArgs {
 
 #[derive(Subcommand, Debug)]
 #[command(
-    after_help = "Examples:\n  astra self snapshot\n  astra self reflect\n  astra self profile 550e8400-e29b-41d4-a716-446655440000\n  astra self mutate preview --path verification.strictness --value 0.8\n  astra self mutate apply --session-id 550e8400-e29b-41d4-a716-446655440000 --path token_budget.max_turn_input_tokens --value 90000"
+    after_help = "Examples:\n  astra self snapshot\n  astra self reflect\n  astra self profile 550e8400-e29b-41d4-a716-446655440000\n  astra self mutate preview --path compression.compression_threshold --value 0.8\n  astra self mutate apply --session-id 550e8400-e29b-41d4-a716-446655440000 --path memory.retrieval_top_k --value 7"
 )]
 pub(crate) enum SelfCmd {
     /// Full persistent self snapshot for a session
@@ -1003,7 +922,7 @@ pub(crate) struct SelfMutateConfigArgs {
     /// Session id or unique prefix (defaults to the most recent resumable session)
     #[arg(long)]
     pub session_id: Option<String>,
-    /// Dotted RuntimeConfig path (for example: verification.strictness)
+    /// Dotted RuntimeConfig path (for example: compression.compression_threshold)
     #[arg(long)]
     pub path: String,
     /// New value as JSON (falls back to a raw string when not valid JSON)
@@ -1025,6 +944,20 @@ pub(crate) struct SessionListArgs {
 
 #[derive(Args, Debug)]
 pub(crate) struct SessionShowArgs {
+    pub session_id: String,
+    /// Capture the Server run tree and reflection together for execution inspection
+    #[arg(long)]
+    pub execution: bool,
+    /// Include the complete bounded Server transcript in execution inspection
+    #[arg(long, requires = "execution")]
+    pub transcript: bool,
+    /// Include bounded recent Server events for each run; not complete event history
+    #[arg(long, requires = "execution")]
+    pub run_events: bool,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SessionIdArgs {
     pub session_id: String,
 }
 
@@ -1113,24 +1046,6 @@ pub(crate) struct SkillShowArgs {
 pub(crate) struct SkillStatusArgs {
     #[arg(long, default_value_t = 50)]
     pub per_group: u32,
-}
-
-#[derive(Args, Debug)]
-#[command(
-    after_help = "Examples:\n  astra replay 550e8400-e29b-41d4-a716-446655440000\n  astra replay 550e8400-e29b-41d4-a716-446655440000 --compare"
-)]
-pub(crate) struct ReplayArgs {
-    /// Session id to replay
-    pub session_id: String,
-    /// Optional sandbox profile
-    #[arg(long)]
-    pub sandbox_name: Option<String>,
-    /// Use mock mode during replay
-    #[arg(long, default_value_t = true)]
-    pub mock_mode: bool,
-    /// Compare replay output against the recorded run
-    #[arg(long)]
-    pub compare: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1245,6 +1160,9 @@ pub(crate) struct JournalDigestArgs {
 }
 
 #[derive(Subcommand, Debug)]
+#[command(
+    after_long_help = "MCP configuration: project $CWD/.astra/mcp.json; user ~/.astra/mcp.json (or $ASTRA_LOCAL_STATE_ROOT/mcp.json).\nChat loads the first enabled definition by name: project > skill manifests > user.\nUse `astra mcp list --effective` to inspect that configuration without connecting.\nUse `astra mcp add-json NAME JSON [-s project|user]` for one server entry (not a mcpServers wrapper).\nSupported JSON types: stdio (command, args, env), sse, streamable_http, ws (url, headers, auth_token).\nConfiguration changes apply on the next chat startup. Adding configuration does not install a server."
+)]
 pub(crate) enum McpCmd {
     /// List configured MCP servers
     List(McpListArgs),
@@ -1255,7 +1173,7 @@ pub(crate) enum McpCmd {
     AddJson(McpAddJsonArgs),
     /// Remove an MCP server
     Remove(McpRemoveArgs),
-    /// Show details of a configured MCP server
+    /// Show the effective MCP server and its source (connection settings hidden)
     Get(McpGetArgs),
     /// Test connection to an MCP server and list its tools
     Test(McpTestArgs),
@@ -1265,9 +1183,12 @@ pub(crate) enum McpCmd {
 
 #[derive(Args, Debug)]
 pub(crate) struct McpListArgs {
-    /// Config scope: project or user
-    #[arg(short = 's', long, default_value = "project")]
+    /// Config scope: project or user (use --effective for chat's merged config)
+    #[arg(short = 's', long, default_value = "project", value_parser = ["project", "user"])]
     pub scope: String,
+    /// Show chat's effective project + skills + user configuration without connecting
+    #[arg(long, conflicts_with = "scope")]
+    pub effective: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1364,15 +1285,6 @@ pub(crate) enum ConfigVersionCmd {
     Diff(ConfigVersionDiffArgs),
     /// Print the id of the config the current process would run under.
     Current,
-    /// Deprecated: config version pull is server-owned.
-    Pull(ConfigVersionPullArgs),
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct ConfigVersionPullArgs {
-    /// Maximum number of versions to pull (default: 500).
-    #[arg(long, default_value_t = 500)]
-    pub limit: i64,
 }
 
 #[derive(Args, Debug)]
@@ -1424,7 +1336,67 @@ pub(crate) struct ConfigShowPolicyArgs {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Command, ModelCmd, SessionCmd, WorkSubcommand};
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn mcp_effective_view_is_explicit_and_conflicts_with_a_selected_scope() {
+        let cli = Cli::try_parse_from(["astra", "mcp", "list", "--effective"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Mcp(super::McpCmd::List(args))) if args.effective)
+        );
+        let cli = Cli::try_parse_from(["astra", "mcp", "list"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Mcp(super::McpCmd::List(args))) if !args.effective && args.scope == "project")
+        );
+        for scope in ["project", "user"] {
+            let cli = Cli::try_parse_from(["astra", "mcp", "list", "-s", scope]).unwrap();
+            assert!(
+                matches!(cli.command, Some(Command::Mcp(super::McpCmd::List(args))) if args.scope == scope)
+            );
+            assert!(
+                Cli::try_parse_from(["astra", "mcp", "list", "--effective", "-s", scope]).is_err()
+            );
+        }
+        assert!(Cli::try_parse_from(["astra", "mcp", "list", "-s", "unknown"]).is_err());
+        let cli = Cli::try_parse_from([
+            "astra",
+            "mcp",
+            "add",
+            "-s",
+            "project",
+            "example",
+            "/path/to/mcp-server",
+            "--",
+            "--server-argument",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Mcp(super::McpCmd::Add(args))) if args.args == ["--server-argument"])
+        );
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("mcp")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains(".astra/mcp.json"));
+        assert!(help.contains("streamable_http"));
+        assert!(help.contains("add-json"));
+        assert!(help.contains("does not install"));
+    }
+
+    #[test]
+    fn cli_has_no_unbacked_messaging_or_session_replay_commands() {
+        let mut command = Cli::command();
+        for name in ["messaging", "replay"] {
+            assert!(command.find_subcommand(name).is_none());
+            assert!(!command.render_long_help().to_string().contains(name));
+            assert!(Cli::try_parse_from(["astra", "help", name]).is_err());
+            // Retired names remain ordinary free text, not compatibility commands.
+            let cli = Cli::try_parse_from(["astra", name]).unwrap();
+            assert!(matches!(cli.command, Some(Command::Message(words)) if words == [name]));
+        }
+    }
 
     #[test]
     fn session_judge_is_an_explicit_command_with_a_bounded_provider_deadline() {

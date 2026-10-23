@@ -17,6 +17,12 @@ This document owns:
 
 Safety policy belongs to [safety-and-permissions.md](safety-and-permissions.md). Provider routing belongs to [capability-system.md](capability-system.md).
 
+The CLI permission manager owns root interaction approvals and exports scoped
+permissions to the runtime. Child execution receives that envelope through the
+canonical runtime permission context and gate, including fingerprint validation,
+deny rules and the immutable read-only ceiling. The unconnected CLI child-manager
+constructor and its separate inheritance receiver are retired.
+
 ## Principle
 
 ```text
@@ -68,6 +74,14 @@ Permission scope must be explicit:
 
 Plan mode denial is policy, not permission absence. Diagnostics should distinguish “permission missing” from “plan mode blocks mutation”.
 
+## Approval diagnostics
+
+When an approval cannot be delivered, the tool result must retain both the
+policy reason that required approval and the delivery failure. In particular,
+a root Run with no parent must still explain the guarded operation; a mailbox
+error alone cannot explain how the caller should recover. The action remains
+denied until the existing permission owner grants it.
+
 ## Revocation
 
 Revocation should be durable and provider-visible. Revoked grants should not be silently re-enabled by reconnect or resume.
@@ -78,3 +92,32 @@ Revocation should be durable and provider-visible. Revoked grants should not be 
 - Revocation wins over stale local state.
 - Web can observe Edge waiting for permission.
 - Plan mode denial is reported distinctly from permission denial.
+
+## Runtime mode selection
+
+Permission-mode selection is an authenticated Run control, separate from model
+guidance. A request binds the expected Session and an idempotency key to a typed
+mode. The durable journal assigns its revision. Only the owning user's active
+root Run accepts requests; children retain inherited restrictions.
+
+Before each model round, the shared loop captures the latest selection and
+commits an application acknowledgement under the current owner generation.
+Failure to commit prevents the model call. A request arriving during a round
+cannot alter that round's captured policy. Recovery reapplies the durable
+selection under the new owner generation. Selection never advances guidance
+cursors or rewrites the stable prompt prefix or tool schema.
+
+The ordered application event updates the CLI policy owner and its root sandbox
+overlay before subsequent tool dispatch. Explicit skill restrictions remain in
+force. TUI intent is pending until its exact request identity is acknowledged;
+a delayed acknowledgement cannot erase a newer selection. When execution ends
+before another model round, the selected preference applies to the next user
+response. No session transcript is resumed implicitly.
+
+When a selection arrives during an approval wait, execution supersedes unstarted
+requests through the existing approval lifecycle and advances to the next model
+round. Completed results are retained; running tools are not reauthorized.
+The CLI stops the obsolete wait without posting a conflicting second approval
+decision. A local acceptance notification wakes promptly; another device's
+selection is discovered by bounded indexed reads only while approval is pending.
+Closed waiters are removed from the TUI without manufacturing an approval.

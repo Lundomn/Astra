@@ -1,85 +1,5 @@
 use async_trait::async_trait;
 
-use crate::activity::SessionActivityUpdatePlan;
-use crate::hook_plans::SnapshotLinkPlan;
-
-#[async_trait]
-pub trait TurnSessionActivityWriter: Send + Sync {
-    async fn update_session_activity(
-        &self,
-        session_id: &str,
-        user_id: &str,
-        plan: SessionActivityUpdatePlan,
-    ) -> Result<(), String>;
-}
-
-#[async_trait]
-pub trait TurnCoreEventWriter: Send + Sync {
-    async fn persist(&self, plan: TurnCorePersistPlan) -> Result<TurnCorePersistOutcome, String>;
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct TurnCoreEventRecord {
-    pub event_id: String,
-    pub user_id: String,
-    pub session_id: String,
-    pub run_id: Option<String>,
-    pub agent_id: Option<String>,
-    pub event_type: String,
-    pub content: String,
-    pub parent_event_id: Option<String>,
-    pub parent_event_ids: Vec<String>,
-    pub causal_chain_id: String,
-    pub turn_seq: Option<i64>,
-    pub llm_model_used: Option<String>,
-    pub token_usage: Option<serde_json::Value>,
-    pub llm_params: Option<serde_json::Value>,
-    pub reasoning_content: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct TurnCorePersistPlan {
-    pub user_query_event: Option<TurnCoreEventRecord>,
-    pub llm_response_event: Option<TurnCoreEventRecord>,
-    pub snapshot_link_plan: Option<SnapshotLinkPlan>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct TurnToolEventRecord {
-    pub event_id: String,
-    pub user_id: String,
-    pub session_id: String,
-    pub run_id: Option<String>,
-    pub tool_call_id: Option<String>,
-    pub agent_id: Option<String>,
-    pub event_type: String,
-    pub content: String,
-    pub parent_event_id: Option<String>,
-    pub parent_event_ids: Vec<String>,
-    pub causal_chain_id: String,
-    pub metadata: Option<serde_json::Value>,
-    pub skill_name: Option<String>,
-    pub skill_version: Option<String>,
-    pub reasoning_content: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct TurnToolEventPersistPlan {
-    pub events: Vec<TurnToolEventRecord>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct TurnDecisionAuditRecord {
-    pub decision_id: String,
-    pub user_id: String,
-    pub session_id: String,
-    pub event_id: String,
-    pub decision_type: String,
-    pub decision_output: serde_json::Value,
-    pub model_used: Option<String>,
-    pub context_capture_id: Option<String>,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct TurnSkillSelectionRecord {
     pub event_id: String,
@@ -96,19 +16,6 @@ pub struct TurnSkillSelectionRecord {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct TurnReflectionMark {
-    pub session_id: String,
-    pub reflect_output: String,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct TurnReflectionLessonRecord {
-    pub user_id: String,
-    pub session_id: String,
-    pub content: String,
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct TurnObserverRequest {
     pub user_id: String,
     pub session_id: String,
@@ -117,45 +24,14 @@ pub struct TurnObserverRequest {
     pub session_start: Option<serde_json::Value>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct TurnReflectionLessonRequest {
-    pub user_id: String,
-    pub session_id: String,
-    pub retry_names: Vec<String>,
-}
-
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TurnHookDbPersistPlan {
-    pub decision_audit: Option<TurnDecisionAuditRecord>,
     pub skill_selection: Option<TurnSkillSelectionRecord>,
-    pub reflection_mark: Option<TurnReflectionMark>,
-    pub reflection_lesson: Option<TurnReflectionLessonRecord>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct TurnCorePersistOutcome {
-    pub llm_response_event_id: Option<String>,
-}
-
-#[async_trait]
-pub trait TurnToolEventWriter: Send + Sync {
-    async fn persist(&self, plan: TurnToolEventPersistPlan) -> Result<(), String>;
 }
 
 #[async_trait]
 pub trait TurnHookDbWriter: Send + Sync {
     async fn persist(&self, plan: TurnHookDbPersistPlan) -> Result<(), String>;
-}
-
-#[async_trait]
-pub trait TurnReflectionStateStore: Send + Sync {
-    async fn mark_reflecting(&self, mark: TurnReflectionMark) -> Result<(), String>;
-    async fn pop_reflecting(&self, session_id: &str) -> Result<Option<TurnReflectionMark>, String>;
-}
-
-#[async_trait]
-pub trait TurnReflectionLessonWriter: Send + Sync {
-    async fn persist_lesson(&self, lesson: TurnReflectionLessonRecord) -> Result<(), String>;
 }
 
 #[async_trait]
@@ -181,114 +57,4 @@ pub struct TurnAuxiliaryEventRecord {
     pub causal_chain_id: String,
     pub metadata: Option<serde_json::Value>,
     pub reasoning_content: Option<String>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tool_event_persist_plan_default_empty() {
-        let plan = TurnToolEventPersistPlan::default();
-        assert!(plan.events.is_empty());
-    }
-
-    #[test]
-    fn hook_db_persist_plan_default_all_none() {
-        let plan = TurnHookDbPersistPlan::default();
-        assert!(plan.decision_audit.is_none());
-        assert!(plan.skill_selection.is_none());
-        assert!(plan.reflection_mark.is_none());
-        assert!(plan.reflection_lesson.is_none());
-    }
-
-    #[test]
-    fn core_persist_outcome_default_none() {
-        let outcome = TurnCorePersistOutcome::default();
-        assert!(outcome.llm_response_event_id.is_none());
-    }
-
-    #[test]
-    fn core_event_record_carries_agent_id() {
-        let record = TurnCoreEventRecord {
-            event_id: "e1".into(),
-            user_id: "u1".into(),
-            session_id: "s1".into(),
-            run_id: Some("r1".into()),
-            agent_id: Some("astra-cli".into()),
-            event_type: "user_query".into(),
-            content: "hi".into(),
-            parent_event_id: None,
-            parent_event_ids: Vec::new(),
-            causal_chain_id: "c1".into(),
-            turn_seq: Some(1),
-            llm_model_used: None,
-            token_usage: None,
-            llm_params: None,
-            reasoning_content: None,
-        };
-        assert_eq!(record.agent_id.as_deref(), Some("astra-cli"));
-    }
-
-    #[test]
-    fn core_event_record_agent_id_none() {
-        let record = TurnCoreEventRecord {
-            event_id: "e1".into(),
-            user_id: "u1".into(),
-            session_id: "s1".into(),
-            run_id: None,
-            agent_id: None,
-            event_type: "user_query".into(),
-            content: "hi".into(),
-            parent_event_id: None,
-            parent_event_ids: Vec::new(),
-            causal_chain_id: "c1".into(),
-            turn_seq: Some(1),
-            llm_model_used: None,
-            token_usage: None,
-            llm_params: None,
-            reasoning_content: None,
-        };
-        assert!(record.agent_id.is_none());
-    }
-
-    #[test]
-    fn tool_event_record_carries_agent_id() {
-        let record = TurnToolEventRecord {
-            event_id: "e1".into(),
-            user_id: "u1".into(),
-            session_id: "s1".into(),
-            run_id: Some("r1".into()),
-            tool_call_id: Some("call-1".into()),
-            agent_id: Some("custom-agent".into()),
-            event_type: "tool_call_started".into(),
-            content: "{}".into(),
-            parent_event_id: None,
-            parent_event_ids: Vec::new(),
-            causal_chain_id: "c1".into(),
-            metadata: None,
-            skill_name: None,
-            skill_version: None,
-            reasoning_content: None,
-        };
-        assert_eq!(record.agent_id.as_deref(), Some("custom-agent"));
-    }
-
-    #[test]
-    fn auxiliary_event_record_carries_agent_id() {
-        let record = TurnAuxiliaryEventRecord {
-            event_id: "e1".into(),
-            user_id: "u1".into(),
-            session_id: "s1".into(),
-            agent_id: Some("astra-cli".into()),
-            event_type: "routing_decision".into(),
-            content: "{}".into(),
-            parent_event_id: None,
-            parent_event_ids: Vec::new(),
-            causal_chain_id: "c1".into(),
-            metadata: None,
-            reasoning_content: None,
-        };
-        assert_eq!(record.agent_id.as_deref(), Some("astra-cli"));
-    }
 }

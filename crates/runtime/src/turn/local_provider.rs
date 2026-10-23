@@ -1,26 +1,14 @@
 //! `LocalSessionProvider` — a single concrete struct that implements
-//! [`LiveRuntimeProvider`], [`ObservationProvider`], and [`SessionStateProvider`]
+//! [`LiveRuntimeProvider`] and [`SessionStateProvider`]
 //! by reading from an [`AgenticLoopState`] reference.
 //!
 //! # Safety
 //!
-//! All methods are panic-free. When underlying data is absent (empty journal,
-//! missing task board, unlimited budget), they return sensible zero/defaults.
+//! All methods are panic-free. Missing measurements retain their explicit
+//! unknown state instead of fabricating ratios.
 //!
-//! # Usage
-//!
-//! ```ignore
-//! let provider = LocalSessionProvider::new(&state);
-//! let mut facts = provider.extract_facts();
-//! facts.token_pressure = provider.token_pressure();
-//! facts.performance.token_pressure = provider.token_pressure();
-//! let actions = policy.decide(&facts);
-//! ```
-
-use astra_core::observation_journal::{JournalFacts, MetricTrend};
-
 use super::agentic_loop::host::{self, AgenticLoopState};
-use super::providers::{LiveRuntimeProvider, ObservationProvider, SessionStateProvider};
+use super::providers::{LiveRuntimeProvider, SessionStateProvider};
 
 // ─── LocalSessionProvider ────────────────────────────────────────────────────
 
@@ -43,12 +31,12 @@ impl LiveRuntimeProvider for LocalSessionProvider<'_> {
         host::introspect_token_pressure(self.state)
     }
 
-    fn cache_hit_ratio(&self) -> f64 {
+    fn cache_hit_ratio(&self) -> Option<f64> {
         let total_in = self.state.provider_input_tokens();
         if total_in > 0 {
-            self.state.total_cache_read as f64 / total_in as f64
+            Some(self.state.total_cache_read as f64 / total_in as f64)
         } else {
-            0.0
+            None
         }
     }
 
@@ -70,29 +58,6 @@ impl LiveRuntimeProvider for LocalSessionProvider<'_> {
 
     fn budget_max(&self) -> u32 {
         self.state.max_turns as u32
-    }
-}
-
-// ─── ObservationProvider impl ────────────────────────────────────────────────
-
-impl ObservationProvider for LocalSessionProvider<'_> {
-    fn extract_facts(&self) -> JournalFacts {
-        self.state.observation_journal.extract_facts(
-            self.state.remaining_turns as u32,
-            self.state.max_turns as u32,
-        )
-    }
-
-    fn compute_trends(&self) -> Vec<MetricTrend> {
-        self.state.observation_journal.compute_trends()
-    }
-
-    fn journal_len(&self) -> usize {
-        self.state.observation_journal.len()
-    }
-
-    fn journal_is_empty(&self) -> bool {
-        self.state.observation_journal.is_empty()
     }
 }
 
@@ -122,8 +87,6 @@ impl SessionStateProvider for LocalSessionProvider<'_> {
 mod tests {
     use super::*;
     use crate::turn::agentic_loop::host::AgenticLoopState;
-    use crate::turn::runtime_policy::RuntimePolicy;
-    use astra_core::observation_journal::ObservationJournal;
 
     fn make_state() -> AgenticLoopState {
         let mut state = host::make_test_loop_state();
@@ -145,7 +108,7 @@ mod tests {
         let p = make_provider(&state);
         assert_eq!(p.budget_remaining(), 0);
         assert_eq!(p.budget_max(), 0);
-        assert!((p.cache_hit_ratio() - 0.0).abs() < f64::EPSILON);
+        assert_eq!(p.cache_hit_ratio(), None);
         assert!((p.current_error_rate() - 0.0).abs() < f64::EPSILON);
     }
 
@@ -168,50 +131,30 @@ mod tests {
         state.total_cache_creation = 50;
         // total_in = 1000, cache ratio = 750/1000 = 0.75
         let p = make_provider(&state);
-        assert!((p.cache_hit_ratio() - 0.75).abs() < 0.001);
+        assert_eq!(p.cache_hit_ratio(), Some(0.75));
+
+        state.total_prompt = 0;
+        state.total_cache_creation = 0;
+        assert_eq!(make_provider(&state).cache_hit_ratio(), Some(1.0));
     }
 
     #[test]
-    fn live_provider_cache_hit_ratio_zero_when_no_tokens() {
+    fn live_provider_cache_hit_ratio_unknown_without_input() {
         let mut state = make_state();
         state.total_cache_read = 0;
         state.total_prompt = 0;
         state.total_cache_creation = 0;
+        state.total_completion = 20;
         let p = make_provider(&state);
-        assert!((p.cache_hit_ratio() - 0.0).abs() < f64::EPSILON);
-    }
-
-    // ── ObservationProvider tests ───────────────────────────────────────
-
-    #[test]
-    fn observation_provider_empty_journal() {
-        let state = make_state();
-        let p = make_provider(&state);
-        assert!(p.journal_is_empty());
-        assert_eq!(p.journal_len(), 0);
-        let facts = p.extract_facts();
-        // All streaks should be zero for empty journal
-        assert_eq!(facts.streaks.consecutive_rounds_with_outcome, 0);
-        assert_eq!(facts.streaks.consecutive_rounds_without_outcome, 0);
+        assert_eq!(p.cache_hit_ratio(), None);
     }
 
     #[test]
-    fn observation_provider_with_entries() {
+    fn live_provider_cache_hit_ratio_zero_with_observed_input() {
         let mut state = make_state();
-        // Record a successful turn to populate the journal
-        let metrics = astra_core::observation::TurnMetrics {
-            rounds_completed: 1,
-            tool_calls_total: 5,
-            mutation_count: 2,
-            error_count: 0,
-            cache_hits: 3,
-            tokens_consumed: 1500,
-            ..Default::default()
-        };
-        state.observation_journal.record_turn(&metrics);
+        state.total_prompt = 100;
         let p = make_provider(&state);
-        assert!(!p.journal_is_empty());
-        assert_eq!(p.journal_len(), 1);
+        assert_eq!(p.cache_hit_ratio(), Some(0.0));
     }
 
     // ── SessionStateProvider tests ──────────────────────────────────────
@@ -239,10 +182,8 @@ mod tests {
     fn provider_composition_smoke() {
         let state = make_state();
         let p = make_provider(&state);
-        // All three traits work together without conflict
+        // Live observations and session state share the same execution owner
         let _pressure = p.token_pressure();
-        let _facts = p.extract_facts();
-        let _trends = p.compute_trends();
         let _cache = p.cache_hit_ratio();
         let _errors = p.current_error_rate();
     }

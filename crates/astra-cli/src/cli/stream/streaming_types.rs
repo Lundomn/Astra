@@ -3,6 +3,12 @@
 //! Data structures for streaming chat responses and handling turn failures.
 //! These types bridge the agentic runtime with the CLI display logic.
 
+use std::collections::BTreeSet;
+
+/// Total budget for interactive response drain and exact-run cancellation.
+pub(crate) const INTERACTIVE_CANCEL_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
 /// Re-export of the verdict audit event type for convenience.
 pub(crate) type VerdictEvent = astra_turn_core::guardrails::verdict_audit::AgenticVerdictAuditEvent;
 
@@ -13,6 +19,368 @@ pub(crate) struct AppliedStreamUserIntent {
     pub(crate) status: astra_turn_types::UserIntentStatus,
     pub(crate) event_index: usize,
     pub(crate) content: String,
+}
+
+/// Token lanes attributed to one execution class. `None` means that the
+/// provider did not report that lane; it is deliberately different from zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AttributedTokenUsage {
+    pub(crate) fresh_input_tokens: Option<u64>,
+    pub(crate) cache_read_tokens: Option<u64>,
+    pub(crate) cache_creation_tokens: Option<u64>,
+    pub(crate) output_tokens: Option<u64>,
+}
+
+impl AttributedTokenUsage {
+    pub(crate) fn known_total_tokens(self) -> u64 {
+        self.fresh_input_tokens
+            .unwrap_or(0)
+            .saturating_add(self.cache_read_tokens.unwrap_or(0))
+            .saturating_add(self.cache_creation_tokens.unwrap_or(0))
+            .saturating_add(self.output_tokens.unwrap_or(0))
+    }
+}
+
+#[derive(Debug, Default)]
+struct UsageLaneAccumulator {
+    usage: AttributedTokenUsage,
+    observed: bool,
+}
+
+impl UsageLaneAccumulator {
+    fn add(&mut self, usage: &astra_turn_types::ExplainAnalyzeTokenUsageV1) {
+        self.observed = true;
+        fn add_lane(total: &mut Option<u64>, value: Option<u64>) {
+            if let Some(value) = value {
+                *total = Some(total.unwrap_or_default().saturating_add(value));
+            }
+        }
+        add_lane(&mut self.usage.fresh_input_tokens, usage.fresh_input_tokens);
+        add_lane(&mut self.usage.cache_read_tokens, usage.cache_read_tokens);
+        add_lane(
+            &mut self.usage.cache_creation_tokens,
+            usage.cache_creation_tokens,
+        );
+        add_lane(&mut self.usage.output_tokens, usage.output_tokens);
+    }
+
+    fn finish(self) -> Option<AttributedTokenUsage> {
+        self.observed.then_some(self.usage)
+    }
+}
+
+/// One logical turn's usage attribution. Overall totals remain available on
+/// `StreamResult` for billing/session accounting, while this split is the only
+/// source allowed for the compact user-facing per-turn summary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct UsageAttribution {
+    pub(crate) primary: Option<AttributedTokenUsage>,
+    pub(crate) primary_complete: bool,
+    /// Input-only eligibility, derived from canonical facts; never persisted.
+    pub(crate) primary_input_complete: bool,
+    pub(crate) primary_attempts: u32,
+    pub(crate) primary_model: Option<String>,
+    /// Explain delivery or settlement was degraded. This is independent of
+    /// whether any numeric lane survived and must remain visible to turn
+    /// settlement consumers.
+    pub(crate) capture_degraded: bool,
+    pub(crate) auxiliary: Option<AttributedTokenUsage>,
+    pub(crate) auxiliary_complete: bool,
+    /// The runtime emitted an auxiliary snapshot, but its facts were
+    /// unavailable or contradictory. Keep this separate from zero usage so a
+    /// missing capture can never render as a successful zero-call judgment.
+    pub(crate) auxiliary_capture_unavailable: bool,
+    /// A terminal turn was observed without the auxiliary snapshot that the
+    /// current runtime normally attaches to it.
+    pub(crate) auxiliary_capture_missing: bool,
+    pub(crate) auxiliary_capture_conflicted: bool,
+    pub(crate) auxiliary_capture_truncated: bool,
+    pub(crate) auxiliary_attempts: u32,
+    /// Bounded, already-associated `provider (model) · operation` labels.
+    /// Keeping the association prevents separate model/operation sets from
+    /// implying pairings that never occurred.
+    pub(crate) auxiliary_sources: Vec<String>,
+}
+
+impl UsageAttribution {
+    pub(crate) fn from_explain_analyze_events(
+        events: &[astra_turn_types::ExplainAnalyzeEventV1],
+        primary_model: Option<String>,
+        explain_analyze_degraded: bool,
+    ) -> Self {
+        let mut graph = astra_turn_types::ExplainAnalyzeGraphV1::default();
+        for event in events {
+            graph.apply(event.clone());
+        }
+        graph.finish_ingest();
+
+        let mut primary_accumulator = UsageLaneAccumulator::default();
+        let provider_attempt_nodes = graph
+            .nodes()
+            .iter()
+            .filter(|node| node.kind == astra_turn_types::ExplainAnalyzeNodeKindV1::ProviderAttempt)
+            .collect::<Vec<_>>();
+        let primary_attempts = provider_attempt_nodes.len().try_into().unwrap_or(u32::MAX);
+        let mut primary_models = BTreeSet::new();
+        for node in &provider_attempt_nodes {
+            if node.terminal_observed
+                && !node.conflicted
+                && let Some(usage) = node.usage.as_ref().filter(|usage| usage.is_valid())
+            {
+                primary_accumulator.add(usage);
+            }
+            if let Some(model) = provider_attempt_model_name(&node.label) {
+                primary_models.insert(model.to_string());
+            }
+        }
+
+        let scope_coverage = graph.execution_scope_coverage();
+        let auxiliary_observed = scope_coverage
+            .iter()
+            .any(|scope| scope.auxiliary_snapshot_observed);
+        // Every observed physical scope must close its own Turn boundary and
+        // carry its own auxiliary snapshot. A completed earlier scope cannot
+        // prove coverage for a resumed or retried later scope.
+        let auxiliary_capture_missing = !scope_coverage.is_empty()
+            && scope_coverage.iter().any(|scope| {
+                !scope.terminal_turn_observed
+                    || scope.turn_conflicted
+                    || !scope.auxiliary_snapshot_observed
+            });
+        let auxiliary_attempts = graph.auxiliary_attempts();
+        let mut auxiliary_accumulator = UsageLaneAccumulator::default();
+        let mut auxiliary_sources = BTreeSet::new();
+        for attempt in &auxiliary_attempts {
+            if let Some(usage) = attempt.usage.as_ref().filter(|usage| usage.is_valid()) {
+                auxiliary_accumulator.add(usage);
+            }
+            let source = format_provider_model(&attempt.provider, &attempt.model_name);
+            let operation = if attempt.operation_id.trim().is_empty() {
+                attempt.purpose.clone()
+            } else {
+                attempt.operation_id.clone()
+            };
+            auxiliary_sources.insert(if operation.trim().is_empty() {
+                source
+            } else {
+                format!("{source} · {operation}")
+            });
+        }
+        let auxiliary_capture_conflicted =
+            graph.auxiliary_usage_conflict_count() > 0 || graph.auxiliary_capture_conflicted();
+        let auxiliary_capture_unavailable = graph.auxiliary_usage_unavailable();
+        let auxiliary_capture_truncated = graph.auxiliary_usage_truncated();
+        let auxiliary = if auxiliary_observed {
+            auxiliary_accumulator
+                .finish()
+                .or(Some(AttributedTokenUsage::default()))
+        } else {
+            None
+        };
+
+        let primary_model = format_model_list(primary_models.into_iter().collect())
+            .or_else(|| (primary_attempts > 0).then_some(primary_model).flatten())
+            .filter(|model| {
+                let model = model.trim();
+                !model.is_empty()
+                    && !model.eq_ignore_ascii_case("auto")
+                    && !model.eq_ignore_ascii_case("default")
+            });
+
+        let primary_input_complete =
+            !explain_analyze_degraded && graph.primary_prompt_cache_usage().is_some();
+        Self {
+            primary: primary_accumulator.finish(),
+            primary_input_complete,
+            primary_complete: primary_input_complete
+                && provider_attempt_nodes.iter().all(|node| {
+                    node.usage
+                        .as_ref()
+                        .is_some_and(|usage| usage.output_tokens.is_some())
+                }),
+            primary_attempts,
+            primary_model,
+            capture_degraded: explain_analyze_degraded,
+            auxiliary,
+            auxiliary_complete: auxiliary_observed
+                && !explain_analyze_degraded
+                && !auxiliary_capture_unavailable
+                && !auxiliary_capture_missing
+                && !auxiliary_capture_conflicted
+                && !auxiliary_capture_truncated
+                && scope_coverage.iter().all(|scope| {
+                    scope.terminal_turn_observed
+                        && !scope.turn_conflicted
+                        && scope.auxiliary_snapshot_observed
+                })
+                && auxiliary_attempts.iter().all(|attempt| {
+                    matches!(
+                        attempt.usage_status,
+                        astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact
+                    ) && attempt.usage.as_ref().is_some_and(|usage| usage.is_valid())
+                }),
+            auxiliary_capture_unavailable,
+            auxiliary_capture_missing,
+            auxiliary_capture_conflicted,
+            auxiliary_capture_truncated,
+            auxiliary_attempts: auxiliary_attempts.len().try_into().unwrap_or(u32::MAX),
+            auxiliary_sources: auxiliary_sources.into_iter().collect(),
+        }
+    }
+
+    pub(crate) fn has_auxiliary(&self) -> bool {
+        self.auxiliary.is_some()
+            || self.auxiliary_attempts > 0
+            || self.auxiliary_capture_missing
+            || self.auxiliary_capture_unavailable
+            || self.auxiliary_capture_conflicted
+            || self.auxiliary_capture_truncated
+    }
+
+    /// Whether Explain captured any usage state, even when no provider token
+    /// lane is known.  A zero-valued or unavailable capture is still a fact
+    /// that must survive turn settlement; it is not equivalent to an absent
+    /// usage snapshot.
+    pub(crate) fn has_observed_state(&self) -> bool {
+        self.primary.is_some()
+            || self.primary_complete
+            || self.primary_attempts > 0
+            || self.primary_model.is_some()
+            || self.capture_degraded
+            || self.has_auxiliary()
+            || self.auxiliary_complete
+            || !self.auxiliary_sources.is_empty()
+    }
+
+    pub(crate) fn auxiliary_summary(&self) -> Option<String> {
+        if !self.has_auxiliary() {
+            return None;
+        }
+        if self.auxiliary_attempts == 0 {
+            return Some(if self.auxiliary_capture_conflicted {
+                "Auxiliary usage · capture unavailable · conflicting facts".to_string()
+            } else if self.auxiliary_capture_missing {
+                "Auxiliary usage · capture unavailable · no snapshot".to_string()
+            } else if self.auxiliary_capture_unavailable {
+                "Auxiliary usage · capture unavailable · no calls reported".to_string()
+            } else if self.auxiliary_capture_truncated {
+                "Auxiliary usage · capture partial · no calls reported".to_string()
+            } else {
+                "Auxiliary usage · no calls reported".to_string()
+            });
+        }
+        let state = if self.auxiliary_capture_conflicted {
+            " · capture unavailable · conflicting facts"
+        } else if self.auxiliary_complete {
+            ""
+        } else if self.auxiliary_capture_missing {
+            " · capture unavailable · no snapshot"
+        } else if self.auxiliary_capture_unavailable
+            && self
+                .auxiliary
+                .is_none_or(|usage| usage.known_total_tokens() == 0)
+        {
+            " · capture unavailable"
+        } else {
+            " · capture partial"
+        };
+        let sources = if self.auxiliary_sources.is_empty() {
+            "model unavailable".to_string()
+        } else {
+            self.auxiliary_sources.join(", ")
+        };
+        let tokens = self
+            .auxiliary
+            .map(AttributedTokenUsage::known_total_tokens)
+            .filter(|tokens| *tokens > 0)
+            .map(|tokens| format!(" · {} tokens", format_token_count(tokens)))
+            .unwrap_or_default();
+        let lanes = self
+            .auxiliary
+            .map(format_auxiliary_lanes)
+            .filter(|lanes| !lanes.is_empty())
+            .map(|lanes| format!(" · {lanes}"))
+            .unwrap_or_default();
+        Some(format!(
+            "{} aux call{} · {}{}{}{}",
+            self.auxiliary_attempts,
+            if self.auxiliary_attempts == 1 {
+                ""
+            } else {
+                "s"
+            },
+            sources,
+            lanes,
+            tokens,
+            state,
+        ))
+    }
+}
+
+fn provider_attempt_model_name(label: &str) -> Option<&str> {
+    label
+        .strip_prefix("Model request ·")
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+}
+
+fn format_model_list(mut models: Vec<String>) -> Option<String> {
+    if models.is_empty() {
+        return None;
+    }
+    const MAX_MODELS: usize = 4;
+    let omitted = models.len().saturating_sub(MAX_MODELS);
+    models.truncate(MAX_MODELS);
+    if omitted > 0 {
+        models.push(format!("+{omitted} more"));
+    }
+    Some(models.join(", "))
+}
+
+fn format_provider_model(provider: &str, model: &str) -> String {
+    let provider = if provider.eq_ignore_ascii_case("typesafe") {
+        "Jev"
+    } else if provider.trim().is_empty() {
+        "Auxiliary"
+    } else {
+        provider
+    };
+    if model.trim().is_empty() {
+        format!("{provider} (model unavailable)")
+    } else {
+        format!("{provider} ({model})")
+    }
+}
+
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn format_auxiliary_lanes(usage: AttributedTokenUsage) -> String {
+    [
+        usage
+            .fresh_input_tokens
+            .map(|tokens| format!("in {}", format_token_count(tokens))),
+        usage
+            .cache_read_tokens
+            .map(|tokens| format!("cache read {}", format_token_count(tokens))),
+        usage
+            .cache_creation_tokens
+            .map(|tokens| format!("cache write {}", format_token_count(tokens))),
+        usage
+            .output_tokens
+            .map(|tokens| format!("out {}", format_token_count(tokens))),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ")
 }
 
 /// Failure of the CLI's public stdout transport, kept distinct from model,
@@ -33,10 +401,11 @@ impl OutputTransportFailure {
     }
 }
 
-/// Partial data rescued from `AgenticLoopState` when a turn fails.
+/// Partial stream and local callback facts retained when a turn fails.
 /// Enables enriched error logging, failure learning, and post-mortem analysis.
 #[derive(Debug, Default)]
 pub(crate) struct PartialTurnData {
+    pub qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
     pub tool_call_records: Vec<astra_services::session_journal::ToolCallRecord>,
     pub tools_used: Vec<String>,
     pub stall_events: Vec<(String, u32)>,
@@ -45,6 +414,10 @@ pub(crate) struct PartialTurnData {
     pub completion_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+    /// Best-effort primary/auxiliary attribution captured from the canonical
+    /// Explain facts before the stream failed. Overall counters above remain
+    /// the durable accounting source.
+    pub usage_attribution: UsageAttribution,
     pub tool_calls_count: u32,
     /// Logical provider rounds observed before failure. Unlike retained tool
     /// records, this survives stream cancellation and record-window eviction.
@@ -61,6 +434,8 @@ pub(crate) struct PartialTurnData {
     pub applied_user_intents: Vec<AppliedStreamUserIntent>,
     pub session_id: Option<String>,
     pub run_id: Option<String>,
+    /// Runtime classification retained across the CLI failure boundary.
+    pub failure_kind: Option<astra_core::ErrorKind>,
     /// Stable server classification for a stream failure.  A rejected
     /// admission may carry this without having created a durable Run.
     pub error_code: Option<String>,
@@ -69,6 +444,9 @@ pub(crate) struct PartialTurnData {
     /// request is not a failed turn and must not be reconciled or journaled as
     /// one.
     pub admission_rejected: bool,
+    /// The CLI admission owner confirms that no Server execution request was
+    /// dispatched. False means unknown, not proof that admission happened.
+    pub server_admission_not_dispatched: bool,
     pub last_heavy_checkpoint: Option<astra_pipeline::step_protocol::StepCheckpoint>,
     /// Partial text the model generated before the turn was interrupted.
     /// Preserved in conversation history so the next turn has context.
@@ -78,8 +456,13 @@ pub(crate) struct PartialTurnData {
     /// a user-facing suffix and cannot represent tools or reasoning.
     pub run_transcript_messages: Vec<serde_json::Value>,
     /// The local client can no longer settle or observe an admitted durable
-    /// run, so that exact owner must receive an explicit cancellation request.
+    /// run. The outer lifecycle decides whether exact-owner cancellation is
+    /// appropriate; a clean internal stream detach preserves server recovery.
     pub remote_cancel_required: bool,
+    /// An edge callback acknowledgement failed and this client detached.
+    /// The sentence in `TurnFailure::error` states that fact only. The outer
+    /// lifecycle owner adds whether the server run is still active.
+    pub callback_client_detached: bool,
     /// Exact durable owner: a callback-producer child when callback delivery
     /// failed, otherwise the immutable physical SSE root.
     pub remote_cancel_run_id: Option<String>,
@@ -92,6 +475,46 @@ pub(crate) struct PartialTurnData {
     /// JSON surfaces preserve a typed, resumable terminal instead of dropping
     /// the entire envelope when the loop returns `TurnFailure`.
     pub interruption: Option<serde_json::Value>,
+}
+
+fn session_cancel_and_resume_commands(session_id: Option<&str>) -> (String, String) {
+    match session_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(session_id) => (
+            format!("`astra session cancel {session_id}`"),
+            format!("`astra --resume {session_id}`"),
+        ),
+        None => (
+            "`astra session cancel <session_id>`".to_string(),
+            "`astra --resume <session_id>`".to_string(),
+        ),
+    }
+}
+
+/// Session cancellation settles the Session to `cancelled`. The same interactive
+/// process keeps its current session id and does not resume, so a later turn
+/// cannot be admitted until the user resumes the Session back to `active`.
+pub(crate) fn session_stop_then_resume(session_id: Option<&str>) -> String {
+    let (cancel_command, resume_command) = session_cancel_and_resume_commands(session_id);
+    format!(
+        "Wait for it to finish, or stop it with {cancel_command}, then run {resume_command} before sending another message."
+    )
+}
+
+/// Interactive detach did not request server cancellation.
+pub(crate) fn interactive_detach_recovery(session_id: Option<&str>) -> String {
+    format!(
+        "The server run was not cancelled. {}",
+        session_stop_then_resume(session_id)
+    )
+}
+
+/// Headless DELETE was attempted, but its settlement was not observed.
+/// The run may already be cancelled server-side.
+pub(crate) fn headless_unconfirmed_cancel_notice(session_id: Option<&str>) -> String {
+    format!(
+        "Exact server run cancellation could not be confirmed; the run may still be active. {}",
+        session_stop_then_resume(session_id)
+    )
 }
 
 pub(crate) fn unsettled_physical_owner_run_id(
@@ -108,6 +531,79 @@ pub(crate) fn unsettled_physical_owner_run_id(
 pub(crate) struct TurnFailure {
     pub error: String,
     pub partial: PartialTurnData,
+}
+
+impl TurnFailure {
+    /// A local cancellation may recover its observed prefix only when no
+    /// harder admission, callback, output or remote-cleanup failure survived.
+    pub(crate) fn is_clean_local_cancel(&self) -> bool {
+        self.partial.failure_kind == Some(astra_core::ErrorKind::Cancelled)
+            && self.partial.error_code.is_none()
+            && !self.partial.remote_cancel_required
+            && !self.partial.admission_rejected
+            && !self.partial.callback_client_detached
+            && self.partial.output_transport_failure.is_none()
+    }
+
+    /// Observation of an internal transport failure is not a user request to
+    /// cancel the durable run. This only classifies the failure; callers must
+    /// still enforce their own identity/lease boundary before releasing it.
+    pub(crate) fn is_clean_internal_stream_detach(&self) -> bool {
+        self.partial.remote_cancel_required
+            && !self.partial.callback_client_detached
+            && self.partial.output_transport_failure.is_none()
+            && self.partial.interruption.as_ref().is_some_and(|record| {
+                matches!(
+                    record.get("kind").and_then(serde_json::Value::as_str),
+                    Some("stream_transport" | "stream_idle" | "executor_dropped")
+                )
+            })
+    }
+}
+
+#[cfg(test)]
+mod internal_detach_tests {
+    use super::{PartialTurnData, TurnFailure};
+
+    #[test]
+    fn settled_cancel_cannot_erase_a_harder_stream_failure() {
+        let mut failure = TurnFailure {
+            error: "display text is not classification authority".into(),
+            partial: PartialTurnData {
+                failure_kind: Some(astra_core::ErrorKind::Cancelled),
+                ..Default::default()
+            },
+        };
+        assert!(failure.is_clean_local_cancel());
+        failure.partial.failure_kind = Some(astra_core::ErrorKind::ContractViolation);
+        assert!(!failure.is_clean_local_cancel());
+        failure.partial.failure_kind = Some(astra_core::ErrorKind::Cancelled);
+        failure.partial.error_code = Some("execution_binding_busy".into());
+        failure.partial.admission_rejected = true;
+        assert!(!failure.is_clean_local_cancel());
+        failure.partial.error_code = None;
+        failure.partial.admission_rejected = false;
+        failure.partial.remote_cancel_required = true;
+        assert!(!failure.is_clean_local_cancel());
+    }
+
+    #[test]
+    fn only_clean_internal_detach_preserves_run_control() {
+        let mut failure = TurnFailure {
+            error: "stream closed".into(),
+            partial: PartialTurnData {
+                remote_cancel_required: true,
+                interruption: Some(serde_json::json!({"kind": "stream_transport"})),
+                ..Default::default()
+            },
+        };
+        assert!(failure.is_clean_internal_stream_detach());
+        failure.partial.callback_client_detached = true;
+        assert!(!failure.is_clean_internal_stream_detach());
+        failure.partial.callback_client_detached = false;
+        failure.partial.interruption = Some(serde_json::json!({"kind": "cancelled"}));
+        assert!(!failure.is_clean_internal_stream_detach());
+    }
 }
 
 /// Promote a typed, resumable runtime interruption into the same terminal
@@ -152,6 +648,8 @@ pub(crate) fn stream_result_from_resumable_turn_failure(
         completion_tokens: failure.partial.completion_tokens,
         cache_read_tokens: failure.partial.cache_read_tokens,
         cache_creation_tokens: failure.partial.cache_creation_tokens,
+        qualified_usage: failure.partial.qualified_usage,
+        usage_attribution: failure.partial.usage_attribution.clone(),
         tool_calls_count: failure.partial.tool_calls_count,
         llm_rounds: failure.partial.llm_rounds,
         token_usage_coverage: failure.partial.token_usage_coverage,
@@ -223,6 +721,7 @@ pub(crate) fn root_run_transcript_events(
         return Vec::new();
     }
 
+    let mut evidence_keys = BTreeSet::new();
     messages
         .iter()
         .filter(|message| {
@@ -230,6 +729,17 @@ pub(crate) fn root_run_transcript_events(
                 message.get("role").and_then(serde_json::Value::as_str),
                 Some("system") | None
             )
+        })
+        .filter(|message| {
+            message
+                .get("evidence")
+                .and_then(|value| {
+                    serde_json::from_value::<astra_turn_types::AgentTranscriptEvidence>(
+                        value.clone(),
+                    )
+                    .ok()
+                })
+                .is_none_or(|evidence| evidence_keys.insert(evidence.stable_key()))
         })
         .enumerate()
         .filter_map(|(index, message)| {
@@ -244,16 +754,22 @@ pub(crate) fn root_run_transcript_events(
 /// Result of a streaming chat turn, including token counts and tool usage data.
 #[derive(Debug)]
 pub(crate) struct StreamResult {
+    pub(crate) qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
     pub(crate) session_id: Option<String>,
     pub(crate) run_id: Option<String>,
     /// Durable local persistence failure recorded after the runtime finished
     /// successfully (for example one-shot journal append failure).
     pub(crate) session_persistence_error: Option<String>,
+    /// Content policy intentionally omitted durable local continuation.
+    pub(crate) local_continuation_omitted: bool,
     pub(crate) full_text: String,
     pub(crate) prompt_tokens: u64,
     pub(crate) completion_tokens: u64,
     pub(crate) cache_read_tokens: u64,
     pub(crate) cache_creation_tokens: u64,
+    /// Explicit attribution for user-visible summaries. The four legacy
+    /// counters above remain observed run subtotals, not complete billing evidence.
+    pub(crate) usage_attribution: UsageAttribution,
     pub(crate) tool_calls_count: u32,
     /// Canonical fixed-size closure of every local and remote tool attempt in
     /// this logical turn. Unlike `tool_call_records`, this is never a trimmed
@@ -278,8 +794,6 @@ pub(crate) struct StreamResult {
     /// advisory threshold, error pressure, and health telemetry). Only
     /// non-Healthy verdicts.
     pub(crate) verdict_events: Vec<VerdictEvent>,
-    /// Step Protocol recorder summary for debugging and audit.
-    pub(crate) step_recorder_summary: Option<astra_pipeline::step_recorder::RecorderSummary>,
     /// Exported tool health entries from this turn's TurnGuard (for cross-session persistence).
     pub(crate) tool_health_export: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
     /// Last heavy checkpoint built during the agentic loop (for cloud persistence).
@@ -299,6 +813,7 @@ pub(crate) struct StreamResult {
     pub(crate) pending_context_assembly_trace: Option<(u32, serde_json::Value)>,
     /// Collected turn observability events (llm_round, tool timing) for batch flush.
     pub(crate) turn_observability_events: Vec<astra_services::session_journal::JournalEvent>,
+    pub(crate) turn_evaluation: Option<astra_services::session_journal::JournalEvent>,
     /// Aggregated LLM round count for this turn.
     pub(crate) llm_rounds: Option<u32>,
     /// Provider-reported token usage coverage. Token totals are lower bounds
@@ -342,9 +857,6 @@ pub(crate) struct StreamResult {
     /// This is the durable fact source for active-run guidance; `final_messages`
     /// is only a prompt projection fallback.
     pub(crate) applied_user_intents: Vec<AppliedStreamUserIntent>,
-    /// Results from background-spawned agents collected after the agentic
-    /// loop ended. Each entry is (agent_id, result_text).
-    pub(crate) background_agent_results: Vec<(String, String)>,
 }
 
 impl StreamResult {
@@ -384,22 +896,6 @@ impl StreamResult {
         event.tool_outcomes = Some(outcomes);
     }
 
-    /// Merge terminal background-agent outputs into the user-facing aggregate
-    /// response used by one-shot CLI and server surfaces.
-    ///
-    /// Interactive turns reconcile the same facts through the root mailbox on
-    /// a later model step. One-shot surfaces have no later step, so leaving the
-    /// drain results only in an internal field would make completed work
-    /// invisible to text consumers.
-    pub(crate) fn integrate_background_agent_results(&mut self) -> Option<String> {
-        let section = format_background_agent_results(&self.background_agent_results)?;
-        if !self.full_text.is_empty() {
-            self.full_text.push_str("\n\n");
-        }
-        self.full_text.push_str(&section);
-        Some(section)
-    }
-
     /// User input that should represent this committed turn in durable history.
     ///
     /// The runtime can apply user guidance while a turn is executing.
@@ -424,21 +920,6 @@ impl StreamResult {
         }
         latest_user_input_from_messages(primary_line, &self.final_messages)
     }
-}
-
-pub(crate) fn format_background_agent_results(results: &[(String, String)]) -> Option<String> {
-    if results.is_empty() {
-        return None;
-    }
-
-    let mut section = String::from("## Background agent results");
-    for (agent_id, result) in results {
-        section.push_str("\n\n### Agent `");
-        section.push_str(agent_id);
-        section.push_str("`\n\n");
-        section.push_str(result.trim());
-    }
-    Some(section)
 }
 
 fn effective_user_input_from_applied_user_intents(
@@ -612,17 +1093,528 @@ mod user_input_tests {
     }
 }
 
+#[cfg(test)]
+mod usage_attribution_tests {
+    use super::UsageAttribution;
+
+    #[test]
+    fn primary_input_coverage_is_independent_of_output() {
+        let mut events = vec![
+            started_primary("primary"),
+            finished_primary(
+                "primary",
+                Some(astra_turn_types::ExplainAnalyzeTokenUsageV1 {
+                    basis: astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderExact,
+                    fresh_input_tokens: Some(100),
+                    cache_read_tokens: Some(900),
+                    cache_creation_tokens: Some(0),
+                    output_tokens: None,
+                }),
+            ),
+            auxiliary_event(true, vec![]),
+        ];
+        let usage = UsageAttribution::from_explain_analyze_events(&events, None, false);
+        assert!(usage.primary_input_complete);
+        assert!(!usage.primary_complete);
+        let projection = crate::cli::turn::turn_reporting::project_primary_usage(&usage, false);
+        assert_eq!(
+            crate::cli::turn::turn_reporting::format_primary_usage_summary(
+                projection.fresh_input_tokens,
+                projection.output_tokens,
+                projection.cache_read_tokens,
+                projection.cache_creation_tokens,
+                projection.observed,
+                projection.complete,
+                projection.input_complete,
+            )
+            .as_deref(),
+            Some("≥1.0k tokens · 90% cached")
+        );
+        assert!(
+            !UsageAttribution::from_explain_analyze_events(&events, None, true)
+                .primary_input_complete
+        );
+        events[1].usage.as_mut().unwrap().cache_creation_tokens = None;
+        assert!(
+            !UsageAttribution::from_explain_analyze_events(&events, None, false)
+                .primary_input_complete
+        );
+    }
+
+    fn finished_primary(
+        node_id: &str,
+        usage: Option<astra_turn_types::ExplainAnalyzeTokenUsageV1>,
+    ) -> astra_turn_types::ExplainAnalyzeEventV1 {
+        astra_turn_types::ExplainAnalyzeEventV1 {
+            schema_version: astra_turn_types::EXPLAIN_ANALYZE_SCHEMA_VERSION,
+            auxiliary_details: None,
+            event_id: format!("{node_id}/finished"),
+            run_id: "run-1".into(),
+            turn_id: "turn-1".into(),
+            node_id: node_id.into(),
+            parent_node_id: None,
+            dependency_node_ids: Vec::new(),
+            producer_id: "test".into(),
+            clock_domain_id: "clock-1".into(),
+            kind: astra_turn_types::ExplainAnalyzeNodeKindV1::ProviderAttempt,
+            round_index: Some(0),
+            attempt_index: Some(0),
+            label: "Model request · deepseek-flash".into(),
+            transition: astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
+            elapsed_ms: 10,
+            start_elapsed_ms: Some(0),
+            duration_ms: Some(10),
+            outcome: Some(astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded),
+            decision_detail: None,
+            usage,
+            auxiliary_usage: None,
+            context: None,
+            coverage_gaps: Vec::new(),
+        }
+    }
+
+    fn started_primary(node_id: &str) -> astra_turn_types::ExplainAnalyzeEventV1 {
+        let mut event = finished_primary(node_id, None);
+        event.event_id = format!("{node_id}/started");
+        event.transition = astra_turn_types::ExplainAnalyzeTransitionV1::Started;
+        event.elapsed_ms = 0;
+        event.start_elapsed_ms = None;
+        event.duration_ms = None;
+        event.outcome = None;
+        event.usage = None;
+        event
+    }
+
+    fn auxiliary_attempt(
+        attempt_id: &str,
+        status: astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1,
+        usage: Option<astra_turn_types::ExplainAnalyzeTokenUsageV1>,
+    ) -> astra_turn_types::ExplainAnalyzeAuxiliaryAttemptV1 {
+        astra_turn_types::ExplainAnalyzeAuxiliaryAttemptV1 {
+            attempt_id: attempt_id.into(),
+            usage_status: status,
+            provider: "typesafe".into(),
+            offering_id: "jev-offering".into(),
+            model_name: "jev-1.13.0".into(),
+            purpose: "introspection".into(),
+            operation_id: "request_judgment".into(),
+            usage,
+        }
+    }
+
+    fn auxiliary_event(
+        available: bool,
+        attempts: Vec<astra_turn_types::ExplainAnalyzeAuxiliaryAttemptV1>,
+    ) -> astra_turn_types::ExplainAnalyzeEventV1 {
+        astra_turn_types::ExplainAnalyzeEventV1 {
+            schema_version: astra_turn_types::EXPLAIN_ANALYZE_SCHEMA_VERSION,
+            auxiliary_details: None,
+            event_id: "auxiliary/turn/finished".into(),
+            run_id: "run-1".into(),
+            turn_id: "turn-1".into(),
+            node_id: "turn".into(),
+            parent_node_id: None,
+            dependency_node_ids: Vec::new(),
+            producer_id: "test".into(),
+            clock_domain_id: "clock-1".into(),
+            kind: astra_turn_types::ExplainAnalyzeNodeKindV1::Turn,
+            round_index: None,
+            attempt_index: None,
+            label: "User turn".into(),
+            transition: astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
+            elapsed_ms: 20,
+            start_elapsed_ms: Some(0),
+            duration_ms: Some(20),
+            outcome: Some(astra_turn_types::ExplainAnalyzeOutcomeV1::Completed),
+            decision_detail: None,
+            usage: None,
+            auxiliary_usage: Some(Box::new(astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
+                available,
+                truncated: false,
+                attempts,
+            })),
+            context: None,
+            coverage_gaps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn primary_and_auxiliary_usage_are_not_mixed() {
+        let primary = finished_primary(
+            "primary",
+            Some(astra_turn_types::ExplainAnalyzeTokenUsageV1 {
+                basis: astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderExact,
+                fresh_input_tokens: Some(100),
+                cache_read_tokens: Some(900),
+                cache_creation_tokens: Some(20),
+                output_tokens: Some(10),
+            }),
+        );
+        let auxiliary = astra_turn_types::ExplainAnalyzeEventV1 {
+            schema_version: astra_turn_types::EXPLAIN_ANALYZE_SCHEMA_VERSION,
+            auxiliary_details: None,
+            event_id: "turn/finished".into(),
+            run_id: "run-1".into(),
+            turn_id: "turn-1".into(),
+            node_id: "turn".into(),
+            parent_node_id: None,
+            dependency_node_ids: Vec::new(),
+            producer_id: "test".into(),
+            clock_domain_id: "clock-1".into(),
+            kind: astra_turn_types::ExplainAnalyzeNodeKindV1::Turn,
+            round_index: None,
+            attempt_index: None,
+            label: "User turn".into(),
+            transition: astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
+            elapsed_ms: 20,
+            start_elapsed_ms: Some(0),
+            duration_ms: Some(20),
+            outcome: Some(astra_turn_types::ExplainAnalyzeOutcomeV1::Completed),
+            decision_detail: None,
+            usage: None,
+            auxiliary_usage: Some(Box::new(astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
+                available: true,
+                truncated: false,
+                attempts: vec![astra_turn_types::ExplainAnalyzeAuxiliaryAttemptV1 {
+                    attempt_id: "aux-1".into(),
+                    usage_status:
+                        astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+                    provider: "typesafe".into(),
+                    offering_id: "jev-offering".into(),
+                    model_name: "jev-1.13.0".into(),
+                    purpose: "introspection".into(),
+                    operation_id: "request_judgment".into(),
+                    usage: Some(astra_turn_types::ExplainAnalyzeTokenUsageV1 {
+                        basis: astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderExact,
+                        fresh_input_tokens: Some(7),
+                        cache_read_tokens: Some(3),
+                        cache_creation_tokens: Some(0),
+                        output_tokens: Some(2),
+                    }),
+                }],
+            })),
+            context: None,
+            coverage_gaps: Vec::new(),
+        };
+
+        let attribution = UsageAttribution::from_explain_analyze_events(
+            &[started_primary("primary"), primary, auxiliary],
+            Some("deepseek-flash".into()),
+            false,
+        );
+        let primary = attribution.primary.expect("primary usage");
+        let auxiliary = attribution.auxiliary.expect("auxiliary usage");
+        assert_eq!(primary.fresh_input_tokens, Some(100));
+        assert_eq!(primary.cache_read_tokens, Some(900));
+        assert_eq!(primary.known_total_tokens(), 1_030);
+        assert_eq!(auxiliary.known_total_tokens(), 12);
+        assert!(attribution.primary_complete);
+        assert!(attribution.auxiliary_complete);
+        let summary = attribution.auxiliary_summary().expect("aux summary");
+        assert!(summary.contains("Jev (jev-1.13.0)"));
+        assert!(summary.contains("request_judgment"));
+        assert!(summary.contains("in 7"));
+        assert!(summary.contains("out 2"));
+    }
+
+    #[test]
+    fn timing_coverage_gaps_do_not_invalidate_complete_token_usage() {
+        let primary = finished_primary(
+            "primary",
+            Some(astra_turn_types::ExplainAnalyzeTokenUsageV1 {
+                basis: astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderExact,
+                fresh_input_tokens: Some(100),
+                cache_read_tokens: Some(900),
+                cache_creation_tokens: Some(0),
+                output_tokens: Some(10),
+            }),
+        );
+        let mut terminal = auxiliary_event(true, Vec::new());
+        terminal.auxiliary_usage = None;
+        terminal.coverage_gaps = vec![
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::ApprovalWaitIntervals,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::ChildRunIntervals,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::FirstTokenLatency,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::ProviderRetryBackoff,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::ToolIoWaitIntervals,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::UserInputWaitIntervals,
+        ];
+
+        let attribution = UsageAttribution::from_explain_analyze_events(
+            &[started_primary("primary"), primary, terminal],
+            Some("deepseek-flash".into()),
+            false,
+        );
+
+        assert!(
+            attribution.primary_complete,
+            "timing coverage is independent from provider token coverage"
+        );
+    }
+
+    #[test]
+    fn timing_coverage_gaps_do_not_hide_missing_token_lanes() {
+        let missing_usage = finished_primary("primary", None);
+        let mut terminal = auxiliary_event(true, Vec::new());
+        terminal.auxiliary_usage = None;
+        terminal.coverage_gaps = vec![
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::FirstTokenLatency,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::ToolIoWaitIntervals,
+        ];
+
+        let attribution = UsageAttribution::from_explain_analyze_events(
+            &[started_primary("primary"), missing_usage, terminal],
+            Some("deepseek-flash".into()),
+            false,
+        );
+
+        assert!(!attribution.primary_complete);
+    }
+
+    #[test]
+    fn later_scope_without_terminal_cannot_inherit_prior_completion() {
+        let first_primary = finished_primary(
+            "primary-first",
+            Some(astra_turn_types::ExplainAnalyzeTokenUsageV1 {
+                basis: astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderExact,
+                fresh_input_tokens: Some(100),
+                cache_read_tokens: Some(900),
+                cache_creation_tokens: Some(0),
+                output_tokens: Some(10),
+            }),
+        );
+        let first_terminal = auxiliary_event(true, Vec::new());
+        let mut second_started = started_primary("primary-second");
+        let mut second_primary = finished_primary(
+            "primary-second",
+            Some(astra_turn_types::ExplainAnalyzeTokenUsageV1 {
+                basis: astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderExact,
+                fresh_input_tokens: Some(120),
+                cache_read_tokens: Some(880),
+                cache_creation_tokens: Some(0),
+                output_tokens: Some(11),
+            }),
+        );
+        // A retry/resume can keep the logical turn id while opening a new
+        // physical clock scope. The second provider request finished, but
+        // the executor exited before the second Turn terminal was emitted.
+        second_started.clock_domain_id = "clock-2".into();
+        second_primary.clock_domain_id = "clock-2".into();
+
+        let attribution = UsageAttribution::from_explain_analyze_events(
+            &[
+                started_primary("primary-first"),
+                first_primary,
+                first_terminal,
+                second_started,
+                second_primary,
+            ],
+            Some("deepseek-flash".into()),
+            false,
+        );
+
+        assert!(!attribution.primary_complete);
+        assert!(attribution.auxiliary_capture_missing);
+        assert!(!attribution.auxiliary_complete);
+    }
+
+    #[test]
+    fn partial_auxiliary_capture_keeps_known_lanes_and_association() {
+        let exact = auxiliary_attempt(
+            "aux-exact",
+            astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+            Some(astra_turn_types::ExplainAnalyzeTokenUsageV1 {
+                basis: astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderExact,
+                fresh_input_tokens: Some(7),
+                cache_read_tokens: Some(3),
+                cache_creation_tokens: Some(0),
+                output_tokens: Some(2),
+            }),
+        );
+        let unavailable = auxiliary_attempt(
+            "aux-unavailable",
+            astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::Unavailable,
+            None,
+        );
+        let attribution = UsageAttribution::from_explain_analyze_events(
+            &[auxiliary_event(true, vec![exact, unavailable])],
+            None,
+            false,
+        );
+
+        assert!(!attribution.auxiliary_complete);
+        assert!(!attribution.auxiliary_capture_unavailable);
+        assert_eq!(
+            attribution
+                .auxiliary
+                .expect("known auxiliary lane")
+                .known_total_tokens(),
+            12
+        );
+        let summary = attribution.auxiliary_summary().expect("aux summary");
+        assert!(summary.contains("Jev (jev-1.13.0) · request_judgment"));
+        assert!(summary.contains("12 tokens"));
+        assert!(summary.contains("capture partial"));
+    }
+
+    #[test]
+    fn degraded_explain_capture_never_claims_complete_auxiliary_usage() {
+        let exact = auxiliary_attempt(
+            "aux-exact",
+            astra_turn_types::ExplainAnalyzeAuxiliaryUsageStatusV1::ProviderExact,
+            Some(astra_turn_types::ExplainAnalyzeTokenUsageV1 {
+                basis: astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderExact,
+                fresh_input_tokens: Some(7),
+                cache_read_tokens: Some(3),
+                cache_creation_tokens: Some(0),
+                output_tokens: Some(2),
+            }),
+        );
+        let attribution = UsageAttribution::from_explain_analyze_events(
+            &[auxiliary_event(true, vec![exact])],
+            None,
+            true,
+        );
+
+        assert!(!attribution.auxiliary_complete);
+        assert!(
+            attribution
+                .auxiliary_summary()
+                .is_some_and(|summary| summary.contains("capture partial"))
+        );
+    }
+
+    #[test]
+    fn degraded_capture_is_retained_without_numeric_usage() {
+        let attribution = UsageAttribution::from_explain_analyze_events(
+            &[started_primary("primary")],
+            Some("deepseek-flash".into()),
+            true,
+        );
+
+        assert!(attribution.capture_degraded);
+        assert!(attribution.has_observed_state());
+        assert!(!attribution.primary_complete);
+    }
+
+    #[test]
+    fn unavailable_auxiliary_snapshot_is_not_rendered_as_zero_calls() {
+        let attribution = UsageAttribution::from_explain_analyze_events(
+            &[auxiliary_event(false, Vec::new())],
+            None,
+            false,
+        );
+
+        assert!(attribution.auxiliary_capture_unavailable);
+        assert_eq!(
+            attribution.auxiliary_summary().as_deref(),
+            Some("Auxiliary usage · capture unavailable · no calls reported")
+        );
+    }
+
+    #[test]
+    fn empty_auxiliary_snapshot_means_zero_calls() {
+        let attribution = UsageAttribution::from_explain_analyze_events(
+            &[auxiliary_event(true, Vec::new())],
+            None,
+            false,
+        );
+
+        assert!(!attribution.auxiliary_capture_unavailable);
+        assert!(!attribution.auxiliary_capture_missing);
+        assert_eq!(
+            attribution.auxiliary_summary().as_deref(),
+            Some("Auxiliary usage · no calls reported")
+        );
+    }
+
+    #[test]
+    fn missing_auxiliary_snapshot_is_not_rendered_as_zero_calls() {
+        let mut terminal = auxiliary_event(true, Vec::new());
+        terminal.auxiliary_usage = None;
+        let attribution = UsageAttribution::from_explain_analyze_events(&[terminal], None, false);
+
+        assert!(attribution.auxiliary_capture_missing);
+        assert_eq!(
+            attribution.auxiliary_summary().as_deref(),
+            Some("Auxiliary usage · capture unavailable · no snapshot")
+        );
+    }
+
+    #[test]
+    fn auxiliary_conflict_remains_visible_without_surviving_attempts() {
+        let first = auxiliary_event(true, Vec::new());
+        let mut conflicting = auxiliary_event(false, Vec::new());
+        conflicting.event_id = first.event_id.clone();
+        let attribution =
+            UsageAttribution::from_explain_analyze_events(&[first, conflicting], None, false);
+
+        assert!(attribution.auxiliary_capture_conflicted);
+        assert_eq!(attribution.auxiliary_attempts, 0);
+        assert_eq!(
+            attribution.auxiliary_summary().as_deref(),
+            Some("Auxiliary usage · capture unavailable · conflicting facts")
+        );
+    }
+
+    #[test]
+    fn partial_primary_capture_preserves_known_lanes_without_claiming_complete() {
+        let partial = finished_primary(
+            "primary",
+            Some(astra_turn_types::ExplainAnalyzeTokenUsageV1 {
+                basis: astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderPartial,
+                fresh_input_tokens: Some(100),
+                cache_read_tokens: Some(900),
+                cache_creation_tokens: None,
+                output_tokens: Some(10),
+            }),
+        );
+        let mut terminal = auxiliary_event(true, Vec::new());
+        terminal.event_id = "turn/terminal".into();
+        terminal.auxiliary_usage = None;
+        let attribution = UsageAttribution::from_explain_analyze_events(
+            &[started_primary("primary"), partial, terminal],
+            Some("deepseek-flash".into()),
+            false,
+        );
+
+        let primary = attribution.primary.expect("known primary lanes");
+        assert_eq!(primary.fresh_input_tokens, Some(100));
+        assert_eq!(primary.cache_read_tokens, Some(900));
+        assert_eq!(primary.output_tokens, Some(10));
+        assert_eq!(primary.cache_creation_tokens, None);
+        assert!(!attribution.primary_complete);
+    }
+
+    #[test]
+    fn no_explain_evidence_does_not_infer_primary_attribution() {
+        let attribution = UsageAttribution::from_explain_analyze_events(
+            &[],
+            Some("deepseek-flash".into()),
+            false,
+        );
+
+        assert!(attribution.primary.is_none());
+        assert!(!attribution.primary_complete);
+        assert!(attribution.primary_model.is_none());
+    }
+}
+
 impl Default for StreamResult {
     fn default() -> Self {
         Self {
+            turn_evaluation: None,
             session_id: None,
             run_id: None,
             session_persistence_error: None,
+            local_continuation_omitted: false,
             full_text: String::new(),
             prompt_tokens: 0,
             completion_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            usage_attribution: UsageAttribution::default(),
+            qualified_usage: None,
             tool_calls_count: 0,
             tool_ledger_aggregate: Default::default(),
             visible_tools: vec![],
@@ -633,7 +1625,6 @@ impl Default for StreamResult {
             budget_pressure: 0.0,
             stall_events: vec![],
             verdict_events: vec![],
-            step_recorder_summary: None,
             tool_health_export: vec![],
             last_heavy_checkpoint: None,
             ttft_ms: None,
@@ -655,7 +1646,6 @@ impl Default for StreamResult {
             deferred_tool_activations: Vec::new(),
             run_transcript_messages: Vec::new(),
             applied_user_intents: Vec::new(),
-            background_agent_results: Vec::new(),
         }
     }
 }

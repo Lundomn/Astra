@@ -6,8 +6,7 @@ use crate::cli::session::session_continuation::{
     portable_resume_descriptor, sanitize_continuation_messages,
 };
 use crate::cli::session::session_restore_client::{
-    fetch_cloud_session_snapshot_with_client, list_cloud_resumable_sessions,
-    restore_session_snapshot_with_client,
+    has_server_auth, list_cloud_resumable_sessions, restore_session_snapshot_with_client,
 };
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -69,6 +68,18 @@ impl OneShotSessionRouting {
                 .ok_or_else(|| "remote ResumeBundle failed causal validation".to_string());
         }
 
+        if let Some(session_id) = self.history_source_session_id.as_deref() {
+            let allowed =
+                crate::cli::session::session_continuation::local_journal_privacy_allows_resume(
+                    session_id,
+                )
+                .map_err(|error| {
+                    format!("cannot verify local continuation privacy boundary: {error}")
+                })?;
+            if !allowed {
+                return Err("local continuation was omitted by privacy policy; select a new session or an explicitly authorized Server canonical resume".into());
+            }
+        }
         let local = self
             .history_source_session_id
             .as_deref()
@@ -209,9 +220,9 @@ async fn load_one_shot_resume_metadata(
         return Ok(OneShotSessionResumeMetadata::default());
     };
 
-    let mut restored = match restore_session_snapshot_with_client(profile, api, session_id).await {
+    let restored = match restore_session_snapshot_with_client(profile, api, session_id).await {
         Ok(restored) => restored,
-        Err(error) if server_session => {
+        Err(error) if server_session || has_server_auth(profile) => {
             return Err(format!(
                 "selected Server session {session_id} could not be restored: {error}"
             ));
@@ -225,44 +236,6 @@ async fn load_one_shot_resume_metadata(
             return Ok(OneShotSessionResumeMetadata::default());
         }
     };
-    if server_session
-        && restored
-            .as_ref()
-            .is_some_and(|snapshot| !snapshot.restored_from_cloud)
-    {
-        // The Server owns both the canonical conversation and turn sequence
-        // for an attached session. Local state can locate that session, but
-        // cannot replace missing Server resume authority.
-        match fetch_cloud_session_snapshot_with_client(profile, api, session_id).await {
-            Ok(Some(remote)) => {
-                if let Some(local) = restored.as_mut() {
-                    // The Server turn clock is authoritative for a networked
-                    // session. Conversation selection remains cursor/root
-                    // based in `continuation`; do not splice remote messages
-                    // into a local snapshot based on turn counts.
-                    local.turn_count = remote.turn_count;
-                    // Conversation-sensitive provider state must come from
-                    // the same server-selected generation. An absent value is
-                    // meaningful; retaining a richer local value would splice
-                    // stale provider state into the remote conversation.
-                    local.model = remote.model.clone();
-                    local.permission_mode = remote.permission_mode.clone();
-                    local.conversation_messages = remote.conversation_messages;
-                    local.resume_bundle = remote.resume_bundle;
-                }
-            }
-            Ok(None) => {
-                return Err(format!(
-                    "selected Server session {session_id} has no authoritative restore bundle"
-                ));
-            }
-            Err(error) => {
-                return Err(format!(
-                    "selected Server session {session_id} could not load its authoritative restore bundle: {error}"
-                ));
-            }
-        }
-    }
 
     match restored {
         Some(restored) => {
@@ -287,7 +260,7 @@ async fn load_one_shot_resume_metadata(
                 resume_bundle: restored.resume_bundle,
             })
         }
-        None if server_session => Err(format!(
+        None if server_session || has_server_auth(profile) => Err(format!(
             "selected Server session {session_id} has no restorable canonical state"
         )),
         None => Ok(OneShotSessionResumeMetadata::default()),
@@ -344,11 +317,17 @@ pub(crate) async fn resolve_one_shot_session_routing(
         return attach_one_shot_resume_metadata(routing, api, profile).await;
     }
 
-    let local_session_id = local_resumable_last_session_id(profile);
+    let local_session_id = (!has_server_auth(profile))
+        .then(|| local_resumable_last_session_id(profile))
+        .flatten();
     let remote_session_id = match list_cloud_resumable_sessions(profile, api).await {
         Ok(sessions) => sessions
             .into_iter()
-            .find(|session| session.turn_count > 0)
+            .find(|session| {
+                session.turn_count > 0
+                    && crate::cli::session::session_continuation::local_journal_privacy_allows_resume(&session.session_id)
+                        .unwrap_or(false)
+            })
             .map(|session| session.session_id),
         Err(error) => {
             tracing::warn!(
@@ -715,6 +694,69 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn privacy_local_boundary_rejects_stale_resume_but_allows_server_canonical_bundle() {
+        let (_sessions, _guard) = crate::tests::isolated_sessions_dir();
+        let _credentials = crate::test_utils::isolate_credentials();
+        let sid = "privacy-routing";
+        let mut event = astra_services::session_journal::JournalEvent::turn(
+            Some(sid),
+            1,
+            None,
+            "",
+            "",
+            0,
+            0,
+            0,
+            0,
+        );
+        event.metadata = Some(serde_json::json!({"local_continuation": "omitted_by_policy"}));
+        astra_services::session_journal::JournalWriter::new(sid)
+            .unwrap()
+            .append(&event)
+            .unwrap();
+        let local = OneShotSessionRouting {
+            history_source_session_id: Some(sid.into()),
+            ..Default::default()
+        };
+        assert!(
+            local
+                .continuation()
+                .unwrap_err()
+                .contains("omitted by privacy policy")
+        );
+        let journal_path = astra_services::session_journal::journal_file_path(sid);
+        let mut bytes = std::fs::read(&journal_path).unwrap();
+        bytes.push(0xff);
+        std::fs::write(&journal_path, bytes).unwrap();
+        let local = OneShotSessionRouting {
+            history_source_session_id: Some(sid.into()),
+            ..Default::default()
+        };
+        assert!(
+            local
+                .continuation()
+                .unwrap_err()
+                .contains("cannot verify local continuation privacy boundary")
+        );
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "Server-owned question"}),
+            serde_json::json!({"role": "assistant", "content": "Server-owned answer"}),
+        ];
+        let mut bundle = typed_resume_bundle(sid, 1, messages.clone(), Vec::new());
+        bundle.source = astra_turn_types::ResumeSourceV1::CanonicalJournal;
+        let remote = OneShotSessionRouting {
+            server_session_id: Some(sid.into()),
+            history_source_session_id: Some(sid.into()),
+            resume_metadata: OneShotSessionResumeMetadata {
+                resume_bundle: Some(bundle),
+                ..Default::default()
+            },
+        };
+        assert_eq!(remote.continuation().unwrap().unwrap().messages, messages);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn attached_session_uses_server_canonical_authority_across_journal_clock_domains() {
         let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("routing-authority-{}", uuid::Uuid::new_v4());
@@ -761,7 +803,7 @@ mod tests {
         // larger Server event sequence combined with a smaller conversation
         // sequence is not a fork and must never be compared as one clock.
         server_bundle.cursor.journal_event_seq = 100;
-        let routing = OneShotSessionRouting {
+        let mut routing = OneShotSessionRouting {
             server_session_id: Some(session_id.clone()),
             history_source_session_id: Some(session_id),
             resume_metadata: OneShotSessionResumeMetadata {
@@ -789,6 +831,7 @@ mod tests {
                 .all(|message| message["content"] != "unacknowledged local answer")
         );
         assert_eq!(continuation.resume.cursor.journal_event_seq, 100);
+        routing.continuation_turn_inputs().unwrap();
     }
 
     #[test]
@@ -856,10 +899,30 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn resolve_one_shot_session_routing_keeps_local_continuation_when_cloud_has_no_session() {
+    async fn disabled_resume_skips_existing_session_and_remote_lookup() {
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let routing = resolve_one_shot_session_routing(
+            &api,
+            None,
+            Some(uuid::Uuid::new_v4().to_string()),
+            false,
+        )
+        .await
+        .expect("new conversation needs no resume lookup");
+        assert!(routing.server_session_id.is_none());
+        assert!(routing.history_source_session_id.is_none());
+        assert!(routing.continuation().unwrap().is_none());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn resolve_one_shot_session_routing_keeps_unauthenticated_local_continuation() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let _home_guard = crate::tests::HomeGuard::temp();
+        let _token_guard = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
         let session_id = uuid::Uuid::new_v4().to_string();
         write_local_resumable_session_with_checkpoint(&session_id);
 
@@ -867,7 +930,6 @@ mod tests {
         creds.profiles.insert(
             "default".to_string(),
             Profile {
-                access_token: Some("test-token".to_string()),
                 last_session_id: Some(session_id.clone()),
                 ..Default::default()
             },
@@ -875,7 +937,6 @@ mod tests {
         save_credentials(&creds).unwrap();
 
         let server = MockServer::start().await;
-        mock_empty_cloud_resumable_list(&server).await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
         let routing = resolve_one_shot_session_routing(&api, Some("default"), None, true)
@@ -902,6 +963,7 @@ mod tests {
         assert_eq!(continuation.len(), 2);
         assert_eq!(continuation[0]["content"], "previous question");
         assert_eq!(continuation[1]["content"], "previous answer");
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[serial_test::serial]
@@ -910,11 +972,14 @@ mod tests {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
 
+        let session_id = uuid::Uuid::new_v4().to_string();
+        write_local_resumable_session_with_checkpoint(&session_id);
         let mut creds = CredentialsFile::default();
         creds.profiles.insert(
             "default".to_string(),
             Profile {
                 access_token: Some("test-token".to_string()),
+                last_session_id: Some(session_id),
                 ..Default::default()
             },
         );
@@ -1104,6 +1169,66 @@ mod tests {
                 .expect_err("an explicit session with no restore state must fail closed");
 
         assert!(error.contains("no restorable canonical state"), "{error}");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn privacy_one_shot_is_not_automatically_resumed_from_cloud_listing() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _credentials = crate::tests::isolate_credentials();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".into(),
+            Profile {
+                access_token: Some("test-token".into()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+        let mut event = astra_services::session_journal::JournalEvent::turn(
+            Some(&sid),
+            1,
+            None,
+            "",
+            "",
+            0,
+            0,
+            0,
+            0,
+        );
+        event.metadata = Some(serde_json::json!({"local_continuation": "omitted_by_policy"}));
+        astra_services::session_journal::JournalWriter::new(&sid)
+            .unwrap()
+            .append(&event)
+            .unwrap();
+        let server = MockServer::start().await;
+        mock_cloud_resumable_session(&server, &sid).await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let routing = resolve_one_shot_session_routing(&api, Some("default"), None, true)
+            .await
+            .unwrap();
+        assert!(routing.server_session_id.is_none());
+        assert!(routing.history_source_session_id.is_none());
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "omitted session must not be restored automatically"
+        );
+        assert_eq!(requests[0].url.path(), "/sessions/resumable");
+        let journal_path = astra_services::session_journal::journal_file_path(&sid);
+        let mut bytes = std::fs::read(&journal_path).unwrap();
+        bytes.push(0xff);
+        std::fs::write(&journal_path, bytes).unwrap();
+        let routing = resolve_one_shot_session_routing(&api, Some("default"), None, true)
+            .await
+            .unwrap();
+        assert!(
+            routing.server_session_id.is_none(),
+            "unknown local privacy boundary must also prevent automatic cloud restore"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
     #[serial_test::serial]

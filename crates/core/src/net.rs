@@ -1,5 +1,16 @@
 //! Shared HTTP networking utilities.
 //!
+//! # TLS trust
+//!
+//! The workspace reqwest features combine bundled public roots with native
+//! platform roots, including `SSL_CERT_FILE` / `SSL_CERT_DIR` overrides. Keep
+//! this policy in the shared dependency rather than loading roots per client.
+//! Certificate-chain and hostname verification remain enabled.
+//!
+//! WebSocket and proxy TLS use bundled Mozilla public roots through
+//! [`public_root_tls_config`]. WSS callers must pass this explicit configuration;
+//! the WebSocket dependency does not select or load a trust store.
+//!
 //! # Proxy policy
 //!
 //! Three tiers, by traffic destination — pick the matching helper instead of
@@ -26,33 +37,15 @@
 /// Build an internal `reqwest` client that must never honor env proxy vars.
 ///
 /// Callers should pass any desired timeouts / redirect policy / TLS settings in
-/// `builder`; this helper enforces `.no_proxy()` and, if the customized build
-/// fails, retries once with a minimal no-proxy client so internal service calls
-/// never silently fall back to `reqwest::Client::new()` (which would re-enable
-/// env proxy handling).
+/// `builder`; this helper enforces `.no_proxy()`. Construction failure stops
+/// initialization rather than discarding the caller's transport policy.
 pub fn build_internal_http_client(
     builder: reqwest::ClientBuilder,
     client_name: &'static str,
 ) -> reqwest::Client {
-    match builder.no_proxy().build() {
-        Ok(client) => client,
-        Err(error) => {
-            tracing::warn!(
-                target: "astra_core::net",
-                client_name,
-                error = %error,
-                "failed to build configured internal HTTP client; retrying with minimal no-proxy client"
-            );
-            reqwest::Client::builder()
-                .no_proxy()
-                .build()
-                .unwrap_or_else(|fallback_error| {
-                    panic!(
-                        "failed to build minimal no-proxy client for {client_name}: {fallback_error}"
-                    )
-                })
-        }
-    }
+    builder.no_proxy().build().unwrap_or_else(|error| {
+        panic!("failed to build configured internal HTTP client for {client_name}: {error}")
+    })
 }
 
 /// Apply proxy settings from the environment to a `reqwest::ClientBuilder`.
@@ -143,6 +136,23 @@ pub fn client_builder_for_target(url: &str) -> reqwest::ClientBuilder {
         builder.no_proxy()
     } else {
         builder
+    }
+}
+
+#[cfg(test)]
+mod internal_http_client_tests {
+    #[test]
+    #[should_panic(
+        expected = "failed to build configured internal HTTP client for test policy client"
+    )]
+    fn invalid_builder_cannot_discard_transport_policy() {
+        super::build_internal_http_client(
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(1))
+                .user_agent("invalid\nheader"),
+            "test policy client",
+        );
     }
 }
 
@@ -243,4 +253,18 @@ mod apply_env_proxy_tests {
             },
         );
     }
+}
+
+/// Mozilla public roots for WebSocket and proxy TLS. Keep this trust policy
+/// explicit: HTTP clients separately include native platform roots.
+pub fn public_root_tls_config() -> std::sync::Arc<rustls::ClientConfig> {
+    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("ring supports the default TLS protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    std::sync::Arc::new(config)
 }

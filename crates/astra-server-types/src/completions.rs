@@ -15,6 +15,7 @@ pub const MAX_COMPLETION_OUTPUT_TOKENS: u32 = 8_192;
 pub enum CompletionOperation {
     MemoryExtraction,
     MemoryRetrievalRerank,
+    ToolResultRerank,
     TurnIntent,
     SkillAutoRoute,
     VerificationJudge,
@@ -22,12 +23,18 @@ pub enum CompletionOperation {
 
 impl CompletionOperation {
     #[must_use]
+    pub const fn is_typed_judgment(self) -> bool {
+        !self.accepts_free_form_output()
+    }
+
+    #[must_use]
     pub const fn purpose(self) -> astra_turn_types::InferencePurpose {
         match self {
             Self::MemoryExtraction => astra_turn_types::InferencePurpose::MemoryExtraction,
             Self::MemoryRetrievalRerank => {
                 astra_turn_types::InferencePurpose::MemoryRetrievalRerank
             }
+            Self::ToolResultRerank => astra_turn_types::InferencePurpose::ToolResultRerank,
             Self::TurnIntent => astra_turn_types::InferencePurpose::Introspection,
             Self::SkillAutoRoute => astra_turn_types::InferencePurpose::Introspection,
             Self::VerificationJudge => astra_turn_types::InferencePurpose::VerificationJudge,
@@ -39,10 +46,16 @@ impl CompletionOperation {
         match self {
             Self::MemoryExtraction => "completion_proxy:memory_extraction",
             Self::MemoryRetrievalRerank => "completion_proxy:memory_retrieval_rerank",
+            Self::ToolResultRerank => "completion_proxy:tool_result_rerank",
             Self::TurnIntent => "completion_proxy:turn_intent",
             Self::SkillAutoRoute => "completion_proxy:skill_auto_route",
             Self::VerificationJudge => "completion_proxy:verification_judge",
         }
+    }
+
+    #[must_use]
+    pub const fn accepts_free_form_output(self) -> bool {
+        matches!(self, Self::MemoryExtraction)
     }
 }
 
@@ -181,6 +194,9 @@ const fn default_timeout_ms() -> u64 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletionResponse {
+    /// Server-authored execution format; assistant content cannot select it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judgment_provenance: Option<astra_turn_types::JudgmentResponseProvenance>,
     pub id: String,
     pub object: String,
     pub offering_id: String,
@@ -314,6 +330,20 @@ mod tests {
         for invalid in [0, MAX_COMPLETION_OUTPUT_TOKENS + 1] {
             request.max_tokens = invalid;
             assert!(request.validate().is_err(), "{invalid} must be rejected");
+        }
+    }
+
+    #[test]
+    fn free_form_operations_skip_typed_output_contract() {
+        assert!(!CompletionOperation::MemoryExtraction.is_typed_judgment());
+        for operation in [
+            CompletionOperation::MemoryRetrievalRerank,
+            CompletionOperation::ToolResultRerank,
+            CompletionOperation::TurnIntent,
+            CompletionOperation::SkillAutoRoute,
+            CompletionOperation::VerificationJudge,
+        ] {
+            assert!(operation.is_typed_judgment());
         }
     }
 }

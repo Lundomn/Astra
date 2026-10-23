@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use astra_services::session_journal::{JournalEvent, JournalWriter};
@@ -10,7 +10,6 @@ use astra_services::session_workspace::{
 use serde::{Deserialize, Serialize};
 
 use astra_config::user_profile::{Scenario, UserProfile, UserProfileManager, UserProfileStore};
-use astra_core::delegation::DelegationOutcomeTracker;
 use astra_core::feedback::{FeedbackSignal, FeedbackSignalStore, SignalType};
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 
@@ -23,14 +22,8 @@ pub struct ObservabilityHub {
     /// Feedback signal store for observation and SelfModel inputs.
     feedback_signals: FeedbackSignalStore,
 
-    /// Delegation outcome tracker for coordination auto-select.
-    delegation_outcomes: DelegationOutcomeTracker,
-
     /// Active sessions.
     sessions: RwLock<HashMap<String, Arc<RwLock<ObservabilitySession>>>>,
-
-    /// High-failure tools surfaced for SelfModel reasoning.
-    low_confidence_tools: Mutex<Vec<(String, f64, u32)>>,
 }
 
 impl Default for ObservabilityHub {
@@ -46,9 +39,7 @@ impl ObservabilityHub {
         Self {
             profile_manager: UserProfileManager::new(profile_store),
             feedback_signals: FeedbackSignalStore::new(),
-            delegation_outcomes: DelegationOutcomeTracker::new(),
             sessions: RwLock::new(HashMap::new()),
-            low_confidence_tools: Mutex::new(Vec::new()),
         }
     }
 
@@ -62,14 +53,11 @@ impl ObservabilityHub {
 
         let profile_path = observability_storage_file(&storage_root, "profiles.json");
         let feedback_path = observability_storage_file(&storage_root, "feedback-signals.json");
-        let outcomes_path = observability_storage_file(&storage_root, "delegation-outcomes.json");
         let profile_store = Arc::new(UserProfileStore::with_storage(profile_path));
         Self {
             profile_manager: UserProfileManager::new(profile_store),
             feedback_signals: FeedbackSignalStore::with_storage(feedback_path),
-            delegation_outcomes: DelegationOutcomeTracker::with_storage(outcomes_path),
             sessions: RwLock::new(HashMap::new()),
-            low_confidence_tools: Mutex::new(Vec::new()),
         }
     }
 
@@ -115,7 +103,6 @@ impl ObservabilityHub {
             turns: session.turn_number,
             detected_scenario: session.profile.current_scenario,
             context_traces: session.context_traces.len() as u32,
-            decisions_explained: session.decision_explanations.len() as u32,
             fuzzy_match_events: session.fuzzy_match_events.len() as u32,
         })
     }
@@ -125,36 +112,6 @@ impl ObservabilityHub {
     /// Record a feedback signal for observation and SelfModel inputs.
     pub fn record_feedback(&self, signal: FeedbackSignal) {
         self.feedback_signals.record(signal);
-    }
-
-    /// Record a batch of streaming speculative tool execution metrics.
-    ///
-    /// Forwards the cumulative counters into the feedback signal store so that
-    /// speculation hit rate can be observed across a session.
-    ///
-    /// Also emits a structured `tracing::info!` event on target
-    /// `astra::streaming_speculation::metrics` for downstream log consumers.
-    pub fn record_streaming_speculation_metrics(
-        &self,
-        metrics: &astra_turn_core::streaming_tool_exec::StreamingSpeculationMetrics,
-    ) {
-        self.feedback_signals.record_streaming_speculation(
-            metrics.started,
-            metrics.hit,
-            metrics.discarded,
-            metrics.total_saved_ms,
-        );
-        tracing::info!(
-            target: "astra::streaming_speculation::metrics",
-            started = metrics.started,
-            hit = metrics.hit,
-            discarded = metrics.discarded,
-            inflight = metrics.inflight,
-            wasted = metrics.wasted(),
-            total_saved_ms = metrics.total_saved_ms,
-            hit_rate = metrics.hit_rate(),
-            "hub.record_streaming_speculation_metrics"
-        );
     }
 
     fn signal_with_session_context(
@@ -207,37 +164,6 @@ impl ObservabilityHub {
         ));
     }
 
-    // ─── Delegation Outcome Tracking ────────────────────────────────────────
-
-    /// Record a delegation outcome for coordination auto-select learning.
-    pub fn record_delegation_outcome(&self, scenario: &str, pattern: &str, succeeded: bool) {
-        self.delegation_outcomes
-            .record(scenario, pattern, succeeded);
-        if let Err(err) = self.delegation_outcomes.persist() {
-            tracing::warn!(
-                target: "astra.observability",
-                error = %err,
-                "delegation_outcomes persist failed"
-            );
-        }
-    }
-
-    /// Get the historically preferred coordination pattern for a scenario.
-    ///
-    /// Returns `None` if insufficient data (< `min_observations` executions).
-    pub fn preferred_delegation_pattern(
-        &self,
-        scenario: &str,
-        min_observations: u32,
-    ) -> Option<String> {
-        let stats = self.delegation_outcomes.stats_for_scenario(scenario);
-        stats
-            .iter()
-            .filter(|(_, s)| s.total() >= min_observations)
-            .max_by(|(_, a), (_, b)| a.success_rate().partial_cmp(&b.success_rate()).unwrap())
-            .map(|(pattern, _)| pattern.clone())
-    }
-
     // ─── Query Observation ──────────────────────────────────────────────────
 
     /// Observe a user query for non-semantic usage statistics.
@@ -248,32 +174,6 @@ impl ObservabilityHub {
     /// Observe a tool call (updates profile stats).
     pub fn observe_tool(&self, user_id: &str, tool_name: &str) {
         self.profile_manager.observe_tool(user_id, tool_name);
-    }
-
-    // ─── Low-Confidence Tools (SelfModel Signal) ────────────────────────────
-
-    /// Replace the current high-failure tool list (doesn't append). Also
-    /// mirrors the value into each active session so downstream snapshot
-    /// builders (e.g. SelfModel) can read it via the session handle.
-    pub fn record_low_confidence_tools(&self, entries: Vec<(String, f64, u32)>) {
-        if let Ok(mut guard) = self.low_confidence_tools.lock() {
-            *guard = entries.clone();
-        }
-        if let Ok(sessions) = self.sessions.read() {
-            for session in sessions.values() {
-                if let Ok(mut guard) = session.write() {
-                    guard.low_confidence_tools = entries.clone();
-                }
-            }
-        }
-    }
-
-    /// Get the current high-failure tool list.
-    pub fn low_confidence_tools(&self) -> Vec<(String, f64, u32)> {
-        self.low_confidence_tools
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default()
     }
 
     /// Return retained feedback signals from oldest to newest.
@@ -307,7 +207,6 @@ pub struct SessionSummary {
     pub turns: u32,
     pub detected_scenario: Option<Scenario>,
     pub context_traces: u32,
-    pub decisions_explained: u32,
     pub fuzzy_match_events: u32,
 }
 
@@ -441,19 +340,13 @@ pub fn latest_context_trace_signal(session: &ObservabilitySession) -> Option<Con
         total_tokens: trace.memory.total_tokens,
         latency_ms: trace.memory.retrieval_latency_ms,
     });
-    let history = (trace.history.total_turns_available > 0
-        || !trace.history.turns_retained.is_empty()
-        || !trace.history.turns_compressed.is_empty()
-        || !trace.history.turns_dropped.is_empty())
-    .then_some(ContextTraceHistorySignal {
-        total_turns_available: trace.history.total_turns_available,
-        retained_turns: trace.history.turns_retained.len(),
-        compressed_turns: trace.history.turns_compressed.len(),
-        dropped_turns: trace.history.turns_dropped.len(),
-        compression_ratio: trace.history.compression_ratio,
-        tokens_before: trace.history.tokens_before,
-        tokens_after: trace.history.tokens_after,
-    });
+    let history = trace
+        .history
+        .as_ref()
+        .map(|history| ContextTraceHistorySignal {
+            retained_groups: history.turns_retained.len(),
+            total_tokens: history.total_tokens,
+        });
     let budget = (trace.token_budget.max_tokens > 0 || trace.token_budget.total_used > 0)
         .then_some(ContextTraceBudgetSignal {
             max_tokens: trace.token_budget.max_tokens,
@@ -478,14 +371,6 @@ pub fn latest_context_trace_signal(session: &ObservabilitySession) -> Option<Con
         history,
         budget,
         timing,
-        explanations: trace
-            .explanations
-            .iter()
-            .filter_map(|explanation| {
-                let trimmed = explanation.reasoning.trim();
-                (!trimmed.is_empty()).then(|| trimmed.chars().take(200).collect::<String>())
-            })
-            .collect(),
     })
 }
 

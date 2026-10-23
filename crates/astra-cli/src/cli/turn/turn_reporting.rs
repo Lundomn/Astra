@@ -1,34 +1,11 @@
 //! Final turn reporting, status lines, and summary rendering.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::cli::session::session_state::SessionState;
-use crate::cli::stream::streaming_types::StreamResult;
+use crate::cli::stream::streaming_types::{StreamResult, UsageAttribution};
 use astra_services::session_journal;
-use astra_turn_core::evaluation::TurnEvaluation;
 use crossterm::style::Stylize;
-
-pub(crate) fn compact_token_count(tokens: u64) -> String {
-    if tokens > 1000 {
-        format!("{:.1}k", tokens as f64 / 1000.0)
-    } else {
-        format!("{tokens}")
-    }
-}
-
-pub(crate) fn cache_hit_percentage(
-    prompt_tokens: u64,
-    cache_read_tokens: u64,
-    cache_creation_tokens: u64,
-) -> f64 {
-    let total_input = astra_turn_types::NormalizedPromptCacheUsage::new(
-        prompt_tokens,
-        cache_read_tokens,
-        cache_creation_tokens,
-    )
-    .total_input_tokens();
-    cache_read_tokens as f64 / total_input.max(1) as f64 * 100.0
-}
 
 /// Build a compact tool-call summary for cross-turn context continuity.
 ///
@@ -98,87 +75,13 @@ pub(crate) fn build_history_text(
 pub(crate) fn print_turn_status_line(
     state: &SessionState,
     result: &StreamResult,
-    evaluation: Option<&TurnEvaluation>,
     turn_start: Instant,
 ) {
     if state.tui_render_policy.is_some() {
         return;
     }
-    let elapsed = turn_start.elapsed();
-    let elapsed_str = if elapsed.as_secs() >= 60 {
-        format!("{}m{:.0}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
-    } else {
-        format!("{:.1}s", elapsed.as_secs_f64())
-    };
-
-    let normalized_input = astra_turn_types::NormalizedPromptCacheUsage::new(
-        result.prompt_tokens,
-        result.cache_read_tokens,
-        result.cache_creation_tokens,
-    );
-    let total_input = normalized_input.total_input_tokens();
-    let total_tokens = normalized_input.total_tokens_with_output(result.completion_tokens);
-    let tokens_str = compact_token_count(total_tokens);
-    let prompt_short = compact_token_count(total_input);
-    let completion_short = compact_token_count(result.completion_tokens);
-
-    let turn_cost = crate::cli::slash::slash_stats::cost_for_tokens(
-        result.prompt_tokens,
-        result.completion_tokens,
-        result.cache_read_tokens,
-        result.cache_creation_tokens,
-        &state.cached_pricing,
-    );
-
-    let mut parts = Vec::new();
-    if let Some(model) = state.model.as_ref() {
-        parts.push(format!("model:{model}"));
-    }
-    parts.push(format!(
-        "tokens:{tokens_str} (↑{prompt_short} ↓{completion_short})"
-    ));
-    if turn_cost > 0.0 {
-        parts.push(crate::cli::slash::slash_stats::format_cost(turn_cost));
-    }
-    parts.push(elapsed_str);
-    if let Some(ttft) = result.ttft_ms
-        && ttft > 0
-    {
-        parts.push(format!("ttft:{ttft}ms"));
-    }
-    if result.tool_calls_count > 0 {
-        parts.push(format!(
-            "{} tool{}",
-            result.tool_calls_count,
-            if result.tool_calls_count == 1 {
-                ""
-            } else {
-                "s"
-            }
-        ));
-    }
-    if result.cache_read_tokens > 0 {
-        let cache_pct = cache_hit_percentage(
-            result.prompt_tokens,
-            result.cache_read_tokens,
-            result.cache_creation_tokens,
-        );
-        parts.push(format!("cache:{cache_pct:.0}%"));
-    }
-
-    eprintln!("{}", format!("  ─ {} ─", parts.join(" │ ")).dim());
-
-    let session_cost = state.total_session_cost + turn_cost;
-    if session_cost > 0.0 && state.turn > 0 {
-        eprintln!(
-            "{}",
-            format!(
-                "  session: {}",
-                crate::cli::slash::slash_stats::format_cost(session_cost)
-            )
-            .dim()
-        );
-    }
+    let parts = compact_completion_parts(state, result, turn_start.elapsed());
+    eprintln!("{}", format!("  ─ {} ─", parts.join(" · ")).dim());
     if let Some(error) = state
         .session_persistence_error
         .as_deref()
@@ -194,9 +97,7 @@ pub(crate) fn print_turn_status_line(
     if let Some(notice) = interruption_status_notice(result) {
         eprintln!("{}", format!("  ⚠ {notice}").yellow());
     }
-    if let Some(notice) =
-        evaluation.and_then(astra_turn_core::evaluation::turn_evaluation_status_notice)
-    {
+    if let Some(notice) = evaluation_status_notice_for_result(result) {
         eprintln!("{}", format!("  ⚠ {notice}").yellow());
     }
     print_context_window_warning(result.budget_pressure);
@@ -205,6 +106,223 @@ pub(crate) fn print_turn_status_line(
         .map(|(columns, _)| columns as usize)
         .unwrap_or(80);
     eprintln!("{}", "─".repeat(width.min(72)).dim());
+}
+
+fn compact_completion_parts(
+    _state: &SessionState,
+    result: &StreamResult,
+    elapsed: Duration,
+) -> Vec<String> {
+    let elapsed_str = if elapsed.as_secs() >= 60 {
+        format!("{}m{:.0}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
+    } else {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    };
+
+    let mut parts = vec![format!("{elapsed_str} total")];
+    if let Some(ttft_ms) = result.ttft_ms.filter(|ttft_ms| *ttft_ms > 0) {
+        parts.push(format!("ttft {}", format_duration_ms(ttft_ms)));
+    }
+    if let Some(usage) = primary_usage_summary(result) {
+        parts.push(usage);
+    }
+    if result.tool_calls_count > 0 {
+        parts.push(format!(
+            "{} tool{}",
+            result.tool_calls_count,
+            if result.tool_calls_count == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+    parts
+}
+
+/// Compact, user-facing primary-model usage. Auxiliary calls and session
+/// lifetime totals belong to Explain Analyze; they must not be folded into
+/// this per-turn marker.
+pub(crate) fn format_primary_usage_summary(
+    tokens_in: Option<u64>,
+    tokens_out: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cache_creation_tokens: Option<u64>,
+    observed: bool,
+    complete: bool,
+    input_complete: bool,
+) -> Option<String> {
+    let has_lane = tokens_in.is_some()
+        || tokens_out.is_some()
+        || cache_read_tokens.is_some()
+        || cache_creation_tokens.is_some();
+    if !observed && !has_lane {
+        return None;
+    }
+    if !has_lane {
+        return Some("main usage unavailable".to_string());
+    }
+
+    let total = tokens_in
+        .unwrap_or(0)
+        .saturating_add(tokens_out.unwrap_or(0))
+        .saturating_add(cache_read_tokens.unwrap_or(0))
+        .saturating_add(cache_creation_tokens.unwrap_or(0));
+    let mut summary = format!("{} tokens", format_usage_count(total, complete));
+    if let Some(cache) = format_cache_usage_summary(
+        tokens_in,
+        cache_read_tokens,
+        cache_creation_tokens,
+        input_complete,
+    ) {
+        summary.push_str(&format!(" · {cache}"));
+    }
+    Some(summary)
+}
+
+/// Shared CLI/TUI cache presentation.
+///
+/// Only a complete attribution can report a whole-turn cache rate. Partial
+/// counters remain useful as lower bounds, but their ratio is misleading.
+pub(crate) fn format_cache_usage_summary(
+    fresh: Option<u64>,
+    cache_read: Option<u64>,
+    cache_creation: Option<u64>,
+    complete: bool,
+) -> Option<String> {
+    let cache_read = cache_read?;
+    if !complete && cache_read == 0 {
+        return None;
+    }
+    let Some(fresh) = fresh else {
+        return Some(format!(
+            "{} cached",
+            format_usage_count(cache_read, complete)
+        ));
+    };
+
+    let known_input = u128::from(fresh)
+        .saturating_add(u128::from(cache_read))
+        .saturating_add(u128::from(cache_creation.unwrap_or(0)));
+    if complete
+        && cache_creation.is_some()
+        && let Some(percent) = (u128::from(cache_read) * 100).checked_div(known_input)
+    {
+        return Some(format!("{percent}% cached"));
+    }
+    if complete && cache_creation.is_some() && known_input == 0 {
+        return Some("0 cached".to_string());
+    }
+    Some(format!(
+        "{} cached",
+        format_usage_count(cache_read, complete)
+    ))
+}
+
+/// Partial sums are lower bounds. Truncate their compact decimal so rounding
+/// cannot advertise a larger lower bound than the provider actually reported.
+pub(crate) fn format_usage_count(tokens: u64, complete: bool) -> String {
+    if complete {
+        return format_token_count(tokens);
+    }
+    let count = if tokens >= 1_000_000 {
+        format!(
+            "{}.{:01}M",
+            tokens / 1_000_000,
+            tokens % 1_000_000 / 100_000
+        )
+    } else if tokens >= 1_000 {
+        format!("{}.{:01}k", tokens / 1_000, tokens % 1_000 / 100)
+    } else {
+        tokens.to_string()
+    };
+    format!("≥{count}")
+}
+
+/// The only usage facts eligible for the compact primary-model summary. Raw
+/// counters without attribution remain observable, but are deliberately not
+/// presented as belonging to the selected model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PrimaryUsageProjection {
+    pub fresh_input_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub observed: bool,
+    pub complete: bool,
+    pub input_complete: bool,
+}
+
+pub(crate) fn project_primary_usage(
+    attribution: &UsageAttribution,
+    raw_usage_observed: bool,
+) -> PrimaryUsageProjection {
+    let primary = attribution.primary;
+    PrimaryUsageProjection {
+        fresh_input_tokens: primary.and_then(|usage| usage.fresh_input_tokens),
+        cache_read_tokens: primary.and_then(|usage| usage.cache_read_tokens),
+        cache_creation_tokens: primary.and_then(|usage| usage.cache_creation_tokens),
+        output_tokens: primary.and_then(|usage| usage.output_tokens),
+        observed: attribution.has_observed_state() || raw_usage_observed,
+        complete: primary.is_some() && attribution.primary_complete,
+        input_complete: primary.is_some() && attribution.primary_input_complete,
+    }
+}
+
+fn primary_usage_summary(result: &StreamResult) -> Option<String> {
+    let attribution = &result.usage_attribution;
+    let raw_has_values = result.prompt_tokens > 0
+        || result.completion_tokens > 0
+        || result.cache_read_tokens > 0
+        || result.cache_creation_tokens > 0;
+    let capture_observed =
+        result.token_usage_coverage.attempts > 0 || result.token_usage_coverage.unavailable > 0;
+    let projection = project_primary_usage(attribution, raw_has_values || capture_observed);
+    format_primary_usage_summary(
+        projection.fresh_input_tokens,
+        projection.output_tokens,
+        projection.cache_read_tokens,
+        projection.cache_creation_tokens,
+        projection.observed,
+        projection.complete,
+        projection.input_complete,
+    )
+}
+
+fn format_duration_ms(ms: u64) -> String {
+    if ms >= 60_000 {
+        format!("{}m {}s", ms / 60_000, (ms % 60_000) / 1_000)
+    } else {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    }
+}
+
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// A typed terminal result owns the user-visible completion state.  The raw
+/// tool ledger remains useful evidence, but it must not reopen a completed
+/// assessment after runtime reconciliation has already accepted it.  When a
+/// turn is interrupted or explicitly marked unverified, use the semantic
+/// record-aware evaluator to explain the remaining obligation.
+fn evaluation_status_notice_for_result(result: &StreamResult) -> Option<&str> {
+    if result.final_state == "completed" && !result.server_terminal_unverified {
+        return None;
+    }
+    result
+        .turn_evaluation
+        .as_ref()?
+        .metadata
+        .as_ref()?
+        .get("status_notice")?
+        .as_str()
 }
 
 pub(crate) fn interruption_status_notice(result: &StreamResult) -> Option<String> {
@@ -267,13 +385,11 @@ pub(crate) fn print_context_window_warning(budget_pressure: f64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_history_text, build_turn_tool_summary, cache_hit_percentage, compact_token_count,
-        interruption_status_notice,
+        build_history_text, build_turn_tool_summary, compact_completion_parts,
+        evaluation_status_notice_for_result, interruption_status_notice,
     };
     use astra_services::session_journal;
-    use astra_turn_core::evaluation::{
-        EvalSignal, EvaluationThresholds, TurnEvaluation, turn_evaluation_status_notice,
-    };
+    use std::time::Duration;
 
     fn make_record(
         name: &str,
@@ -289,34 +405,30 @@ mod tests {
     }
 
     #[test]
-    fn turn_evaluation_notice_reports_unresolved_outcome_failure() {
-        let eval = TurnEvaluation {
-            success: false,
-            quality: 0.2,
-            confidence: 0.9,
-            signals: vec![EvalSignal::ToolOutcomeFailure {
-                class: "test_failure".to_string(),
-                count: 1,
-            }],
-            thresholds: EvaluationThresholds::default(),
-        };
-
-        let notice = turn_evaluation_status_notice(&eval).expect("notice");
-        assert!(notice.contains("test_failure x1"));
-        assert!(notice.contains("incomplete"));
-    }
-
-    #[test]
-    fn turn_evaluation_notice_ignores_successful_turn() {
-        let eval = TurnEvaluation {
-            success: true,
-            quality: 0.8,
-            confidence: 0.7,
-            signals: vec![EvalSignal::AllToolsHealthy],
-            thresholds: EvaluationThresholds::default(),
-        };
-
-        assert!(turn_evaluation_status_notice(&eval).is_none());
+    fn status_notice_consumes_server_fact_without_reinterpreting_partial_records() {
+        let mut result = crate::tests::stub_stream_result("");
+        result.final_state = "interrupted".into();
+        result.server_terminal_unverified = true;
+        assert!(evaluation_status_notice_for_result(&result).is_none());
+        let mut event = session_journal::JournalEvent::base_public(
+            session_journal::JournalEventType::TurnEvaluation,
+            Some("session"),
+        );
+        event.metadata =
+            Some(serde_json::json!({"status_notice":"Server validation remains incomplete"}));
+        result.turn_evaluation = Some(event);
+        assert_eq!(
+            evaluation_status_notice_for_result(&result),
+            Some("Server validation remains incomplete")
+        );
+        result.tool_call_records = vec![make_record("bash", true, None)];
+        assert_eq!(
+            evaluation_status_notice_for_result(&result),
+            Some("Server validation remains incomplete")
+        );
+        result.final_state = "completed".into();
+        result.server_terminal_unverified = false;
+        assert!(evaluation_status_notice_for_result(&result).is_none());
     }
 
     #[test]
@@ -345,6 +457,183 @@ mod tests {
             interruption_status_notice(&result).as_deref(),
             Some("[context_budget] Turn interrupted. You can continue in the next message.")
         );
+    }
+
+    #[test]
+    fn interruption_status_notice_labels_answer_separately_from_unverified_execution() {
+        let mut result = crate::tests::stub_stream_result("partial answer");
+        result.interruption_kind = Some("execution_incomplete".into());
+        result.interruption = Some(serde_json::json!({
+            "kind": "execution_incomplete",
+            "resumable": true,
+            "user_message": "Execution did not reach a verified terminal state. Review the available execution evidence, then continue to reconcile the unfinished work."
+        }));
+
+        let notice = interruption_status_notice(&result).expect("notice");
+        assert!(!notice.starts_with("Partial answer shown."));
+        assert!(notice.contains("verified terminal state"));
+        assert_eq!(result.full_text, "partial answer");
+    }
+
+    #[test]
+    fn unclassified_overall_is_not_presented_as_primary_usage() {
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.model = Some("deepseek-flash".into());
+        let mut result = crate::tests::stub_stream_result("answer");
+        result.prompt_tokens = 87_900;
+        result.cache_read_tokens = 75_000;
+        result.completion_tokens = 9;
+        result.tool_calls_count = 1;
+
+        assert_eq!(
+            compact_completion_parts(&state, &result, Duration::from_millis(8_500)),
+            vec![
+                "8.5s total".to_string(),
+                "main usage unavailable".to_string(),
+                "1 tool".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn complete_primary_metrics_show_cache_rate_but_not_auxiliary_details() {
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.model = Some("deepseek-flash".into());
+        let mut result = crate::tests::stub_stream_result("answer");
+        result.ttft_ms = Some(1_250);
+        result.usage_attribution.primary =
+            Some(crate::cli::stream::streaming_types::AttributedTokenUsage {
+                fresh_input_tokens: Some(100),
+                cache_read_tokens: Some(900),
+                cache_creation_tokens: Some(0),
+                output_tokens: Some(9),
+            });
+        result.usage_attribution.primary_complete = true;
+        result.usage_attribution.primary_input_complete = true;
+        result.usage_attribution.primary_model = Some("deepseek-flash".into());
+
+        assert_eq!(
+            compact_completion_parts(&state, &result, Duration::from_millis(5_200)),
+            vec![
+                "5.2s total".to_string(),
+                "ttft 1.2s".to_string(),
+                "1.0k tokens · 90% cached".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn incomplete_primary_metrics_do_not_claim_a_cache_rate() {
+        let state = crate::cli::session::session_state::SessionState::default();
+        let mut result = crate::tests::stub_stream_result("answer");
+        result.usage_attribution.primary =
+            Some(crate::cli::stream::streaming_types::AttributedTokenUsage {
+                fresh_input_tokens: Some(100),
+                cache_read_tokens: Some(900),
+                cache_creation_tokens: Some(0),
+                output_tokens: Some(20),
+            });
+        result.usage_attribution.primary_complete = false;
+
+        let parts = compact_completion_parts(&state, &result, Duration::from_millis(5_200));
+        assert!(parts.contains(&"≥1.0k tokens · ≥900 cached".to_string()));
+    }
+
+    #[test]
+    fn observed_partial_usage_keeps_cache_count_without_rate() {
+        assert_eq!(
+            super::format_primary_usage_summary(
+                Some(10_392),
+                Some(926),
+                Some(34_944),
+                Some(0),
+                true,
+                false,
+                false,
+            )
+            .as_deref(),
+            Some("≥46.2k tokens · ≥34.9k cached")
+        );
+    }
+
+    #[test]
+    fn primary_attempt_without_usage_is_not_presented_as_zero() {
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.model = Some("deepseek-flash".into());
+        let mut result = crate::tests::stub_stream_result("answer");
+        result.usage_attribution.primary_attempts = 1;
+        result.usage_attribution.primary_model = Some("deepseek-flash".into());
+
+        assert!(
+            compact_completion_parts(&state, &result, Duration::from_millis(900))
+                .contains(&"main usage unavailable".to_string())
+        );
+        assert!(
+            !compact_completion_parts(&state, &result, Duration::from_millis(900))
+                .iter()
+                .any(|part| part.contains("tokens"))
+        );
+    }
+
+    #[test]
+    fn explicit_zero_cache_lane_renders_zero_percent() {
+        assert_eq!(
+            super::format_primary_usage_summary(
+                Some(100),
+                Some(9),
+                Some(0),
+                Some(0),
+                true,
+                true,
+                true
+            )
+            .as_deref(),
+            Some("109 tokens · 0% cached")
+        );
+    }
+
+    #[test]
+    fn complete_input_keeps_cache_rate_when_output_is_unknown() {
+        assert_eq!(
+            super::format_primary_usage_summary(
+                Some(100),
+                None,
+                Some(900),
+                Some(0),
+                true,
+                false,
+                true
+            )
+            .as_deref(),
+            Some("≥1.0k tokens · 90% cached")
+        );
+    }
+
+    #[test]
+    fn cache_summary_distinguishes_unknown_zero_partial_and_complete() {
+        assert_eq!(super::format_usage_count(19_999, false), "≥19.9k");
+        assert_eq!(super::format_usage_count(1_999_999, false), "≥1.9M");
+        assert_eq!(super::format_usage_count(19_999, true), "20.0k");
+        for (fresh, read, write, complete, expected) in [
+            (Some(100), None, None, false, None),
+            (Some(100), Some(0), None, false, None),
+            (None, Some(900), None, false, Some("≥900 cached")),
+            (Some(100), Some(900), Some(1000), false, Some("≥900 cached")),
+            (Some(100), Some(900), Some(1000), true, Some("45% cached")),
+            (Some(0), Some(0), Some(0), true, Some("0 cached")),
+            (
+                Some(u64::MAX),
+                Some(u64::MAX),
+                Some(0),
+                true,
+                Some("50% cached"),
+            ),
+        ] {
+            assert_eq!(
+                super::format_cache_usage_summary(fresh, read, write, complete).as_deref(),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -455,42 +744,5 @@ mod tests {
     fn history_text_noop_without_tool_summary() {
         let full_text = "No tools used.";
         assert_eq!(build_history_text(full_text, &[]), full_text);
-    }
-
-    #[test]
-    fn cache_hit_percentage_formula() {
-        let cache_pct = cache_hit_percentage(200, 800, 0);
-        assert!((cache_pct - 80.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn cache_hit_percentage_zero_when_no_cache() {
-        let cache_pct = cache_hit_percentage(1000, 0, 0);
-        assert!((cache_pct - 0.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn cache_hit_percentage_with_heavy_cache_creation() {
-        let cache_pct = cache_hit_percentage(12, 29_816, 38_788);
-        assert!(
-            (cache_pct - 43.5).abs() < 1.0,
-            "expected ~43.5%, got {cache_pct:.1}%"
-        );
-    }
-
-    #[test]
-    fn cache_hit_percentage_100_only_when_all_input_was_cache_read() {
-        let cache_pct = cache_hit_percentage(0, 5000, 0);
-        assert!((cache_pct - 100.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn compact_token_count_below_1k() {
-        assert_eq!(compact_token_count(999), "999");
-    }
-
-    #[test]
-    fn compact_token_count_above_1k() {
-        assert_eq!(compact_token_count(12_500), "12.5k");
     }
 }

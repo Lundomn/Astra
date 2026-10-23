@@ -8,7 +8,7 @@
 //! Individual components (stall.rs, tool_health.rs, error_recovery.rs)
 //! remain independent and testable; this module composes them.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -16,16 +16,15 @@ use crate::chat_turn_heuristics::TaskExecutionProfile;
 use crate::cloud::approval_policy::CLOUD_APPROVAL_REQUIRED_TOOLS;
 use crate::error_recovery::{self, EscalationLevel, SessionErrorSummary};
 use crate::result_quality::{self, ResultQuality};
-use crate::stall::{self, DivergenceStatus, StallReflection};
-use crate::tool::args::shape::tool_call_name;
+use crate::stall::{self, DivergenceStatus};
 use crate::tool::health::ToolHealthTracker;
 
 /// Advisory verdict for the current turn.
 #[derive(Debug, Clone)]
 pub struct TurnVerdict {
-    /// Messages to inject into the conversation before the next LLM call.
+    /// Audit descriptions of observed recovery signals, not delivery receipts.
     pub injections: Vec<String>,
-    /// Tools the LLM should be told to avoid.
+    /// Tools associated with advisory recovery evidence; not restrictions.
     pub avoid_tools: Vec<String>,
     /// Overall severity level of the verdict.
     pub severity: VerdictSeverity,
@@ -53,79 +52,6 @@ pub enum VerdictSeverity {
     Critical,
 }
 
-/// A record of a correction issued by TurnGuard during `evaluate`.
-/// Captures what was asked of the agent so compliance can be checked later.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CorrectionRecord {
-    /// Turn number (0-indexed) at which the correction was issued.
-    pub turn: u32,
-    /// Examples: "stall_nudge", "divergence", "health_avoidance", "cache_waste".
-    pub correction_type: String,
-    /// Tools the agent was told to avoid.
-    pub avoid_tools: Vec<String>,
-    /// Alternative tools or approaches suggested.
-    pub suggested_alternatives: Vec<String>,
-}
-
-/// Outcome of a prior `CorrectionRecord`, evaluated after the agent's next action.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CorrectionOutcome {
-    /// The correction that was issued.
-    pub record: CorrectionRecord,
-    /// Did the agent avoid the tools listed in `avoid_tools`?
-    pub followed: bool,
-    /// Did the agent use any of the `suggested_alternatives`?
-    pub used_alternative: bool,
-    /// Did the turn immediately after the correction succeed (severity <= Info)?
-    pub next_turn_succeeded: bool,
-    /// Whether `next_turn_succeeded` has been resolved (set on the first
-    /// evaluate() after the correction). Prevents later turns from
-    /// retroactively flipping the outcome.
-    pub resolved: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LatestRoundBehavior {
-    assessment: stall::RewardHackingAssessment,
-    avoid_tools: Vec<String>,
-}
-
-impl Default for LatestRoundBehavior {
-    fn default() -> Self {
-        Self {
-            assessment: stall::RewardHackingAssessment {
-                risk: 0.0,
-                flags: Vec::new(),
-            },
-            avoid_tools: Vec::new(),
-        }
-    }
-}
-
-impl LatestRoundBehavior {
-    fn from_calls(calls: &[serde_json::Value]) -> Self {
-        let assessment = stall::assess_reward_hacking(calls, 0.0, None)
-            .unwrap_or_else(|error| {
-                tracing::warn!(target: "turn_guard", %error, "reward hacking assessment failed; using zero risk");
-                Self::default().assessment
-            });
-        let avoid_tools = if assessment.risk >= stall::ACTIVE_REWARD_HACKING_RISK_THRESHOLD
-            && !assessment.flags.is_empty()
-        {
-            stall::reward_hacking_avoid_tools(calls)
-        } else {
-            Vec::new()
-        };
-        Self {
-            assessment,
-            avoid_tools,
-        }
-    }
-}
-
 /// Session-scoped turn guard state.
 /// Accumulates signals across turns and composes non-happy-path decisions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,17 +61,13 @@ pub struct TurnGuard {
     task_profile: TaskExecutionProfile,
     /// Per-turn tool call signatures for stall/divergence detection.
     pub tool_sigs: Vec<BTreeSet<crate::stall::StallSignature>>,
-    /// Classified latest-round behavior; raw tool arguments are not retained.
-    latest_behavior: LatestRoundBehavior,
     /// How many stall nudges have been sent this session.
     pub nudge_count: usize,
     /// Per-tool health tracker.
     pub health: ToolHealthTracker,
     /// Session-level error summary.
     pub errors: SessionErrorSummary,
-    /// The last stall reflection sent (for nudge-ignore detection).
-    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
-    last_reflection: Option<StallReflection>,
+
     /// Consecutive turns at Critical escalation. The first emits recovery
     /// guidance; later turns raise evidence strength without stopping.
     critical_turns: usize,
@@ -166,21 +88,11 @@ pub struct TurnGuard {
     /// Fingerprint of the most recently emitted escalation guidance.
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     last_escalation_fingerprint: Option<String>,
-    /// Correction issued on the most recent `evaluate` call, awaiting compliance check.
-    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
-    pub pending_correction: Option<CorrectionRecord>,
-    /// Decision statistics plus the only outcome that can still be resolved.
-    corrections: CorrectionTracking,
-    /// Adaptive thresholds tuned by correction effectiveness.
-    adaptive_thresholds: stall::AdaptiveStallThresholds,
     /// Monotonic turn-local epoch for observations whose
     /// result depends on workspace state. Successful workspace mutations
     /// advance the epoch. Recovery preserves this grouping token, not cached
     /// results. It is never durable workspace identity or reuse authority.
     workspace_epoch: u64,
-    /// Validation command attempts observed in the current workspace epoch,
-    /// keyed by a normalized validation prefix.
-    validation_attempts_since_workspace_mutation: HashMap<String, u32>,
 }
 
 /// Check if a tool is read-only and must never be restricted.
@@ -215,53 +127,50 @@ fn health_avoidance_warning_for_tools(tools: &[String]) -> Option<String> {
 }
 
 impl TurnGuard {
+    /// Read current recovery state without evaluating or mutating the guard.
+    /// Canonical policy may retain this snapshot, never a second health tracker.
+    #[must_use]
+    pub fn recovery_evidence(&self) -> Option<crate::context_feedback::RuntimeRecoveryEvidence> {
+        use crate::context_feedback::RuntimeRecoveryEvidence;
+
+        fn bound_names(mut names: Vec<&str>) -> (Vec<String>, u32) {
+            names.sort_unstable();
+            names.dedup();
+            let total = names.len();
+            let included = names
+                .into_iter()
+                .filter(|name| RuntimeRecoveryEvidence::valid_tool_name(name))
+                .take(RuntimeRecoveryEvidence::MAX_TOOLS)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let omitted = u32::try_from(total - included.len()).unwrap_or(u32::MAX);
+            (included, omitted)
+        }
+
+        let cautioned = avoidable_health_avoidance_tools(&self.health);
+        let (cautioned_tools, omitted_cautioned) =
+            bound_names(cautioned.iter().map(String::as_str).collect());
+        let (timeout_dominant_tools, omitted_timeouts) =
+            bound_names(self.health.timeout_dominant_tools());
+        let evidence = RuntimeRecoveryEvidence {
+            error_pressure: u32::try_from(self.errors.recent_error_pressure()).unwrap_or(u32::MAX),
+            timeout_pressure: u32::try_from(
+                self.errors
+                    .recent_error_count(error_recovery::ErrorCategory::ToolTimeout),
+            )
+            .unwrap_or(u32::MAX),
+            cautioned_tools,
+            timeout_dominant_tools,
+            omitted_tools: omitted_cautioned.saturating_add(omitted_timeouts),
+        };
+        evidence.is_valid().then_some(evidence)
+    }
+
     /// Validate same-execution facts at the checkpoint boundary. This is not a
     /// fresh-session import and must not reset pressure, permissions or epochs.
     pub fn validate_continuation(&self) -> Result<(), &'static str> {
-        let totals = &self.corrections.totals;
-        if [
-            totals.followed,
-            totals.used_alternative,
-            totals.succeeded,
-            totals.effective,
-        ]
-        .iter()
-        .any(|count| *count > totals.total)
-            || totals.effective > totals.followed.min(totals.succeeded)
-            || totals.followed - totals.effective > totals.total - totals.succeeded
-            || totals
-                .total
-                .checked_add(usize::from(self.corrections.latest.is_some()))
-                .is_none()
-        {
-            return Err("invalid correction totals");
-        }
-        if self
-            .corrections
-            .latest
-            .as_ref()
-            .is_some_and(|latest| !latest.resolved && latest.next_turn_succeeded)
-        {
-            return Err("unresolved correction cannot already have succeeded");
-        }
-        let assessment = &self.latest_behavior.assessment;
-        if !assessment.risk.is_finite()
-            || !(0.0..=1.0).contains(&assessment.risk)
-            || ((assessment.risk < stall::ACTIVE_REWARD_HACKING_RISK_THRESHOLD
-                || assessment.flags.is_empty())
-                && !self.latest_behavior.avoid_tools.is_empty())
-        {
-            return Err("invalid latest behavior assessment");
-        }
-        if self.last_reflection.as_ref().is_some_and(|reflection| {
-            !reflection.confidence.is_finite() || !(0.0..=1.0).contains(&reflection.confidence)
-        }) {
-            return Err("invalid reflection confidence");
-        }
         if self.task_profile.stall_window == 0
             || self.task_profile.exploration_round_window == 0
-            || self.adaptive_thresholds.stall_window == 0
-            || self.adaptive_thresholds.max_exploration_rounds == 0
             || self
                 .task_profile
                 .stall_window
@@ -270,13 +179,6 @@ impl TurnGuard {
                 .is_none()
         {
             return Err("invalid detection window");
-        }
-        if self
-            .validation_attempts_since_workspace_mutation
-            .values()
-            .any(|count| *count == 0)
-        {
-            return Err("invalid validation attempt count");
         }
         if self
             .health
@@ -315,11 +217,10 @@ impl TurnGuard {
         Self {
             task_profile,
             tool_sigs: Vec::new(),
-            latest_behavior: LatestRoundBehavior::default(),
             nudge_count: 0,
             health: ToolHealthTracker::new(),
             errors: SessionErrorSummary::new(),
-            last_reflection: None,
+
             critical_turns: 0,
             critical_recovery_turns: 0,
             consecutive_warnings: 0,
@@ -328,11 +229,7 @@ impl TurnGuard {
             last_health_avoidance_warning_fingerprint: None,
             last_cache_warning_fingerprint: None,
             last_escalation_fingerprint: None,
-            pending_correction: None,
-            corrections: CorrectionTracking::default(),
-            adaptive_thresholds: stall::AdaptiveStallThresholds::default(),
             workspace_epoch: 0,
-            validation_attempts_since_workspace_mutation: HashMap::new(),
         }
     }
 
@@ -368,75 +265,21 @@ impl TurnGuard {
 
     /// Advance the workspace observation epoch after a successful mutation.
     ///
-    /// Validation attempts are scoped to an epoch: after a real mutation, the
-    /// same validation command can produce new evidence and must not inherit
-    /// stale retry pressure from the previous workspace state.
+    /// A real mutation invalidates observations tied to the previous epoch.
     pub fn record_workspace_mutation(&mut self) {
         self.workspace_epoch = self.workspace_epoch.saturating_add(1);
-        self.validation_attempts_since_workspace_mutation.clear();
-    }
-
-    /// Number of attempts already recorded for a normalized validation prefix
-    /// in the current workspace epoch.
-    #[must_use]
-    pub fn validation_attempts_since_workspace_mutation(&self, prefix: &str) -> u32 {
-        self.validation_attempts_since_workspace_mutation
-            .get(prefix)
-            .copied()
-            .unwrap_or_default()
-    }
-
-    /// Record that a validation command is about to execute in this workspace
-    /// epoch. Returns the updated attempt count.
-    pub fn record_validation_attempt(&mut self, prefix: &str) -> u32 {
-        let count = self
-            .validation_attempts_since_workspace_mutation
-            .entry(prefix.to_string())
-            .or_default();
-        *count = count.saturating_add(1);
-        *count
     }
 
     pub fn stall_window(&self) -> usize {
-        // Adaptive threshold overrides the static profile when corrections
-        // have been ineffective (window widens to reduce false positives).
-        self.adaptive_thresholds
+        // Preserve the baseline floor without adapting it from unobserved
+        // correction compliance.
+        self.task_profile
             .stall_window
-            .max(self.task_profile.stall_window)
+            .max(stall::SERVER_STALL_WINDOW)
     }
 
     /// Record tool call signatures for this turn.
-    ///
-    /// Also resolves any `pending_correction` by checking whether the agent
-    /// complied with the avoid-list and used suggested alternatives.
     pub fn record_tool_calls(&mut self, tool_calls: &[serde_json::Value]) {
-        self.latest_behavior = LatestRoundBehavior::from_calls(tool_calls);
-
-        if let Some(correction) = self.pending_correction.take() {
-            let current_tools: HashSet<String> = tool_calls
-                .iter()
-                .filter_map(|tc| tool_call_name(tc).map(String::from))
-                .collect();
-
-            let followed = !correction
-                .avoid_tools
-                .iter()
-                .any(|t| current_tools.contains(t));
-
-            let used_alternative = correction
-                .suggested_alternatives
-                .iter()
-                .any(|alt| current_tools.contains(alt));
-
-            self.corrections.record(CorrectionOutcome {
-                record: correction,
-                followed,
-                used_alternative,
-                next_turn_succeeded: false, // resolved once at next evaluate()
-                resolved: false,
-            });
-        }
-
         let window = self
             .task_profile
             .stall_window
@@ -475,9 +318,25 @@ impl TurnGuard {
         result_str: &str,
         source_error_kind: Option<astra_core::ErrorKind>,
     ) -> ResultQuality {
-        let quality = match result_quality::classify_result(result_str) {
-            ResultQuality::Error => ResultQuality::Success,
-            other => other,
+        use crate::orchestration::agent_result_wire::{
+            DecodedAgentToolResult, agent_control_result_value, decode_agent_tool_result,
+        };
+        let admitted_control = tool_name == "agent"
+            && agent_control_result_value(result_str).is_some_and(|value| {
+                matches!(
+                    decode_agent_tool_result(&value),
+                    Some(DecodedAgentToolResult::ControlReceipt(_))
+                )
+            });
+        // An accepted coordination operation is meaningful, even without a
+        // finished child result. This does not promote it to child completion.
+        let quality = if admitted_control {
+            ResultQuality::Success
+        } else {
+            match result_quality::classify_result(result_str) {
+                ResultQuality::Error => ResultQuality::Success,
+                other => other,
+            }
         };
         self.record_tool_result_quality_with_kind(tool_name, source_error_kind, quality)
     }
@@ -603,17 +462,15 @@ impl TurnGuard {
     /// Clear episode-scoped pressure while preserving durable diagnostics.
     ///
     /// Tool health and lifetime error counters describe facts that may still
-    /// be useful later. Nudge pressure, pending corrections, critical streaks,
+    /// be useful later. Nudge pressure, critical streaks,
     /// and recent error pressure describe the current failure episode; carrying
     /// them after recovery makes long sessions increasingly brittle.
     pub fn clear_transient_pressure(&mut self) {
         self.nudge_count = 0;
-        self.last_reflection = None;
         self.critical_turns = 0;
         self.critical_recovery_turns = 0;
         self.consecutive_warnings = 0;
         self.round_had_error = false;
-        self.pending_correction = None;
         self.errors.clear_recent_pressure();
     }
 
@@ -623,20 +480,17 @@ impl TurnGuard {
     /// pressure from the previous user request.
     pub fn begin_fresh_user_turn(&mut self) {
         // Clear episode pressure at the semantic user-turn boundary. Lifetime
-        // tool/error telemetry and correction history remain available for
+        // tool/error telemetry remains available for
         // diagnostics, but stale episode counters must not disable or suppress
         // a fresh request.
         self.nudge_count = 0;
-        self.last_reflection = None;
+
         self.critical_turns = 0;
         self.critical_recovery_turns = 0;
         self.consecutive_warnings = 0;
         self.round_had_error = false;
-        self.pending_correction = None;
         self.errors.clear_recent_pressure();
         self.tool_sigs.clear();
-        self.latest_behavior = LatestRoundBehavior::default();
-        self.validation_attempts_since_workspace_mutation.clear();
         self.health.clear_cache_hit_signatures();
     }
 
@@ -725,10 +579,8 @@ impl TurnGuard {
     ///
     /// ## Calm-turn decay
     ///
-    /// On turns with no stall, divergence, reward-hacking, cache-waste,
-    /// or tool errors, `nudge_count` decays by 1. This prevents stale
-    /// nudge pressure from keeping the session in a warning state
-    /// indefinitely.
+    /// With no new tool errors, transient recovery pressure is cleared.
+    /// Repeated signatures alone cannot keep a failure episode active.
     pub fn evaluate(&mut self) -> TurnVerdict {
         let mut injections = Vec::new();
         let mut avoid_tools: HashSet<String> = HashSet::new();
@@ -741,26 +593,8 @@ impl TurnGuard {
                 false
             });
 
-        if stall_detected {
-            let avoidance_advised = self.health.health_avoidance_tools();
-            let health_avoidance_refs: Vec<&str> = avoidance_advised.to_vec();
-            let reflection = stall::build_stall_reflection(
-                &self.tool_sigs,
-                &health_avoidance_refs,
-                self.nudge_count,
-            );
-            injections.push(reflection.to_nudge_message());
-            for tool in &reflection.avoid_tools {
-                insert_avoid_tool(&mut avoid_tools, tool);
-            }
-            self.nudge_count += 1;
-            self.last_reflection = Some(reflection);
-            severity = severity.max(VerdictSeverity::Warning);
-        }
-
-        // 2. Divergence detection
-        // Only increment nudge_count if stall wasn't already detected this turn
-        // (both detect overlapping patterns; counting both inflates escalation).
+        // Repetition is a signature observation, not a failure diagnosis.
+        // Canonical runtime policy owns any model-facing progress feedback.
         let divergence = stall::detect_divergence_with_window(
             &self.tool_sigs,
             self.task_profile.exploration_round_window,
@@ -770,66 +604,7 @@ impl TurnGuard {
             DivergenceStatus::Healthy
         });
         let divergence_detected = matches!(divergence, DivergenceStatus::Diverging(_));
-        if divergence_detected {
-            injections.push(stall::DIVERGENCE_CORRECTION.to_string());
-            if !stall_detected {
-                self.nudge_count += 1;
-            }
-            severity = severity.max(VerdictSeverity::Warning);
-        }
-
-        // 3. Reward-hacking detection for the current turn.
-        let reward_hacking = &self.latest_behavior.assessment;
-        let reward_hacking_detected = reward_hacking.risk
-            >= stall::ACTIVE_REWARD_HACKING_RISK_THRESHOLD
-            && !reward_hacking.flags.is_empty();
-        if reward_hacking_detected {
-            let reward_hacking_avoid = &self.latest_behavior.avoid_tools;
-            injections.push(stall::build_reward_hacking_correction(
-                reward_hacking,
-                reward_hacking_avoid,
-            ));
-            for tool in reward_hacking_avoid {
-                insert_avoid_tool(&mut avoid_tools, tool);
-            }
-            if !stall_detected && !divergence_detected {
-                self.nudge_count += 1;
-            }
-            severity = severity.max(VerdictSeverity::Warning);
-        }
-
-        // 4. Nudge-ignore detection
-        if let Some(ref reflection) = self.last_reflection
-            && !stall_detected
-        {
-            // Check if the latest turn repeated a previously cautioned pattern.
-            let current_tools: HashSet<String> = self
-                .tool_sigs
-                .last()
-                .map(|sigs| sigs.iter().map(|s| s.tool_name().to_owned()).collect())
-                .unwrap_or_default();
-            let violated: Vec<String> =
-                stall::detect_nudge_ignored(&reflection.avoid_tools, &current_tools)
-                    .into_iter()
-                    .filter(|tool| !is_read_only_never_restrict(tool))
-                    .collect();
-            if !violated.is_empty() {
-                injections.push(format!(
-                    "⚠ A prior correction asked you to change approach for [{}], \
-                         but the latest round repeated the same tool pattern. \
-                         Pivot now: change inputs, use a focused alternative, or report the blocker. \
-                         These tools are not disabled unless a restricted_tool result says so.",
-                    violated.join(", ")
-                ));
-                for t in violated {
-                    insert_avoid_tool(&mut avoid_tools, &t);
-                }
-                severity = severity.max(VerdictSeverity::Warning);
-            }
-        }
-
         // 5. Tool health warnings
-        let mut fresh_health_avoidance_warning = false;
         let health_avoidance_tools = avoidable_health_avoidance_tools(&self.health);
         let health_avoidance_fingerprint =
             tool_fingerprint(health_avoidance_tools.iter().map(String::as_str));
@@ -843,7 +618,6 @@ impl TurnGuard {
                         insert_avoid_tool(&mut avoid_tools, tool);
                     }
                     severity = severity.max(VerdictSeverity::Warning);
-                    fresh_health_avoidance_warning = true;
                 }
                 self.last_health_avoidance_warning_fingerprint = Some(fingerprint);
             }
@@ -856,7 +630,6 @@ impl TurnGuard {
         // Cache hits are guidance-only: the tool did not execute, so they must
         // not degrade tool health, hide observation tools, or build escalation
         // pressure in long sessions.
-        let mut cache_warning_emitted = false;
         let cache_wasteful = self.health.cache_wasteful_tools(3);
         let current_total = self.health.total_cache_hits();
         let new_cache_hits = current_total > self.last_cache_hit_total;
@@ -873,20 +646,10 @@ impl TurnGuard {
                 injections.push(format!(
                     "♻ Duplicate calls detected: [{}]. \
                      You've made identical calls that were served from cache. \
-                     Reuse the earlier results instead of calling again.",
+                     Reuse earlier output when it is still available and sufficient; \
+                     cache reuse does not establish current prompt coverage.",
                     tool_list.join(", ")
                 ));
-                for (tool_name, _) in &cache_wasteful {
-                    if *tool_name == "read_file" {
-                        injections.push(
-                            "For repeated read_file cache hits, reuse the earlier file output. \
-                             If you need a different slice, switch to start_line/end_line, \
-                             outline=true, grep, or glob instead of rereading the same file."
-                                .to_string(),
-                        );
-                    }
-                }
-                cache_warning_emitted = true;
                 severity = severity.max(VerdictSeverity::Info);
                 self.last_cache_warning_fingerprint = Some(fingerprint);
             }
@@ -895,10 +658,7 @@ impl TurnGuard {
         }
         self.last_cache_hit_total = current_total;
 
-        let recovered_this_round = !stall_detected
-            && !divergence_detected
-            && !reward_hacking_detected
-            && !self.round_had_error;
+        let recovered_this_round = !self.round_had_error;
         if recovered_this_round {
             self.clear_transient_pressure();
         }
@@ -1003,63 +763,6 @@ impl TurnGuard {
             .collect();
         avoid_tools_vec.sort();
 
-        // Resolve next_turn_succeeded on the most recent unresolved CorrectionOutcome.
-        // Only resolve once (on the immediate next turn). Once resolved, the
-        // value is frozen — later turns cannot retroactively change it.
-        let mut just_resolved = false;
-        if let Some(last) = self.corrections.latest.as_mut()
-            && !last.resolved
-        {
-            last.next_turn_succeeded = severity <= VerdictSeverity::Info;
-            last.resolved = true;
-            just_resolved = true;
-        }
-
-        // Tune adaptive thresholds when a correction outcome is resolved.
-        if just_resolved {
-            let eff = self.correction_effectiveness();
-            self.adaptive_thresholds
-                .adjust_from_effectiveness(eff.follow_rate, eff.effective_rate);
-        }
-
-        // Store a CorrectionRecord only when the verdict carries actionable
-        // corrections. Info-level guidance is audit/UI feedback, not a
-        // commitment the next turn must satisfy.
-        if !injections.is_empty() && severity >= VerdictSeverity::Warning {
-            let correction_type =
-                if escalation == EscalationLevel::Critical || escalation_message_emitted {
-                    "error_escalation"
-                } else if stall_detected {
-                    "stall_nudge"
-                } else if is_diverging {
-                    "divergence"
-                } else if reward_hacking_detected {
-                    "reward_hacking"
-                } else if fresh_health_avoidance_warning {
-                    "health_avoidance"
-                } else if cache_warning_emitted {
-                    "cache_waste"
-                } else {
-                    "stall_nudge"
-                };
-
-            let suggested_alternatives: Vec<String> = if stall_detected {
-                self.last_reflection
-                    .as_ref()
-                    .map(|r| vec![r.what_to_try.clone()])
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-
-            self.pending_correction = Some(CorrectionRecord {
-                turn: self.tool_sigs.len() as u32,
-                correction_type: correction_type.to_string(),
-                avoid_tools: avoid_tools_vec.clone(),
-                suggested_alternatives,
-            });
-        }
-
         // Track consecutive warnings for progressive penalty in the agentic loop.
         if severity >= VerdictSeverity::Warning {
             self.consecutive_warnings = self.consecutive_warnings.saturating_add(1);
@@ -1069,7 +772,7 @@ impl TurnGuard {
         self.round_had_error = false;
 
         // Consolidate: at most 2 injection messages to avoid noise overload.
-        // Primary = first (highest-priority: stall/divergence/escalation).
+        // Primary = first health/error recovery observation.
         // Secondary = remaining tips joined into one message.
         let injections = consolidate_injections(injections);
 
@@ -1087,80 +790,6 @@ impl TurnGuard {
     /// Call this for each tool result to get immediate feedback.
     pub fn result_feedback(&self, tool_name: &str, quality: ResultQuality) -> Option<String> {
         result_quality::quality_feedback(tool_name, quality)
-    }
-}
-
-/// Effectiveness metrics for corrections.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CorrectionEffectiveness {
-    pub total_corrections: usize,
-    pub follow_rate: f64,
-    pub alternative_usage_rate: f64,
-    pub success_after_correction_rate: f64,
-    pub effective_rate: f64,
-}
-
-impl TurnGuard {
-    /// Compute effectiveness metrics for all recorded corrections.
-    pub fn correction_effectiveness(&self) -> CorrectionEffectiveness {
-        self.corrections.effectiveness()
-    }
-}
-
-/// Older outcomes cannot change: evaluation only resolves the latest outcome.
-/// Fold them exactly once when a new outcome arrives instead of retaining and
-/// rescanning their tool names and correction text for the lifetime of a task.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CorrectionTracking {
-    totals: CorrectionTotals,
-    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
-    latest: Option<CorrectionOutcome>,
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CorrectionTotals {
-    total: usize,
-    followed: usize,
-    used_alternative: usize,
-    succeeded: usize,
-    effective: usize,
-}
-
-impl CorrectionTotals {
-    fn add(&mut self, outcome: &CorrectionOutcome) {
-        self.total += 1;
-        self.followed += usize::from(outcome.followed);
-        self.used_alternative += usize::from(outcome.used_alternative);
-        self.succeeded += usize::from(outcome.next_turn_succeeded);
-        self.effective += usize::from(outcome.followed && outcome.next_turn_succeeded);
-    }
-}
-
-impl CorrectionTracking {
-    fn record(&mut self, outcome: CorrectionOutcome) {
-        if let Some(previous) = self.latest.replace(outcome) {
-            self.totals.add(&previous);
-        }
-    }
-
-    fn effectiveness(&self) -> CorrectionEffectiveness {
-        let mut totals = self.totals;
-        if let Some(latest) = &self.latest {
-            totals.add(latest);
-        }
-        let total = totals.total;
-        if total == 0 {
-            return CorrectionEffectiveness::default();
-        }
-        CorrectionEffectiveness {
-            total_corrections: total,
-            follow_rate: totals.followed as f64 / total as f64,
-            alternative_usage_rate: totals.used_alternative as f64 / total as f64,
-            success_after_correction_rate: totals.succeeded as f64 / total as f64,
-            effective_rate: totals.effective as f64 / total as f64,
-        }
     }
 }
 
@@ -1225,10 +854,102 @@ mod tests {
     }
 
     #[test]
+    fn continuation_rejects_retired_correction_state() {
+        let wire = continuation_wire(&TurnGuard::new());
+        for (field, value) in [
+            ("pending_correction", json!(null)),
+            ("corrections", json!({"totals": {}, "latest": null})),
+            (
+                "validation_attempts_since_workspace_mutation",
+                json!({"cargo test": 2}),
+            ),
+            (
+                "adaptive_thresholds",
+                json!({"stall_window": 3, "max_exploration_rounds": 5}),
+            ),
+        ] {
+            assert!(wire.get(field).is_none());
+            let mut legacy = wire.clone();
+            legacy[field] = value;
+            assert!(TurnGuard::deserialize_continuation(legacy).is_err());
+        }
+    }
+
+    #[test]
+    fn health_warning_and_same_tool_recovery_preserve_detection_window() {
+        let mut guard = TurnGuard::new();
+        let window = guard.stall_window();
+        for _ in 0..4 {
+            guard.record_tool_calls(&[make_tool_call("bash", r#"{"command":"missing-reader"}"#)]);
+            guard.record_failed_tool_result_with_kind("bash", None);
+            guard.evaluate();
+        }
+        assert!(guard.recovery_evidence().is_some());
+        for _ in 0..8 {
+            guard.record_tool_calls(&[make_tool_call("bash", r#"{"command":"head README.md"}"#)]);
+            guard.record_tool_result("bash", "# Astra");
+            let verdict = guard.evaluate();
+            assert_eq!(guard.stall_window(), window);
+            assert!(!verdict.advisory_threshold_reached);
+        }
+        assert!(guard.recovery_evidence().is_none());
+        assert_eq!(guard.errors.total_errors, 4);
+    }
+
+    #[test]
+    fn recovery_evidence_is_a_pure_current_health_projection() {
+        let mut guard = TurnGuard::new();
+        assert_eq!(guard.recovery_evidence(), None);
+        for _ in 0..3 {
+            guard.record_tool_timeout("write_file");
+        }
+        record_tool_failures(&mut guard, "read_file", 3);
+        let before = continuation_wire(&guard);
+        let recovery = guard.recovery_evidence().unwrap();
+        assert_eq!(recovery.error_pressure, 3);
+        assert_eq!(recovery.timeout_pressure, 3);
+        assert_eq!(recovery.cautioned_tools, ["write_file"]);
+        assert_eq!(recovery.timeout_dominant_tools, ["write_file"]);
+        assert_eq!(recovery.omitted_tools, 0);
+        assert_eq!(guard.recovery_evidence(), Some(recovery));
+        assert_eq!(continuation_wire(&guard), before);
+
+        // Recovery clears current pressure without erasing lifetime history.
+        for _ in 0..3 {
+            guard.record_tool_result("write_file", "ok");
+        }
+        assert_eq!(guard.errors.total_errors, 3);
+        assert_eq!(guard.health.summary().total_timeouts, 3);
+        assert_eq!(guard.recovery_evidence(), None);
+    }
+
+    #[test]
+    fn recovery_evidence_bounds_each_sorted_tool_list_without_truncating_names() {
+        let mut guard = TurnGuard::new();
+        let mut names = (0..10)
+            .map(|n| format!("custom_{n:02}"))
+            .collect::<Vec<_>>();
+        names.push("界".repeat(100));
+        names.push("invalid\nname".into());
+        for name in names.iter().rev() {
+            for _ in 0..3 {
+                guard.health.record_timeout(name);
+            }
+        }
+        let before = continuation_wire(&guard);
+        let recovery = guard.recovery_evidence().unwrap();
+        let expected = (0..8).map(|n| format!("custom_{n:02}")).collect::<Vec<_>>();
+        assert_eq!(recovery.cautioned_tools, expected);
+        assert_eq!(recovery.timeout_dominant_tools, expected);
+        assert_eq!(recovery.omitted_tools, 8);
+        assert!(recovery.is_valid());
+        assert_eq!(continuation_wire(&guard), before);
+    }
+
+    #[test]
     fn guard_continuation_preserves_prefix_suffix_decisions() {
         let mut original = TurnGuard::new();
         original.record_workspace_mutation();
-        original.record_validation_attempt("cargo test");
         let calls = [make_tool_call(
             "bash",
             r#"{"command":"private-argument-sentinel"}"#,
@@ -1238,8 +959,8 @@ mod tests {
             original.record_tool_result("bash", "ok");
             original.evaluate();
         }
-        // Checkpoint both after evaluate (pending correction) and between call
-        // and evaluate (an unresolved outcome). Resume is not a fresh turn.
+        // Checkpoint before and after evaluation. Resume preserves observations
+        // without turning signature repetition into recovery pressure.
         for _ in 0..8 {
             for before_evaluate in [false, true] {
                 if before_evaluate {
@@ -1250,10 +971,6 @@ mod tests {
                 assert!(!wire.to_string().contains("private-argument-sentinel"));
                 let mut restored = TurnGuard::deserialize_continuation(wire).unwrap();
                 assert_eq!(restored.workspace_epoch(), 1);
-                assert_eq!(
-                    restored.validation_attempts_since_workspace_mutation("cargo test"),
-                    1
-                );
                 let expected = original.evaluate();
                 let actual = restored.evaluate();
                 assert_eq!(actual.injections, expected.injections);
@@ -1267,6 +984,12 @@ mod tests {
                 assert_eq!(continuation_wire(&restored), continuation_wire(&original));
             }
         }
+        original.record_failed_tool_result_with_kind("write_file", None);
+        record_tool_failures(&mut original, "write_file", 3);
+        original.evaluate();
+        assert!(original.recovery_evidence().is_some());
+        let restored = TurnGuard::deserialize_continuation(continuation_wire(&original)).unwrap();
+        assert_eq!(continuation_wire(&restored), continuation_wire(&original));
         // A profile change need not have trimmed existing retained history yet.
         original.set_task_profile(TaskExecutionProfile {
             stall_window: 1,
@@ -1279,6 +1002,9 @@ mod tests {
     #[test]
     fn guard_continuation_rejects_missing_and_inconsistent_facts() {
         let wire = continuation_wire(&TurnGuard::new());
+        let mut unknown = wire.clone();
+        unknown["last_reflection"] = json!(null);
+        assert!(TurnGuard::deserialize_continuation(unknown).is_err());
         for field in wire.as_object().unwrap().keys() {
             let mut missing = wire.clone();
             missing.as_object_mut().unwrap().remove(field);
@@ -1288,20 +1014,11 @@ mod tests {
             );
         }
         for (path, value) in [
-            ("/corrections/totals/followed", json!(1)),
-            ("/corrections/totals/total", json!(usize::MAX)),
-            ("/latest_behavior/assessment/risk", json!(1.1)),
-            ("/latest_behavior/avoid_tools", json!(["bash"])),
             ("/task_profile/stall_window", json!(0)),
-            ("/adaptive_thresholds/stall_window", json!(0)),
             ("/last_cache_hit_total", json!(1)),
         ] {
             let mut invalid = wire.clone();
             *invalid.pointer_mut(path).unwrap() = value;
-            // total=MAX alone is representable until a latest outcome exists.
-            if path == "/corrections/totals/total" {
-                invalid["corrections"]["latest"] = json!({"record":{"turn":0,"correction_type":"stall_nudge","avoid_tools":[],"suggested_alternatives":[]},"followed":false,"used_alternative":false,"next_turn_succeeded":false,"resolved":false});
-            }
             assert!(
                 TurnGuard::deserialize_continuation(invalid).is_err(),
                 "accepted {path}"
@@ -1371,46 +1088,37 @@ mod tests {
     }
 
     #[test]
-    fn stall_triggers_nudge() {
-        let mut guard = TurnGuard::new();
-        // Same tool call 3x → stall (SERVER_STALL_WINDOW=3)
-        let calls = [make_tool_call("bash", r#"{"command":"ls"}"#)];
-        guard.record_tool_calls(&calls);
-        guard.record_tool_calls(&calls);
-        guard.record_tool_calls(&calls);
-
-        let verdict = guard.evaluate();
-        assert!(verdict.severity >= VerdictSeverity::Warning);
-        assert!(!verdict.injections.is_empty());
-        assert!(verdict.injections.iter().any(|m| m.contains("REFLECTION")));
-    }
-
-    #[test]
-    fn divergence_triggers_correction() {
-        let mut guard = TurnGuard::new();
-        // New semantics: divergence correction fires on exact signature
-        // repetition over the exploration budget window (5 rounds default).
-        for _ in 0..5 {
-            guard.record_tool_calls(&[make_tool_call("bash", r#"{"command":"ls"}"#)]);
+    fn signature_repetition_records_facts_without_recovery_pressure() {
+        for (stall_window, exploration_window) in [(3, 5), (8, 3)] {
+            for batch_size in [1, 3] {
+                let mut guard = TurnGuard::with_profile(TaskExecutionProfile {
+                    stall_window,
+                    exploration_round_window: exploration_window,
+                    ..Default::default()
+                });
+                let calls = vec![make_tool_call("custom_poll", r#"{"target":"same"}"#); batch_size];
+                for round in 1..=24 {
+                    guard.record_tool_calls(&calls);
+                    guard.record_tool_result("custom_poll", "operation completed");
+                    let verdict = guard.evaluate();
+                    assert_eq!(verdict.stall_detected, round >= guard.stall_window());
+                    assert_eq!(verdict.is_diverging, round >= exploration_window);
+                    assert_eq!(verdict.severity, VerdictSeverity::Healthy);
+                    assert!(verdict.injections.is_empty());
+                    assert!(verdict.avoid_tools.is_empty());
+                    assert!(!verdict.advisory_threshold_reached);
+                    assert_eq!(guard.nudge_count, 0);
+                    assert_eq!(guard.consecutive_warnings, 0);
+                }
+            }
         }
-
-        let verdict = guard.evaluate();
-        assert!(
-            verdict
-                .injections
-                .iter()
-                .any(|m| m.contains("same tool calls") || m.contains("same arguments")),
-            "injections: {:?}",
-            verdict.injections
-        );
-        assert!(verdict.is_diverging);
     }
 
     /// Regression for session bc74b214-3e2e turn-2: distinct
-    /// exploration-tool calls across rounds must NOT inject a correction.
+    /// exploration-tool calls across rounds must NOT emit recovery guidance.
     /// The old whitelist heuristic false-positived here.
     #[test]
-    fn diverse_exploration_does_not_trigger_correction() {
+    fn diverse_exploration_does_not_trigger_recovery_guidance() {
         let mut guard = TurnGuard::new();
         guard.record_tool_calls(&[make_tool_call("bash", r#"{"command":"ls src"}"#)]);
         guard.record_tool_calls(&[make_tool_call("read_file", r#"{"path":"a.rs"}"#)]);
@@ -1424,7 +1132,7 @@ mod tests {
                 .injections
                 .iter()
                 .any(|m| m.contains("same tool calls") || m.contains("STOP exploring")),
-            "unexpected correction injection: {:?}",
+            "unexpected recovery guidance: {:?}",
             verdict.injections
         );
     }
@@ -1825,7 +1533,7 @@ mod tests {
                 .injections
                 .iter()
                 .any(|m| m.contains("same tool calls")),
-            "unexpected correction: {:?}",
+            "unexpected recovery guidance: {:?}",
             verdict.injections
         );
     }
@@ -2111,14 +1819,7 @@ mod tests {
         guard.critical_turns = 1;
         guard.critical_recovery_turns = 1;
         guard.consecutive_warnings = 3;
-        guard.pending_correction = Some(CorrectionRecord {
-            turn: 7,
-            correction_type: "stall_nudge".to_string(),
-            avoid_tools: vec!["bash".to_string()],
-            suggested_alternatives: Vec::new(),
-        });
         guard.record_tool_calls(&[make_tool_call("bash", r#"{"command":"ls"}"#)]);
-        guard.record_validation_attempt("cargo test");
         guard
             .health
             .record_cache_hit_for_signature(&astra_pipeline::ToolHealthIdentity::new(
@@ -2129,7 +1830,6 @@ mod tests {
         guard.begin_fresh_user_turn();
 
         assert_eq!(guard.nudge_count, 0);
-        assert!(guard.pending_correction.is_none());
         assert!(guard.tool_sigs.is_empty());
         assert_eq!(guard.errors.recent_error_pressure(), 0);
         assert_eq!(
@@ -2139,10 +1839,6 @@ mod tests {
         assert_eq!(
             guard.critical_recovery_turns, 0,
             "critical recovery pressure must not leak into a new turn"
-        );
-        assert_eq!(
-            guard.validation_attempts_since_workspace_mutation("cargo test"),
-            0
         );
         assert_eq!(
             guard
@@ -2358,7 +2054,8 @@ mod tests {
         );
         assert_eq!(verdict.severity, super::VerdictSeverity::Critical);
 
-        // Second evaluate → stronger advisory evidence
+        // Continued actual failures, not signatures, sustain the error episode.
+        guard.record_failed_tool_result_with_kind("write_file", None);
         let verdict2 = guard.evaluate();
         assert!(
             verdict2.advisory_threshold_reached,
@@ -2366,326 +2063,33 @@ mod tests {
         );
     }
 
-    // ── Divergence increments nudge_count (Fix) ──
-
     #[test]
-    fn divergence_increments_nudge_count_when_no_stall() {
-        let mut guard = TurnGuard::new();
-        // Build a diverging pattern: all exploration tools, but varied enough
-        // that stall detection doesn't fire (stall needs identical consecutive sigs).
-        // Use different glob patterns each turn.
-        for i in 0..8 {
-            let sigs: std::collections::BTreeSet<crate::stall::StallSignature> =
-                [crate::stall::StallSignature::new(
-                    "glob",
-                    format!("*.{i}").as_bytes(),
-                )]
-                .into_iter()
-                .collect();
-            guard.tool_sigs.push(sigs);
-        }
-        let initial_nudge = guard.nudge_count;
-        let verdict = guard.evaluate();
-        // Divergence should fire (all exploration tools) and increment nudge_count
-        // since stall shouldn't fire (different tool sigs each turn)
-        if verdict.injections.iter().any(|i| {
-            i.contains("productive action") || i.contains("diverge") || i.contains("Diverge")
-        }) {
-            assert!(
-                guard.nudge_count > initial_nudge,
-                "divergence detection must increment nudge_count when no stall"
-            );
-        }
-    }
-
-    #[test]
-    fn reward_hacking_turn_triggers_runtime_warning() {
-        let mut guard = TurnGuard::new();
-        guard.record_tool_calls(&[
-            make_tool_call("read_file", r#"{"path":"src/lib.rs"}"#),
-            make_tool_call("read_file", r#"{"path":"src/lib.rs"}"#),
-        ]);
-        guard.record_tool_result("read_file", r#"fn main() {}"#);
-        guard.record_tool_result("read_file", r#"fn main() {}"#);
-
-        let initial_nudges = guard.nudge_count;
-        let verdict = guard.evaluate();
-        assert_eq!(verdict.severity, VerdictSeverity::Warning);
-        assert!(
-            verdict
-                .injections
-                .iter()
-                .any(|message| message.contains("Reward-hacking guard"))
-        );
-        assert!(
-            verdict.avoid_tools.is_empty(),
-            "reward-hacking guidance must not hide read-only observation tools"
-        );
-        assert_eq!(guard.nudge_count, initial_nudges + 1);
-    }
-
-    // ── CorrectionRecord / CorrectionOutcome tests ──
-
-    #[test]
-    fn stall_creates_pending_correction() {
-        let mut guard = TurnGuard::new();
-        let calls = [make_tool_call("bash", r#"{"command":"ls"}"#)];
-        guard.record_tool_calls(&calls);
-        guard.record_tool_calls(&calls);
-        guard.record_tool_calls(&calls);
-        assert!(guard.pending_correction.is_none(), "before evaluate");
-        let _ = guard.evaluate();
-        assert!(
-            guard.pending_correction.is_some(),
-            "evaluate should set pending_correction on stall"
-        );
-        let pc = guard.pending_correction.as_ref().unwrap();
-        assert!(!pc.correction_type.is_empty());
-    }
-
-    #[test]
-    fn record_tool_calls_resolves_pending_to_history() {
-        let mut guard = TurnGuard::new();
-        let calls = [make_tool_call("bash", r#"{"command":"ls"}"#)];
-        guard.record_tool_calls(&calls);
-        guard.record_tool_calls(&calls);
-        guard.record_tool_calls(&calls);
-        let _ = guard.evaluate();
-        assert!(guard.pending_correction.is_some());
-        assert!(guard.corrections.latest.is_none());
-
-        // Next turn: agent uses a different tool
-        guard.record_tool_calls(&[make_tool_call("read_file", r#"{"path":"foo"}"#)]);
-        assert!(guard.pending_correction.is_none(), "should be consumed");
-        assert_eq!(guard.correction_effectiveness().total_corrections, 1);
-    }
-
-    #[test]
-    fn followed_true_when_following_avoid_guidance() {
-        let mut guard = TurnGuard::new();
-        let calls = [make_tool_call("bash", r#"{"command":"ls"}"#)];
-        guard.record_tool_calls(&calls);
-        guard.record_tool_calls(&calls);
-        guard.record_tool_calls(&calls);
-        let _ = guard.evaluate();
-        assert!(guard.pending_correction.is_some());
-        assert!(
-            guard
-                .pending_correction
-                .as_ref()
-                .unwrap()
-                .avoid_tools
-                .contains(&"bash".to_string()),
-            "bash should be in avoid_tools after stall"
-        );
-
-        // Agent follows avoid guidance.
-        guard.record_tool_calls(&[make_tool_call("read_file", r#"{"path":"bar"}"#)]);
-        let outcome = guard.corrections.latest.as_ref().unwrap();
-        assert!(
-            outcome.followed,
-            "should be true when agent followed avoid guidance"
-        );
-    }
-
-    #[test]
-    fn followed_false_when_ignoring_avoid_guidance() {
-        let mut guard = TurnGuard::new();
-        let calls = [make_tool_call("bash", r#"{"command":"ls"}"#)];
-        guard.record_tool_calls(&calls);
-        guard.record_tool_calls(&calls);
-        guard.record_tool_calls(&calls);
-        let _ = guard.evaluate();
-        assert!(guard.pending_correction.is_some());
-        let outcome_record = guard.pending_correction.as_ref().unwrap();
-        assert!(
-            outcome_record.avoid_tools.contains(&"bash".to_string()),
-            "bash should be in avoid guidance after stall"
-        );
-
-        // Agent ignores the correction and uses bash again
-        guard.record_tool_calls(&[make_tool_call("bash", r#"{"command":"pwd"}"#)]);
-        let outcome = guard.corrections.latest.as_ref().unwrap();
-        assert!(
-            !outcome.followed,
-            "should be false when agent ignored avoid guidance"
-        );
-    }
-
-    #[test]
-    fn next_turn_succeeded_resolved_on_first_evaluate_only() {
-        let mut guard = TurnGuard::new();
-        // Trigger a stall → correction
-        let calls = [make_tool_call("bash", r#"{"command":"ls"}"#)];
-        guard.record_tool_calls(&calls);
-        guard.record_tool_calls(&calls);
-        guard.record_tool_calls(&calls);
-        let _ = guard.evaluate(); // triggers correction
-        guard.record_tool_calls(&[make_tool_call("read_file", r#"{"path":"x"}"#)]); // resolves pending
-
-        // Force another stall to make severity > Info (Warning)
-        guard.record_tool_calls(&[make_tool_call("read_file", r#"{"path":"x"}"#)]);
-        guard.record_tool_calls(&[make_tool_call("read_file", r#"{"path":"x"}"#)]);
-        let _v1 = guard.evaluate();
-
-        // Keep evaluating the same outcome, without issuing another correction.
-        let outcome = guard.corrections.latest.as_ref().unwrap();
-        assert!(outcome.resolved, "should be resolved after first evaluate");
-        let frozen_value = outcome.next_turn_succeeded;
-        guard.pending_correction = None;
-
-        // Second evaluate: even if healthy, should NOT change the frozen value
-        guard.record_tool_calls(&[make_tool_call("write_file", r#"{"path":"y"}"#)]);
-        let _v2 = guard.evaluate();
-        let outcome_after = guard.corrections.latest.as_ref().unwrap();
-        assert!(outcome_after.resolved, "should still be resolved");
-        assert_eq!(
-            outcome_after.next_turn_succeeded, frozen_value,
-            "next_turn_succeeded must not change after resolution"
-        );
-    }
-
-    #[test]
-    fn next_turn_succeeded_true_on_healthy_immediate_followup() {
-        let mut guard = TurnGuard::new();
-        let calls = [make_tool_call("bash", r#"{"command":"ls"}"#)];
-        guard.record_tool_calls(&calls);
-        guard.record_tool_calls(&calls);
-        guard.record_tool_calls(&calls);
-        let _ = guard.evaluate(); // stall → correction
-
-        // Agent uses different tools (breaks the stall)
-        guard.record_tool_calls(&[make_tool_call("write_file", r#"{"path":"a"}"#)]);
-        // Evaluate: no stall, no errors → Healthy
-        let verdict = guard.evaluate();
-        assert_eq!(
-            verdict.severity,
-            VerdictSeverity::Healthy,
-            "should be healthy after breaking stall"
-        );
-
-        let outcome = guard.corrections.latest.as_ref().unwrap();
-        assert!(outcome.resolved);
-        assert!(
-            outcome.next_turn_succeeded,
-            "next_turn_succeeded should be true when immediate followup is Healthy"
-        );
-    }
-
-    #[test]
-    fn correction_effectiveness_empty_history() {
-        let guard = TurnGuard::new();
-        let eff = guard.correction_effectiveness();
-        assert_eq!(eff.total_corrections, 0);
-        assert_eq!(eff.follow_rate, 0.0);
-    }
-
-    #[test]
-    fn bounded_corrections_match_full_history_at_every_boundary() {
-        let mut tracking = CorrectionTracking::default();
-        let mut history = Vec::<CorrectionOutcome>::new();
-        for turn in 0..1024 {
-            let outcome = CorrectionOutcome {
-                record: CorrectionRecord {
-                    turn,
-                    correction_type: "test".into(),
-                    avoid_tools: vec![],
-                    suggested_alternatives: vec![],
-                },
-                followed: turn % 2 == 0,
-                used_alternative: turn % 3 == 0,
-                next_turn_succeeded: false,
-                resolved: false,
-            };
-            tracking.record(outcome.clone());
-            history.push(outcome);
-            for resolve in [false, true, true] {
-                // Include unresolved outcomes replaced by a later correction,
-                // and repeated resolution attempts after the result is frozen.
-                if resolve && turn % 5 != 0 {
-                    for latest in [
-                        tracking.latest.as_mut().unwrap(),
-                        history.last_mut().unwrap(),
-                    ] {
-                        if !latest.resolved {
-                            latest.next_turn_succeeded = turn % 7 != 0;
-                            latest.resolved = true;
-                        }
-                    }
+    fn repeated_calls_within_one_batch_do_not_diagnose_behavior() {
+        for name in ["read_file", "bash", "agent_fanout", "custom_poll"] {
+            for count in [2, 3] {
+                let mut guard = TurnGuard::new();
+                let calls = vec![make_tool_call(name, r#"{"target":"same"}"#); count];
+                guard.record_tool_calls(&calls);
+                for _ in 0..count {
+                    guard.record_tool_result(name, "operation completed");
                 }
-                let actual = tracking.effectiveness();
-                let rate = |predicate: fn(&CorrectionOutcome) -> bool| {
-                    history.iter().filter(|item| predicate(item)).count() as f64
-                        / history.len() as f64
-                };
-                assert_eq!(actual.total_corrections, history.len());
-                assert_eq!(actual.follow_rate, rate(|c| c.followed));
-                assert_eq!(actual.alternative_usage_rate, rate(|c| c.used_alternative));
+
+                let verdict = guard.evaluate();
+                assert_eq!(verdict.severity, VerdictSeverity::Healthy, "{name}");
+                assert!(verdict.injections.is_empty());
+                assert!(verdict.avoid_tools.is_empty());
+                assert!(!verdict.stall_detected);
+                assert!(!verdict.is_diverging);
+                assert!(!verdict.advisory_threshold_reached);
+                assert_eq!(guard.nudge_count, 0);
+                assert!(!guard.health.is_avoidance_advised(name));
+                assert_eq!(guard.tool_sigs.len(), 1);
                 assert_eq!(
-                    actual.success_after_correction_rate,
-                    rate(|c| c.next_turn_succeeded)
-                );
-                assert_eq!(
-                    actual.effective_rate,
-                    rate(|c| c.followed && c.next_turn_succeeded)
+                    guard.tool_sigs[0],
+                    stall::server_tool_call_signature(&calls)
                 );
             }
         }
-        assert_eq!(tracking.totals.total, 1023);
-    }
-
-    #[test]
-    fn correction_effectiveness_computes_rates() {
-        let mut guard = TurnGuard::new();
-
-        // Manually push outcomes for testing
-        guard.corrections.record(CorrectionOutcome {
-            record: CorrectionRecord {
-                turn: 1,
-                correction_type: "stall_nudge".to_string(),
-                avoid_tools: vec!["bash".to_string()],
-                suggested_alternatives: vec![],
-            },
-            followed: true,
-            used_alternative: false,
-            next_turn_succeeded: true,
-            resolved: true,
-        });
-        guard.corrections.record(CorrectionOutcome {
-            record: CorrectionRecord {
-                turn: 3,
-                correction_type: "divergence".to_string(),
-                avoid_tools: vec![],
-                suggested_alternatives: vec!["write_file".to_string()],
-            },
-            followed: true,
-            used_alternative: true,
-            next_turn_succeeded: false,
-            resolved: true,
-        });
-        guard.corrections.record(CorrectionOutcome {
-            record: CorrectionRecord {
-                turn: 5,
-                correction_type: "stall_nudge".to_string(),
-                avoid_tools: vec!["read_file".to_string()],
-                suggested_alternatives: vec![],
-            },
-            followed: false,
-            used_alternative: false,
-            next_turn_succeeded: true,
-            resolved: true,
-        });
-
-        let eff = guard.correction_effectiveness();
-        assert_eq!(eff.total_corrections, 3);
-        // 2 out of 3 followed
-        assert!((eff.follow_rate - 2.0 / 3.0).abs() < 0.01);
-        // 1 out of 3 used alternative
-        assert!((eff.alternative_usage_rate - 1.0 / 3.0).abs() < 0.01);
-        // 2 out of 3 succeeded after
-        assert!((eff.success_after_correction_rate - 2.0 / 3.0).abs() < 0.01);
-        // 1 out of 3 effective (followed AND succeeded)
-        assert!((eff.effective_rate - 1.0 / 3.0).abs() < 0.01);
     }
 
     // ── Bug #2 regression: read-only tools must never be restricted even
@@ -2753,266 +2157,33 @@ mod tests {
         assert!(!verdict.avoid_tools.contains(&"grep".to_string()));
     }
 
-    // ── P0-B: Full stall recovery pipeline behavioral test ──────────
-
-    /// Simulate an agent stuck in a loop calling the same tool with the same
-    /// args for many turns. Verify the FULL pipeline:
-    ///   1. Stall detected after window (3 identical rounds)
-    ///   2. Structured reflection built with avoid_tools
-    ///   3. Nudge injected into verdict
-    ///   4. Continued stalling → escalation to Warning → Critical
-    ///   5. Second Critical → stronger advisory evidence
     #[test]
-    fn stall_pipeline_detection_through_advisory_threshold_reached() {
+    fn repeated_successful_calls_clear_prior_error_pressure() {
         let mut guard = TurnGuard::new();
-        let identical_call = vec![
-            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}}),
-        ];
+        let calls = [make_tool_call("bash", r#"{"command":"check"}"#)];
+        guard.nudge_count = 4;
+        for _ in 0..3 {
+            guard.record_failed_tool_result_with_kind("bash", None);
+        }
+        assert_eq!(guard.evaluate().severity, VerdictSeverity::Critical);
 
-        let mut first_stall_turn = None;
-        let mut first_warning_turn = None;
-        let mut first_critical_turn = None;
-        let mut advisory_threshold_reached_turn = None;
-
-        for turn in 0..30 {
-            guard.record_tool_calls(&identical_call);
-            guard.record_tool_result("bash", "total 42\ndrwxr-xr-x 2 user user 4096 ...");
+        for _ in 0..12 {
+            guard.record_tool_calls(&calls);
+            guard.record_tool_result("bash", "operation completed");
             let verdict = guard.evaluate();
-
-            if verdict.stall_detected && first_stall_turn.is_none() {
-                first_stall_turn = Some(turn);
-            }
-            if verdict.severity >= VerdictSeverity::Warning && first_warning_turn.is_none() {
-                first_warning_turn = Some(turn);
-            }
-            if verdict.severity >= VerdictSeverity::Critical && first_critical_turn.is_none() {
-                first_critical_turn = Some(turn);
-            }
-            if verdict.advisory_threshold_reached {
-                advisory_threshold_reached_turn = Some(turn);
-                break;
-            }
+            assert_eq!(verdict.severity, VerdictSeverity::Healthy);
+            assert!(verdict.injections.is_empty());
+            assert!(verdict.avoid_tools.is_empty());
+            assert!(!verdict.advisory_threshold_reached);
+            assert_eq!(guard.nudge_count, 0);
+            assert_eq!(guard.errors.recent_error_pressure(), 0);
         }
-
-        let stall_turn = first_stall_turn.expect("stall must be detected");
-        assert!(
-            stall_turn <= 5,
-            "stall detected too late: turn {stall_turn}"
-        );
-
-        let warn_turn = first_warning_turn.expect("warning must be issued");
-        assert!(warn_turn <= stall_turn, "warning should come with stall");
-
-        let crit_turn = first_critical_turn.expect("critical must be reached");
-        assert!(crit_turn > warn_turn, "critical must come after warning");
-
-        let strong_advisory_turn =
-            advisory_threshold_reached_turn.expect("strong-advisory threshold must be reached");
-        assert!(
-            strong_advisory_turn > crit_turn,
-            "strong advisory must come after first critical"
-        );
+        assert!(guard.evaluate().stall_detected);
+        assert_eq!(guard.errors.total_errors, 3);
     }
 
-    /// Verify that stall reflection contains structured guidance, not just
-    /// a flat string.
     #[test]
-    fn stall_reflection_is_structured_and_actionable() {
-        let mut guard = TurnGuard::new();
-        let identical_call = vec![
-            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}}),
-        ];
-
-        for _ in 0..5 {
-            guard.record_tool_calls(&identical_call);
-            guard.record_tool_result("bash", "ok");
-            let verdict = guard.evaluate();
-            if verdict.stall_detected {
-                assert!(
-                    !verdict.injections.is_empty(),
-                    "stall must inject correction messages"
-                );
-                let msg = &verdict.injections[0];
-                assert!(
-                    msg.len() > 50,
-                    "stall nudge must be substantial, got: {msg}"
-                );
-                return;
-            }
-        }
-        panic!("stall was never detected in 5 identical turns");
-    }
-
-    /// Verify that when the agent ignores a correction (uses avoided tools),
-    /// the next evaluate detects the violation and escalates.
-    #[test]
-    fn nudge_ignore_detected_and_escalates() {
-        let mut guard = TurnGuard::new();
-        let bash_call = vec![
-            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}}),
-        ];
-
-        for _ in 0..5 {
-            guard.record_tool_calls(&bash_call);
-            guard.record_tool_result("bash", "ok");
-            guard.evaluate();
-        }
-
-        // Agent IGNORES correction — uses bash again
-        guard.record_tool_calls(&bash_call);
-        guard.record_tool_result("bash", "ok");
-        let verdict = guard.evaluate();
-
-        // After 6 identical turns, the system must produce correction injections
-        assert!(
-            verdict.severity >= VerdictSeverity::Warning,
-            "ignoring correction must escalate to at least Warning"
-        );
-        assert!(
-            !verdict.injections.is_empty(),
-            "ignoring correction must produce injection messages"
-        );
-        // The injections should contain stall reflection or escalation guidance
-        let all_text = verdict.injections.join(" ");
-        assert!(
-            all_text.contains("stuck")
-                || all_text.contains("Avoid")
-                || all_text.contains("WARNING"),
-            "injections must contain stall/avoidance guidance: {all_text}"
-        );
-    }
-
-    /// Verify correction tracking: after a correction is issued, the next
-    /// turn's tool calls are checked for compliance.
-    #[test]
-    fn correction_compliance_tracked_accurately() {
-        let mut guard = TurnGuard::new();
-        let bash_call = vec![
-            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}}),
-        ];
-        let grep_call = vec![
-            serde_json::json!({"function": {"name": "grep", "arguments": "{\"pattern\": \"TODO\"}"}}),
-        ];
-
-        // Trigger stall → correction issued
-        for _ in 0..5 {
-            guard.record_tool_calls(&bash_call);
-            guard.record_tool_result("bash", "ok");
-            guard.evaluate();
-        }
-
-        // Switch to a different tool (compliance)
-        guard.record_tool_calls(&grep_call);
-        guard.record_tool_result("grep", "found 3 matches");
-        let verdict = guard.evaluate();
-
-        assert!(
-            !verdict.advisory_threshold_reached,
-            "compliant agent must not reach the strong-advisory threshold"
-        );
-
-        let effectiveness = guard.correction_effectiveness();
-        assert!(
-            effectiveness.total_corrections > 0,
-            "corrections must be tracked"
-        );
-    }
-
-    /// P1-F: Full correction lifecycle — stall → correction → compliance →
-    /// ignore → mixed effectiveness metrics.
-    #[test]
-    fn correction_lifecycle_mixed_compliance() {
-        let mut guard = TurnGuard::new();
-        let bash_call = vec![
-            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}}),
-        ];
-        let grep_call = vec![
-            serde_json::json!({"function": {"name": "grep", "arguments": "{\"pattern\": \"TODO\"}"}}),
-        ];
-
-        // Phase 1: Trigger stall (3 identical turns)
-        for _ in 0..4 {
-            guard.record_tool_calls(&bash_call);
-            guard.record_tool_result("bash", "ok");
-            guard.evaluate();
-        }
-
-        // Phase 2: Comply — switch to grep
-        guard.record_tool_calls(&grep_call);
-        guard.record_tool_result("grep", "found 5 matches");
-        let v = guard.evaluate();
-        assert!(!v.advisory_threshold_reached);
-
-        // Phase 3: Relapse — back to bash stall
-        for _ in 0..4 {
-            guard.record_tool_calls(&bash_call);
-            guard.record_tool_result("bash", "ok");
-            guard.evaluate();
-        }
-
-        // Phase 4: Ignore correction — keep using bash
-        guard.record_tool_calls(&bash_call);
-        guard.record_tool_result("bash", "ok");
-        guard.evaluate();
-
-        // Verify effectiveness metrics reflect mixed compliance
-        let eff = guard.correction_effectiveness();
-        assert!(
-            eff.total_corrections >= 2,
-            "must have at least 2 corrections, got {}",
-            eff.total_corrections
-        );
-        // follow_rate should be between 0 and 1 (some followed, some not)
-        assert!(
-            eff.follow_rate > 0.0,
-            "at least one correction was followed (grep turn)"
-        );
-        assert!(
-            eff.follow_rate < 1.0,
-            "not all corrections were followed (relapse happened), got follow_rate={}",
-            eff.follow_rate
-        );
-        assert!(
-            eff.effective_rate < 1.0,
-            "effective_rate must reflect the relapse, got {}",
-            eff.effective_rate
-        );
-    }
-
-    /// Verify that adaptive stall thresholds are actually wired into
-    /// TurnGuard: when corrections are repeatedly ignored, the stall
-    /// window widens to reduce false positives.
-    #[test]
-    fn adaptive_thresholds_widen_after_repeated_ignored_corrections() {
-        let mut guard = TurnGuard::new();
-        let initial_window = guard.stall_window();
-
-        let bash_call = vec![
-            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}}),
-        ];
-
-        // Run many turns of stall → correction → ignore → resolve.
-        for _cycle in 0..6 {
-            for _ in 0..5 {
-                guard.record_tool_calls(&bash_call);
-                guard.record_tool_result("bash", "ok");
-                guard.evaluate();
-            }
-        }
-
-        // After many ignored corrections, the adaptive window should have widened
-        let final_window = guard.stall_window();
-        assert!(
-            final_window > initial_window,
-            "stall window must widen after repeated ignored corrections \
-             (initial={initial_window}, final={final_window})"
-        );
-    }
-
-    // ─── Optimization: avoid_tools must respect READ_ONLY_NEVER_RESTRICT ─────
-
-    #[test]
-    fn read_only_tools_never_enter_avoid_guidance() {
+    fn read_only_repetition_remains_observable_without_recovery_pressure() {
         let mut guard = TurnGuard::new();
         // Trigger stall on read_file (3 identical calls)
         let calls = [make_tool_call("read_file", r#"{"path":"a.rs"}"#)];
@@ -3021,18 +2192,10 @@ mod tests {
         guard.record_tool_calls(&calls);
 
         let verdict = guard.evaluate();
-        // Stall should be detected and injections should exist
         assert!(verdict.stall_detected, "stall must be detected");
-        assert!(!verdict.injections.is_empty(), "should have injections");
-
-        // read_file must NOT be in avoid_tools — it's read-only
-        assert!(
-            !verdict.avoid_tools.contains(&"read_file".to_string()),
-            "read_file must never be in avoid_tools; got: {:?}",
-            verdict.avoid_tools
-        );
-
-        // Tool-health pressure is advisory and never mutates schema visibility.
+        assert!(verdict.injections.is_empty());
+        assert!(verdict.avoid_tools.is_empty());
+        assert_eq!(guard.nudge_count, 0);
     }
 
     #[test]

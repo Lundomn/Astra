@@ -57,6 +57,44 @@ pub(crate) enum InvocationPrepareDisposition {
     },
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum InvocationPreparationProbe {
+    Existing(Box<ToolInvocationRecord>),
+    Missing(MissingInvocationPreparation),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum MissingInvocationPreparation {
+    Database(Box<astra_services::tool_invocation_ledger::MissingToolInvocationPreparation>),
+    InMemory(Box<InMemoryMissingInvocationPreparation>),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct InMemoryMissingInvocationPreparation {
+    identity: ToolInvocationIdentity,
+    tool: astra_turn_types::DurableToolReference,
+    canonical_arguments_hash: String,
+}
+
+impl MissingInvocationPreparation {
+    pub(crate) fn matches(
+        &self,
+        identity: &ToolInvocationIdentity,
+        fingerprint: &ToolInvocationFingerprint,
+    ) -> bool {
+        match self {
+            Self::Database(missing) => {
+                missing.identity() == identity && missing.matches_tool_and_arguments(fingerprint)
+            }
+            Self::InMemory(missing) => {
+                missing.identity == *identity
+                    && missing.tool == fingerprint.tool
+                    && missing.canonical_arguments_hash == fingerprint.canonical_arguments_hash
+            }
+        }
+    }
+}
+
 /// Per-call durable control boundary supplied by the agentic loop. The owner
 /// pod capability is bound separately when the database ledger is composed,
 /// so provider-authored arguments cannot choose either authority value.
@@ -484,6 +522,58 @@ impl RuntimeToolInvocationLedger {
         }
     }
 
+    pub(crate) async fn probe_for_prepare(
+        &self,
+        identity: &ToolInvocationIdentity,
+        fingerprint: &ToolInvocationFingerprint,
+    ) -> Result<InvocationPreparationProbe, RuntimeInvocationLedgerError> {
+        match self {
+            Self::Database { ledger, .. } => Ok(match ledger.probe_for_prepare(identity, fingerprint).await? {
+                astra_services::tool_invocation_ledger::ToolInvocationPreparationProbe::Existing(record) => InvocationPreparationProbe::Existing(record),
+                astra_services::tool_invocation_ledger::ToolInvocationPreparationProbe::Missing(missing) => InvocationPreparationProbe::Missing(MissingInvocationPreparation::Database(missing)),
+            }),
+            Self::InMemory { .. } => match self.get(identity).await? {
+                Some(record) if record.fingerprint.same_tool_and_arguments(fingerprint) => {
+                    Ok(InvocationPreparationProbe::Existing(Box::new(record)))
+                }
+                Some(_) => Err(RuntimeInvocationLedgerError::InvalidRecord(
+                    "delegation invocation identity changed tool or arguments".into(),
+                )),
+                None => Ok(InvocationPreparationProbe::Missing(
+                    MissingInvocationPreparation::InMemory(Box::new(InMemoryMissingInvocationPreparation {
+                        identity: identity.clone(),
+                        tool: fingerprint.tool.clone(),
+                        canonical_arguments_hash: fingerprint.canonical_arguments_hash.clone(),
+                    })),
+                )),
+            },
+        }
+    }
+
+    pub(crate) async fn prepare_after_miss(
+        &self,
+        missing: MissingInvocationPreparation,
+        decision: &ToolInvocationDecision,
+    ) -> Result<ToolInvocationPrepareOutcome, RuntimeInvocationLedgerError> {
+        match (self, missing) {
+            (Self::Database { ledger, .. }, MissingInvocationPreparation::Database(missing)) => {
+                Ok(ledger.finish_prepare_after_miss(missing, decision).await?)
+            }
+            (Self::InMemory { .. }, MissingInvocationPreparation::InMemory(missing)) => {
+                let fingerprint = ToolInvocationFingerprint {
+                    tool: missing.tool.clone(),
+                    canonical_arguments_hash: missing.canonical_arguments_hash.clone(),
+                    policy_decision_id: decision.decision_id.clone(),
+                };
+                self.prepare(&missing.identity, &fingerprint, decision)
+                    .await
+            }
+            _ => Err(RuntimeInvocationLedgerError::InvalidRecord(
+                "delegation preparation belongs to another ledger backend".into(),
+            )),
+        }
+    }
+
     pub(crate) async fn dispatch(
         &self,
         identity: &ToolInvocationIdentity,
@@ -838,6 +928,56 @@ impl RuntimeToolInvocationLedger {
             ToolInvocationPrepareOutcome::Prepared(record)
             | ToolInvocationPrepareOutcome::Existing(record) => record,
         };
+        self.prepared_record_disposition(identity, record, validate_decision)
+            .await
+    }
+
+    pub(crate) async fn prepare_for_execution_with_probe(
+        &self,
+        identity: &ToolInvocationIdentity,
+        fingerprint: &ToolInvocationFingerprint,
+        probe: InvocationPreparationProbe,
+        decision: Option<&ToolInvocationDecision>,
+        validate_decision: impl FnOnce(&ToolInvocationDecision) -> Result<(), String>,
+    ) -> Result<InvocationPrepareDisposition, RuntimeInvocationLedgerError> {
+        let record = match probe {
+            InvocationPreparationProbe::Existing(record) => {
+                if &record.identity != identity
+                    || !record.fingerprint.same_tool_and_arguments(fingerprint)
+                {
+                    return Err(RuntimeInvocationLedgerError::InvalidRecord(
+                        "replayed delegation changed tool or arguments".into(),
+                    ));
+                }
+                *record
+            }
+            InvocationPreparationProbe::Missing(missing) => {
+                if !missing.matches(identity, fingerprint) {
+                    return Err(RuntimeInvocationLedgerError::InvalidRecord(
+                        "delegation preparation does not match invocation".into(),
+                    ));
+                }
+                let decision = decision.ok_or_else(|| {
+                    RuntimeInvocationLedgerError::InvalidRecord(
+                        "new delegation has no complete decision".into(),
+                    )
+                })?;
+                match self.prepare_after_miss(missing, decision).await? {
+                    ToolInvocationPrepareOutcome::Prepared(record)
+                    | ToolInvocationPrepareOutcome::Existing(record) => record,
+                }
+            }
+        };
+        self.prepared_record_disposition(identity, record, validate_decision)
+            .await
+    }
+
+    async fn prepared_record_disposition(
+        &self,
+        identity: &ToolInvocationIdentity,
+        record: ToolInvocationRecord,
+        validate_decision: impl FnOnce(&ToolInvocationDecision) -> Result<(), String>,
+    ) -> Result<InvocationPrepareDisposition, RuntimeInvocationLedgerError> {
         match record.state {
             ToolInvocationState::Prepared => {
                 validate_decision(&record.decision)
@@ -1272,10 +1412,25 @@ fn rejection_evidence(result: &astra_tools::ToolResult) -> Option<(Option<String
         .and_then(|value| value.as_str().map(str::to_string));
     let error_kind =
         structured_field(result, "error_kind").and_then(|value| value.as_str().map(str::to_string));
+    let execution_fact = structured_field(result, "execution_fact")
+        .and_then(|value| value.as_str().map(str::to_string));
+    let execution_started =
+        structured_field(result, "execution_started").and_then(|value| value.as_bool());
+    let disposition = structured_field(result, "disposition")
+        .and_then(|value| value.as_str().map(str::to_string));
     let reason_kind = structured_field(result, "reason_kind")
         .and_then(|value| value.as_str().map(str::to_string));
     let capability_denial = structured_field(result, "capability_denial").is_some();
-    let explicitly_rejected = rejection_code.is_some()
+    // Control tools may return a structured error after inspecting durable
+    // state without ever entering their executor (for example a duplicate
+    // fanout start).  Preserve that producer-owned fact in the canonical
+    // invocation state; otherwise the ledger records a failed execution and
+    // later policy treats an advisory admission result as unfinished work.
+    let explicitly_not_executed = execution_fact.as_deref() == Some("not_executed")
+        || disposition.as_deref() == Some("rejected")
+        || (execution_started == Some(false) && disposition.is_none());
+    let explicitly_rejected = explicitly_not_executed
+        || rejection_code.is_some()
         || capability_denial
         || matches!(
             error_kind.as_deref(),
@@ -1312,6 +1467,9 @@ fn result_side_effects_maybe(result: &astra_tools::ToolResult) -> bool {
     structured_field(result, "side_effects_maybe")
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
+        || structured_field(result, "execution_fact")
+            .and_then(|value| value.as_str().map(|fact| fact == "unknown"))
+            .unwrap_or(false)
 }
 
 fn replay_terminal_record(
@@ -1515,6 +1673,11 @@ pub(crate) fn ledger_unavailable_result(
         ),
         ("invocation_identity".to_string(), json!(identity)),
         ("side_effects_maybe".to_string(), Value::Bool(false)),
+        ("execution_started".to_string(), Value::Bool(false)),
+        (
+            "disposition".to_string(),
+            Value::String("rejected".to_string()),
+        ),
         ("retryable".to_string(), Value::Bool(true)),
         ("resumable".to_string(), Value::Bool(true)),
     ]));
@@ -2732,6 +2895,111 @@ mod tests {
                 ..
             } if code == "tenant_policy"
         ));
+    }
+
+    #[test]
+    fn control_execution_fact_reaches_canonical_terminal_classification() {
+        let result = crate::server::tool_execution_result::agent_tool_result_from_output(
+            "agent_fanout",
+            json!({
+                "status": "failed",
+                "error_kind": "fanout_group_already_started",
+                "error": "the existing group is still active",
+                "executed": false,
+                "group_id": "existing-group"
+            })
+            .to_string(),
+        );
+
+        assert!(matches!(
+            terminal_outcome_from_result(&result),
+            ToolInvocationTerminalOutcome::Rejected {
+                rejection_code: Some(code),
+                ..
+            } if code == "fanout_group_already_started"
+        ));
+    }
+
+    #[tokio::test]
+    async fn fanout_rejection_and_unknown_facts_survive_finish_and_replay() {
+        let ledger = RuntimeToolInvocationLedger::new(None);
+
+        let rejected_identity = identity("fanout-rejected");
+        let rejected_fingerprint = fingerprint(&json!({"action": "start"}));
+        let rejected_owner = execute_owner(
+            begin(&ledger, &rejected_identity, &rejected_fingerprint)
+                .await
+                .unwrap(),
+        );
+        let rejected_result = crate::server::tool_execution_result::agent_tool_result_from_output(
+            "agent_fanout",
+            json!({
+                "status": "failed",
+                "error_kind": "fanout_group_already_started",
+                "error": "the existing group is still active",
+                "executed": false,
+                "group_id": "existing-group"
+            })
+            .to_string(),
+        );
+        let rejected = ledger
+            .finish(&rejected_identity, &rejected_owner, rejected_result)
+            .await;
+        assert_eq!(
+            rejected.record.as_deref().map(|record| record.state),
+            Some(ToolInvocationState::Rejected)
+        );
+        let rejected_replay = match begin(&ledger, &rejected_identity, &rejected_fingerprint)
+            .await
+            .unwrap()
+        {
+            InvocationBeginDisposition::Return(result) => result,
+            InvocationBeginDisposition::Execute { .. } => {
+                panic!("a rejected control invocation must replay its rejection")
+            }
+        };
+        assert_eq!(
+            rejected_replay.record.as_deref().map(|record| record.state),
+            Some(ToolInvocationState::Rejected)
+        );
+
+        let unknown_identity = identity("fanout-unknown");
+        let unknown_fingerprint = fingerprint(&json!({"action": "start"}));
+        let unknown_owner = execute_owner(
+            begin(&ledger, &unknown_identity, &unknown_fingerprint)
+                .await
+                .unwrap(),
+        );
+        let unknown_result = crate::server::tool_execution_result::agent_tool_result_from_output(
+            "agent_fanout",
+            json!({
+                "status": "unknown",
+                "error_kind": "action_outcome_unknown",
+                "error": "dispatch acknowledgement was lost",
+                "executed": null
+            })
+            .to_string(),
+        );
+        let unknown = ledger
+            .finish(&unknown_identity, &unknown_owner, unknown_result)
+            .await;
+        assert_eq!(
+            unknown.record.as_deref().map(|record| record.state),
+            Some(ToolInvocationState::OutcomeUnknown)
+        );
+        let unknown_replay = match begin(&ledger, &unknown_identity, &unknown_fingerprint)
+            .await
+            .unwrap()
+        {
+            InvocationBeginDisposition::Return(result) => result,
+            InvocationBeginDisposition::Execute { .. } => {
+                panic!("an unknown control invocation must not be replayed as executable")
+            }
+        };
+        assert_eq!(
+            unknown_replay.record.as_deref().map(|record| record.state),
+            Some(ToolInvocationState::OutcomeUnknown)
+        );
     }
 
     #[tokio::test]

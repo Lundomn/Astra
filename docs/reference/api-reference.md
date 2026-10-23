@@ -72,6 +72,79 @@ Account identity, Work/history and Memoria memories are retained. This disconnec
 
 ---
 
+## Auto model routing for chat
+
+On `POST /chat` and `POST /chat/stream`, an authenticated Server-catalog user
+can opt into the configured economy/strong routing policy:
+
+```json
+{"message":"Explain this result", "execution_policy":{"model_routing":"auto"}}
+```
+
+Omit `model_selection` for Auto. Missing configuration returns
+`model_routing_unavailable`; explicit model state, provider model gateways,
+bound Work, or fixed-default semantic admission combined with Auto returns
+`model_routing_unsupported`. Existing Offering authorization still applies.
+With no Auto request, model selection behaves as before. The initial policy
+uses economy only for confidently easy, read-only tasks with compatible model
+contracts. See [model routing](../design/model-routing.md#deterministic-auto-selection-stage-3)
+for configuration, coverage, and persistence semantics.
+
+## Active run permission mode
+
+### POST /chat/runs/{run_id}/permission-mode
+
+The authenticated owner can select a permission policy for an active root run.
+The session ID must match the run. Request IDs are idempotent; reusing an ID
+with another mode returns 409.
+
+```json
+{"expected_session_id":"session-1","request_id":"change-1","mode":"bypass"}
+```
+
+Modes use the canonical wire values: `prompt`, `accept_edits`, `plan`, `auto`,
+`bypass`, and `deny`. Here `plan` means read-only tool policy; it does not create
+or approve a planning workflow.
+
+The response acknowledges durable acceptance:
+
+```json
+{"request_id":"change-1","mode":"bypass","revision":12}
+```
+
+The run captures the latest accepted policy at its next model-round boundary.
+An already-started round keeps its captured server policy. Acceptance alone is
+not proof of application. The `permission_mode_applied` stream event reports
+`request_id`, `mode`, `revision`, `round_index`, and `owner_generation` after the
+runtime has applied the policy and durably recorded the acknowledgement.
+Bypass retains capability restrictions and policy hard denies.
+
+Missing, foreign, non-root, or session-mismatched runs return 404. Inactive runs
+and request identity conflicts return 409; unavailable storage or an
+unconfirmed commit returns 503. Retry an unconfirmed request with the same
+request ID.
+
+### GET /chat/runs/{run_id}/permission-mode?expected_session_id={session_id}
+
+Returns a bounded snapshot for recovering a pending acknowledgement:
+
+```json
+{
+  "requested":{"request_id":"change-1","mode":"bypass","revision":12},
+  "applied":{
+    "selection":{"request_id":"change-1","mode":"bypass","revision":12},
+    "round_index":3,
+    "owner_generation":0
+  }
+}
+```
+
+Either field can be `null`. A newer `requested` revision than the `applied`
+selection remains pending. Clients can stop polling once the requested revision
+is acknowledged; ordinary observation uses the run stream.
+
+---
+
 ## Agents
 
 ### POST /agents
@@ -95,6 +168,11 @@ pagination parameters.
 
 ### DELETE /agents/{agent_id} → 204
 
+Agent names are unique per owner. Creating a duplicate name or renaming an
+agent to another of the owner's names returns 409 without changing either
+record. Different owners may use the same name. Reads and mutations of another
+owner's agent, and reads or deletes of a missing agent, return 404.
+
 ---
 
 ## Sessions
@@ -116,6 +194,19 @@ Query params: `agent_id`, `session_status`, `limit`, `after_updated_at`, and
 provided together; `offset` pagination is not supported.
 
 ### GET /sessions/{session_id}
+
+### GET /sessions/{session_id}/transcript
+
+Owner-scoped item pagination accepts `limit`, `before_seq`, and either
+`scope=root_conversation` or `run_id`. Combining those filters is rejected;
+omitting both selects the session audit stream. Items retain ascending
+`item_seq` order and stable `source_event_id` values. The response contains
+`session_id`, `items`, `next_before_seq`, and `has_more`. Use the returned
+sequence with the same scope for older items. Artifact hydration is included.
+Physical page references/hashes are no longer part of this response.
+
+Work transcript responses retain their committed cursor and per-item commitment
+fields; a newer canonical context head does not certify transcript publication.
 
 ### PUT /sessions/{session_id}
 
@@ -201,24 +292,6 @@ filter.
 
 ---
 
-## Replay
-
-### POST /sessions/{session_id}/replay
-
-Reserved for durable replay reconstruction. For an owned session this route
-currently returns HTTP 501 with an explicit unavailable detail; it does not
-create a replay identity or execute any provider, tool, or external call.
-Missing or foreign sessions return HTTP 404 without revealing ownership.
-
-### GET /sessions/{session_id}/replay/compare
-
-Reserved for durable replay reconstruction. For an owned session this route
-currently returns HTTP 501 with an explicit unavailable detail; it does not
-return replay or comparison counts. Missing or foreign sessions return HTTP
-404 without revealing ownership.
-
----
-
 ## Skills
 
 ### GET /skills
@@ -294,8 +367,25 @@ the replica should be removed from service routing.
 ### GET /health
 
 Aggregate diagnostic state, including optional Memoria degradation and build
-identity. This endpoint is for observation; use `/live` and `/ready` for
-orchestrator probes.
+identity. `build_git_dirty=false` is an explicit clean-build declaration;
+`true` means tracked source changes **or an unverified source state**. Ordinary
+Cargo builds (debug or release) without a valid attestation nonce or a complete
+trusted source declaration conservatively report `true`, even in a clean
+checkout. They do not watch every tracked file, so unrelated edits can reuse
+core without leaving an old clean identity that artifact verification accepts.
+
+Identity-sensitive builds must either use a valid 64-hex
+`ASTRA_BUILD_ATTESTATION_NONCE` (which watches all tracked files, even when the
+nonce is reused), or a trusted orchestrator must supply both the full
+`ASTRA_BUILD_SOURCE_GIT_SHA` and `ASTRA_BUILD_SOURCE_GIT_DIRTY=true|false` for the
+exact source being compiled. The orchestrator must refresh that declaration on
+every build and prevent source changes during compilation; setting a constant
+`false` in a development shell is not verification. Container/manual harness
+builds and `scripts/dev/start-api.sh` use the explicit declaration. Missing or
+malformed declarations cannot establish a clean identity. The same conservative
+boolean is exposed through `--build-info-json`, so existing clean-artifact probes
+reject ordinary unverified builds. This endpoint is for observation;
+use `/live` and `/ready` for orchestrator probes.
 
 ```json
 {
@@ -303,7 +393,8 @@ orchestrator probes.
   "database": "connected",
   "memoria": "available",
   "interaction_api_major": "3",
-  "build_git_sha": "0123456789abcdef0123456789abcdef01234567"
+  "build_git_sha": "0123456789abcdef0123456789abcdef01234567",
+  "build_git_dirty": false
 }
 ```
 

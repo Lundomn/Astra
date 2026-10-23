@@ -2,18 +2,471 @@ mod common;
 
 use std::{sync::Arc, time::Duration};
 
+use astra_core::SharedPool;
 use astra_services::{
     AcquireWriterAndReserveTurnOutcome, AcquireWriterOutcome, BeginSessionExecutionSwitchV1,
     DatabaseSessionContextCoordinator, ReserveTurnOutcome, SessionContextCoordinator,
     SessionContextCoordinatorError, SessionExecutionBindingStateV1, SessionExecutionBindingV1,
+    SessionService,
 };
 use astra_turn_types::{
     ActorContextV1, ActorKindV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION,
     CanonicalDeltaModeV1, CanonicalTurnDeltaV1, ContextManifestNodeV1, ConversationSegmentV1,
-    CoordinatorMutationV1, SESSION_ATTACHMENT_SCHEMA_VERSION, SessionAttachmentModeV1,
-    SessionAttachmentV1, SessionKeyV1, SessionPlacementV1, SessionSurfaceV1,
+    CoordinatorMutationV1, SessionKeyV1, SessionSurfaceV1,
 };
+use serial_test::serial;
 use uuid::Uuid;
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn canonical_commit_releases_only_its_own_completed_writer() {
+    let pool = common::setup_pool().await;
+    let owner = format!("commit-release-owner-{}", Uuid::new_v4());
+    let session = format!("commit-release-session-{}", Uuid::new_v4());
+    let key = SessionKeyV1::owner_session("server", &owner, &session, "main");
+    let actor = ActorContextV1::owner_user(
+        &owner,
+        "commit-release-db-it",
+        ActorKindV1::Server,
+        SessionSurfaceV1::Server,
+        None,
+        AuthorityEpochsV1::default(),
+    );
+    let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+    let (lease, reservation) = match coordinator
+        .acquire_writer_and_reserve_turn(
+            &key,
+            None,
+            &actor,
+            Duration::from_secs(30),
+            "writer-1",
+            "turn-1",
+            None,
+        )
+        .await
+        .unwrap()
+    {
+        AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation } => (lease, reservation),
+        other => panic!("unexpected admission: {other:?}"),
+    };
+    let delta = |turn| CanonicalTurnDeltaV1 {
+        schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+        completed_turn: turn,
+        journal_event_seq: u64::from(turn),
+        conversation_seq: u64::from(turn),
+        compaction_generation: 0,
+        config_version_id: None,
+        mode: CanonicalDeltaModeV1::Append,
+        logical_segments: vec![vec![
+            serde_json::json!({"role":"assistant", "content":"hi"}),
+        ]],
+    };
+    assert!(
+        coordinator
+            .commit_turn_and_release_writer(&reservation, delta(2), "invalid-turn",)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        coordinator.load_active_writer(&key).await.unwrap(),
+        Some(lease)
+    );
+    assert!(coordinator.load_head(&key).await.unwrap().is_none());
+    let (first, concurrent_retry) = tokio::join!(
+        coordinator.commit_turn_and_release_writer(&reservation, delta(1), "commit-1"),
+        coordinator.commit_turn_and_release_writer(&reservation, delta(1), "commit-1"),
+    );
+    let outcomes = [first.unwrap(), concurrent_retry.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|o| matches!(o, CoordinatorMutationV1::Applied { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|o| matches!(o, CoordinatorMutationV1::AlreadyApplied { .. }))
+            .count(),
+        1
+    );
+    let cursor = match &outcomes[0] {
+        CoordinatorMutationV1::Applied { cursor }
+        | CoordinatorMutationV1::AlreadyApplied { cursor } => cursor.clone(),
+        other => panic!("unexpected commit: {other:?}"),
+    };
+    let commit_actor: Option<String> = sqlx::query_scalar(
+        "SELECT actor_id FROM session_context_authority_events
+         WHERE owner_user_id = ? AND session_id = ?
+           AND operation_kind = 'commit_turn' AND outcome = 'committed'",
+    )
+    .bind(&owner)
+    .bind(&session)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(commit_actor.as_deref(), Some(actor.actor_id.as_str()));
+    assert!(
+        coordinator
+            .load_active_writer(&key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        coordinator
+            .commit_turn_and_release_writer(&reservation, delta(1), "commit-1",)
+            .await
+            .unwrap(),
+        CoordinatorMutationV1::AlreadyApplied { .. }
+    ));
+    let (next_lease, next_reservation) = match coordinator
+        .acquire_writer_and_reserve_turn(
+            &key,
+            Some(&cursor),
+            &actor,
+            Duration::from_secs(30),
+            "writer-2",
+            "turn-2",
+            None,
+        )
+        .await
+        .unwrap()
+    {
+        AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation } => (lease, reservation),
+        other => panic!("unexpected next admission: {other:?}"),
+    };
+    assert!(matches!(
+        coordinator
+            .commit_turn_and_release_writer(&reservation, delta(1), "commit-1",)
+            .await
+            .unwrap(),
+        CoordinatorMutationV1::AlreadyApplied { .. }
+    ));
+    assert_eq!(
+        coordinator.load_active_writer(&key).await.unwrap(),
+        Some(next_lease.clone())
+    );
+    // The next reservation must still be valid, not just the writer row.
+    let next_cursor = match coordinator
+        .commit_turn(&next_reservation, delta(2), "commit-2")
+        .await
+        .unwrap()
+    {
+        CoordinatorMutationV1::Applied { cursor } => cursor,
+        other => panic!("unexpected retained commit: {other:?}"),
+    };
+    assert_eq!(
+        coordinator.load_active_writer(&key).await.unwrap(),
+        Some(next_lease.clone())
+    );
+    let third = match coordinator
+        .reserve_turn(
+            &next_lease,
+            Some(&next_cursor),
+            Duration::from_secs(30),
+            "turn-3",
+            None,
+        )
+        .await
+        .unwrap()
+    {
+        ReserveTurnOutcome::Reserved(reservation) => reservation,
+        other => panic!("unexpected third reservation: {other:?}"),
+    };
+    // An older retained commit may share this lease but must not erase turn 3.
+    assert!(matches!(
+        coordinator
+            .commit_turn_and_release_writer(&next_reservation, delta(2), "commit-2",)
+            .await
+            .unwrap(),
+        CoordinatorMutationV1::AlreadyApplied { .. }
+    ));
+    assert_eq!(
+        coordinator.load_active_writer(&key).await.unwrap(),
+        Some(next_lease)
+    );
+    assert!(matches!(
+        coordinator
+            .commit_turn_and_release_writer(&third, delta(3), "commit-3",)
+            .await
+            .unwrap(),
+        CoordinatorMutationV1::Applied { .. }
+    ));
+    assert!(
+        coordinator
+            .load_active_writer(&key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Exercise the archived receipt path after a newer turn has committed.
+    assert!(matches!(
+        coordinator
+            .commit_turn_and_release_writer(&reservation, delta(1), "commit-1",)
+            .await
+            .unwrap(),
+        CoordinatorMutationV1::AlreadyApplied { .. }
+    ));
+    assert_eq!(
+        coordinator
+            .load_head(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .cursor
+            .completed_turn,
+        3
+    );
+    for table in [
+        "conversation_manifest_segments",
+        "conversation_manifest_nodes",
+        "conversation_segments",
+        "session_context_operation_receipts",
+        "session_context_authority_events",
+        "session_context_heads",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ?"
+        )))
+        .bind(&key.isolation_domain)
+        .bind(&owner)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live MatrixOne (ASTRA_TEST_DB_IT=1)"]
+#[serial]
+async fn cancelled_session_authority_lock_releases_its_physical_checkout() {
+    let observer_pool = common::setup_pool().await;
+    let (_, mut settings) = common::setup_pool_and_settings().await;
+    settings.db_pool_min_connections = 0;
+    settings.db_pool_max_connections = 2;
+    let shared_pool = SharedPool::new(&settings)
+        .await
+        .expect("create two-connection cancellation pool");
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let owner_id = format!("authority-cancel-owner-{suffix}");
+    let session_id = format!("authority-cancel-session-{suffix}");
+    let key = SessionKeyV1::owner_session("server", &owner_id, &session_id, "main");
+    let coordinator = DatabaseSessionContextCoordinator::new(shared_pool.clone());
+    coordinator
+        .load_or_initialize_execution_binding(
+            &key,
+            &SessionExecutionBindingV1::server_work_default(format!(
+                "authority-cancel-work-{suffix}"
+            )),
+        )
+        .await
+        .expect("initialize cancellation fixture");
+    let actor = ActorContextV1::owner_user(
+        &owner_id,
+        "authority-cancellation-db-it",
+        ActorKindV1::Server,
+        SessionSurfaceV1::Server,
+        None,
+        AuthorityEpochsV1::default(),
+    );
+
+    let mut blocker = pool.begin().await.expect("begin session-head blocker");
+    let blocker_connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(&mut *blocker)
+        .await
+        .expect("read blocker connection id");
+    sqlx::query(
+        "SELECT head_json FROM session_context_heads
+         WHERE isolation_domain = ? AND owner_user_id = ?
+           AND session_id = ? AND branch_id = ? FOR UPDATE",
+    )
+    .bind(&key.isolation_domain)
+    .bind(&key.owner_user_id)
+    .bind(&key.session_id)
+    .bind(&key.branch_id)
+    .fetch_one(&mut *blocker)
+    .await
+    .expect("hold the canonical session-head lock");
+
+    // The blocker owns one of the two pool slots. Prime the only other slot
+    // and record its server identity before the coordinator starts; observing
+    // that exact connection avoids mistaking another test's query for the
+    // cancelled operation.
+    let worker_connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(pool)
+        .await
+        .expect("identify the coordinator connection slot");
+
+    let blocked = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let key = key.clone();
+        let actor = actor.clone();
+        async move {
+            coordinator
+                .acquire_writer(
+                    &key,
+                    None,
+                    &actor,
+                    Duration::from_secs(30),
+                    "blocked-writer",
+                )
+                .await
+        }
+    });
+    let database_name = settings.database.clone();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut observed_wait = false;
+    let mut last_processlist = Vec::new();
+    let mut observation_error = None;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let processlist = tokio::time::timeout(
+            remaining,
+            sqlx::query_as::<_, (u64, Option<String>)>(
+                "SELECT conn_id, info FROM information_schema.processlist
+                 WHERE db = ? AND conn_id = ?
+                   AND info IS NOT NULL",
+            )
+            .bind(&database_name)
+            .bind(worker_connection_id)
+            .fetch_all(observer_pool.get()),
+        )
+        .await;
+        let processlist = match processlist {
+            Ok(Ok(processlist)) => processlist,
+            Ok(Err(error)) => {
+                observation_error = Some(format!("processlist query failed: {error}"));
+                break;
+            }
+            Err(_) => {
+                observation_error = Some("processlist query exceeded its deadline".into());
+                break;
+            }
+        };
+        last_processlist = processlist;
+        if last_processlist.iter().any(|(_, info)| {
+            info.as_deref()
+                .is_some_and(|info| info.contains("session_context_heads"))
+        }) {
+            observed_wait = true;
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let _ =
+            tokio::time::timeout(remaining, tokio::time::sleep(Duration::from_millis(10))).await;
+    }
+
+    blocked.abort();
+    let blocked_result = blocked.await;
+    let replacement_connection_id = tokio::time::timeout(
+        Duration::from_secs(1),
+        sqlx::query_scalar::<_, u64>("SELECT CONNECTION_ID()").fetch_one(pool),
+    )
+    .await;
+
+    blocker
+        .rollback()
+        .await
+        .expect("release the canonical session-head blocker");
+    for table in [
+        "session_execution_bindings",
+        "session_context_operation_receipts",
+        "session_context_authority_events",
+        "session_context_heads",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?"
+        )))
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .execute(pool)
+        .await
+        .expect("clean cancellation fixture");
+    }
+
+    assert!(
+        observation_error.is_none(),
+        "processlist observation must finish before its deadline: error={observation_error:?}"
+    );
+    assert!(
+        observed_wait,
+        "cancellation regression must observe the exact coordinator connection waiting on the locked session head; worker_connection_id={worker_connection_id}, blocker_connection_id={blocker_connection_id}, processlist={last_processlist:?}"
+    );
+    assert!(
+        blocked_result
+            .as_ref()
+            .is_err_and(|error| error.is_cancelled()),
+        "blocked coordinator must be externally cancellable: result={blocked_result:?}"
+    );
+    let replacement_connection_id = replacement_connection_id
+        .expect("a replacement checkout must remain available after cancellation")
+        .expect("replacement checkout health query");
+    assert_ne!(
+        replacement_connection_id, worker_connection_id,
+        "cancellation must close the physical connection instead of returning it to the pool"
+    );
+}
+
+fn edge_binding(
+    logical: &str,
+    generation: u64,
+    state: SessionExecutionBindingStateV1,
+    executor: &str,
+    materialization: &str,
+    root: &str,
+) -> SessionExecutionBindingV1 {
+    SessionExecutionBindingV1 {
+        schema_version: astra_services::SESSION_EXECUTION_BINDING_SCHEMA_VERSION,
+        generation,
+        state,
+        logical_workspace_id: logical.into(),
+        physical_workspace_id: Some(
+            SessionExecutionBindingV1::edge_materialization_physical_identity(
+                materialization,
+                root,
+            ),
+        ),
+        workspace: astra_services::runs::WorkspaceBindingRequest {
+            kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+            display_name: Some(executor.into()),
+            root: Some(root.into()),
+            source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
+                path: root.into(),
+            }),
+            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+        },
+        executor: astra_services::runs::ExecutorBindingRequest {
+            kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+            executor_id: Some(executor.into()),
+            display_name: Some(executor.into()),
+            transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger),
+            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+        },
+    }
+}
+
+fn source_evidence(root: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "root": root,
+        "head": "head",
+        "tree": "tree",
+        "object_format": "sha1",
+        "reference": "main",
+        "repository": "repo",
+        "clean": true
+    })
+}
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
@@ -97,9 +550,9 @@ async fn complete_turn_authority_renews_atomically_in_database() {
         "session_context_authority_events",
         "session_context_heads",
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?"
-        ))
+        )))
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
         .bind(&key.session_id)
@@ -117,16 +570,37 @@ async fn execution_binding_is_owner_scoped_fenced_and_quiescent_per_session() {
     let owner_a = format!("execution-binding-owner-a-{suffix}");
     let owner_b = format!("execution-binding-owner-b-{suffix}");
     let shared_session = format!("execution-binding-session-{suffix}");
-    let other_session = format!("execution-binding-other-session-{suffix}");
+    let other_session = format!("execution-other-{suffix}");
     let key_a = SessionKeyV1::owner_session("server", &owner_a, &shared_session, "main");
     let key_a_other = SessionKeyV1::owner_session("server", &owner_a, &other_session, "main");
     // Deliberately reuse the session id across owners to prove the owner key
     // remains part of selection identity.
     let key_b = SessionKeyV1::owner_session("server", &owner_b, &shared_session, "main");
     let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
-    let initial_a = SessionExecutionBindingV1::server_work_default("work:shared:branch:main");
-    let initial_a_other = SessionExecutionBindingV1::server_work_default("work:other:branch:main");
-    let initial_b = SessionExecutionBindingV1::server_work_default("work:shared:branch:main");
+    let initial_a = edge_binding(
+        "work:shared:branch:main",
+        1,
+        SessionExecutionBindingStateV1::Ready,
+        "edge-source",
+        "source",
+        "/workspace/source",
+    );
+    let initial_a_other = edge_binding(
+        "work:other:branch:main",
+        1,
+        SessionExecutionBindingStateV1::Ready,
+        "edge-source",
+        "source",
+        "/workspace/source",
+    );
+    let initial_b = edge_binding(
+        "work:shared:branch:main",
+        1,
+        SessionExecutionBindingStateV1::Ready,
+        "edge-source",
+        "source",
+        "/workspace/source",
+    );
 
     for (key, initial) in [
         (&key_a, &initial_a),
@@ -140,15 +614,6 @@ async fn execution_binding_is_owner_scoped_fenced_and_quiescent_per_session() {
         assert_eq!(loaded.generation, 1);
     }
 
-    let mut switching = initial_a.clone();
-    switching.generation = 2;
-    switching.state = SessionExecutionBindingStateV1::Switching;
-    let switched = coordinator
-        .compare_and_swap_execution_binding(&key_a, 1, &switching)
-        .await
-        .expect("advance exactly the selected Session binding");
-    assert_eq!(switched.state, SessionExecutionBindingStateV1::Switching);
-
     let actor_a = ActorContextV1::owner_user(
         &owner_a,
         "execution-binding-db-it",
@@ -157,6 +622,33 @@ async fn execution_binding_is_owner_scoped_fenced_and_quiescent_per_session() {
         None,
         AuthorityEpochsV1::default(),
     );
+    let attachment = common::controller_attachment(&pool, &key_a, actor_a.clone()).await;
+    let switched = coordinator
+        .begin_execution_switch(
+            &key_a,
+            &BeginSessionExecutionSwitchV1 {
+                request_id: "owner-switch-request".into(),
+                operation_id: "owner-switch-operation".into(),
+                controller_attachment_id: attachment.attachment_id.clone(),
+                expected_generation: 1,
+                target: edge_binding(
+                    &initial_a.logical_workspace_id,
+                    2,
+                    SessionExecutionBindingStateV1::Switching,
+                    "edge-target",
+                    "target",
+                    "/workspace/target",
+                ),
+                source_evidence: source_evidence("/workspace/source"),
+            },
+        )
+        .await
+        .expect("advance exactly the selected Session binding");
+    assert_eq!(
+        switched.state,
+        astra_services::SessionExecutionSwitchStateV1::Switching
+    );
+
     assert!(matches!(
         coordinator
             .acquire_writer_and_reserve_turn(
@@ -220,25 +712,50 @@ async fn execution_binding_is_owner_scoped_fenced_and_quiescent_per_session() {
         AcquireWriterOutcome::Acquired(lease) => lease,
         other => panic!("unexpected writer outcome: {other:?}"),
     };
-    let mut blocked_switch = other_a.clone();
-    blocked_switch.generation = 2;
-    blocked_switch.state = SessionExecutionBindingStateV1::Switching;
+    let other_attachment = common::controller_attachment(&pool, &key_a_other, actor_a).await;
     assert!(matches!(
         coordinator
-            .compare_and_swap_execution_binding(&key_a_other, 1, &blocked_switch)
+            .begin_execution_switch(
+                &key_a_other,
+                &BeginSessionExecutionSwitchV1 {
+                    request_id: "busy-switch-request".into(),
+                    operation_id: "busy-switch-operation".into(),
+                    controller_attachment_id: other_attachment.attachment_id,
+                    expected_generation: 1,
+                    target: edge_binding(
+                        &other_a.logical_workspace_id,
+                        2,
+                        SessionExecutionBindingStateV1::Switching,
+                        "edge-target",
+                        "target",
+                        "/workspace/target"
+                    ),
+                    source_evidence: source_evidence("/workspace/source"),
+                }
+            )
             .await,
         Err(SessionContextCoordinatorError::ExecutionBindingBusy)
     ));
 
-    // A live writer on one Session does not hold a global provider-selection
-    // lock or block another Session owned by the same user.
-    let mut ready_a = initial_a.clone();
-    ready_a.generation = 3;
+    // Another Session's live writer cannot block this receipt's completion.
     let ready_a = coordinator
-        .compare_and_swap_execution_binding(&key_a, 2, &ready_a)
+        .complete_execution_switch(
+            &key_a,
+            &switched.operation_id,
+            Some(&attachment.attachment_id),
+            switched.attempt,
+            switched.switching_generation,
+            true,
+            Some(serde_json::json!({"source": source_evidence("/workspace/source")})),
+            None,
+        )
         .await
         .expect("unrelated Session remains independently writable");
-    assert_eq!(ready_a.state, SessionExecutionBindingStateV1::Ready);
+    assert_eq!(ready_a.completed_generation, Some(3));
+    assert_eq!(
+        ready_a.state,
+        astra_services::SessionExecutionSwitchStateV1::Succeeded
+    );
 
     coordinator
         .release_writer(&lease)
@@ -246,28 +763,21 @@ async fn execution_binding_is_owner_scoped_fenced_and_quiescent_per_session() {
         .expect("release fixture writer");
 
     for key in [&key_a, &key_a_other, &key_b] {
-        sqlx::query(
-            "DELETE FROM session_execution_bindings WHERE isolation_domain = ? \
-             AND owner_user_id = ? AND session_id = ? AND branch_id = ?",
-        )
-        .bind(&key.isolation_domain)
-        .bind(&key.owner_user_id)
-        .bind(&key.session_id)
-        .bind(&key.branch_id)
-        .execute(pool.get())
-        .await
-        .expect("clean execution binding fixture");
-        sqlx::query(
-            "DELETE FROM session_context_heads WHERE isolation_domain = ? \
-             AND owner_user_id = ? AND session_id = ? AND branch_id = ?",
-        )
-        .bind(&key.isolation_domain)
-        .bind(&key.owner_user_id)
-        .bind(&key.session_id)
-        .bind(&key.branch_id)
-        .execute(pool.get())
-        .await
-        .expect("clean Session coordination fixture");
+        for table in [
+            "session_execution_switches",
+            "session_attachments",
+            "session_execution_bindings",
+            "session_context_operation_receipts",
+            "session_context_authority_events",
+            "session_context_heads",
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ?"
+            )))
+            .bind(&key.isolation_domain).bind(&key.owner_user_id)
+            .bind(&key.session_id).bind(&key.branch_id)
+            .execute(pool.get()).await.expect("clean owner-scoped execution fixture");
+        }
     }
 }
 
@@ -280,8 +790,15 @@ async fn execution_switch_and_turn_admission_have_one_linearization_winner() {
     let session_id = format!("execution-race-session-{suffix}");
     let key = SessionKeyV1::owner_session("server", &owner_id, &session_id, "main");
     let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
-    let initial =
-        SessionExecutionBindingV1::server_work_default(format!("session:{session_id}:branch:main"));
+    let logical = format!("session:{session_id}:branch:main");
+    let initial = edge_binding(
+        &logical,
+        1,
+        SessionExecutionBindingStateV1::Ready,
+        "race-source",
+        "race-source-materialization",
+        "/workspace/source",
+    );
     coordinator
         .load_or_initialize_execution_binding(&key, &initial)
         .await
@@ -295,9 +812,15 @@ async fn execution_switch_and_turn_admission_have_one_linearization_winner() {
         None,
         AuthorityEpochsV1::default(),
     );
-    let mut switching = initial.clone();
-    switching.generation = 2;
-    switching.state = SessionExecutionBindingStateV1::Switching;
+    let attachment = common::controller_attachment(&pool, &key, actor.clone()).await;
+    let switching = edge_binding(
+        &logical,
+        2,
+        SessionExecutionBindingStateV1::Switching,
+        "race-target",
+        "race-target-materialization",
+        "/workspace/target",
+    );
 
     // Both paths start together.  The coordinator locks the canonical
     // Session head before checking the binding, so exactly one can cross the
@@ -313,7 +836,17 @@ async fn execution_switch_and_turn_admission_have_one_linearization_winner() {
     let switch = async move {
         switch_barrier.wait().await;
         switch_coordinator
-            .compare_and_swap_execution_binding(&switch_key, 1, &switching)
+            .begin_execution_switch(
+                &switch_key,
+                &BeginSessionExecutionSwitchV1 {
+                    request_id: "race-switch-request".into(),
+                    operation_id: "race-switch-operation".into(),
+                    controller_attachment_id: attachment.attachment_id,
+                    expected_generation: 1,
+                    target: switching,
+                    source_evidence: source_evidence("/workspace/source"),
+                },
+            )
             .await
     };
     let reserve = async move {
@@ -350,8 +883,11 @@ async fn execution_switch_and_turn_admission_have_one_linearization_winner() {
                 current: Some(2),
             }),
         ) => {
-            assert_eq!(binding.generation, 2);
-            assert_eq!(binding.state, SessionExecutionBindingStateV1::Switching);
+            assert_eq!(binding.switching_generation, 2);
+            assert_eq!(
+                binding.state,
+                astra_services::SessionExecutionSwitchStateV1::Switching
+            );
         }
         (
             Err(SessionContextCoordinatorError::ExecutionBindingBusy),
@@ -375,15 +911,15 @@ async fn execution_switch_and_turn_admission_have_one_linearization_winner() {
 
     for table in [
         "session_execution_switches",
-        "session_execution_workspace_claims",
+        "session_attachments",
         "session_execution_bindings",
         "session_context_operation_receipts",
         "session_context_authority_events",
         "session_context_heads",
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?"
-        ))
+        )))
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
         .bind(&key.session_id)
@@ -440,28 +976,15 @@ async fn execution_read_is_non_mutating_during_an_active_turn() {
         .expect("read execution binding during active turn")
         .expect("binding remains present");
     assert_eq!(loaded, initial);
-    let claim_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM session_execution_workspace_claims
-         WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?",
-    )
-    .bind(&key.isolation_domain)
-    .bind(&owner_id)
-    .bind(&session_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("count read fixture claims");
-    assert_eq!(claim_count, 0, "server-only reads do not create claims");
-
     for table in [
-        "session_execution_workspace_claims",
         "session_execution_bindings",
         "session_context_operation_receipts",
         "session_context_authority_events",
         "session_context_heads",
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?"
-        ))
+        )))
         .bind(&key.isolation_domain)
         .bind(&owner_id)
         .bind(&session_id)
@@ -470,15 +993,257 @@ async fn execution_read_is_non_mutating_during_an_active_turn() {
         .expect("clean execution read fixture");
     }
     for table in ["agent_session_lifecycle_fences", "agent_sessions"] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
-        ))
+        )))
         .bind(&owner_id)
         .bind(&session_id)
         .execute(pool.get())
         .await
         .expect("clean execution read session fixture");
     }
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_lifecycle_fence_rejects_context_admission_before_child_locks() {
+    let pool = common::setup_pool().await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let owner_id = format!("lifecycle-fence-owner-{suffix}");
+    let session_id = format!("lifecycle-fence-session-{suffix}");
+    let key = SessionKeyV1::owner_session("server", &owner_id, &session_id, "main");
+    sqlx::query(
+        "INSERT INTO agent_sessions
+         (session_id, user_id, status, event_count, created_at, updated_at, last_active_at)
+         VALUES (?, ?, 'active', 0, NOW(6), NOW(6), NOW(6))",
+    )
+    .bind(&session_id)
+    .bind(&owner_id)
+    .execute(pool.get())
+    .await
+    .expect("create lifecycle fence fixture session");
+
+    let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+    coordinator
+        .load_or_initialize_execution_binding(
+            &key,
+            &SessionExecutionBindingV1::server_work_default(format!(
+                "lifecycle-fence-work-{suffix}"
+            )),
+        )
+        .await
+        .expect("initialize lifecycle fence fixture");
+    let actor = ActorContextV1::owner_user(
+        &owner_id,
+        "lifecycle-fence-db-it",
+        ActorKindV1::Server,
+        SessionSurfaceV1::Server,
+        None,
+        AuthorityEpochsV1::default(),
+    );
+
+    sqlx::query(
+        "UPDATE agent_session_lifecycle_fences
+         SET delete_requested_at = NOW(6), updated_at = NOW(6)
+         WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&owner_id)
+    .bind(&session_id)
+    .execute(pool.get())
+    .await
+    .expect("mark lifecycle fence pending");
+    assert!(matches!(
+        coordinator
+            .acquire_writer(&key, None, &actor, Duration::from_secs(30), "fenced-writer")
+            .await,
+        Err(SessionContextCoordinatorError::SessionLifecycleFenced)
+    ));
+
+    sqlx::query(
+        "UPDATE agent_session_lifecycle_fences
+         SET database_deleted_at = NOW(6), updated_at = NOW(6)
+         WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&owner_id)
+    .bind(&session_id)
+    .execute(pool.get())
+    .await
+    .expect("mark lifecycle fence completed");
+    assert!(matches!(
+        coordinator
+            .acquire_writer(
+                &key,
+                None,
+                &actor,
+                Duration::from_secs(30),
+                "completed-fenced-writer",
+            )
+            .await,
+        Err(SessionContextCoordinatorError::SessionLifecycleFenced)
+    ));
+
+    let receipt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_context_operation_receipts
+         WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?",
+    )
+    .bind(&key.isolation_domain)
+    .bind(&owner_id)
+    .bind(&session_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("count fenced receipts");
+    assert_eq!(
+        receipt_count, 0,
+        "fenced admission must not create receipts"
+    );
+
+    for table in [
+        "session_execution_bindings",
+        "session_context_operation_receipts",
+        "session_context_authority_events",
+        "session_context_heads",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?"
+        )))
+        .bind(&key.isolation_domain)
+        .bind(&owner_id)
+        .bind(&session_id)
+        .execute(pool.get())
+        .await
+        .expect("clean lifecycle fence context fixture");
+    }
+    for table in ["agent_session_lifecycle_fences", "agent_sessions"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
+        )))
+        .bind(&owner_id)
+        .bind(&session_id)
+        .execute(pool.get())
+        .await
+        .expect("clean lifecycle fence session fixture");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_lifecycle_fence_serializes_delete_and_late_writer() {
+    let (shared, settings) = common::setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let owner_id = format!("lifecycle-race-owner-{suffix}");
+    let session_id = format!("lifecycle-race-session-{suffix}");
+    let key = SessionKeyV1::owner_session("server", &owner_id, &session_id, "main");
+    sqlx::query(
+        "INSERT INTO agent_sessions
+         (session_id, user_id, status, event_count, created_at, updated_at, last_active_at)
+         VALUES (?, ?, 'active', 0, NOW(6), NOW(6), NOW(6))",
+    )
+    .bind(&session_id)
+    .bind(&owner_id)
+    .execute(&pool)
+    .await
+    .expect("create lifecycle race fixture session");
+
+    let coordinator = DatabaseSessionContextCoordinator::new(shared.clone());
+    coordinator
+        .load_or_initialize_execution_binding(
+            &key,
+            &SessionExecutionBindingV1::server_work_default(format!(
+                "lifecycle-race-work-{suffix}"
+            )),
+        )
+        .await
+        .expect("initialize lifecycle race fixture");
+
+    // Hold the exact fence used by a coordinator writer. The real delete path
+    // must wait here rather than deleting child rows out from under the
+    // admitted transaction.
+    let mut admitted_writer = pool.begin().await.expect("begin admitted writer");
+    astra_services::storage::lock_agent_session_write_fence(
+        &mut admitted_writer,
+        &session_id,
+        &owner_id,
+    )
+    .await
+    .expect("admit writer lifecycle fence");
+
+    let delete_session_id = session_id.clone();
+    let delete_owner_id = owner_id.clone();
+    let mut delete_task = tokio::spawn(async move {
+        astra_services::DatabaseSessionService::new(settings)
+            .with_pool(shared)
+            .delete_session(delete_session_id, delete_owner_id)
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut delete_task)
+            .await
+            .is_err(),
+        "delete must wait for an already-admitted writer fence"
+    );
+    admitted_writer
+        .commit()
+        .await
+        .expect("commit admitted writer before delete");
+    tokio::time::timeout(Duration::from_secs(5), delete_task)
+        .await
+        .expect("delete must finish after the writer fence is released")
+        .expect("delete task must not panic")
+        .expect("delete session after admitted writer");
+
+    let actor = ActorContextV1::owner_user(
+        &owner_id,
+        "lifecycle-race-db-it",
+        ActorKindV1::Server,
+        SessionSurfaceV1::Server,
+        None,
+        AuthorityEpochsV1::default(),
+    );
+    assert!(matches!(
+        coordinator
+            .acquire_writer(&key, None, &actor, Duration::from_secs(30), "late-writer")
+            .await,
+        Err(SessionContextCoordinatorError::SessionLifecycleFenced)
+    ));
+    let head_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_context_heads
+         WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?",
+    )
+    .bind(&key.isolation_domain)
+    .bind(&owner_id)
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count deleted context heads");
+    let receipt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_context_operation_receipts
+         WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?",
+    )
+    .bind(&key.isolation_domain)
+    .bind(&owner_id)
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count deleted context receipts");
+    assert_eq!(
+        head_count, 0,
+        "late writer must not recreate the context head"
+    );
+    assert_eq!(
+        receipt_count, 0,
+        "late writer must not create an operation receipt"
+    );
+
+    sqlx::query(
+        "DELETE FROM agent_session_lifecycle_fences
+         WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&owner_id)
+    .bind(&session_id)
+    .execute(&pool)
+    .await
+    .expect("clean lifecycle race fence fixture");
 }
 
 #[tokio::test]
@@ -493,11 +1258,6 @@ async fn execution_switch_is_idempotent_retriable_and_workspace_exclusive() {
     let other_key = SessionKeyV1::owner_session("server", &owner_id, &other_session_id, "main");
     let logical = format!("session:{session_id}:branch:main");
     let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
-    let initial = SessionExecutionBindingV1::server_work_default(logical.clone());
-    coordinator
-        .load_or_initialize_execution_binding(&key, &initial)
-        .await
-        .expect("initialize switch binding");
 
     let actor = ActorContextV1::owner_user(
         &owner_id,
@@ -507,113 +1267,39 @@ async fn execution_switch_is_idempotent_retriable_and_workspace_exclusive() {
         None,
         AuthorityEpochsV1::default(),
     );
-    let attachment = SessionAttachmentV1 {
-        schema_version: SESSION_ATTACHMENT_SCHEMA_VERSION,
-        attachment_id: Uuid::new_v4().to_string(),
-        attachment_epoch: 1,
-        key: key.clone(),
-        actor,
-        mode: SessionAttachmentModeV1::Controller,
-        placement: SessionPlacementV1::Server,
-        observed_cursor: None,
-        observed_manifest_root: None,
-        workspace: None,
-        attached_at_unix_ms: 1,
-        expires_at_unix_ms: i64::MAX,
-    };
-    sqlx::query(
-        "INSERT INTO session_attachments
-         (isolation_domain, owner_user_id, session_id, branch_id, attachment_id,
-          attachment_epoch, idempotency_hash, request_hash, actor_id, mode,
-          placement, attachment_json, expires_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'controller', 'server', ?, ?)",
-    )
-    .bind(&key.isolation_domain)
-    .bind(&key.owner_user_id)
-    .bind(&key.session_id)
-    .bind(&key.branch_id)
-    .bind(&attachment.attachment_id)
-    .bind(attachment.attachment_epoch as i64)
-    .bind("a".repeat(64))
-    .bind("b".repeat(64))
-    .bind(&attachment.actor.actor_id)
-    .bind(serde_json::to_string(&attachment).expect("encode attachment"))
-    .bind(attachment.expires_at_unix_ms)
-    .execute(pool.get())
-    .await
-    .expect("insert controller attachment");
+    let attachment = common::controller_attachment(&pool, &key, actor).await;
 
-    let edge_binding = |generation: u64,
-                        state: SessionExecutionBindingStateV1,
-                        executor_id: &str,
-                        root: &str| SessionExecutionBindingV1 {
-        schema_version: astra_services::SESSION_EXECUTION_BINDING_SCHEMA_VERSION,
-        generation,
-        state,
-        logical_workspace_id: logical.to_string(),
-        physical_workspace_id: Some(
-            SessionExecutionBindingV1::edge_materialization_physical_identity(
-                if root == "/workspace/target" {
-                    "materialization-target"
-                } else {
-                    "materialization-source"
-                },
-                root,
-            ),
-        ),
-        workspace: astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
-            display_name: Some(executor_id.to_string()),
-            root: Some(root.to_string()),
-            source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
-                path: root.to_string(),
-            }),
-            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-        },
-        executor: astra_services::runs::ExecutorBindingRequest {
-            kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
-            executor_id: Some(executor_id.to_string()),
-            display_name: Some(executor_id.to_string()),
-            transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger),
-            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
-        },
+    let edge_binding = |generation, state, executor: &str, root: &str| {
+        edge_binding(
+            &logical,
+            generation,
+            state,
+            executor,
+            if root == "/workspace/target" {
+                "materialization-target"
+            } else {
+                "materialization-source"
+            },
+            root,
+        )
     };
-    let source_switching = edge_binding(
-        2,
-        SessionExecutionBindingStateV1::Switching,
-        "edge-source",
-        "/workspace/source",
-    );
-    coordinator
-        .compare_and_swap_execution_binding(&key, 1, &source_switching)
-        .await
-        .expect("prepare source Edge");
+    let evidence = source_evidence("/workspace/source");
     let source = edge_binding(
-        3,
+        1,
         SessionExecutionBindingStateV1::Ready,
         "edge-source",
         "/workspace/source",
     );
     coordinator
-        .compare_and_swap_execution_binding(&key, 2, &source)
+        .load_or_initialize_execution_binding(&key, &source)
         .await
-        .expect("confirm source Edge");
+        .expect("initialize the actual Ready Edge source");
     let target = edge_binding(
-        4,
+        2,
         SessionExecutionBindingStateV1::Switching,
         "edge-target",
         "/workspace/target",
     );
-    let evidence = serde_json::json!({
-        "schema_version": 1,
-        "root": "/workspace/source",
-        "head": "head",
-        "tree": "tree",
-        "object_format": "sha1",
-        "reference": "main",
-        "repository": "repo",
-        "clean": true
-    });
     let begun = coordinator
         .begin_execution_switch(
             &key,
@@ -621,7 +1307,7 @@ async fn execution_switch_is_idempotent_retriable_and_workspace_exclusive() {
                 request_id: "switch-request".into(),
                 operation_id: "switch-operation".into(),
                 controller_attachment_id: attachment.attachment_id.clone(),
-                expected_generation: 3,
+                expected_generation: 1,
                 target,
                 source_evidence: evidence.clone(),
             },
@@ -629,6 +1315,20 @@ async fn execution_switch_is_idempotent_retriable_and_workspace_exclusive() {
         .await
         .expect("begin durable switch");
     assert_eq!(begun.attempt, 1);
+
+    // Simulate the original handler exiting after the durable begin commit.
+    // A controller-authorized retry must be able to resume this permanently
+    // switching receipt instead of treating it as a terminal failure.
+    let stranded = coordinator
+        .authorize_execution_switch_retry(&key, &begun.operation_id, &attachment.attachment_id)
+        .await
+        .expect("authorize recovery of stranded switch");
+    assert_eq!(
+        stranded.state,
+        astra_services::SessionExecutionSwitchStateV1::Switching
+    );
+    assert_eq!(stranded.operation_id, begun.operation_id);
+
     let failed = coordinator
         .complete_execution_switch(
             &key,
@@ -646,16 +1346,16 @@ async fn execution_switch_is_idempotent_retriable_and_workspace_exclusive() {
         failed.state,
         astra_services::SessionExecutionSwitchStateV1::Failed
     );
-    assert_eq!(failed.completed_generation, Some(5));
+    assert_eq!(failed.completed_generation, Some(3));
 
     let retried = coordinator
-        .retry_execution_switch(&key, &begun.operation_id, &attachment.attachment_id, 5)
+        .retry_execution_switch(&key, &begun.operation_id, &attachment.attachment_id, 3)
         .await
         .expect("retry failed switch");
     assert_eq!(retried.attempt, 2);
-    assert_eq!(retried.expected_generation, 3);
-    assert_eq!(retried.attempt_expected_generation, 5);
-    assert_eq!(retried.switching_generation, 6);
+    assert_eq!(retried.expected_generation, 1);
+    assert_eq!(retried.attempt_expected_generation, 3);
+    assert_eq!(retried.switching_generation, 4);
     assert!(
         coordinator
             .load_execution_switch(&key, &begun.operation_id)
@@ -680,7 +1380,7 @@ async fn execution_switch_is_idempotent_retriable_and_workspace_exclusive() {
         completed.state,
         astra_services::SessionExecutionSwitchStateV1::Succeeded
     );
-    assert_eq!(completed.completed_generation, Some(7));
+    assert_eq!(completed.completed_generation, Some(5));
 
     let duplicate = coordinator
         .begin_execution_switch(
@@ -689,23 +1389,14 @@ async fn execution_switch_is_idempotent_retriable_and_workspace_exclusive() {
                 request_id: "switch-request".into(),
                 operation_id: "switch-operation-replay".into(),
                 controller_attachment_id: attachment.attachment_id.clone(),
-                expected_generation: 3,
+                expected_generation: 1,
                 target: edge_binding(
-                    4,
+                    2,
                     SessionExecutionBindingStateV1::Switching,
                     "edge-target",
                     "/workspace/target",
                 ),
-                source_evidence: serde_json::json!({
-                    "schema_version": 1,
-                    "root": "/workspace/source",
-                    "head": "head",
-                    "tree": "tree",
-                    "object_format": "sha1",
-                    "reference": "main",
-                    "repository": "repo",
-                    "clean": true
-                }),
+                source_evidence: source_evidence("/workspace/source"),
             },
         )
         .await
@@ -716,36 +1407,28 @@ async fn execution_switch_is_idempotent_retriable_and_workspace_exclusive() {
         astra_services::SessionExecutionSwitchStateV1::Succeeded
     );
 
-    coordinator
-        .load_or_initialize_execution_binding(&other_key, &initial)
-        .await
-        .expect("initialize second Session binding");
     let same_checkout = edge_binding(
-        2,
-        SessionExecutionBindingStateV1::Switching,
+        1,
+        SessionExecutionBindingStateV1::Ready,
         "edge-other",
         "/workspace/target",
     );
-    assert!(matches!(
-        coordinator
-            .compare_and_swap_execution_binding(&other_key, 1, &same_checkout)
-            .await,
-        Err(SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
-            ref owner_session_id,
-            ref owner_branch_id,
-        }) if owner_session_id == &key.session_id && owner_branch_id == &key.branch_id
-    ));
+    let shared_checkout = coordinator
+        .load_or_initialize_execution_binding(&other_key, &same_checkout)
+        .await
+        .expect("independent sessions may start on the same physical checkout");
+    assert_eq!(shared_checkout.generation, 1);
+    assert_eq!(shared_checkout.state, SessionExecutionBindingStateV1::Ready);
 
     for table in [
         "session_execution_switches",
-        "session_execution_workspace_claims",
         "session_attachments",
         "session_execution_bindings",
         "session_context_heads",
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? AND session_id IN (?, ?)"
-        ))
+        )))
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
         .bind(&key.session_id)
@@ -758,13 +1441,13 @@ async fn execution_switch_is_idempotent_retriable_and_workspace_exclusive() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_checkout() {
+async fn independent_sessions_share_one_physical_checkout() {
     let pool = common::setup_pool().await;
     let suffix = Uuid::new_v4().to_string();
     let owner_id = format!("execution-claim-owner-{suffix}");
-    let work_session_id = format!("execution-claim-work-session-{suffix}");
-    let ordinary_session_id = format!("execution-claim-ordinary-session-{suffix}");
-    let other_device_session_id = format!("execution-claim-other-device-session-{suffix}");
+    let work_session_id = format!("claim-work-{suffix}");
+    let ordinary_session_id = format!("claim-chat-{suffix}");
+    let other_device_session_id = format!("claim-device-{suffix}");
     let work_key = SessionKeyV1::owner_session("server", &owner_id, &work_session_id, "main");
     let ordinary_key =
         SessionKeyV1::owner_session("server", &owner_id, &ordinary_session_id, "main");
@@ -772,187 +1455,161 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
         SessionKeyV1::owner_session("server", &owner_id, &other_device_session_id, "main");
     let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
 
-    let work_initial = SessionExecutionBindingV1::server_work_default("work:claim:branch:main");
-    let ordinary_initial =
-        SessionExecutionBindingV1::server_work_default("session:ordinary:branch:default");
-    let other_device_initial =
-        SessionExecutionBindingV1::server_work_default("session:other-device:branch:default");
-    for (key, initial) in [
-        (&work_key, &work_initial),
-        (&ordinary_key, &ordinary_initial),
-        (&other_device_key, &other_device_initial),
-    ] {
-        coordinator
-            .load_or_initialize_execution_binding(key, initial)
-            .await
-            .expect("initialize both logical Sessions");
-    }
-
-    let edge_binding = |logical_workspace_id: &str,
-                        generation: u64,
-                        executor_id: &str,
-                        materialization_id: &str| {
-        SessionExecutionBindingV1 {
-            schema_version: astra_services::SESSION_EXECUTION_BINDING_SCHEMA_VERSION,
-            generation,
-            state: SessionExecutionBindingStateV1::Ready,
-            logical_workspace_id: logical_workspace_id.to_owned(),
-            physical_workspace_id: Some(
-                SessionExecutionBindingV1::edge_materialization_physical_identity(
-                    materialization_id,
-                    "/workspace/shared",
-                ),
-            ),
-            workspace: astra_services::runs::WorkspaceBindingRequest {
-                kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
-                display_name: Some("shared-checkout".into()),
-                root: Some("/workspace/shared".into()),
-                source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
-                    path: "/workspace/shared".into(),
-                }),
-                authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-            },
-            executor: astra_services::runs::ExecutorBindingRequest {
-                kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
-                executor_id: Some(executor_id.into()),
-                display_name: Some(executor_id.into()),
-                transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger),
-                status: Some(astra_services::runs::ExecutorStatusRequest::Online),
-            },
-        }
-    };
-
-    let mut work_preparing = edge_binding(
-        &work_initial.logical_workspace_id,
-        2,
+    let work_initial = edge_binding(
+        "work:claim:branch:main",
+        1,
+        SessionExecutionBindingStateV1::Ready,
         "edge-shared",
         "materialization-shared-device",
+        "/workspace/shared",
     );
-    work_preparing.state = SessionExecutionBindingStateV1::Switching;
-    coordinator
-        .compare_and_swap_execution_binding(&work_key, 1, &work_preparing)
-        .await
-        .expect("the first Session prepares the checkout");
-    let work_edge = edge_binding(
-        &work_initial.logical_workspace_id,
-        3,
-        "edge-shared",
-        "materialization-shared-device",
-    );
-    coordinator
-        .compare_and_swap_execution_binding(&work_key, 2, &work_edge)
-        .await
-        .expect("the first Session claims the checkout");
-
-    let mut ordinary_edge = edge_binding(
-        &ordinary_initial.logical_workspace_id,
-        2,
+    let ordinary_initial = edge_binding(
+        "session:ordinary:branch:default",
+        1,
+        SessionExecutionBindingStateV1::Ready,
         "edge-renamed",
         "materialization-shared-device",
+        "/workspace/shared",
     );
-    ordinary_edge.state = SessionExecutionBindingStateV1::Switching;
-    let error = coordinator
-        .compare_and_swap_execution_binding(&ordinary_key, 1, &ordinary_edge)
-        .await
-        .expect_err("a second Session must not share one physical checkout");
-    assert!(matches!(
-        error,
-        SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
-            ref owner_session_id,
-            ref owner_branch_id,
-        } if owner_session_id == &work_key.session_id && owner_branch_id == &work_key.branch_id
-    ));
-    let ordinary_after = coordinator
-        .load_execution_binding(&ordinary_key)
-        .await
-        .expect("load ordinary binding after rejected claim")
-        .expect("ordinary binding remains present");
-    assert_eq!(ordinary_after.generation, 1);
-    assert_eq!(
-        ordinary_after.workspace.kind,
-        astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox
+    let other_device_initial = edge_binding(
+        "session:other-device:branch:default",
+        1,
+        SessionExecutionBindingStateV1::Ready,
+        "edge-other-device",
+        "materialization-independent-device",
+        "/workspace/shared",
     );
+    for key in [&work_key, &ordinary_key, &other_device_key] {
+        sqlx::query(
+            "INSERT INTO agent_sessions
+             (session_id, user_id, status, event_count, created_at, updated_at, last_active_at)
+             VALUES (?, ?, 'active', 0, NOW(6), NOW(6), NOW(6))",
+        )
+        .bind(&key.session_id)
+        .bind(&key.owner_user_id)
+        .execute(pool.get())
+        .await
+        .expect("create durable checkout owner");
+    }
+    coordinator
+        .load_or_initialize_execution_binding(&work_key, &work_initial)
+        .await
+        .expect("the first Session selects the checkout");
 
-    let mut other_device_preparing = edge_binding(
-        &other_device_initial.logical_workspace_id,
-        2,
-        "edge-other-device",
-        "materialization-independent-device",
-    );
-    other_device_preparing.state = SessionExecutionBindingStateV1::Switching;
-    coordinator
-        .compare_and_swap_execution_binding(&other_device_key, 1, &other_device_preparing)
+    let active_writer = match coordinator
+        .acquire_writer(
+            &work_key,
+            None,
+            &ActorContextV1::owner_user(
+                &owner_id,
+                "checkout-owner",
+                ActorKindV1::Server,
+                SessionSurfaceV1::Server,
+                None,
+                AuthorityEpochsV1::default(),
+            ),
+            Duration::from_secs(60),
+            "active-checkout-writer",
+        )
         .await
-        .expect("an independent device may prepare the same path");
-    let other_device_edge = edge_binding(
-        &other_device_initial.logical_workspace_id,
-        3,
-        "edge-other-device",
-        "materialization-independent-device",
+        .expect("make checkout genuinely active")
+    {
+        AcquireWriterOutcome::Acquired(lease) => lease,
+        other => panic!("unexpected writer outcome: {other:?}"),
+    };
+
+    let shared = coordinator
+        .load_or_initialize_execution_binding(&ordinary_key, &ordinary_initial)
+        .await
+        .expect("another Session may select an actively used checkout");
+    assert_eq!(shared.generation, 1);
+    assert_eq!(shared.state, SessionExecutionBindingStateV1::Ready);
+    assert_eq!(
+        shared.physical_workspace_id,
+        work_initial.physical_workspace_id
     );
-    coordinator
-        .compare_and_swap_execution_binding(&other_device_key, 2, &other_device_edge)
+    let independent = coordinator
+        .load_or_initialize_execution_binding(&other_device_key, &other_device_initial)
         .await
         .expect("an independent device may materialize the same path");
-
-    // Moving one Session to another materialization must release its old
-    // claim and install the new one in the same transaction. The old checkout
-    // is then available to a different Session without a transient self-
-    // conflict from the per-Session unique claim key.
-    let mut work_preparing = edge_binding(
-        &work_initial.logical_workspace_id,
-        4,
-        "edge-other-device",
-        "materialization-handoff-device",
+    assert_ne!(
+        independent.physical_workspace_id,
+        work_initial.physical_workspace_id
     );
-    work_preparing.state = SessionExecutionBindingStateV1::Switching;
+    coordinator.release_writer(&active_writer).await.unwrap();
+
+    // Moving this Session does not change another Session's checkout identity.
+    let actor = ActorContextV1::owner_user(
+        &owner_id,
+        "checkout-owner",
+        ActorKindV1::Server,
+        SessionSurfaceV1::Server,
+        None,
+        AuthorityEpochsV1::default(),
+    );
+    let attachment = common::controller_attachment(&pool, &work_key, actor).await;
     let switched = coordinator
-        .compare_and_swap_execution_binding(&work_key, 3, &work_preparing)
+        .begin_execution_switch(
+            &work_key,
+            &BeginSessionExecutionSwitchV1 {
+                request_id: "checkout-switch-request".into(),
+                operation_id: "checkout-switch-operation".into(),
+                controller_attachment_id: attachment.attachment_id.clone(),
+                expected_generation: 1,
+                target: edge_binding(
+                    &work_initial.logical_workspace_id,
+                    2,
+                    SessionExecutionBindingStateV1::Switching,
+                    "edge-other-device",
+                    "materialization-handoff-device",
+                    "/workspace/shared",
+                ),
+                source_evidence: source_evidence("/workspace/shared"),
+            },
+        )
         .await
         .expect("the Session can prepare another materialization");
-    assert_eq!(switched.generation, 4);
-    let work_switching = edge_binding(
-        &work_initial.logical_workspace_id,
-        5,
-        "edge-other-device",
-        "materialization-handoff-device",
-    );
-    let switched = coordinator
-        .compare_and_swap_execution_binding(&work_key, 4, &work_switching)
+    assert_eq!(switched.switching_generation, 2);
+    let completed = coordinator
+        .complete_execution_switch(
+            &work_key,
+            &switched.operation_id,
+            Some(&attachment.attachment_id),
+            switched.attempt,
+            switched.switching_generation,
+            true,
+            Some(serde_json::json!({"source": source_evidence("/workspace/shared")})),
+            None,
+        )
         .await
         .expect("the Session can move its claim to another materialization");
-    assert_eq!(switched.generation, 5);
-    let mut ordinary_reclaim = edge_binding(
-        &ordinary_initial.logical_workspace_id,
-        2,
-        "edge-reclaimed",
-        "materialization-shared-device",
+    assert_eq!(completed.completed_generation, Some(3));
+    assert_eq!(
+        coordinator
+            .load_execution_binding(&ordinary_key)
+            .await
+            .unwrap(),
+        Some(ordinary_initial)
     );
-    ordinary_reclaim.state = SessionExecutionBindingStateV1::Switching;
-    coordinator
-        .compare_and_swap_execution_binding(&ordinary_key, 1, &ordinary_reclaim)
-        .await
-        .expect("the old materialization can be prepared after the handoff");
-    let ordinary_reclaim = edge_binding(
-        &ordinary_initial.logical_workspace_id,
-        3,
-        "edge-reclaimed",
-        "materialization-shared-device",
+    assert_eq!(
+        coordinator
+            .load_execution_binding(&other_device_key)
+            .await
+            .unwrap(),
+        Some(other_device_initial)
     );
-    coordinator
-        .compare_and_swap_execution_binding(&ordinary_key, 2, &ordinary_reclaim)
-        .await
-        .expect("the old materialization is released after the handoff");
-
     for key in [&work_key, &ordinary_key, &other_device_key] {
         for table in [
-            "session_execution_workspace_claims",
+            "session_execution_switches",
+            "session_attachments",
             "session_execution_bindings",
+            "session_context_operation_receipts",
+            "session_context_authority_events",
             "session_context_heads",
         ] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?"
-            ))
+            )))
             .bind(&key.isolation_domain)
             .bind(&key.owner_user_id)
             .bind(&key.session_id)
@@ -960,12 +1617,22 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
             .await
             .expect("clean execution claim fixture");
         }
+        for table in ["agent_session_lifecycle_fences", "agent_sessions"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
+            )))
+            .bind(&key.owner_user_id)
+            .bind(&key.session_id)
+            .execute(pool.get())
+            .await
+            .expect("clean durable checkout owner");
+        }
     }
 }
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn commit_reactivates_matching_legacy_staged_manifest() {
+async fn canonical_commit_replays_staged_manifest_and_preserves_idempotency() {
     let pool = common::setup_pool().await;
     let owner_id = format!("staged-manifest-owner-{}", Uuid::new_v4());
     let session_id = format!("staged-manifest-session-{}", Uuid::new_v4());
@@ -973,8 +1640,8 @@ async fn commit_reactivates_matching_legacy_staged_manifest() {
     let actor = ActorContextV1::owner_user(
         &owner_id,
         "staged-manifest-db-it",
-        ActorKindV1::Server,
-        SessionSurfaceV1::Server,
+        ActorKindV1::Cli,
+        SessionSurfaceV1::Cli,
         None,
         AuthorityEpochsV1::default(),
     );
@@ -1067,23 +1734,20 @@ async fn commit_reactivates_matching_legacy_staged_manifest() {
     .await
     .expect("stage legacy manifest reference");
 
+    let delta = CanonicalTurnDeltaV1 {
+        schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+        completed_turn: 1,
+        journal_event_seq: 1,
+        conversation_seq: 1,
+        compaction_generation: 0,
+        config_version_id: None,
+        mode: CanonicalDeltaModeV1::Append,
+        logical_segments: vec![messages.clone()],
+    };
     let outcome = coordinator
-        .commit_turn(
-            &reservation,
-            CanonicalTurnDeltaV1 {
-                schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
-                completed_turn: 1,
-                journal_event_seq: 1,
-                conversation_seq: 1,
-                compaction_generation: 0,
-                config_version_id: None,
-                mode: CanonicalDeltaModeV1::Append,
-                logical_segments: vec![messages.clone()],
-            },
-            "commit-staged-manifest",
-        )
+        .commit_turn(&reservation, delta.clone(), "commit-staged-manifest")
         .await
-        .expect("commit over legacy staged manifest");
+        .expect("commit over staged manifest");
     let cursor = match outcome {
         CoordinatorMutationV1::Applied { cursor } => cursor,
         other => panic!("unexpected commit outcome: {other:?}"),
@@ -1114,6 +1778,60 @@ async fn commit_reactivates_matching_legacy_staged_manifest() {
         .expect("materialize reactivated manifest");
     assert_eq!(materialized.messages, messages);
 
+    let snapshot = coordinator.load_admission_snapshot(&key).await.unwrap();
+    assert_eq!(snapshot.head.unwrap().cursor, cursor);
+    assert!(matches!(
+        coordinator
+            .commit_turn(&reservation, delta.clone(), "commit-staged-manifest")
+            .await
+            .unwrap(),
+        CoordinatorMutationV1::AlreadyApplied { .. }
+    ));
+    let mut changed = delta.clone();
+    changed.config_version_id = Some("changed-config".into());
+    assert!(matches!(
+        coordinator
+            .commit_turn(&reservation, changed, "commit-staged-manifest")
+            .await,
+        Err(SessionContextCoordinatorError::IdempotencyMismatch)
+    ));
+    let next = match coordinator
+        .reserve_turn(&lease, Some(&cursor), Duration::from_secs(30), "next", None)
+        .await
+        .unwrap()
+    {
+        ReserveTurnOutcome::Reserved(next) => next,
+        other => panic!("unexpected reservation: {other:?}"),
+    };
+    let mut plain = delta.clone();
+    plain.completed_turn = 2;
+    plain.journal_event_seq = 2;
+    plain.conversation_seq = 2;
+    plain.logical_segments = vec![vec![
+        serde_json::json!({"role":"assistant","content":"plain follow-up"}),
+    ]];
+    coordinator
+        .commit_turn(&next, plain, "plain-commit")
+        .await
+        .unwrap();
+    // The first receipt has now been archived; replay must still bind the
+    // same canonical idempotency record.
+    let mut changed = delta.clone();
+    changed.config_version_id = Some("other-config".into());
+    assert!(matches!(
+        coordinator
+            .commit_turn(&reservation, changed, "commit-staged-manifest")
+            .await,
+        Err(SessionContextCoordinatorError::IdempotencyMismatch)
+    ));
+    assert!(matches!(
+        coordinator
+            .commit_turn(&reservation, delta, "commit-staged-manifest")
+            .await
+            .unwrap(),
+        CoordinatorMutationV1::AlreadyApplied { .. }
+    ));
+
     for table in [
         "conversation_manifest_segments",
         "conversation_manifest_nodes",
@@ -1122,9 +1840,9 @@ async fn commit_reactivates_matching_legacy_staged_manifest() {
         "session_context_authority_events",
         "session_context_heads",
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ?"
-        ))
+        )))
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
         .execute(pool.get())

@@ -2,26 +2,20 @@ mod common;
 
 use astra_services::work::{
     DatabaseWorkRepository, GoalRevision, GraphRevision, NewWorkItem, NewWorkPlanProposal,
-    WorkBranchId, WorkBranchRevision, WorkChangeRef, WorkContentHash, WorkGoal, WorkGoalChange,
-    WorkGraphChange, WorkGraphItemChange, WorkId, WorkItemDeclarationState, WorkItemEdge,
-    WorkItemEdgeKind, WorkItemId, WorkItemKind, WorkItemRevision, WorkItemRevisionChange,
-    WorkItemRevisionRef, WorkItemText, WorkOwnerId, WorkPlanProposalAcceptance, WorkProposalId,
+    WorkBranchId, WorkBranchRevision, WorkChangeRef, WorkContentHash, WorkId,
+    WorkItemDeclarationState, WorkItemEdge, WorkItemEdgeKind, WorkItemId, WorkItemKind,
+    WorkItemRevision, WorkItemRevisionChange, WorkItemText, WorkOwnerId, WorkProposalId,
     WorkProposalSourceKind, WorkProposalStatus, WorkRepository, WorkRepositoryError, WorkRevision,
 };
 use sqlx::Row;
-use uuid::Uuid;
-
-fn id(prefix: &str) -> String {
-    format!("{prefix}-{}", Uuid::new_v4())
-}
 
 fn genesis(owner_id: &str, work_id: &str, branch_id: &str) -> astra_services::work::WorkGenesis {
     common::work_genesis(
         owner_id,
         work_id,
         branch_id,
-        &id("session"),
-        &id("intent"),
+        &common::id("session"),
+        &common::id("intent"),
         "Expand a typed plan without changing authority.",
     )
 }
@@ -69,61 +63,7 @@ fn proposal(
         reason: astra_services::work::WorkChangeReason::parse("Refine the Work plan")
             .expect("reason"),
         source_kind: WorkProposalSourceKind::Model,
-        source_ref: WorkChangeRef::parse(id("model-invocation")).expect("source"),
-    }
-}
-
-fn acceptance(
-    recorded: &astra_services::work::RecordedWorkPlanProposal,
-    resolution_ref: &str,
-) -> WorkPlanProposalAcceptance {
-    WorkPlanProposalAcceptance {
-        owner_id: recorded.proposal.owner_id.clone(),
-        work_id: recorded.proposal.work_id.clone(),
-        branch_id: recorded.proposal.branch_id.clone(),
-        proposal_id: recorded.proposal.proposal_id.clone(),
-        payload_hash: recorded.payload_hash.clone(),
-        expected_work_revision: recorded.proposal.expected_work_revision,
-        expected_goal_revision: recorded.proposal.expected_goal_revision,
-        expected_criteria_set_revision: recorded.proposal.expected_criteria_set_revision,
-        expected_branch_revision: recorded.proposal.expected_branch_revision,
-        expected_graph_revision: recorded.proposal.expected_graph_revision,
-        resolution_ref: WorkChangeRef::parse(resolution_ref).expect("resolution"),
-    }
-}
-
-async fn cleanup_owner(pool: &astra_core::SharedPool, owner_id: &str) {
-    for (table, owner_column) in [
-        ("work_runtime_event_outbox", "owner_id"),
-        ("work_runtime_event_outbox_slots", "owner_id"),
-        ("work_events", "owner_id"),
-        ("work_attention_receipts", "owner_id"),
-        ("work_event_sequences", "owner_id"),
-        ("work_current_gap_acceptances", "owner_id"),
-        ("work_acceptance_decisions", "owner_id"),
-        ("work_check_runs", "owner_id"),
-        ("work_proposals", "owner_id"),
-        ("work_proposal_sequences", "owner_id"),
-        ("work_branch_subjects", "owner_id"),
-        ("work_branches", "owner_id"),
-        ("work_item_edges", "owner_id"),
-        ("work_item_revisions", "owner_id"),
-        ("work_items", "owner_id"),
-        ("work_graph_revisions", "owner_id"),
-        ("work_graph_sequences", "owner_id"),
-        ("work_criterion_sets", "owner_id"),
-        ("work_criterion_revisions", "owner_id"),
-        ("work_criteria", "owner_id"),
-        ("work_goal_revisions", "owner_id"),
-        ("works", "owner_id"),
-        ("agent_sessions", "user_id"),
-    ] {
-        let statement = format!("DELETE FROM {table} WHERE {owner_column} = ?");
-        sqlx::query(&statement)
-            .bind(owner_id)
-            .execute(pool.get())
-            .await
-            .unwrap_or_else(|error| panic!("clean {table}: {error}"));
+        source_ref: WorkChangeRef::parse(common::id("model-invocation")).expect("source"),
     }
 }
 
@@ -132,32 +72,37 @@ async fn cleanup_owner(pool: &astra_core::SharedPool, owner_id: &str) {
 async fn concurrent_acceptance_materializes_one_graph_revision_and_is_exactly_idempotent() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let proposal_id = id("proposal");
-    let root_task = id("root-task");
-    let task_a = id("task-a");
-    let task_b = id("task-b");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let proposal_id = common::id("proposal");
+    let root_task = common::id("root-task");
+    let task_a = common::id("task-a");
+    let task_b = common::id("task-b");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
         .expect("genesis");
-    let rooted = repository
-        .replace_graph(WorkGraphChange {
-            owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
-            work_id: WorkId::parse(&work_id).expect("work"),
-            branch_id: WorkBranchId::parse(&branch_id).expect("branch"),
-            expected_branch_revision: WorkBranchRevision::INITIAL,
-            expected_graph_revision: GraphRevision::INITIAL,
-            items: vec![WorkGraphItemChange::New(item(&root_task))],
-            edges: Vec::new(),
-            source_ref: WorkChangeRef::parse(id("root-graph")).expect("source"),
-            reason: None,
-        })
+    let root_proposal = repository
+        .propose_plan(proposal(
+            &owner_id,
+            &work_id,
+            &branch_id,
+            &common::id("root-proposal"),
+            vec![item(&root_task)],
+            Vec::new(),
+        ))
         .await
-        .expect("materialize root task");
+        .expect("root proposal");
+    let rooted = repository
+        .accept_plan_proposal(common::plan_acceptance(
+            &root_proposal,
+            &common::id("accept-root"),
+        ))
+        .await
+        .expect("materialize root task")
+        .resolution
+        .expect("root resolution");
     let mut plan = proposal(
         &owner_id,
         &work_id,
@@ -169,10 +114,10 @@ async fn concurrent_acceptance_materializes_one_graph_revision_and_is_exactly_id
             dependency(&task_a, &task_b),
         ],
     );
-    plan.expected_branch_revision = rooted.parts().branch_revision;
-    plan.expected_graph_revision = rooted.parts().current_graph_revision;
+    plan.expected_branch_revision = rooted.result_branch_revision.expect("root branch");
+    plan.expected_graph_revision = rooted.result_graph_revision.expect("root graph");
     let proposed = repository.propose_plan(plan).await.expect("proposal");
-    let command = acceptance(&proposed, &id("root-action"));
+    let command = common::plan_acceptance(&proposed, &common::id("root-action"));
     let mut wrong_hash = command.clone();
     wrong_hash.payload_hash =
         WorkContentHash::parse(format!("sha256:{}", "f".repeat(64))).expect("different hash");
@@ -237,16 +182,16 @@ async fn concurrent_acceptance_materializes_one_graph_revision_and_is_exactly_id
     );
     assert_eq!(graph.try_get::<String, _>("actor_kind").unwrap(), "model");
     assert_eq!(graph.try_get::<String, _>("actor_id").unwrap(), proposal_id);
-    assert_eq!(graph.try_get::<i64, _>("item_count").unwrap(), 3);
+    assert_eq!(graph.try_get::<i64, _>("item_count").unwrap(), 4);
     assert_eq!(graph.try_get::<i64, _>("edge_count").unwrap(), 2);
     for (table, expected) in [
         ("work_items", 4_i64),
         ("work_item_revisions", 4_i64),
         ("work_item_edges", 2_i64),
     ] {
-        let count: i64 = sqlx::query_scalar(&format!(
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM {table} WHERE owner_id = ? AND work_id = ?"
-        ))
+        )))
         .bind(&owner_id)
         .bind(&work_id)
         .fetch_one(pool.get())
@@ -267,35 +212,29 @@ async fn concurrent_acceptance_materializes_one_graph_revision_and_is_exactly_id
         event_kinds,
         [
             "work_created",
+            "plan_proposed",
             "graph_replaced",
             "plan_proposed",
             "graph_replaced"
         ]
     );
 
+    let mut later = proposal(
+        &owner_id,
+        &work_id,
+        &branch_id,
+        &common::id("later-proposal"),
+        vec![item(&common::id("later-task"))],
+        Vec::new(),
+    );
+    later.expected_branch_revision = WorkBranchRevision::new(3).expect("branch r3");
+    later.expected_graph_revision = GraphRevision::new(3).expect("graph r3");
+    let later = repository
+        .propose_plan(later)
+        .await
+        .expect("later proposal");
     repository
-        .replace_graph(WorkGraphChange {
-            owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
-            work_id: WorkId::parse(&work_id).expect("work"),
-            branch_id: WorkBranchId::parse(&branch_id).expect("branch"),
-            expected_branch_revision: WorkBranchRevision::new(3).expect("branch revision"),
-            expected_graph_revision: GraphRevision::new(3).expect("graph revision"),
-            items: [&root_task, &task_a, &task_b]
-                .into_iter()
-                .map(|item_id| {
-                    WorkGraphItemChange::Existing(WorkItemRevisionRef {
-                        item_id: WorkItemId::parse(item_id).expect("item"),
-                        revision: WorkItemRevision::INITIAL,
-                    })
-                })
-                .collect(),
-            edges: vec![
-                dependency(&root_task, &task_a),
-                dependency(&task_a, &task_b),
-            ],
-            source_ref: WorkChangeRef::parse(id("later-graph-change")).expect("source"),
-            reason: None,
-        })
+        .accept_plan_proposal(common::plan_acceptance(&later, &common::id("accept-later")))
         .await
         .expect("later branch advance");
     assert_eq!(
@@ -307,14 +246,15 @@ async fn concurrent_acceptance_materializes_one_graph_revision_and_is_exactly_id
         "idempotent acceptance returns its original immutable result"
     );
 
-    let different_resolution = acceptance(&proposed, &id("different-root-action"));
+    let different_resolution =
+        common::plan_acceptance(&proposed, &common::id("different-root-action"));
     assert!(matches!(
         repository.accept_plan_proposal(different_resolution).await,
         Err(WorkRepositoryError::WorkProposalAlreadyResolved {
             status: WorkProposalStatus::Accepted
         })
     ));
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -322,12 +262,11 @@ async fn concurrent_acceptance_materializes_one_graph_revision_and_is_exactly_id
 async fn replan_creates_successor_item_revisions_and_removes_dependencies_atomically() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let task_a = id("task-a");
-    let task_b = id("task-b");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let task_a = common::id("task-a");
+    let task_b = common::id("task-b");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -338,14 +277,17 @@ async fn replan_creates_successor_item_revisions_and_removes_dependencies_atomic
             &owner_id,
             &work_id,
             &branch_id,
-            &id("initial-plan"),
+            &common::id("initial-plan"),
             vec![item(&task_a), item(&task_b)],
             vec![dependency(&task_a, &task_b)],
         ))
         .await
         .expect("initial proposal");
     let first = repository
-        .accept_plan_proposal(acceptance(&first, &id("initial-acceptance")))
+        .accept_plan_proposal(common::plan_acceptance(
+            &first,
+            &common::id("initial-acceptance"),
+        ))
         .await
         .expect("initial acceptance");
     let first_resolution = first.resolution.expect("initial resolution");
@@ -355,7 +297,7 @@ async fn replan_creates_successor_item_revisions_and_removes_dependencies_atomic
         &owner_id,
         &work_id,
         &branch_id,
-        &id("replan"),
+        &common::id("replan"),
         Vec::new(),
         Vec::new(),
     );
@@ -394,7 +336,10 @@ async fn replan_creates_successor_item_revisions_and_removes_dependencies_atomic
         .await
         .expect("replan proposal");
     let accepted = repository
-        .accept_plan_proposal(acceptance(&replan, &id("replan-acceptance")))
+        .accept_plan_proposal(common::plan_acceptance(
+            &replan,
+            &common::id("replan-acceptance"),
+        ))
         .await
         .expect("replan acceptance");
     let result_graph_revision = accepted
@@ -491,7 +436,7 @@ async fn replan_creates_successor_item_revisions_and_removes_dependencies_atomic
         &owner_id,
         &work_id,
         &branch_id,
-        &id("stale-replan"),
+        &common::id("stale-replan"),
         Vec::new(),
         Vec::new(),
     );
@@ -524,7 +469,7 @@ async fn replan_creates_successor_item_revisions_and_removes_dependencies_atomic
     .await
     .expect("proposal count after stale rejection");
     assert_eq!(proposal_count_after, proposal_count_before);
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -532,12 +477,11 @@ async fn replan_creates_successor_item_revisions_and_removes_dependencies_atomic
 async fn sibling_branches_allocate_distinct_successors_from_one_item_revision() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let delivery_branch = id("delivery");
-    let sibling_branch = id("sibling");
-    let sibling_session = id("session");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let delivery_branch = common::id("delivery");
+    let sibling_branch = common::id("sibling");
+    let sibling_session = common::id("session");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &delivery_branch))
         .await
@@ -572,44 +516,61 @@ async fn sibling_branches_allocate_distinct_successors_from_one_item_revision() 
     .await
     .expect("sibling branch");
 
-    let change = |branch_id: &str, objective: &str, source: &str| WorkGraphChange {
-        owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
-        work_id: WorkId::parse(&work_id).expect("work"),
-        branch_id: WorkBranchId::parse(branch_id).expect("branch"),
-        expected_branch_revision: WorkBranchRevision::INITIAL,
-        expected_graph_revision: GraphRevision::INITIAL,
-        items: vec![WorkGraphItemChange::Revised(WorkItemRevisionChange::new(
+    // The explicit sibling fixture needs the proposal admission row that
+    // production branch creation installs alongside work_branches.
+    sqlx::query(
+        "INSERT INTO work_proposal_sequences (owner_id, work_id, branch_id, last_proposal_seq) VALUES (?, ?, ?, 0)",
+    ).bind(&owner_id).bind(&work_id).bind(&sibling_branch)
+        .execute(pool.get()).await.expect("sibling proposal sequence");
+
+    let replan = |branch_id: &str, objective: &str| {
+        let mut plan = proposal(
+            &owner_id,
+            &work_id,
+            branch_id,
+            &common::id("replan"),
+            Vec::new(),
+            Vec::new(),
+        );
+        plan.revisions.push(WorkItemRevisionChange::new(
             WorkItemId::root(),
             WorkItemRevision::INITIAL,
             WorkItemKind::Milestone,
             WorkItemText::parse(objective).expect("objective"),
             WorkItemText::parse("The branch-specific plan is explicit").expect("result"),
             WorkItemDeclarationState::Active,
-        ))],
-        edges: Vec::new(),
-        source_ref: WorkChangeRef::parse(source).expect("source"),
-        reason: Some(
-            astra_services::work::WorkChangeReason::parse("Explore a branch-specific plan")
-                .expect("reason"),
-        ),
+        ));
+        plan
     };
+    let delivery_proposal = repository
+        .propose_plan(replan(&delivery_branch, "Explore the delivery approach"))
+        .await
+        .expect("delivery proposal");
+    let sibling_proposal = repository
+        .propose_plan(replan(&sibling_branch, "Explore the sibling approach"))
+        .await
+        .expect("sibling proposal");
     let (delivery, sibling) = tokio::join!(
-        repository.replace_graph(change(
-            &delivery_branch,
-            "Explore the delivery approach",
-            &id("delivery-replan")
+        repository.accept_plan_proposal(common::plan_acceptance(
+            &delivery_proposal,
+            &common::id("accept-delivery")
         )),
-        repository.replace_graph(change(
-            &sibling_branch,
-            "Explore the sibling approach",
-            &id("sibling-replan")
-        ))
+        repository.accept_plan_proposal(common::plan_acceptance(
+            &sibling_proposal,
+            &common::id("accept-sibling")
+        )),
     );
-    let delivery = delivery.expect("delivery replan");
-    let sibling = sibling.expect("sibling replan");
+    let delivery = delivery
+        .expect("delivery replan")
+        .resolution
+        .expect("delivery resolution");
+    let sibling = sibling
+        .expect("sibling replan")
+        .resolution
+        .expect("sibling resolution");
     assert_ne!(
-        delivery.parts().current_graph_revision,
-        sibling.parts().current_graph_revision
+        delivery.result_graph_revision,
+        sibling.result_graph_revision
     );
 
     let rows = sqlx::query(
@@ -641,7 +602,7 @@ async fn sibling_branches_allocate_distinct_successors_from_one_item_revision() 
             "Explore the sibling approach".to_string(),
         ])
     );
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -649,10 +610,9 @@ async fn sibling_branches_allocate_distinct_successors_from_one_item_revision() 
 async fn stale_and_expired_acceptance_never_leave_graph_residue() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -662,27 +622,51 @@ async fn stale_and_expired_acceptance_never_leave_graph_residue() {
             &owner_id,
             &work_id,
             &branch_id,
-            &id("proposal"),
-            vec![item(&id("task"))],
+            &common::id("proposal"),
+            vec![item(&common::id("task"))],
             Vec::new(),
         ))
         .await
         .expect("proposal");
-    repository
-        .revise_goal(WorkGoalChange {
-            owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
-            work_id: WorkId::parse(&work_id).expect("work"),
+    let criteria = repository
+        .propose_criteria(astra_services::work::NewWorkCriteriaProposal {
+            owner_id: proposed.proposal.owner_id.clone(),
+            work_id: proposed.proposal.work_id.clone(),
+            branch_id: proposed.proposal.branch_id.clone(),
+            proposal_id: WorkProposalId::parse(common::id("criteria-proposal")).expect("proposal"),
             expected_work_revision: WorkRevision::INITIAL,
             expected_goal_revision: GoalRevision::INITIAL,
-            goal: WorkGoal::parse("A changed goal invalidates the proposed graph.").expect("goal"),
-            source_ref: WorkChangeRef::parse(id("goal-change")).expect("source"),
-            reason: None,
+            expected_criteria_set_revision: astra_services::work::CriterionSetRevision::INITIAL,
+            expected_branch_revision: WorkBranchRevision::INITIAL,
+            expected_graph_revision: GraphRevision::INITIAL,
+            members: vec![astra_services::work::WorkCriteriaProposalMember::New {
+                criterion_id: astra_services::work::CriterionId::parse(common::id("criterion"))
+                    .expect("criterion"),
+                definition: astra_services::work::CriterionDefinition::HumanReview {
+                    statement: astra_services::work::CriterionStatement::parse(
+                        "A reviewer accepts the result",
+                    )
+                    .expect("statement"),
+                },
+            }],
+            source_kind: WorkProposalSourceKind::Model,
+            source_ref: WorkChangeRef::parse(common::id("criteria-source")).expect("source"),
         })
         .await
-        .expect("revise goal");
+        .expect("criteria proposal");
+    repository
+        .accept_criteria_proposal(common::criteria_acceptance(
+            &criteria,
+            &common::id("accept-criteria"),
+        ))
+        .await
+        .expect("advance Work criteria basis");
     assert!(matches!(
         repository
-            .accept_plan_proposal(acceptance(&proposed, &id("root-action")))
+            .accept_plan_proposal(common::plan_acceptance(
+                &proposed,
+                &common::id("root-action")
+            ))
             .await,
         Err(WorkRepositoryError::InvalidWorkProposalBasis {
             resource: astra_services::work::WorkProposalBasisResource::WorkRevision
@@ -727,7 +711,10 @@ async fn stale_and_expired_acceptance_never_leave_graph_residue() {
     .expect("expire pending proposal");
     assert!(matches!(
         repository
-            .accept_plan_proposal(acceptance(&proposed, &id("expired-action")))
+            .accept_plan_proposal(common::plan_acceptance(
+                &proposed,
+                &common::id("expired-action")
+            ))
             .await,
         Err(WorkRepositoryError::WorkProposalAlreadyResolved {
             status: WorkProposalStatus::Expired
@@ -760,7 +747,7 @@ async fn stale_and_expired_acceptance_never_leave_graph_residue() {
             .unwrap(),
         None
     );
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -768,11 +755,10 @@ async fn stale_and_expired_acceptance_never_leave_graph_residue() {
 async fn acceptance_event_conflict_rolls_back_graph_items_branch_and_proposal() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let proposal_id = id("proposal");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let proposal_id = common::id("proposal");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -783,7 +769,7 @@ async fn acceptance_event_conflict_rolls_back_graph_items_branch_and_proposal() 
             &work_id,
             &branch_id,
             &proposal_id,
-            vec![item(&id("task"))],
+            vec![item(&common::id("task"))],
             Vec::new(),
         ))
         .await
@@ -803,7 +789,10 @@ async fn acceptance_event_conflict_rolls_back_graph_items_branch_and_proposal() 
     .expect("inject graph event identity conflict");
     assert!(matches!(
         repository
-            .accept_plan_proposal(acceptance(&proposed, &id("root-action")))
+            .accept_plan_proposal(common::plan_acceptance(
+                &proposed,
+                &common::id("root-action")
+            ))
             .await,
         Err(WorkRepositoryError::Conflict {
             resource: astra_services::work::WorkConflictResource::WorkEventIdentity
@@ -843,21 +832,20 @@ async fn acceptance_event_conflict_rolls_back_graph_items_branch_and_proposal() 
     );
     assert_eq!(state.try_get::<i64, _>("item_count").unwrap(), 1);
     assert_eq!(state.try_get::<i64, _>("last_event_seq").unwrap(), 2);
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn acceptance_racing_direct_graph_change_has_one_complete_winner() {
+async fn competing_proposal_acceptances_have_one_complete_winner() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = id("owner");
-    let work_id = id("work");
-    let branch_id = id("branch");
-    let proposal_id = id("proposal");
-    let proposed_task = id("proposed-task");
-    let direct_task = id("direct-task");
-    cleanup_owner(&pool, &owner_id).await;
+    let owner_id = common::id("owner");
+    let work_id = common::id("work");
+    let branch_id = common::id("branch");
+    let proposal_id = common::id("proposal");
+    let proposed_task = common::id("proposed-task");
+    let competing_task = common::id("competing-task");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -873,41 +861,55 @@ async fn acceptance_racing_direct_graph_change_has_one_complete_winner() {
         ))
         .await
         .expect("proposal");
-    let direct = WorkGraphChange {
-        owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
-        work_id: WorkId::parse(&work_id).expect("work"),
-        branch_id: WorkBranchId::parse(&branch_id).expect("branch"),
-        expected_branch_revision: WorkBranchRevision::INITIAL,
-        expected_graph_revision: GraphRevision::INITIAL,
-        items: vec![WorkGraphItemChange::New(item(&direct_task))],
-        edges: Vec::new(),
-        source_ref: WorkChangeRef::parse(id("direct-change")).expect("source"),
-        reason: None,
-    };
-    let (accepted, replaced) = tokio::join!(
-        repository.accept_plan_proposal(acceptance(&proposed, &id("root-action"))),
-        repository.replace_graph(direct)
+    let competing = repository
+        .propose_plan(proposal(
+            &owner_id,
+            &work_id,
+            &branch_id,
+            &common::id("competing-proposal"),
+            vec![item(&competing_task)],
+            Vec::new(),
+        ))
+        .await
+        .expect("competing proposal");
+    let (accepted, other) = tokio::join!(
+        repository.accept_plan_proposal(common::plan_acceptance(
+            &proposed,
+            &common::id("accept-first")
+        )),
+        repository.accept_plan_proposal(common::plan_acceptance(
+            &competing,
+            &common::id("accept-competing")
+        ))
     );
     let acceptance_won = accepted.is_ok();
-    assert_ne!(
-        acceptance_won,
-        replaced.is_ok(),
-        "the branch CAS must admit exactly one graph writer"
-    );
-    if acceptance_won {
-        assert!(matches!(
-            replaced,
-            Err(WorkRepositoryError::StaleGraphRevision { .. })
-        ));
-    } else {
-        assert!(replaced.is_ok());
-        assert!(matches!(
-            accepted,
-            Err(WorkRepositoryError::InvalidWorkProposalBasis {
-                resource: astra_services::work::WorkProposalBasisResource::BranchRevision
-                    | astra_services::work::WorkProposalBasisResource::GraphRevision
-            }) | Err(WorkRepositoryError::StaleGraphRevision { .. })
-        ));
+    assert_ne!(acceptance_won, other.is_ok(), "exactly one proposal wins");
+    let loser = if acceptance_won { other } else { accepted };
+    assert!(matches!(
+        loser,
+        Err(WorkRepositoryError::InvalidWorkProposalBasis {
+            resource: astra_services::work::WorkProposalBasisResource::BranchRevision
+        })
+    ));
+    for (recorded, won) in [(&proposed, acceptance_won), (&competing, !acceptance_won)] {
+        let stored = repository
+            .load_plan_proposal(
+                &recorded.proposal.owner_id,
+                &recorded.proposal.work_id,
+                &recorded.proposal.proposal_id,
+            )
+            .await
+            .expect("reload proposal")
+            .expect("recorded proposal");
+        assert_eq!(
+            stored.status,
+            if won {
+                WorkProposalStatus::Accepted
+            } else {
+                WorkProposalStatus::Pending
+            }
+        );
+        assert_eq!(stored.resolution.is_some(), won);
     }
     let state = sqlx::query(
         "SELECT p.status, gs.last_revision, b.branch_revision, b.current_graph_revision,
@@ -937,7 +939,7 @@ async fn acceptance_racing_direct_graph_change_has_one_complete_winner() {
     );
     assert_eq!(state.try_get::<i64, _>("graph_count").unwrap(), 2);
     assert_eq!(state.try_get::<i64, _>("item_count").unwrap(), 2);
-    assert_eq!(state.try_get::<i64, _>("last_event_seq").unwrap(), 3);
+    assert_eq!(state.try_get::<i64, _>("last_event_seq").unwrap(), 4);
     assert_eq!(
         state.try_get::<String, _>("status").unwrap(),
         if acceptance_won {
@@ -946,20 +948,26 @@ async fn acceptance_racing_direct_graph_change_has_one_complete_winner() {
             "pending"
         }
     );
-    let winning_item: String =
-        sqlx::query_scalar("SELECT item_id FROM work_items WHERE owner_id = ? AND work_id = ?")
-            .bind(&owner_id)
-            .bind(&work_id)
-            .fetch_one(pool.get())
-            .await
-            .expect("winning item");
+    let persisted_items: Vec<String> = sqlx::query_scalar(
+        "SELECT item_id FROM work_items WHERE owner_id = ? AND work_id = ? ORDER BY item_id",
+    )
+    .bind(&owner_id)
+    .bind(&work_id)
+    .fetch_all(pool.get())
+    .await
+    .expect("materialized items");
     assert_eq!(
-        winning_item,
-        if acceptance_won {
-            proposed_task
-        } else {
-            direct_task
-        }
+        persisted_items
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "root".to_string(),
+            if acceptance_won {
+                proposed_task
+            } else {
+                competing_task
+            },
+        ])
     );
-    cleanup_owner(&pool, &owner_id).await;
+    common::cleanup_work_owner(&pool, &owner_id).await;
 }

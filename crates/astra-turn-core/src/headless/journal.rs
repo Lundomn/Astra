@@ -4,6 +4,58 @@ use astra_services::session_journal::{
     BLOCKED_TOOL_RESULT_CLASS, NOOP_OR_CACHED_RESULT_CLASS, ToolCallDisposition, ToolCallRecord,
 };
 
+/// Audit an already settled provider callback. This does not issue execution
+/// authority or synthesize a durable invocation receipt.
+#[must_use]
+pub fn journal_record_edge_tool_result(
+    result: &crate::sse_stream_host::EdgeToolExecResult,
+) -> ToolCallRecord {
+    let args = result.args.to_string();
+    let content = crate::edge_ledger::tool_content_from_callback_output(
+        &result.status,
+        result.output.clone(),
+    );
+    let output = crate::tool_result_sanitize::tool_result_content_for_model_unbounded(
+        &result.tool,
+        &content,
+    );
+    let mut record = journal_record_executed_tool_call(
+        result.tool.clone(),
+        astra_tools::tool_result_status::ToolResultStatusKind::from_status_str(&result.status)
+            .is_failure(),
+        result.duration_ms,
+        u32::try_from(args.len()).unwrap_or(u32::MAX),
+        &output,
+        None,
+        None,
+        Some(args),
+    );
+    record.tool_call_id = Some(result.request_id.clone());
+    record.execution_completion = result.execution_completion.clone();
+    record.work_attribution = result.work_attribution.clone();
+    let fields = result.tool_result_fields.as_ref();
+    record.disposition = Some(
+        fields
+            .and_then(|fields| fields.get("disposition"))
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or(ToolCallDisposition::Executed),
+    );
+    record.error_kind = fields
+        .and_then(|fields| fields.get("error_kind"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(astra_core::ErrorKind::parse_tag);
+    record.exit_semantics = fields
+        .and_then(|fields| fields.get("exit_semantics"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    record.result_class = fields
+        .and_then(|fields| fields.get("result_class"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    record
+}
+
 #[must_use]
 pub fn journal_record_duplicate_within_turn(
     tool_call_id: String,
@@ -33,8 +85,8 @@ pub fn journal_record_duplicate_within_turn(
 /// journal's `result_preview` when a snippet is available. Keeps
 /// forensics useful (you can see *what* was reused) without
 /// blowing up the journal with duplicate content — the full body
-/// is already in the earlier turn the cache hit refers to.
-/// Byte ceiling for the cached-body snippet appended to a cross-turn cache
+/// remains in the associated invocation outcome.
+/// Byte ceiling for the cached-body snippet appended to a same-invocation replay
 /// hit's `result_preview`. We truncate on a UTF-8 char boundary at or below
 /// this many bytes so the snippet stays bounded regardless of how wide the
 /// source encoding is, and never panics on multi-byte input.
@@ -59,32 +111,61 @@ pub fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> (&str, bool) {
     (&s[..end], true)
 }
 
-/// Record a cross-turn cache hit.
+/// Record a same-invocation replay.
 ///
-/// Populates `result_preview` with a `[cached_cross_turn: ...]`
+/// Populates `result_preview` with a `[cached_same_invocation: ...]`
 /// tagged string so downstream analysis (digest, LLM self-
-/// diagnosis) can distinguish "cache reused N bytes" from "tool
+/// diagnosis) can distinguish "same invocation replayed N bytes" from "tool
 /// returned empty body".
 ///
 /// `cached_body` is optional because some short-circuit paths
-/// (e.g. pre-suppressed repeated cache hits) don't have the full
+/// (e.g. a repeated-invocation suppression) don't have the full
 /// body handy; when absent, the preview still carries the byte
 /// count and tag so it's self-identifying.
 #[must_use]
-pub fn journal_record_cross_turn_cache_hit(
+pub fn journal_record_invocation_replay(
     tool_call_id: String,
     name: String,
     output_len: u32,
     args_preview: Option<String>,
     cached_body: Option<&str>,
 ) -> ToolCallRecord {
-    let preview = format_cross_turn_cache_hit_preview(output_len, cached_body);
+    journal_record_invocation_replay_with_evidence(
+        tool_call_id,
+        name,
+        output_len,
+        args_preview,
+        cached_body,
+        None,
+        None,
+    )
+}
+
+/// Record a same-invocation replay together with the bounded, model-visible
+/// request/result identity needed by the online observation evaluator.
+///
+/// `cached_body` is presentation-only and may describe a suppressed request;
+/// `delivered_body` is set only when the cached result was actually returned to
+/// the model. Keeping those lanes separate prevents a suppression message from
+/// masquerading as delivered evidence.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn journal_record_invocation_replay_with_evidence(
+    tool_call_id: String,
+    name: String,
+    output_len: u32,
+    args_preview: Option<String>,
+    cached_body: Option<&str>,
+    args_full: Option<String>,
+    delivered_body: Option<&str>,
+) -> ToolCallRecord {
+    let preview = format_invocation_replay_preview(output_len, cached_body);
     ToolCallRecord {
         tool_call_id: Some(tool_call_id),
         name,
         ok: true,
         ms: 0,
-        error: Some("cached_cross_turn".to_string()),
+        error: Some("cached_same_invocation".to_string()),
         input_bytes: None,
         output_bytes: Some(output_len),
         args_preview,
@@ -93,13 +174,20 @@ pub fn journal_record_cross_turn_cache_hit(
         surgically_removed: None,
         original_tool_name: None,
         result_class: Some(NOOP_OR_CACHED_RESULT_CLASS.to_string()),
+        args_full,
+        runtime_model_result_full: delivered_body
+            .filter(|body| !body.is_empty())
+            .map(ToString::to_string),
+        result_full: delivered_body
+            .filter(|body| !body.is_empty())
+            .map(bounded_journal_result),
         disposition: Some(ToolCallDisposition::Reused),
         ..Default::default()
     }
 }
 
-fn format_cross_turn_cache_hit_preview(output_len: u32, cached_body: Option<&str>) -> String {
-    let tag = format!("[cached_cross_turn: reused {output_len} bytes from earlier turn]");
+fn format_invocation_replay_preview(output_len: u32, cached_body: Option<&str>) -> String {
+    let tag = format!("[cached_same_invocation: replayed {output_len} bytes]");
     match cached_body {
         Some(body) if !body.is_empty() => {
             // Truncate at a char boundary to avoid splitting UTF-8
@@ -360,6 +448,98 @@ mod tests {
     use super::*;
 
     #[test]
+    fn callback_audit_matches_remote_content_for_each_terminal_status() {
+        for (tool, status, output, expected, failed) in [
+            (
+                "read_file",
+                "completed",
+                "read result",
+                "read result",
+                false,
+            ),
+            (
+                "read_file",
+                "failed",
+                "Denied by policy",
+                "status=failed\nDenied by policy",
+                true,
+            ),
+            (
+                "read_file",
+                "cancelled",
+                "Stopped",
+                "status=cancelled\nStopped",
+                true,
+            ),
+            (
+                "read_file",
+                "failed",
+                r#"{"error":"denied"}"#,
+                r#"{"error":"denied"}"#,
+                true,
+            ),
+            ("read_file", "failed", "", r#"{"status":"failed"}"#, true),
+            (
+                "write_file",
+                "completed",
+                r#"{"message":"written","_cli_diff":"display only"}"#,
+                r#"{"message":"written"}"#,
+                false,
+            ),
+            (
+                "str_replace",
+                "failed",
+                "Conflict\n<<<ASTRA_UNIFIED_DIFF>>>\ndisplay only\n<<<END_ASTRA_UNIFIED_DIFF>>>\n",
+                "status=failed\nConflict",
+                true,
+            ),
+        ] {
+            let result = crate::sse_stream_host::EdgeToolExecResult {
+                work_attribution: Some(astra_services::runs::WorkInvocationAttribution::Unbound),
+
+                request_id: "call-1".into(),
+                tool: tool.into(),
+                args: serde_json::json!({"path": "document.txt"}),
+                output: output.into(),
+                status: status.into(),
+                duration_ms: 1,
+                tool_result_fields: Some(
+                    serde_json::from_value(
+                        serde_json::json!({"work_attribution":{"state":"control"}}),
+                    )
+                    .unwrap(),
+                ),
+                execution_completion: None,
+            };
+            let local = journal_record_edge_tool_result(&result);
+            assert_eq!(local.work_attribution, result.work_attribution);
+            let remote_content = crate::edge_ledger::tool_content_from_ledger_entry(
+                &serde_json::json!({"body": {"status": status, "output": output}}),
+            );
+            let remote_content =
+                crate::tool_result_sanitize::tool_result_content_for_model_unbounded(
+                    tool,
+                    &remote_content,
+                );
+            let remote = journal_record_executed_tool_call(
+                tool.into(),
+                failed,
+                1,
+                0,
+                &remote_content,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(local.result_full.as_deref(), Some(expected));
+            assert_eq!(local.result_full, remote.result_full);
+            assert_eq!(local.error, remote.error);
+            assert_eq!(local.ok, !failed);
+            assert_eq!(local.tool_call_id.as_deref(), Some("call-1"));
+        }
+    }
+
+    #[test]
     fn duplicate_record_fields() {
         let r = journal_record_duplicate_within_turn(
             "call-duplicate".into(),
@@ -375,7 +555,7 @@ mod tests {
 
     #[test]
     fn cache_hit_record_has_output_bytes() {
-        let r = journal_record_cross_turn_cache_hit(
+        let r = journal_record_invocation_replay(
             "call-cache".into(),
             "read_file".into(),
             12,
@@ -389,7 +569,7 @@ mod tests {
 
     #[test]
     fn cache_hit_record_carries_exact_call_identity() {
-        let r = journal_record_cross_turn_cache_hit(
+        let r = journal_record_invocation_replay(
             "call-cache".into(),
             "read_file".into(),
             12,
@@ -416,7 +596,7 @@ mod tests {
         // hallucinating a `{}`-return bug.  The fix is to populate
         // `result_preview` with a synthetic explanatory string that
         // makes the cache-hit nature explicit.
-        let r = journal_record_cross_turn_cache_hit(
+        let r = journal_record_invocation_replay(
             "call-cache".into(),
             "read_file".into(),
             2000,
@@ -425,7 +605,7 @@ mod tests {
         );
         let preview = r.result_preview.expect("cache-hit must carry a preview");
         assert!(
-            preview.starts_with("[cached_cross_turn:"),
+            preview.starts_with("[cached_same_invocation:"),
             "preview must be tagged so analysis tools can classify it: {preview:?}"
         );
         assert!(
@@ -439,13 +619,55 @@ mod tests {
     }
 
     #[test]
+    fn cache_hit_evidence_keeps_delivery_identity_separate_from_preview() {
+        let record = journal_record_invocation_replay_with_evidence(
+            "call-cache".into(),
+            "introspect".into(),
+            120,
+            Some("overview".into()),
+            Some("suppressed or preview text"),
+            Some(r#"{"facet":"overview"}"#.into()),
+            Some(
+                r#"{"evidence_revision":"v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","covered_facets":[]}"#,
+            ),
+        );
+        assert_eq!(record.effective_disposition(), ToolCallDisposition::Reused);
+        assert_eq!(record.args_full.as_deref(), Some(r#"{"facet":"overview"}"#));
+        assert!(
+            record.result_full.is_some(),
+            "delivered cache evidence is retained"
+        );
+        assert_eq!(
+            record.runtime_model_result_full.as_deref(),
+            Some(
+                r#"{"evidence_revision":"v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","covered_facets":[]}"#
+            ),
+            "live evidence must retain the delivered body separately from its bounded durable form"
+        );
+
+        let suppressed = journal_record_invocation_replay_with_evidence(
+            "call-suppressed".into(),
+            "introspect".into(),
+            80,
+            Some("overview".into()),
+            Some("repeated cache hit suppressed"),
+            Some(r#"{"facet":"overview"}"#.into()),
+            None,
+        );
+        assert!(
+            suppressed.result_full.is_none(),
+            "a suppression message must not masquerade as delivered observation evidence"
+        );
+    }
+
+    #[test]
     fn cache_hit_preview_keeps_short_multibyte_body_intact() {
         // 100 Han characters = 300 bytes — safely under the 400-byte
         // snippet ceiling. Every glyph must survive the preview
         // intact (no panic, no truncation, no replacement char).
         let body: String = "中".repeat(100);
         assert_eq!(body.len(), 300, "setup: 100 Han chars must be 300 bytes");
-        let r = journal_record_cross_turn_cache_hit(
+        let r = journal_record_invocation_replay(
             "call-cache".into(),
             "read_file".into(),
             body.len() as u32,
@@ -475,7 +697,7 @@ mod tests {
         let body: String = "中".repeat(200);
         assert_eq!(body.len(), 600, "setup: 200 Han chars must be 600 bytes");
 
-        let r = journal_record_cross_turn_cache_hit(
+        let r = journal_record_invocation_replay(
             "call-cache".into(),
             "read_file".into(),
             body.len() as u32,
@@ -490,8 +712,8 @@ mod tests {
 
         // Extract the snippet between the tag line and the trailing
         // ellipsis.  The prefix is fixed per
-        // format_cross_turn_cache_hit_preview.
-        let tag_line = "[cached_cross_turn: reused 600 bytes from earlier turn]\n";
+        // format_invocation_replay_preview.
+        let tag_line = "[cached_same_invocation: replayed 600 bytes]\n";
         let snippet = preview
             .strip_prefix(tag_line)
             .expect("preview must start with tag line")
@@ -551,7 +773,7 @@ mod tests {
         // pre-suppressed "repeated cache hit" short-circuit), we
         // still emit a non-empty preview so downstream tooling
         // isn't misled.
-        let r = journal_record_cross_turn_cache_hit(
+        let r = journal_record_invocation_replay(
             "call-cache".into(),
             "read_file".into(),
             1024,
@@ -561,7 +783,7 @@ mod tests {
         let preview = r
             .result_preview
             .expect("cache-hit with no snippet must still carry a preview");
-        assert!(preview.starts_with("[cached_cross_turn:"));
+        assert!(preview.starts_with("[cached_same_invocation:"));
         assert!(preview.contains("1024 bytes"));
     }
 
