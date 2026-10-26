@@ -27,6 +27,8 @@ use std::{
 use tower::ServiceExt;
 use uuid::Uuid;
 
+#[path = "moi_fresh_astra/fork_auth_compat.rs"]
+mod fork_auth_compat;
 #[path = "moi_fresh_astra/forks.rs"]
 mod forks;
 #[path = "moi_fresh_astra/normal_chat.rs"]

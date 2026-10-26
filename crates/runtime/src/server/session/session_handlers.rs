@@ -2506,24 +2506,32 @@ pub(crate) async fn activate_session_handoff_handler(
         .map_err(session_handoff_http_error)
 }
 
+fn fork_provider_scope(
+    auth: &astra_services::RequestAuthResult,
+) -> Option<astra_services::runs::ProviderRunOwner> {
+    if auth.mechanism == astra_services::RequestAuthMechanism::KnownLegacy {
+        return None;
+    }
+    match &auth.principal.origin {
+        astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(context) => {
+            Some(astra_services::runs::ProviderRunOwner {
+                provider_id: context.provider_id.clone(),
+                provider_scope_id: context.provider_scope_id.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
 async fn authorize_fork_cursor(
     state: &AppState,
-    principal: &astra_services::AuthPrincipal,
+    auth: &astra_services::RequestAuthResult,
     key: &astra_turn_types::SessionKeyV1,
     cursor: &astra_turn_types::SessionCursorV1,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    if let astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(context) =
-        &principal.origin
-    {
+    if let Some(provider_scope) = fork_provider_scope(auth) {
         fork_coordinator(state)?
-            .authorize_provider_cursor(
-                key,
-                cursor,
-                &astra_services::runs::ProviderRunOwner {
-                    provider_id: context.provider_id.clone(),
-                    provider_scope_id: context.provider_scope_id.clone(),
-                },
-            )
+            .authorize_provider_cursor(key, cursor, &provider_scope)
             .await
             .map_err(session_fork_http_error)?;
     }
@@ -2538,9 +2546,9 @@ pub(crate) async fn get_session_run_cursor_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<astra_turn_types::SessionCursorV1>, (StatusCode, Json<ErrorResponse>)> {
-    let principal = state
+    let auth = state
         .auth_service
-        .current_principal_for_request(
+        .current_principal_for_request_with_provenance(
             &headers,
             external_request_descriptor(
                 &method,
@@ -2551,20 +2559,13 @@ pub(crate) async fn get_session_run_cursor_handler(
             ),
         )
         .await?;
+    let principal = &auth.principal;
     state
         .session_service
         .get_session(session_id.clone(), principal.user.user_id.clone())
         .await?;
     let key = server_session_key(&principal.user.user_id, &session_id);
-    let provider_scope = match &principal.origin {
-        astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(context) => {
-            Some(astra_services::runs::ProviderRunOwner {
-                provider_id: context.provider_id.clone(),
-                provider_scope_id: context.provider_scope_id.clone(),
-            })
-        }
-        _ => None,
-    };
+    let provider_scope = fork_provider_scope(&auth);
     let cursor = fork_coordinator(&state)?
         .resolve_run_cursor(&key, &run_id, provider_scope.as_ref())
         .await
@@ -2584,9 +2585,9 @@ pub(crate) async fn activate_session_fork_for_continuation_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<astra_services::SessionForkContinuationV1>, (StatusCode, Json<ErrorResponse>)> {
-    let principal = state
+    let auth = state
         .auth_service
-        .current_principal_for_request(
+        .current_principal_for_request_with_provenance(
             &headers,
             external_request_descriptor(
                 &method,
@@ -2597,6 +2598,7 @@ pub(crate) async fn activate_session_fork_for_continuation_handler(
             ),
         )
         .await?;
+    let principal = &auth.principal;
     let _: SessionForkContinuationRequest = serde_json::from_slice(&body).map_err(|_| {
         error_response_coded(
             StatusCode::BAD_REQUEST,
@@ -2614,7 +2616,7 @@ pub(crate) async fn activate_session_fork_for_continuation_handler(
         .load(&key, &fork_id)
         .await
         .map_err(session_fork_http_error)?;
-    authorize_fork_cursor(&state, &principal, &key, &manifest.parent_head.cursor).await?;
+    authorize_fork_cursor(&state, &auth, &key, &manifest.parent_head.cursor).await?;
     coordinator
         .activate_for_continuation(&key, &fork_id)
         .await
@@ -2630,9 +2632,9 @@ pub(crate) async fn prepare_session_fork_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<astra_turn_types::SessionForkManifestV1>, (StatusCode, Json<ErrorResponse>)> {
-    let principal = state
+    let auth = state
         .auth_service
-        .current_principal_for_request(
+        .current_principal_for_request_with_provenance(
             &headers,
             external_request_descriptor(
                 &method,
@@ -2643,6 +2645,7 @@ pub(crate) async fn prepare_session_fork_handler(
             ),
         )
         .await?;
+    let principal = &auth.principal;
     let request: SessionForkPrepareRequest = serde_json::from_slice(&body).map_err(|_| {
         error_response_coded(
             StatusCode::BAD_REQUEST,
@@ -2656,13 +2659,7 @@ pub(crate) async fn prepare_session_fork_handler(
         .get_session(session_id, user.user_id.clone())
         .await?;
     let parent_key = server_session_key(&user.user_id, &session.session_id);
-    authorize_fork_cursor(
-        &state,
-        &principal,
-        &parent_key,
-        &request.expected_parent_cursor,
-    )
-    .await?;
+    authorize_fork_cursor(&state, &auth, &parent_key, &request.expected_parent_cursor).await?;
     let child_session_id =
         deterministic_fork_session_id(&user.user_id, &session.session_id, &request.idempotency_key);
     let child_key = server_session_key(&user.user_id, &child_session_id);
@@ -3109,6 +3106,11 @@ fn session_fork_http_error(
             "session_fork_invalid",
             "Invalid session fork request",
         ),
+        ForkError::Coordinator(ContextError::ResourceLimit(_)) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "session_fork_resource_limit",
+            "Session fork exceeds the context resource limit",
+        ),
         ForkError::NotFound | ForkError::Coordinator(ContextError::SegmentNotFound) => (
             StatusCode::NOT_FOUND,
             "session_fork_not_found",
@@ -3148,6 +3150,7 @@ fn session_fork_http_error(
         ForkError::Conflict
         | ForkError::Coordinator(
             ContextError::Fenced
+            | ContextError::ExecutionOccupied(_)
             | ContextError::SessionLifecycleFenced
             | ContextError::Expired
             | ContextError::DivergentManifest,

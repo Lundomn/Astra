@@ -302,6 +302,17 @@ head; activation alone grants no writer lease and makes no inference call.
 Negative controls cover signature/body/path tampering, nonce replay, workspace
 scope isolation, idempotency conflicts, non-root runs, incomplete projection,
 and unavailable historical roots. The earlier consumer baseline is unchanged.
+The same fork journey deletes its middle Session, then its ancestor, and proves
+the descendant can still materialize and continue from the exact pinned history
+after bounded cleanup. Deleted Sessions retain no live head or execution state.
+Deleting the final descendant releases fork metadata, pins and manifest rows,
+including the node-local payloads stored by the current canonical owner.
+
+`moi_fresh_astra/fork_auth_compat.rs` adds two focused checks to this same target:
+real runtime and Edge user tokens can prepare at a canonical head before Server
+projection; a custom request-only provider authenticator without provenance
+cannot bypass scope or retry legacy authentication. The canonical verifier also
+proves the legacy/HMAC mechanism distinction and single nonce consumption.
 
 Buffered and live consumers share the pinned MOI SSE framing rules, including
 LF/CRLF, multiline data, EOF frames and stopping at `[DONE]`. Negative controls

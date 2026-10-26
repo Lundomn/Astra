@@ -3,6 +3,11 @@ use super::*;
 use astra_runtime::server::provider_test_support::{
     ProviderGateway, ProviderResponse, ProviderScript,
 };
+use astra_services::{
+    DatabaseSessionContextCoordinator, DatabaseSessionForkCoordinator, DatabaseSessionService,
+    SessionContextCoordinator, SessionService,
+};
+use astra_turn_types::SessionKeyV1;
 
 async fn control(
     app: &Router,
@@ -150,6 +155,7 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
     let gateway_task = tokio::spawn(async move {
         axum::serve(listener, gateway_app).await.unwrap();
     });
+    let session_settings = settings.matrixone.clone();
     let state = build_server_state(settings)
         .await
         .expect("fresh Astra bootstrap");
@@ -171,6 +177,8 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
             "SIBLING-ANSWER",
             "CHILD-NEXT",
             "NESTED-ANSWER",
+            "AFTER-CHILD-DELETE-ANSWER",
+            "AFTER-ANCESTOR-DELETE-ANSWER",
         ]
         .into_iter()
         .map(answer)
@@ -338,7 +346,7 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
     let child_cursor = cursor(&app, &child, &child_run).await;
     assert_eq!(
         child_cursor["completed_turn"], 2,
-        "child projection starts after its shared prefix"
+        "child canonical cursor starts after its shared prefix"
     );
     moi.session = Some(parent.clone());
     moi.chat(&app, "PARENT-FACT", "PARENT-ANSWER").await;
@@ -451,6 +459,150 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(value["error_code"], "session_fork_cursor_unsupported");
 
+    // The middle Session is ordinary mutable state; its descendants retain
+    // immutable history without retaining its live head or execution authority.
+    let shared_pool = state.shared_pool.as_ref().unwrap().clone();
+    let context = Arc::new(DatabaseSessionContextCoordinator::new(shared_pool.clone()));
+    let fork_owner = DatabaseSessionForkCoordinator::new(shared_pool.clone(), context.clone());
+    let sessions = DatabaseSessionService::new(session_settings).with_pool(shared_pool);
+    let nested_key: SessionKeyV1 = serde_json::from_value(json!({
+        "schema_version": 1, "isolation_domain": "server", "owner_user_id": owner,
+        "session_id": nested, "branch_id": "main"
+    }))
+    .unwrap();
+    let nested_head = context.load_head(&nested_key).await.unwrap().unwrap();
+    let exact_nested = context.materialize(&nested_head).await.unwrap();
+    sessions
+        .delete_session(child.clone(), owner.into())
+        .await
+        .unwrap();
+    let middle_heads: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_context_heads WHERE owner_user_id = ? AND session_id = ?",
+    )
+    .bind(owner)
+    .bind(&child)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        middle_heads, 0,
+        "deletion must remove the middle live context head"
+    );
+    assert_eq!(
+        context
+            .materialize(&nested_head)
+            .await
+            .expect("nested history survives middle Session deletion"),
+        exact_nested,
+        "deleting a middle Session must preserve the exact descendant prefix"
+    );
+    let middle_key: SessionKeyV1 =
+        serde_json::from_value(active["manifest"]["child_key"].clone()).unwrap();
+    let retained_manifest: astra_turn_types::SessionForkManifestV1 =
+        serde_json::from_value(active["manifest"].clone()).unwrap();
+    assert_eq!(
+        context.load_fork_prefix(&middle_key).await.unwrap(),
+        Some(retained_manifest.shared_prefix())
+    );
+    for wrong_key in [
+        SessionKeyV1 {
+            owner_user_id: "another-owner".into(),
+            ..middle_key.clone()
+        },
+        SessionKeyV1 {
+            isolation_domain: "another-domain".into(),
+            ..middle_key.clone()
+        },
+        SessionKeyV1 {
+            branch_id: "another-branch".into(),
+            ..middle_key.clone()
+        },
+    ] {
+        assert!(
+            context
+                .load_fork_prefix(&wrong_key)
+                .await
+                .unwrap()
+                .is_none(),
+            "retained prefix must not escape the complete child key"
+        );
+    }
+    assert_eq!(
+        sessions
+            .get_session(child.clone(), owner.into())
+            .await
+            .unwrap_err()
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let middle_runs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE user_id = ? AND session_id = ?")
+            .bind(owner)
+            .bind(&child)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        middle_runs, 0,
+        "retaining immutable lineage must not retain execution runs"
+    );
+    let incoming_pin: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_manifest_pins WHERE owner_user_id = ? AND pin_id = ? AND pin_state = 'active'")
+        .bind(owner).bind(&retained_manifest.fork_id).fetch_one(pool).await.unwrap();
+    assert_eq!(
+        incoming_pin, 1,
+        "the upstream retention pin must survive middle deletion"
+    );
+    moi.session = Some(nested.clone());
+    let after_middle = moi
+        .chat(&app, "AFTER-CHILD-DELETE-FACT", "AFTER-CHILD-DELETE-ANSWER")
+        .await;
+    cursor(&app, &nested, &after_middle).await;
+    assert!(state.drain_background_runs(Duration::from_secs(10)).await);
+    // Release the independent sibling before deleting A. Otherwise its A pin
+    // could hide a broken ancestor pin on the B -> C lineage.
+    sessions
+        .delete_session(sibling.clone(), owner.into())
+        .await
+        .unwrap();
+    let after_middle_head = context.load_head(&nested_key).await.unwrap().unwrap();
+    let exact_after_middle = context.materialize(&after_middle_head).await.unwrap();
+    sessions
+        .delete_session(parent.clone(), owner.into())
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        fork_owner.collect_orphaned_fork_records(100).await.unwrap();
+        fork_owner
+            .collect_unpinned_orphan_manifests(100)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        sessions
+            .get_session(parent.clone(), owner.into())
+            .await
+            .unwrap_err()
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let after_middle_history = context
+        .materialize(&after_middle_head)
+        .await
+        .expect("nested history survives ancestor deletion and GC");
+    assert_eq!(
+        after_middle_history, exact_after_middle,
+        "ancestor deletion and GC preserve the complete exact child history"
+    );
+    let after_ancestor = moi
+        .chat(
+            &app,
+            "AFTER-ANCESTOR-DELETE-FACT",
+            "AFTER-ANCESTOR-DELETE-ANSWER",
+        )
+        .await;
+    cursor(&app, &nested, &after_ancestor).await;
+    assert!(state.drain_background_runs(Duration::from_secs(10)).await);
+
     let requests = provider.requests.lock().await;
     for (index, included, excluded) in [
         (
@@ -478,6 +630,27 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
             vec!["FIRST-FACT", "CHILD-FACT", "NESTED-FACT"],
             vec!["CHILD-NEXT-FACT", "SIBLING-FACT", "PARENT-FACT"],
         ),
+        (
+            8,
+            vec![
+                "FIRST-FACT",
+                "CHILD-FACT",
+                "NESTED-FACT",
+                "AFTER-CHILD-DELETE-FACT",
+            ],
+            vec!["CHILD-NEXT-FACT", "SIBLING-FACT", "PARENT-FACT"],
+        ),
+        (
+            9,
+            vec![
+                "FIRST-FACT",
+                "CHILD-FACT",
+                "NESTED-FACT",
+                "AFTER-CHILD-DELETE-FACT",
+                "AFTER-ANCESTOR-DELETE-FACT",
+            ],
+            vec!["CHILD-NEXT-FACT", "SIBLING-FACT", "PARENT-FACT"],
+        ),
     ] {
         let messages = requests[index].body["messages"].to_string();
         for value in included {
@@ -489,6 +662,32 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
     }
     drop(requests);
     provider.assert_complete();
+    sessions.delete_session(nested, owner.into()).await.unwrap();
+    for _ in 0..4 {
+        fork_owner.collect_orphaned_fork_records(100).await.unwrap();
+        fork_owner
+            .collect_unpinned_orphan_manifests(100)
+            .await
+            .unwrap();
+    }
+    for table in [
+        "session_forks",
+        "session_fork_events",
+        "conversation_manifest_pins",
+        "conversation_manifest_nodes",
+    ] {
+        let remaining: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM `{table}` WHERE owner_user_id = ?"
+        )))
+        .bind(owner)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "retained lineage must converge after the last descendant is deleted: {table}"
+        );
+    }
     assert!(state.drain_background_runs(Duration::from_secs(10)).await);
     state.close_database_pools().await;
     gateway_task.abort();

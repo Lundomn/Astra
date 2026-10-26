@@ -177,7 +177,7 @@ impl DatabaseSessionForkCoordinator {
             });
         };
         let row = sqlx::query(
-            "SELECT manifest_json FROM conversation_manifest_nodes
+            "SELECT manifest_json FROM conversation_manifest_nodes FORCE INDEX (uq_context_manifest_root)
              WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?
                AND branch_id = ? AND manifest_root = ? AND reachable = 1",
         )

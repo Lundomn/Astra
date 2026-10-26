@@ -276,18 +276,25 @@ fields; a newer canonical context head does not certify transcript publication.
 
 The run-cursor, prepare, and continuation-activation operations below accept
 ordinary Astra authentication and the existing request-authorized provider
-protocol. Provider tokens bind the exact method, path, route template, body
-digest, and fresh request ID. The provider scope must match the selected
+protocol. Request-HMAC credentials bind the exact method, path, route template,
+body digest, and fresh request ID. Their provider scope must match the selected
 committed root run's authenticated `provider_run_owner`. A provider subject
 alone does not identify a workspace. An inherited fork base follows its existing
 immutable lineage to that evidence.
+The canonical auth verifier identifies the verified mechanism. Existing JWT, UC,
+and runtime/Edge user-token credentials retain their canonical-head prepare
+contract without a new Server transcript prerequisite. An existing custom
+request authenticator without mechanism provenance remains conservative: its
+provider principal still requires the source-scope check. Invalid request-HMAC
+credentials never fall back to legacy authentication.
 
 `GET /sessions/{session_id}/runs/{run_id}/cursor` returns a `SessionCursorV1`
 for that completed root conversation run. It verifies the run's committed
 transcript markers against its retained canonical manifest. It never substitutes
 the current Session head, counts display messages, or reconstructs a legacy
-cursor from text. A terminal SSE may precede asynchronous transcript projection;
-a client receiving `session_fork_cursor_not_ready` may retry this read.
+cursor from text. Canonical terminal settlement commits Context and raw transcript
+with terminal status; a client querying an incomplete run may receive
+`session_fork_cursor_not_ready` and retry this read.
 
 `POST /sessions/{session_id}/forks` accepts
 `{idempotency_key, expected_parent_cursor, reason}` and returns the prepared
@@ -314,6 +321,7 @@ Fork errors use the existing public error envelope and stable `error_code`:
 | HTTP | Code | Meaning |
 | --- | --- | --- |
 | 400 | `session_fork_invalid` | Invalid request |
+| 413 | `session_fork_resource_limit` | Canonical context resource limit exceeded |
 | 403 | `session_fork_forbidden` | Source is outside the authorized provider scope |
 | 404 | `session_fork_not_found` | Scoped run or fork was not found |
 | 409 | `session_fork_cursor_not_ready` | Run or committed transcript projection is incomplete |

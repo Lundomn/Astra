@@ -151,9 +151,9 @@ pub use auth::{
     ExternalProviderClient, ExternalRequestDescriptor, ExternalRuntimeContextRequestData,
     ExternalRuntimeContextResponse, FernetTokenEncryptor, HttpExternalProviderClient,
     ProviderRequestDescriptor, ProviderSessionCreationIdentity, ReauthenticationProofRecord,
-    ReauthenticationPurpose, ReauthenticationRequestData, SessionCreateRequestData,
-    SessionCreationResult, SessionListFilter, SessionListRecord, SessionRecord, SessionService,
-    SessionUpdateRequestData,
+    ReauthenticationPurpose, ReauthenticationRequestData, RequestAuthMechanism, RequestAuthResult,
+    SessionCreateRequestData, SessionCreationResult, SessionListFilter, SessionListRecord,
+    SessionRecord, SessionService, SessionUpdateRequestData,
 };
 pub use context::{
     ContextService, DatabaseContextService, SnapshotCreateRequestData, SnapshotListFilter,
