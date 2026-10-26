@@ -452,12 +452,21 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
     let (status, value) = control(&app, "GET", &legacy_path, cursor_route, "").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(value["error_code"], "session_fork_forbidden");
-    sqlx::query("INSERT INTO agent_run_events (id, run_id, event_idx, user_id, session_id, event_type, event_id, event_hash, payload_json) SELECT ?, ?, 0, user_id, ?, event_type, ?, event_hash, payload_json FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_type = 'run_started'")
-        .bind(Uuid::new_v4().to_string()).bind(&legacy_run).bind(legacy_session).bind(Uuid::new_v4().to_string())
-        .bind(owner).bind(&first).execute(pool).await.unwrap();
+    // A diagnostic run_started row is no longer canonical admission evidence.
+    // It must not grant scope to a legacy run with no immutable opening.
+    let diagnostic_started = json!({"event_type":"run_started", "data":{
+        "provider_run_owner":{"provider_id":"moi","provider_scope_id":"moi-contract-workspace"}
+    }})
+    .to_string();
+    let diagnostic_hash = format!("{:x}", Sha256::digest(diagnostic_started.as_bytes()));
+    let diagnostic_insert = sqlx::query("INSERT INTO agent_run_events (id, run_id, event_idx, user_id, session_id, event_type, event_id, event_hash, payload_json) VALUES (?, ?, 0, ?, ?, 'run_started', ?, ?, ?)")
+        .bind(Uuid::new_v4().to_string()).bind(&legacy_run).bind(owner).bind(legacy_session)
+        .bind(Uuid::new_v4().to_string()).bind(diagnostic_hash).bind(diagnostic_started)
+        .execute(pool).await.unwrap();
+    assert_eq!(diagnostic_insert.rows_affected(), 1);
     let (status, value) = control(&app, "GET", &legacy_path, cursor_route, "").await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(value["error_code"], "session_fork_cursor_unsupported");
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(value["error_code"], "session_fork_forbidden");
 
     // The middle Session is ordinary mutable state; its descendants retain
     // immutable history without retaining its live head or execution authority.

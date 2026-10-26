@@ -211,28 +211,28 @@ impl DatabaseSessionForkCoordinator {
         run_id: &str,
         required: &crate::runs::ProviderRunOwner,
     ) -> Result<(), SessionForkCoordinatorError> {
-        let events: Vec<String> = sqlx::query_scalar(
-            "SELECT payload_json FROM agent_run_events
-             WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = 'run_started'
-             ORDER BY event_idx ASC LIMIT 2",
+        // Opening facts moved into the immutable Run admission record. Reuse
+        // its canonical decoder so both physical columns and their hashes are
+        // verified; diagnostic event rows never establish provider ownership.
+        let row = sqlx::query(
+            "SELECT opening_events_json, opening_context_json, opening_hash,
+                    context_admission_hash, 1 AS opening_body_loaded
+             FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = ?",
         )
         .bind(&key.owner_user_id)
         .bind(&key.session_id)
         .bind(run_id)
-        .fetch_all(self.pool.get())
+        .fetch_optional(self.pool.get())
         .await
-        .map_err(|source| database_error("load_fork_provider_scope", source))?;
-        if events.len() != 1 {
-            return Err(SessionForkCoordinatorError::Forbidden);
-        }
-        let event: serde_json::Value = serde_json::from_str(&events[0]).map_err(|source| {
-            SessionForkCoordinatorError::Json {
-                entity: "fork_source_run_started",
-                source,
-            }
-        })?;
-        let actual = event
-            .pointer("/data/provider_run_owner")
+        .map_err(|source| database_error("load_fork_provider_scope", source))?
+        .ok_or(SessionForkCoordinatorError::Forbidden)?;
+        let opening = crate::runs::decode_loaded_run_opening(&row)
+            .map_err(SessionForkCoordinatorError::NeedsRepair)?
+            .ok_or(SessionForkCoordinatorError::Forbidden)?;
+        let actual = opening
+            .events()
+            .first()
+            .and_then(|event| event.pointer("/data/provider_run_owner"))
             .cloned()
             .and_then(|value| serde_json::from_value::<crate::runs::ProviderRunOwner>(value).ok());
         if actual.as_ref() == Some(required) {
