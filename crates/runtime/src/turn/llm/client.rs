@@ -9157,6 +9157,8 @@ mod tests {
 
     #[tokio::test]
     async fn successful_headers_then_body_budget_records_delivery_unknown() {
+        // Exercise the request phase after cold client initialization.
+        let _ = global_llm_client();
         let app = Router::new().route(
             "/chat/completions",
             post(|| async {
@@ -12336,6 +12338,8 @@ mod tests {
 
     #[tokio::test]
     async fn successful_provider_result_survives_slow_terminalization_as_partial_evidence() {
+        // Exercise the request phase after cold client initialization.
+        let _ = global_llm_client();
         let app = Router::new().route(
             "/chat/completions",
             post(|| async {
@@ -15156,6 +15160,8 @@ mod tests {
 
     #[tokio::test]
     async fn call_llm_and_collect_cancel_during_429_backoff_sleep() {
+        // Exercise the request phase after cold client initialization.
+        let _ = global_llm_client();
         reset_rate_limit_cooldown_for_tests();
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
@@ -15288,6 +15294,8 @@ mod tests {
 
     #[tokio::test]
     async fn call_llm_and_collect_cancel_during_exponential_backoff_after_500() {
+        // Exercise the request phase after cold client initialization.
+        let _ = global_llm_client();
         reset_rate_limit_cooldown_for_tests();
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
