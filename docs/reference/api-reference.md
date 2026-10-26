@@ -272,6 +272,58 @@ Physical page references/hashes are no longer part of this response.
 Work transcript responses retain their committed cursor and per-item commitment
 fields; a newer canonical context head does not certify transcript publication.
 
+### Session forks
+
+The run-cursor, prepare, and continuation-activation operations below accept
+ordinary Astra authentication and the existing request-authorized provider
+protocol. Provider tokens bind the exact method, path, route template, body
+digest, and fresh request ID. The provider scope must match the selected
+committed root run's authenticated `provider_run_owner`. A provider subject
+alone does not identify a workspace. An inherited fork base follows its existing
+immutable lineage to that evidence.
+
+`GET /sessions/{session_id}/runs/{run_id}/cursor` returns a `SessionCursorV1`
+for that completed root conversation run. It verifies the run's committed
+transcript markers against its retained canonical manifest. It never substitutes
+the current Session head, counts display messages, or reconstructs a legacy
+cursor from text. A terminal SSE may precede asynchronous transcript projection;
+a client receiving `session_fork_cursor_not_ready` may retry this read.
+
+`POST /sessions/{session_id}/forks` accepts
+`{idempotency_key, expected_parent_cursor, reason}` and returns the prepared
+`SessionForkManifestV1`. The key identifies the immutable request; changing the
+request under the same key conflicts.
+
+`POST /sessions/{session_id}/forks/{fork_id}/activate-for-continuation` accepts
+`{}` and returns `{manifest, child_head}`. It activates the shared conversation
+prefix without acquiring or returning a writer lease. The next ordinary
+`/chat/stream` request uses `manifest.child_key.session_id` and acquires its own
+writer immediately. Retrying activation returns the current child head and never
+rewinds a continued child. This endpoint does not replay tools or inherit runs,
+writers, approvals, mailboxes, invocations, filesystem state, or model credentials.
+The existing `GET /sessions/{session_id}/forks` list,
+`GET /sessions/{session_id}/forks/{fork_id}` read,
+`POST /sessions/{session_id}/forks/{fork_id}/activate`, and
+`POST /sessions/{session_id}/forks/{fork_id}/abort` controls retain their existing
+authentication contract; request-signed provider credentials do not grant
+access to them. The existing `/activate` endpoint retains its writer-lease
+response, and `/abort` retains `{detail, grace_seconds}` for prepared forks.
+
+Fork errors use the existing public error envelope and stable `error_code`:
+
+| HTTP | Code | Meaning |
+| --- | --- | --- |
+| 400 | `session_fork_invalid` | Invalid request |
+| 403 | `session_fork_forbidden` | Source is outside the authorized provider scope |
+| 404 | `session_fork_not_found` | Scoped run or fork was not found |
+| 409 | `session_fork_cursor_not_ready` | Run or committed transcript projection is incomplete |
+| 409 | `session_fork_cursor_unavailable` | Exact retained canonical root is unavailable |
+| 422 | `session_fork_cursor_unsupported` | Run is not an eligible root conversation commit |
+| 409 | `session_fork_idempotency_mismatch` | Same key with a different request |
+| 409 | `session_fork_writer_conflict` | Existing activation's writer belongs to another actor |
+| 409 | `session_fork_conflict` | Fork lifecycle or context conflict |
+| 503 | `session_fork_dependency_unavailable` | Dependency or stored-state failure; internal details are not returned |
+
 ### PUT /sessions/{session_id}
 
 ### POST /sessions/{session_id}/close

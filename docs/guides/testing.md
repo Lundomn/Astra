@@ -289,6 +289,20 @@ using Astra request types or fetching a moving MOI branch. It checks:
 - a valid turn still completes on that session after the rejected requests,
   without duplicate inference.
 
+The additive `moi_fresh_astra/forks.rs` contract uses the same independent
+signer and real router, with its own `astra_test_moi_fork_<uuid>` database.
+It exercises signed prepare, continuation activation, and exact committed
+root-run cursor lookup, then continues the parent, two siblings, and a nested
+fork through ordinary chat. Signature path and replay controls use the supported
+cursor route; legacy list/read/writer-activation/abort routes retain their
+existing authentication rather than admitting request-signed provider tokens.
+The finite model inventory checks the actual inherited input and excludes later
+parent or sibling turns. Activation replay must preserve a continued child's
+head; activation alone grants no writer lease and makes no inference call.
+Negative controls cover signature/body/path tampering, nonce replay, workspace
+scope isolation, idempotency conflicts, non-root runs, incomplete projection,
+and unavailable historical roots. The earlier consumer baseline is unchanged.
+
 Buffered and live consumers share the pinned MOI SSE framing rules, including
 LF/CRLF, multiline data, EOF frames and stopping at `[DONE]`. Negative controls
 reject an early `[DONE]` even when a terminal follows it. MCP and Skill callbacks

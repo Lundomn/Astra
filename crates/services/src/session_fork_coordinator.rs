@@ -36,6 +36,14 @@ pub enum SessionForkCoordinatorError {
     Invalid(String),
     #[error("session fork was not found")]
     NotFound,
+    #[error("session fork is outside the authorized provider scope")]
+    Forbidden,
+    #[error("session fork cursor projection is not ready")]
+    CursorNotReady,
+    #[error("session fork cursor is no longer available")]
+    CursorUnavailable,
+    #[error("run does not support a canonical fork cursor")]
+    CursorUnsupported,
     #[error("session fork conflicts with existing child state")]
     Conflict,
     #[error("session fork idempotency key was reused for a different request")]
@@ -70,6 +78,13 @@ pub struct PrepareSessionForkV1 {
     pub reason: String,
 }
 
+/// Activated context without a writer lease or execution authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionForkContinuationV1 {
+    pub manifest: SessionForkManifestV1,
+    pub child_head: astra_turn_types::SessionContextHeadV1,
+}
+
 #[derive(Clone)]
 pub struct DatabaseSessionForkCoordinator {
     pool: SharedPool,
@@ -79,6 +94,273 @@ pub struct DatabaseSessionForkCoordinator {
 impl DatabaseSessionForkCoordinator {
     pub fn new(pool: SharedPool, context: Arc<dyn SessionContextCoordinator>) -> Self {
         Self { pool, context }
+    }
+
+    /// Resolve an exact root-run commit, never the Session's current head.
+    pub async fn resolve_run_cursor(
+        &self,
+        key: &SessionKeyV1,
+        run_id: &str,
+        provider_scope: Option<&crate::runs::ProviderRunOwner>,
+    ) -> Result<SessionCursorV1, SessionForkCoordinatorError> {
+        validate_key_and_id(key, run_id)?;
+        let run = sqlx::query(
+            "SELECT parent_run_id, root_run_id, depth, status FROM agent_runs
+             WHERE user_id = ? AND session_id = ? AND run_id = ?",
+        )
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(run_id)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| database_error("load_fork_source_run", source))?
+        .ok_or(SessionForkCoordinatorError::NotFound)?;
+        if let Some(required) = provider_scope {
+            self.authorize_source_run(key, run_id, required).await?;
+        }
+        let parent: Option<String> = run
+            .try_get("parent_run_id")
+            .map_err(|source| database_error("decode_fork_source_parent", source))?;
+        let root: String = run
+            .try_get("root_run_id")
+            .map_err(|source| database_error("decode_fork_source_root", source))?;
+        let depth: i32 = run
+            .try_get("depth")
+            .map_err(|source| database_error("decode_fork_source_depth", source))?;
+        let status: String = run
+            .try_get("status")
+            .map_err(|source| database_error("decode_fork_source_status", source))?;
+        if parent.is_some() || root != run_id || depth != 0 {
+            return Err(SessionForkCoordinatorError::CursorUnsupported);
+        }
+        if status != "completed" {
+            return Err(if matches!(status.as_str(), "failed" | "cancelled") {
+                SessionForkCoordinatorError::CursorUnsupported
+            } else {
+                SessionForkCoordinatorError::CursorNotReady
+            });
+        }
+        let rows = sqlx::query(
+        "SELECT DISTINCT canonical_completed_turn, canonical_conversation_seq, canonical_root_hash
+             FROM session_transcript_items WHERE user_id = ? AND session_id = ? AND run_id = ? LIMIT 2",
+    )
+    .bind(&key.owner_user_id)
+    .bind(&key.session_id)
+    .bind(run_id)
+    .fetch_all(self.pool.get())
+    .await
+    .map_err(|source| database_error("load_fork_source_commit", source))?;
+        if rows.len() != 1 {
+            return Err(
+                if rows.is_empty() && self.context.load_head(key).await?.is_none() {
+                    SessionForkCoordinatorError::CursorUnsupported
+                } else {
+                    SessionForkCoordinatorError::CursorNotReady
+                },
+            );
+        }
+        let row = &rows[0];
+        let turn: Option<i64> = row
+            .try_get("canonical_completed_turn")
+            .map_err(|source| database_error("decode_fork_source_turn", source))?;
+        let sequence: Option<i64> = row
+            .try_get("canonical_conversation_seq")
+            .map_err(|source| database_error("decode_fork_source_sequence", source))?;
+        let root: Option<String> = row
+            .try_get("canonical_root_hash")
+            .map_err(|source| database_error("decode_fork_source_commit_root", source))?;
+        let (Some(turn), Some(sequence), Some(root)) = (turn, sequence, root) else {
+            return Err(if self.context.load_head(key).await?.is_none() {
+                SessionForkCoordinatorError::CursorUnsupported
+            } else {
+                SessionForkCoordinatorError::CursorNotReady
+            });
+        };
+        let row = sqlx::query(
+            "SELECT manifest_json FROM conversation_manifest_nodes
+             WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?
+               AND branch_id = ? AND manifest_root = ? AND reachable = 1",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .bind(&root)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| database_error("load_fork_source_manifest", source))?
+        .ok_or(SessionForkCoordinatorError::CursorUnavailable)?;
+        let node: astra_turn_types::ContextManifestNodeV1 =
+            decode_json_row(&row, "manifest_json", "fork_source_manifest")?;
+        node.validate()
+            .map_err(|error| SessionForkCoordinatorError::NeedsRepair(error.to_string()))?;
+        let cursor = node.cursor();
+        if node.key != *key
+            || cursor.canonical_root_hash != root
+            || i64::from(cursor.completed_turn) != turn
+            || i64::try_from(cursor.conversation_seq).ok() != Some(sequence)
+        {
+            return Err(SessionForkCoordinatorError::CursorUnavailable);
+        }
+        Ok(cursor)
+    }
+
+    async fn authorize_source_run(
+        &self,
+        key: &SessionKeyV1,
+        run_id: &str,
+        required: &crate::runs::ProviderRunOwner,
+    ) -> Result<(), SessionForkCoordinatorError> {
+        let events: Vec<String> = sqlx::query_scalar(
+            "SELECT payload_json FROM agent_run_events
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = 'run_started'
+             ORDER BY event_idx ASC LIMIT 2",
+        )
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(run_id)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(|source| database_error("load_fork_provider_scope", source))?;
+        if events.len() != 1 {
+            return Err(SessionForkCoordinatorError::Forbidden);
+        }
+        let event: serde_json::Value = serde_json::from_str(&events[0]).map_err(|source| {
+            SessionForkCoordinatorError::Json {
+                entity: "fork_source_run_started",
+                source,
+            }
+        })?;
+        let actual = event
+            .pointer("/data/provider_run_owner")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<crate::runs::ProviderRunOwner>(value).ok());
+        if actual.as_ref() == Some(required) {
+            Ok(())
+        } else {
+            Err(SessionForkCoordinatorError::Forbidden)
+        }
+    }
+
+    /// Provider workspace scope belongs to the source run's authenticated
+    /// start event, not to an owner ID or client-supplied Session metadata.
+    pub async fn authorize_provider_cursor(
+        &self,
+        key: &SessionKeyV1,
+        cursor: &SessionCursorV1,
+        required: &crate::runs::ProviderRunOwner,
+    ) -> Result<(), SessionForkCoordinatorError> {
+        let mut key = key.clone();
+        let mut cursor = cursor.clone();
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            key.validate()
+                .map_err(|error| SessionForkCoordinatorError::Invalid(error.to_string()))?;
+            if !key.validates_cursor(&cursor)
+                || !visited.insert((
+                    key.session_id.clone(),
+                    key.branch_id.clone(),
+                    cursor.canonical_root_hash.clone(),
+                ))
+            {
+                return Err(SessionForkCoordinatorError::Forbidden);
+            }
+            let runs: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT run_id FROM session_transcript_items
+                 WHERE user_id = ? AND session_id = ? AND canonical_root_hash = ?
+                   AND canonical_completed_turn = ? AND canonical_conversation_seq = ?
+                   AND run_id IS NOT NULL LIMIT 2",
+            )
+            .bind(&key.owner_user_id)
+            .bind(&key.session_id)
+            .bind(&cursor.canonical_root_hash)
+            .bind(i64::from(cursor.completed_turn))
+            .bind(
+                i64::try_from(cursor.conversation_seq)
+                    .map_err(|_| SessionForkCoordinatorError::CursorUnavailable)?,
+            )
+            .fetch_all(self.pool.get())
+            .await
+            .map_err(|source| database_error("load_fork_scope_run", source))?;
+            if runs.len() == 1 {
+                let run_id = &runs[0];
+                if self
+                    .resolve_run_cursor(&key, run_id, Some(required))
+                    .await?
+                    != cursor
+                {
+                    return Err(SessionForkCoordinatorError::CursorUnavailable);
+                }
+                return Ok(());
+            }
+            if !runs.is_empty() {
+                return Err(SessionForkCoordinatorError::CursorUnavailable);
+            }
+            let prefix = self
+                .context
+                .load_fork_prefix(&key)
+                .await?
+                .ok_or(SessionForkCoordinatorError::Forbidden)?;
+            // Only the exact inherited boundary may follow this lineage edge.
+            // A missing child run must never be replaced by a parent's newest run.
+            let mut child_base = prefix.parent_cursor.clone();
+            child_base.owner_id = key.owner_user_id.clone();
+            child_base.session_id = key.session_id.clone();
+            child_base.branch_id = key.branch_id.clone();
+            if child_base != cursor {
+                return Err(SessionForkCoordinatorError::Forbidden);
+            }
+            key = prefix.parent_key;
+            cursor = prefix.parent_cursor;
+        }
+    }
+
+    /// Activate immutable context only. Ordinary chat obtains its own writer.
+    pub async fn activate_for_continuation(
+        &self,
+        parent_key: &SessionKeyV1,
+        fork_id: &str,
+    ) -> Result<SessionForkContinuationV1, SessionForkCoordinatorError> {
+        let stored = self.load(parent_key, fork_id).await?;
+        self.activate_stored_fork(stored).await
+    }
+
+    async fn activate_stored_fork(
+        &self,
+        stored: SessionForkManifestV1,
+    ) -> Result<SessionForkContinuationV1, SessionForkCoordinatorError> {
+        if stored.state == SessionForkStateV1::Aborted {
+            return Err(SessionForkCoordinatorError::Conflict);
+        }
+        let child_head = if stored.state == SessionForkStateV1::Prepared {
+            self.context.activate_fork(&stored).await?
+        } else {
+            self.context
+                .load_head(&stored.child_key)
+                .await?
+                .ok_or_else(|| {
+                    SessionForkCoordinatorError::NeedsRepair(
+                        "active fork has no child context head".into(),
+                    )
+                })?
+        };
+        if child_head.key != stored.child_key
+            || !stored.child_key.validates_cursor(&child_head.cursor)
+        {
+            return Err(SessionForkCoordinatorError::NeedsRepair(
+                "active fork child head escaped its owner".into(),
+            ));
+        }
+        let manifest = self.load(&stored.parent_key, &stored.fork_id).await?;
+        if manifest.state != SessionForkStateV1::Active {
+            return Err(SessionForkCoordinatorError::NeedsRepair(
+                "fork activation did not durably transition to active".into(),
+            ));
+        }
+        Ok(SessionForkContinuationV1 {
+            manifest,
+            child_head,
+        })
     }
 
     pub async fn prepare(
@@ -209,21 +491,9 @@ impl DatabaseSessionForkCoordinator {
         actor
             .validate_for(&stored.child_key)
             .map_err(|error| SessionForkCoordinatorError::Invalid(error.to_string()))?;
-        if stored.state == SessionForkStateV1::Aborted {
-            return Err(SessionForkCoordinatorError::Conflict);
-        }
-        let child_head = if stored.state == SessionForkStateV1::Prepared {
-            self.context.activate_fork(&stored).await?
-        } else {
-            self.context
-                .load_head(&stored.child_key)
-                .await?
-                .ok_or_else(|| {
-                    SessionForkCoordinatorError::NeedsRepair(
-                        "active fork has no child context head".into(),
-                    )
-                })?
-        };
+        let continuation = self.activate_stored_fork(stored).await?;
+        let stored = continuation.manifest;
+        let child_head = continuation.child_head;
         let writer_idempotency = identity_hash(
             "activate-writer",
             &format!("{}\0{}", stored.fork_id, actor.actor_id),
@@ -1243,6 +1513,18 @@ mod tests {
             .await
             .expect("activate fork");
         assert_eq!(activation.manifest.state, SessionForkStateV1::Active);
+        let copied_transcript: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_transcript_items WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&owner)
+        .bind(&child_key.session_id)
+        .fetch_one(pool.get())
+        .await
+        .expect("read child transcript");
+        assert_eq!(
+            copied_transcript, 0,
+            "baseline must not copy parent transcript rows"
+        );
         let child_manifest_count_after: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM conversation_manifest_nodes
              WHERE isolation_domain = ? AND owner_user_id = ?

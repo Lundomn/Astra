@@ -272,6 +272,18 @@ Physical page counts, page high watermarks, and page lag are not exposed.
 The committed projection may honestly lag canonical context until its evidence
 has been materialized and the contiguous cursor promoted.
 
+A Session fork starts its committed transcript projection at the validated shared
+prefix cursor in the same transaction that activates its child context. This
+baseline certifies the pinned immutable prefix; it does not copy parent display
+rows or allocate historical child runs. The child's first own run advances from
+turn N to N+1 under the existing continuity check. Repeated activation cannot
+rewind that projection. Ordinary Sessions still start at turn 1, and incomplete
+run evidence never becomes committed merely because a canonical head is newer.
+
+Nested forks materialize their prefix through the existing immutable lineage.
+Each ancestor read remains within its validated owner, isolation domain, branch,
+and pinned sequence; a replacement-history generation stops older prefix reads.
+
 ## One-shot local content privacy
 
 `astra --no-journal-content chat ...` (or `ASTRA_JOURNAL_CONTENT_REDACT=1`)
