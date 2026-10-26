@@ -304,8 +304,8 @@ request under the same key conflicts.
 `POST /sessions/{session_id}/forks/{fork_id}/activate-for-continuation` accepts
 `{}` and returns `{manifest, child_head}`. It activates the shared conversation
 prefix without acquiring or returning a writer lease. The next ordinary
-`/chat/stream` request uses `manifest.child_key.session_id` and acquires its own
-writer immediately. Retrying activation returns the current child head and never
+`/chat/stream` request uses `manifest.child_key.session_id` and admits fresh
+Run-owned Context authority. Retrying activation returns the current child head and never
 rewinds a continued child. This endpoint does not replay tools or inherit runs,
 writers, approvals, mailboxes, invocations, filesystem state, or model credentials.
 The existing `GET /sessions/{session_id}/forks` list,

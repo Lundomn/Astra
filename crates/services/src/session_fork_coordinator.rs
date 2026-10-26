@@ -315,7 +315,7 @@ impl DatabaseSessionForkCoordinator {
         }
     }
 
-    /// Activate immutable context only. Ordinary chat obtains its own writer.
+    /// Activate immutable context only. Ordinary chat admits fresh Run-owned Context authority.
     pub async fn activate_for_continuation(
         &self,
         parent_key: &SessionKeyV1,
