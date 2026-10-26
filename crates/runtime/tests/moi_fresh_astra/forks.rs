@@ -376,7 +376,10 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
         cursor(&app, &nested, &nested_run).await["completed_turn"],
         3
     );
-    assert!(state.drain_background_runs(Duration::from_secs(10)).await);
+    // Each chat consumes terminal + [DONE] and its cursor proves canonical
+    // settlement. drain_background_runs now shuts admission down, so it is
+    // reserved for final fixture teardown after all continuation assertions.
+
     // Persisted adversarial states must never resolve to the Session's latest head.
     let pool = state.shared_pool.as_ref().unwrap().get();
     let owner = first_cursor["owner_id"].as_str().unwrap();
@@ -566,7 +569,7 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
         .chat(&app, "AFTER-CHILD-DELETE-FACT", "AFTER-CHILD-DELETE-ANSWER")
         .await;
     cursor(&app, &nested, &after_middle).await;
-    assert!(state.drain_background_runs(Duration::from_secs(10)).await);
+
     // Release the independent sibling before deleting A. Otherwise its A pin
     // could hide a broken ancestor pin on the B -> C lineage.
     sessions
@@ -610,7 +613,6 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
         )
         .await;
     cursor(&app, &nested, &after_ancestor).await;
-    assert!(state.drain_background_runs(Duration::from_secs(10)).await);
 
     let requests = provider.requests.lock().await;
     for (index, included, excluded) in [
