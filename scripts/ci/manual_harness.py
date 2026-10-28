@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-SCHEMA = "astra.harness_progress.v5"
+SCHEMA = "astra.harness_progress.v7"
 MAX_RECORD = 262_144
 MAX_FILE = 32 * 1024 * 1024
 STATUSES = ("passed", "failed", "cancelled", "unavailable")
@@ -53,6 +53,116 @@ OUTCOME_ERROR_KINDS = ERROR_KINDS | {"other", "not_reported",
                "delegation_model_scope_unresolved", "delegation_model_unavailable",
                "delegation_preparation_unavailable", "delegation_model_assessment_unavailable",
                "invalid_delegation_model_scope", "execution_time_budget_exhausted"}
+INTERRUPTION_KINDS = frozenset("""
+budget_exhausted empty_completion token_budget_exceeded rate_limited cooldown_rejected
+user_cancelled context_overflow auth_failure critical_verdict approval_rejected server_overload
+stream_transport stream_idle provider_deadline harness_blocked harness_paused interrupted
+execution_incomplete executor_dropped timeout cancelled other
+""".split())
+TERMINAL_ERROR_KINDS = ERROR_KINDS | {"api_error", "tool_failure", "persistence_error",
+    "partial", "unfinished", "session_cancellation_pending", "other"}
+ERROR_CODES = TERMINAL_ERROR_KINDS | INTERRUPTION_KINDS | {
+    "canonical_persistence_failed", "crash_recovery", "genesis_unavailable",
+    "terminal_handoff_window_closed", "internal_error", "tool_error", "api_error"}
+STREAM_EVENTS = frozenset("""
+run_started transcript_committed output_delta terminated_completed terminated_delegated
+terminated_failed terminated_interrupted terminated_cancelled gap other
+""".split())
+JOURNAL_EVENTS = frozenset("""
+llm_round turn turn_error tool_invocation llm_round_started llm_round_completed llm_round_failed
+ tool_call_started tool_call_completed tool_call_failed tool_call_skipped
+step_started step_completed step_incomplete step_failed other
+""".split())
+DEADLINE_PHASES = frozenset("""
+semantic_progress actionable_output provider_work consuming_provider_stream waiting_provider_response
+sending_provider_request provider_attempt_admission provider_attempt_terminalization
+provider_attempt_persistence other
+""".split())
+LOOP_FINISH_REASONS = frozenset("""
+stop content_filter function_call length tool_calls continue interrupted superseded_by_runtime_input direct_child_completion_wait
+runtime_input_arrived_before_settlement textless_response_retry canonical_work_revalidation_unavailable
+paused_after_provider_response canonical_work_synthesis_revoked work_settlement_retry
+completion_action_no_tool_retry completion_action_incomplete workspace_completion_retry
+explicit_verification_retry round_slice_without_typed_completion completion_contract_incomplete token_budget_exceeded
+other not_reported
+""".split())
+CHILD_BOUNDARY_OUTCOMES = frozenset("""
+results_staged results_adopted wait_started cancelled readmission_failed synthesis_ready runtime_input_ready
+observation_timed_out synthesis_budget_exhausted deadline finalization_accepted finalization_incomplete
+finalization_interrupted other not_reported
+""".split())
+
+
+def safe_loop_boundaries(value):
+    if not isinstance(value, dict) or set(value) != {"llm_round", "child_barrier"}:
+        raise ValueError("invalid loop boundaries")
+    for kind, tags in (("llm_round", LOOP_FINISH_REASONS), ("child_barrier", CHILD_BOUNDARY_OUTCOMES)):
+        scopes = value[kind]
+        if not isinstance(scopes, dict) or not set(scopes) <= {"root", "other_run", "unattributed"}:
+            raise ValueError("invalid loop scope")
+        for counts in scopes.values():
+            if not isinstance(counts, dict) or not set(counts) <= tags:
+                raise ValueError("invalid loop codes")
+            for count in counts.values():
+                integer(count)
+
+
+def safe_execution_diagnostic(value):
+    if (not isinstance(value, dict) or set(value) != {
+        "final_state", "interruption_kind", "error_kind", "error_code",
+        "server_admission_not_dispatched", "stream", "journal"}):
+        raise ValueError("invalid execution diagnostic")
+    for key, allowed in (("final_state", {"completed", "failed", "interrupted", "other"}),
+                         ("interruption_kind", INTERRUPTION_KINDS),
+                         ("error_kind", TERMINAL_ERROR_KINDS), ("error_code", ERROR_CODES)):
+        tag = value[key]
+        if tag is not None and (not isinstance(tag, str) or tag not in allowed):
+            raise ValueError("invalid execution tag")
+    if type(value["server_admission_not_dispatched"]) is not bool:
+        raise ValueError("invalid admission diagnostic")
+    for key, allowed, fields in (
+        ("stream", STREAM_EVENTS, {"identity_verified", "has_diagnostics"}),
+        ("journal", JOURNAL_EVENTS, {"skipped_lines", "dropped_lines", "integrity_errors"})):
+        capture = value[key]
+        if capture is None:
+            continue
+        expected = fields | {"last_event", "event_counts"}
+        if key == "journal":
+            expected.add("last_provider_failure")
+            expected.add("loop_boundaries")
+        if not isinstance(capture, dict) or set(capture) != expected:
+            raise ValueError("invalid capture diagnostic")
+        if key == "stream":
+            if any(type(capture[field]) is not bool for field in fields):
+                raise ValueError("invalid capture identity")
+        else:
+            for field in fields:
+                integer(capture[field])
+            safe_loop_boundaries(capture["loop_boundaries"])
+        counts = capture["event_counts"]
+        if not isinstance(counts, dict) or not set(counts) <= allowed:
+            raise ValueError("invalid event counters")
+        for count in counts.values():
+            integer(count)
+        last = capture["last_event"]
+        if last is not None and (not isinstance(last, str) or last not in allowed):
+            raise ValueError("invalid last event")
+        if key == "journal" and capture["last_provider_failure"] is not None:
+            failure = capture["last_provider_failure"]
+            if not isinstance(failure, dict) or set(failure) != {
+                "event", "run_scope", "error_kind", "failure_stage", "deadline_phase", "dispatch_started", "provider_completed"}:
+                raise ValueError("invalid provider failure diagnostic")
+            for field, tags in (("event", {"llm_round_failed", "llm_round_completed"}),
+                                ("run_scope", {"root", "other_run", "unattributed"}),
+                                ("error_kind", TERMINAL_ERROR_KINDS),
+                                ("failure_stage", {"admission", "provider", "settlement", "other"}),
+                                ("deadline_phase", DEADLINE_PHASES)):
+                tag = failure[field]
+                if tag is not None and (not isinstance(tag, str) or tag not in tags):
+                    raise ValueError("invalid provider failure tag")
+            for field in ("dispatch_started", "provider_completed"):
+                if failure[field] is not None and type(failure[field]) is not bool:
+                    raise ValueError("invalid provider failure flag")
 
 VALIDATION_CODES = frozenset("""
 required type const enum min_length max_length minimum maximum unique_items
@@ -370,10 +480,16 @@ def check_lines(items, prefix):
 
 def row_checks(row):
     lines = list(check_lines(row["criteria"], "root"))
+    if row["status"] != "passed":
+        lines.append("Execution diagnostics (observations, not causal attribution): " +
+                     json.dumps(row["execution_diagnostic"], sort_keys=True))
     if row["token_usage_coverage"] is None:
         lines.append("Provider usage coverage unavailable; terminal-reported zero counters do not prove zero usage or no tool execution.")
     for step in row["steps"]:
         lines.extend(check_lines(step["criteria"], f"step[{step['step_index']}]"))
+        if not step["passed"]:
+            lines.append(f"step[{step['step_index']}] execution diagnostics: " +
+                         json.dumps(step["execution_diagnostic"], sort_keys=True))
     if not any(c["type"] in ("judger", "hard_judger") for checks in
                [row["criteria"], *(s["criteria"] for s in row["steps"])] for c in checks):
         lines.append("LLM judge: not configured for this case; checks are deterministic, not an LLM assessment.")
@@ -382,7 +498,8 @@ def row_checks(row):
 
 def safe_row(row):
     if set(row) != {"case", "model", "run_index", "status", "has_warnings", "failure_class",
-                    "exit_code", "criteria", "steps", "token_usage_coverage", "terminal_reported"}:
+                    "exit_code", "criteria", "steps", "token_usage_coverage", "terminal_reported",
+                    "execution_diagnostic"}:
         raise ValueError("unexpected row payload")
     identity(row["case"]), identity(row["model"]), integer(row["run_index"])
     if row["status"] not in STATUSES or type(row["has_warnings"]) is not bool or type(row["exit_code"]) is not int:
@@ -390,15 +507,17 @@ def safe_row(row):
     if row["failure_class"] is not None:
         identity(row["failure_class"])
     safe_criteria(row["criteria"], owner_passed=row["status"] == "passed")
+    safe_execution_diagnostic(row["execution_diagnostic"])
     if not isinstance(row["steps"], list) or set(row["terminal_reported"]) != set(METRICS):
         raise ValueError("invalid steps or metrics")
     for value in row["terminal_reported"].values():
         integer(value)
     for step in row["steps"]:
-        if set(step) != {"step_index", "passed", "duration_ms", "criteria"} or type(step["passed"]) is not bool:
+        if set(step) != {"step_index", "passed", "duration_ms", "criteria", "execution_diagnostic"} or type(step["passed"]) is not bool:
             raise ValueError("unexpected step payload")
         integer(step["step_index"]), integer(step["duration_ms"])
         safe_criteria(step["criteria"], owner_passed=step["passed"])
+        safe_execution_diagnostic(step["execution_diagnostic"])
     if row["status"] == "passed" and any(not step["passed"] for step in row["steps"]):
         raise ValueError("passed status contradicts canonical checks")
     coverage = row["token_usage_coverage"]
