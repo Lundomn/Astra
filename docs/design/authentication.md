@@ -341,6 +341,49 @@ make test-memoria-auth-online-contract
 
 The test issues and revokes upstream keys; never point it at a production service.
 
+## MOI device authorization
+
+`astra login --device-code` is an explicit native UC alternative for terminals
+without a browser. It shares discovery/environment validation, nonce-verified
+ID tokens, product preparation, atomic login publication, refresh and logout
+with the existing UC browser login. It has no new local credential schema.
+Discovery's device endpoint is optional; its absence leaves browser login
+unchanged and rejects only the explicit device command.
+
+UC admits the fixed `astra-cli` scope set and S256 PKCE request. The CLI prints
+the manual verification URI and user code, never the grant secret or a complete
+verification URI. Keycloak owns grant state and the final consent. UC's typed
+identity continuation must return to the original Keycloak device session,
+without opening a fresh authorization-code flow. The UC implementation and
+rollout are tracked in [Matrixflow #17972](https://github.com/matrixorigin/matrixflow/issues/17972).
+
+Polling obeys the issuer interval, increases it permanently for `slow_down`,
+backs off proven connection failures, and
+stops at a bounded wait of `min(expires_in, 600)` seconds. Longer server lifetimes remain valid;
+the local wait limit is reported separately from server grant expiry. No final
+poll bypasses the issuer interval or retry delay. Authorization creation errors
+distinguish HTTP 429, HTTP 5xx and rejection without rendering upstream bodies.
+A token request with an unconfirmed outcome is terminal and is not replayed,
+including ambiguous transport failures, HTTP 429/5xx, and
+`temporarily_unavailable` responses. New credentials are
+published only after existing MOI and Astra preparation succeeds. No implicit
+browser/manual fallback is introduced.
+
+An in-flight token request gets an independent bounded settlement period after
+the local deadline or cancellation. An unconfirmed response is reported as such,
+rather than claiming the grant expired. The shared native credential owner
+arbitrates cancellation against rename admission, polls contended publication locks for up
+to ten seconds, and distinguishes pre-rename failure from visible publication
+whose directory durability is unconfirmed. Callers join the writer after
+cancellation, revoke new credentials only on definite pre-commit failure, and
+attempt old-session revocation for both durable and visible-but-unconfirmed
+publication. Filesystem operations themselves cannot be forcibly interrupted;
+no caller timeout may leave a detached writer behind. This publication contract
+is shared by browser and device login; there is no device-only auth.json writer.
+Optional workspace selection uses the same bounded publication owner after login.
+Refresh sends the one-time token only after its pending intent is durably synced;
+a visible replacement with unconfirmed directory durability is never revoked.
+
 ## CLI in-flight credential ownership
 
 A CLI turn captures its admitted credential owner once, including when
