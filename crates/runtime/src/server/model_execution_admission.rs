@@ -475,6 +475,56 @@ mod tests {
     }
 
     #[test]
+    fn published_reasoning_controls_preserve_protocol_admission() {
+        use astra_core::model_wire::thinking::ThinkingProtocol;
+        use astra_services::models::ThinkingCapability;
+        use astra_turn_core::thinking_config::ThinkingConfig;
+
+        // Actual 0.2.10 context.thinking representation, not a current picker.
+        let old_request: astra_server_types::ChatRequest =
+            serde_json::from_value(serde_json::json!({
+                "message": "compatibility",
+                "model_selection": {"offering_id": "offering"},
+                "context": {"thinking": {"mode": "adaptive", "effort": "high"}}
+            }))
+            .unwrap();
+        let old_control: ThinkingConfig =
+            serde_json::from_value(old_request.context.unwrap()["thinking"].clone()).unwrap();
+        let mut execution = AdmittedModelExecution::from_endpoint(
+            "offering".into(),
+            "model".into(),
+            "openai".into(),
+            "http://127.0.0.1:1/chat/completions".into(),
+            "Bearer fixture".into(),
+            None,
+            128_000,
+        );
+        execution.thinking_capability = Some(ThinkingCapability::Both);
+        for protocol in [ThinkingProtocol::EnableThinking, ThinkingProtocol::Moonshot] {
+            execution.thinking_protocol = Some(protocol);
+            let error = validate_reasoning_control(&execution, &old_control).unwrap_err();
+            assert!(error.contains("cannot execute requested reasoning control"));
+            assert!(validate_reasoning_control(&execution, &ThinkingConfig::On {}).is_ok());
+            let mut wire = serde_json::json!({});
+            ThinkingConfig::On {}.apply_openai_protocol(&mut wire, protocol);
+            match protocol {
+                ThinkingProtocol::EnableThinking => {
+                    assert_eq!(wire, serde_json::json!({"enable_thinking": true}))
+                }
+                ThinkingProtocol::Moonshot => {
+                    assert_eq!(wire, serde_json::json!({"thinking": {"type": "enabled"}}))
+                }
+                _ => unreachable!(),
+            }
+        }
+        execution.thinking_protocol = Some(ThinkingProtocol::ReasoningEffort);
+        validate_reasoning_control(&execution, &old_control).unwrap();
+        let mut wire = serde_json::json!({});
+        old_control.apply_openai_protocol(&mut wire, ThinkingProtocol::ReasoningEffort);
+        assert_eq!(wire, serde_json::json!({"reasoning_effort": "high"}));
+    }
+
+    #[test]
     fn explicit_off_requires_an_actual_disabling_contract_for_thinking_models() {
         use astra_core::model_wire::thinking::ThinkingProtocol;
         use astra_services::models::ThinkingCapability;
