@@ -279,19 +279,25 @@ fields; a newer canonical context head does not certify transcript publication.
 
 ### Session forks
 
-The run-cursor, prepare, and continuation-activation operations below accept
-ordinary Astra authentication and the existing request-authorized provider
-protocol. Request-HMAC credentials bind the exact method, path, route template,
-body digest, and fresh request ID. Their provider scope must match the selected
-committed root run's authenticated `provider_run_owner`. A provider subject
-alone does not identify a workspace. An inherited fork base follows its existing
-immutable lineage to that evidence.
-The canonical auth verifier identifies the verified mechanism. Existing JWT, UC,
-and runtime/Edge user-token credentials retain their canonical-head prepare
-contract without a new Server transcript prerequisite. An existing custom
-request authenticator without mechanism provenance remains conservative: its
-provider principal still requires the source-scope check. Invalid request-HMAC
-credentials never fall back to legacy authentication.
+The operations below retain ordinary Astra owner authentication. Provider access
+to the new run-cursor and continuation-activation operations requires
+request-bound HMAC authentication, binding the exact method, path, route
+template, body digest, and fresh request ID. Scope is verified against the
+source Session's server-authenticated binding or its retained fork manifest,
+not a display message or the latest Run. The child retains that scope.
+
+Existing runtime/Edge user tokens retain the original prepare and writer-
+activation contract, including canonical heads before Server transcript
+projection. They cannot use the new provider cursor or continuation controls,
+or access request-signed Sessions in the distinct provider owner namespace.
+Provider authenticators without explicit mechanism provenance are rejected.
+Invalid request-HMAC credentials never fall back to legacy authentication.
+
+New request-signed Sessions and forks enforce scope on subsequent Run admission
+and access. Older ordinary Sessions without a binding retain their previous
+chat behavior but cannot become new provider fork sources. A later Run does not
+claim their historical scope; malformed bindings and fork manifests cannot use
+the ordinary-session compatibility path.
 
 `GET /sessions/{session_id}/runs/{run_id}/cursor` returns a `SessionCursorV1`
 for that completed root conversation run. It verifies the run's committed
@@ -315,11 +321,18 @@ rewinds a continued child. This endpoint does not replay tools or inherit runs,
 writers, approvals, mailboxes, invocations, filesystem state, or model credentials.
 The existing `GET /sessions/{session_id}/forks` list,
 `GET /sessions/{session_id}/forks/{fork_id}` read,
-`POST /sessions/{session_id}/forks/{fork_id}/activate`, and
-`POST /sessions/{session_id}/forks/{fork_id}/abort` controls retain their existing
+and `POST /sessions/{session_id}/forks/{fork_id}/activate` retain their existing
 authentication contract; request-signed provider credentials do not grant
-access to them. The existing `/activate` endpoint retains its writer-lease
-response, and `/abort` retains `{detail, grace_seconds}` for prepared forks.
+access to them. `/activate` retains its writer-lease response.
+
+`POST /sessions/{session_id}/forks/{fork_id}/abort` retains
+`{detail, grace_seconds}` and additionally accepts request-signed provider
+credentials for the matching prepared fork. It cancels preparation without
+granting execution authority; active forks cannot be aborted. Interrupted
+provider preparations expire after 24 hours and maintenance reclaims the
+unused child and pin. Replaying a confirmed aborted operation returns
+`session_fork_aborted`, including after child cleanup. Unknown outcomes must
+still be retried with the same idempotency key.
 
 Fork errors use the existing public error envelope and stable `error_code`:
 
@@ -335,6 +348,10 @@ Fork errors use the existing public error envelope and stable `error_code`:
 | 409 | `session_fork_idempotency_mismatch` | Same key with a different request |
 | 409 | `session_fork_writer_conflict` | Existing activation's writer belongs to another actor |
 | 409 | `session_fork_conflict` | Fork lifecycle or context conflict |
+| 410 | `session_fork_aborted` | Preparation was cancelled and can no longer activate |
+| 429 | `per_user_daily_session_quota` | Daily Session creation quota exceeded |
+| 429 | `per_user_concurrent_session_quota` | Concurrent Session quota exceeded |
+| 429 | `per_user_daily_token_quota` | Daily token quota exceeded |
 | 503 | `session_fork_dependency_unavailable` | Dependency or stored-state failure; internal details are not returned |
 
 ### PUT /sessions/{session_id}

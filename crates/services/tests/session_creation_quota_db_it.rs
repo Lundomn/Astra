@@ -146,8 +146,36 @@ async fn provider_creation_reserves_daily_quota_once_in_its_transaction() {
         (None, None)
     };
     let replay = sessions
-        .create_provider_session(first_identity, request.clone(), LimitCheck::Allowed)
+        .create_provider_session(first_identity.clone(), request.clone(), LimitCheck::Allowed)
         .await;
+    let (old_replay, corrupt_replay) = if let Ok(first) = first.as_ref() {
+        // Existing deterministic creation intents remain readable across an
+        // upgrade. Replaying them must not invent ownership of old history.
+        sqlx::query(
+            "UPDATE agent_sessions SET metadata = '{}' WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&first.session.session_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        let old = sessions
+            .create_provider_session(first_identity.clone(), request.clone(), LimitCheck::Allowed)
+            .await;
+        sqlx::query("UPDATE agent_sessions SET metadata = ? WHERE user_id = ? AND session_id = ?")
+            .bind(serde_json::json!({(proof_key): null}).to_string())
+            .bind(&user_id)
+            .bind(&first.session.session_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        let corrupt = sessions
+            .create_provider_session(first_identity, request.clone(), LimitCheck::Allowed)
+            .await;
+        (Some(old), Some(corrupt))
+    } else {
+        (None, None)
+    };
     // A stale preflight check must not bypass the authoritative transaction.
     let second = sessions
         .create_provider_session(
@@ -229,6 +257,16 @@ async fn provider_creation_reserves_daily_quota_once_in_its_transaction() {
     );
     assert!(first.unwrap().created);
     assert!(!replay.unwrap().created);
+    let old_replay = old_replay.unwrap().unwrap();
+    assert!(!old_replay.created);
+    assert!(
+        !old_replay.session.metadata.contains_key(proof_key),
+        "replay must not backfill scope"
+    );
+    assert_eq!(
+        corrupt_replay.unwrap().unwrap_err().0,
+        StatusCode::FORBIDDEN
+    );
     assert_eq!(second.unwrap_err().0, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
         usage.sessions_created, 1,

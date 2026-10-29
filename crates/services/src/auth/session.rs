@@ -711,7 +711,11 @@ impl DatabaseSessionService {
                     .fetch_session_for_user_with_admission_facts(&mut *tx, &session_id, &user_id)
                     .await?
                     .ok_or_else(|| internal_error("failed to read idempotent session"))?;
-                if let Some(scope) = provider_scope {
+                // Replaying the same deterministic creation intent may read
+                // an older unbound Session, but must never backfill its scope.
+                if let Some(scope) = provider_scope
+                    && record.metadata.contains_key(PROVIDER_SCOPE_PROOF_KEY)
+                {
                     let valid = record
                         .metadata
                         .get(PROVIDER_SCOPE_PROOF_KEY)
