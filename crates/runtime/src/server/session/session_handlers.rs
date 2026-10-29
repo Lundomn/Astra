@@ -469,20 +469,14 @@ pub(crate) async fn create_session_handler(
         let identity = astra_services::ProviderSessionCreationIdentity::from_principal(
             &principal, client_ref,
         )?;
-        let quota = state
-            .resource_governor
-            .check_session_create(&principal.user.user_id)
-            .await;
         let result = state
             .session_service
-            .create_provider_session(identity, data, quota)
+            .create_provider_session(
+                identity,
+                data,
+                astra_services::resource_governor::LimitCheck::Allowed,
+            )
             .await?;
-        if result.created {
-            state
-                .resource_governor
-                .record_session_created(&principal.user.user_id)
-                .await;
-        }
         let status = if result.created {
             StatusCode::CREATED
         } else {
@@ -2545,34 +2539,25 @@ pub(crate) async fn activate_session_handoff_handler(
 
 fn fork_provider_scope(
     auth: &astra_services::RequestAuthResult,
-) -> Option<astra_services::runs::ProviderRunOwner> {
-    if auth.mechanism == astra_services::RequestAuthMechanism::KnownLegacy {
-        return None;
-    }
+    allow_legacy: bool,
+) -> Result<Option<astra_services::runs::ProviderRunOwner>, (StatusCode, Json<ErrorResponse>)> {
     match &auth.principal.origin {
         astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(context) => {
-            Some(astra_services::runs::ProviderRunOwner {
-                provider_id: context.provider_id.clone(),
-                provider_scope_id: context.provider_scope_id.clone(),
-            })
+            match auth.mechanism {
+                astra_services::RequestAuthMechanism::RequestBoundHmac => {
+                    Ok(Some(astra_services::runs::ProviderRunOwner {
+                        provider_id: context.provider_id.clone(),
+                        provider_scope_id: context.provider_scope_id.clone(),
+                    }))
+                }
+                astra_services::RequestAuthMechanism::KnownLegacy if allow_legacy => Ok(None),
+                _ => Err(session_fork_http_error(
+                    astra_services::SessionForkCoordinatorError::Forbidden,
+                )),
+            }
         }
-        _ => None,
+        _ => Ok(None),
     }
-}
-
-async fn authorize_fork_cursor(
-    state: &AppState,
-    auth: &astra_services::RequestAuthResult,
-    key: &astra_turn_types::SessionKeyV1,
-    cursor: &astra_turn_types::SessionCursorV1,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    if let Some(provider_scope) = fork_provider_scope(auth) {
-        fork_coordinator(state)?
-            .authorize_provider_cursor(key, cursor, &provider_scope)
-            .await
-            .map_err(session_fork_http_error)?;
-    }
-    Ok(())
 }
 
 pub(crate) async fn get_session_run_cursor_handler(
@@ -2602,7 +2587,7 @@ pub(crate) async fn get_session_run_cursor_handler(
         .get_session(session_id.clone(), principal.user.user_id.clone())
         .await?;
     let key = server_session_key(&principal.user.user_id, &session_id);
-    let provider_scope = fork_provider_scope(&auth);
+    let provider_scope = fork_provider_scope(&auth, false)?;
     let cursor = fork_coordinator(&state)?
         .resolve_run_cursor(&key, &run_id, provider_scope.as_ref())
         .await
@@ -2635,6 +2620,7 @@ pub(crate) async fn activate_session_fork_for_continuation_handler(
             ),
         )
         .await?;
+    let provider_owner = fork_provider_scope(&auth, false)?;
     let principal = &auth.principal;
     let _: SessionForkContinuationRequest = serde_json::from_slice(&body).map_err(|_| {
         error_response_coded(
@@ -2653,7 +2639,10 @@ pub(crate) async fn activate_session_fork_for_continuation_handler(
         .load(&key, &fork_id)
         .await
         .map_err(session_fork_http_error)?;
-    authorize_fork_cursor(&state, &auth, &key, &manifest.parent_head.cursor).await?;
+    if let Some(owner) = provider_owner {
+        astra_services::session_fork_coordinator::authorize_manifest_provider(&manifest, &owner)
+            .map_err(session_fork_http_error)?;
+    }
     coordinator
         .activate_for_continuation(&key, &fork_id)
         .await
@@ -2696,7 +2685,7 @@ pub(crate) async fn prepare_session_fork_handler(
         .get_session(session_id, user.user_id.clone())
         .await?;
     let parent_key = server_session_key(&user.user_id, &session.session_id);
-    authorize_fork_cursor(&state, &auth, &parent_key, &request.expected_parent_cursor).await?;
+    let provider_owner = fork_provider_scope(&auth, true)?;
     let child_session_id =
         deterministic_fork_session_id(&user.user_id, &session.session_id, &request.idempotency_key);
     let child_key = server_session_key(&user.user_id, &child_session_id);
@@ -2727,14 +2716,18 @@ pub(crate) async fn prepare_session_fork_handler(
     })
     .collect();
     fork_coordinator(&state)?
-        .prepare(&astra_services::PrepareSessionForkV1 {
-            idempotency_key: request.idempotency_key,
-            parent_key,
-            child_key,
-            expected_parent_cursor: request.expected_parent_cursor,
-            dimensions,
-            reason: request.reason,
-        })
+        .prepare_admitted(
+            &astra_services::PrepareSessionForkV1 {
+                idempotency_key: request.idempotency_key,
+                parent_key,
+                child_key,
+                expected_parent_cursor: request.expected_parent_cursor,
+                dimensions,
+                reason: request.reason,
+            },
+            provider_owner.as_ref(),
+            true,
+        )
         .await
         .map(Json)
         .map_err(session_fork_http_error)
@@ -2869,17 +2862,49 @@ pub(crate) async fn activate_session_fork_handler(
 pub(crate) async fn abort_session_fork_handler(
     State(state): State<AppState>,
     Path((session_id, fork_id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
-    Json(request): Json<SessionForkAbortRequest>,
+    body: Bytes,
 ) -> Result<Json<astra_turn_types::SessionForkManifestV1>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
+    let auth = state
+        .auth_service
+        .current_principal_for_request_with_provenance(
+            &headers,
+            external_request_descriptor(
+                &method,
+                &uri,
+                &headers,
+                "/sessions/{session_id}/forks/{fork_id}/abort",
+                &body,
+            ),
+        )
+        .await?;
+    let request: SessionForkAbortRequest = serde_json::from_slice(&body).map_err(|_| {
+        error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "Invalid session fork request",
+            "session_fork_invalid",
+        )
+    })?;
+    let user = &auth.principal.user;
     let session = state
         .session_service
         .get_session(session_id, user.user_id.clone())
         .await?;
-    fork_coordinator(&state)?
+    let key = server_session_key(&user.user_id, &session.session_id);
+    let coordinator = fork_coordinator(&state)?;
+    if let Some(owner) = fork_provider_scope(&auth, true)? {
+        let manifest = coordinator
+            .load(&key, &fork_id)
+            .await
+            .map_err(session_fork_http_error)?;
+        astra_services::session_fork_coordinator::authorize_manifest_provider(&manifest, &owner)
+            .map_err(session_fork_http_error)?;
+    }
+    coordinator
         .abort(
-            &server_session_key(&user.user_id, &session.session_id),
+            &key,
             &fork_id,
             std::time::Duration::from_secs(request.grace_seconds),
             &request.detail,
@@ -3138,6 +3163,14 @@ fn session_fork_http_error(
         SessionContextCoordinatorError as ContextError, SessionForkCoordinatorError as ForkError,
     };
     let (status, code, message) = match &error {
+        ForkError::Aborted => (
+            StatusCode::GONE,
+            "session_fork_aborted",
+            "Session fork was cancelled before activation",
+        ),
+        ForkError::QuotaDenied { limit, reason } => {
+            return error_response_coded(StatusCode::TOO_MANY_REQUESTS, reason, limit.error_code());
+        }
         ForkError::Invalid(_) | ForkError::Coordinator(ContextError::Invalid(_)) => (
             StatusCode::BAD_REQUEST,
             "session_fork_invalid",

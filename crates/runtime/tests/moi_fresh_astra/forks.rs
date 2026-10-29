@@ -125,6 +125,881 @@ fn answer(text: &str) -> ProviderResponse {
         "usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110}}))
 }
 
+struct ReviewFixture {
+    state: astra_runtime::AppState,
+    app: Router,
+    moi: MoiClient,
+    provider: ProviderGateway,
+    sessions: DatabaseSessionService,
+    admin: MySqlConnection,
+    database: String,
+    gateway_task: tokio::task::JoinHandle<()>,
+    parent: String,
+    parent_run: String,
+    parent_cursor: Value,
+}
+
+impl ReviewFixture {
+    async fn new() -> Self {
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let mut settings = AppSettings::from_explicit_env().unwrap();
+        settings.matrixone.database = "mysql".into();
+        let mut admin = MySqlConnection::connect(&settings.matrixone.database_url_with_password())
+            .await
+            .unwrap();
+        let database = format!("astra_test_moi_fork_{}", Uuid::new_v4().simple());
+        eprintln!("MOI review fixture database: {database}");
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE `{database}`")))
+            .execute(&mut admin)
+            .await
+            .unwrap();
+        settings.matrixone.database = database.clone();
+        settings.provider_request_auth = vec![ProviderRequestAuthConfig {
+            provider: "moi".into(),
+            auth_type: "hmac".into(),
+            key: KEY.into(),
+        }];
+        settings.external_providers.clear();
+        let gateway_state = Arc::new(Mutex::new(GatewayState::default()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        settings.memoria.base_url = endpoint.clone();
+        let gateway_app = gateway_router(gateway_state.clone());
+        let gateway_task = tokio::spawn(async move {
+            axum::serve(listener, gateway_app).await.unwrap();
+        });
+        let session_settings = settings.matrixone.clone();
+        let state = build_server_state(settings).await.unwrap();
+        let sessions = DatabaseSessionService::new(session_settings)
+            .with_pool(state.shared_pool.as_ref().unwrap().clone());
+        let app = build_app(state.clone());
+        let mut moi = MoiClient::new(false, endpoint, "fork-review", gateway_state);
+        moi.repair_session(&app).await;
+        moi.repair_bindings(&app).await;
+        moi.history.clear();
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "fork review",
+            |r| r.path == "/v1/chat/completions",
+            (0..5).map(|_| answer("REVIEW-ANSWER")).collect(),
+        )])
+        .await;
+        moi.model_endpoint = Some(format!("{}/v1/chat/completions", provider.base_url));
+        let parent = moi.session.clone().unwrap();
+        let run = moi
+            .chat(&app, "WORKSPACE-A-PRIVATE-HISTORY", "REVIEW-ANSWER")
+            .await;
+        let parent_cursor = cursor(&app, &parent, &run).await;
+        Self {
+            state,
+            app,
+            moi,
+            provider,
+            sessions,
+            admin,
+            database,
+            gateway_task,
+            parent,
+            parent_run: run,
+            parent_cursor,
+        }
+    }
+
+    async fn close(mut self) {
+        assert!(
+            self.state
+                .drain_background_runs(Duration::from_secs(10))
+                .await
+        );
+        self.state.close_database_pools().await;
+        self.gateway_task.abort();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE `{}`",
+            self.database
+        )))
+        .execute(&mut self.admin)
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real disposable MatrixOne; provider run stream and cancel scope"]
+async fn provider_fork_review_rejects_cross_workspace_run_stream_and_cancel() {
+    let fixture = ReviewFixture::new().await;
+    let run = fixture.parent_run.clone();
+    let stream_path = format!("/chat/runs/{run}/stream");
+    let replay_path = format!("{stream_path}?replay_only=true");
+    let mut rejected_streams = Vec::new();
+    for path in [&stream_path, &replay_path] {
+        let mut request = signed_in_scope(
+            "GET",
+            &stream_path,
+            "/chat/runs/{run_id}/stream",
+            "",
+            "other-workspace",
+        );
+        *request.uri_mut() = path.parse().unwrap();
+        let response = fixture.app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        rejected_streams.push((status, body));
+    }
+    let cancel_path = format!("/chat/runs/{run}");
+    let (cancel_status, cancel_body) = self::response(
+        &fixture.app,
+        signed_in_scope(
+            "DELETE",
+            &cancel_path,
+            "/chat/runs/{run_id}",
+            "",
+            "other-workspace",
+        ),
+    )
+    .await;
+    // The same-workspace replay must remain usable after a rejected cancellation.
+    let mut request =
+        signed_http_request("GET", &stream_path, "/chat/runs/{run_id}/stream", "".into());
+    *request.uri_mut() = replay_path.parse().unwrap();
+    let response = fixture.app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    fixture.close().await;
+    for (status, body) in rejected_streams {
+        assert!(
+            status == StatusCode::FORBIDDEN
+                || events(&body)
+                    .iter()
+                    .any(|event| event["error_code"] == "session_fork_forbidden"),
+            "{status} {body}"
+        );
+        assert!(!body.contains("WORKSPACE-A-PRIVATE-HISTORY"));
+    }
+    assert_eq!(cancel_status, StatusCode::FORBIDDEN, "{cancel_body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        events(&body)
+            .iter()
+            .any(|event| event["type"] == "run_finished"),
+        "{body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real disposable MatrixOne; PR review workspace regression"]
+async fn provider_fork_review_rejects_cross_workspace_chat() {
+    let mut fixture = ReviewFixture::new().await;
+    let (active, child) = fork(
+        &fixture.app,
+        &fixture.parent,
+        &fixture.parent_cursor,
+        "scope-child",
+    )
+    .await;
+    fixture.moi.session = Some(child.clone());
+    let owner = fixture.parent_cursor["owner_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fixture
+        .sessions
+        .update_session(
+            child.clone(),
+            owner.clone(),
+            astra_services::SessionUpdateRequestData {
+                title: None,
+                status: None,
+                metadata_patch: None,
+                metadata: Some(serde_json::Map::from_iter([(
+                    "provider_owner".into(),
+                    json!({"provider_id":"moi", "provider_scope_id":"other-workspace"}),
+                )])),
+            },
+        )
+        .await
+        .unwrap();
+    let body = fixture.moi.payload("WORKSPACE-B-REQUEST").to_string();
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(signed_in_scope(
+            "POST",
+            "/chat/stream",
+            "/chat/stream",
+            &body,
+            "other-workspace",
+        ))
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    let requests = fixture.provider.requests.lock().await.len();
+    let (background_status, background_error) = self::response(
+        &fixture.app,
+        signed_in_scope(
+            "POST",
+            "/chat",
+            "/chat",
+            &fixture.moi.payload("B-BACKGROUND").to_string(),
+            "other-workspace",
+        ),
+    )
+    .await;
+    assert_eq!(
+        background_status,
+        StatusCode::FORBIDDEN,
+        "{background_error}"
+    );
+    let mut replay_request = fixture.moi.payload("SAME-WORKSPACE-CONTROL");
+    replay_request["context"] = json!({"task_ref":"fork-scope-replay"});
+    let (same_status, same_body) = post(&fixture.app, "/chat/stream", &replay_request).await;
+    assert_eq!(same_status, StatusCode::OK);
+    assert!(
+        events(&same_body)
+            .iter()
+            .any(|event| event["type"] == "run_finished"),
+        "{same_body}"
+    );
+    // Model a pre-upgrade provider fork: even exact Run replay must not bypass
+    // its missing immutable scope proof.
+    let mut old_manifest = active["manifest"].clone();
+    old_manifest
+        .as_object_mut()
+        .unwrap()
+        .remove("provider_owner");
+    sqlx::query(
+        "UPDATE session_forks SET manifest_json = ? WHERE owner_user_id = ? AND fork_id = ?",
+    )
+    .bind(old_manifest.to_string())
+    .bind(&owner)
+    .bind(old_manifest["fork_id"].as_str().unwrap())
+    .execute(fixture.state.shared_pool.as_ref().unwrap().get())
+    .await
+    .unwrap();
+    let (old_status, old_body) = post(&fixture.app, "/chat/stream", &replay_request).await;
+    assert!(
+        old_status == StatusCode::FORBIDDEN
+            || events(&old_body)
+                .iter()
+                .any(|event| event["error_code"] == "session_fork_forbidden"),
+        "{old_body}"
+    );
+    assert_eq!(fixture.provider.requests.lock().await.len(), 2);
+    fixture.close().await;
+    assert!(
+        status == StatusCode::FORBIDDEN
+            || events(&body)
+                .iter()
+                .any(|event| event["error_code"] == "session_fork_forbidden"),
+        "cross-workspace continuation: {status} {body}"
+    );
+    assert_eq!(
+        requests, 1,
+        "rejected continuation must never send inherited history to a model"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real disposable MatrixOne; PR review retained-head regression"]
+async fn provider_fork_review_reforks_inherited_head_after_middle_deletion() {
+    let mut fixture = ReviewFixture::new().await;
+    let (_, middle_id) = fork(
+        &fixture.app,
+        &fixture.parent,
+        &fixture.parent_cursor,
+        "middle",
+    )
+    .await;
+    fixture.moi.session = Some(middle_id.clone());
+    let middle_run = fixture
+        .moi
+        .chat(&fixture.app, "MIDDLE-HISTORY", "REVIEW-ANSWER")
+        .await;
+    let middle_cursor = cursor(&fixture.app, &middle_id, &middle_run).await;
+    let (child, child_id) = fork(&fixture.app, &middle_id, &middle_cursor, "child").await;
+    let (_, control_id) = fork(
+        &fixture.app,
+        &child_id,
+        &child["child_head"]["cursor"],
+        "before-delete",
+    )
+    .await;
+    let owner = fixture.parent_cursor["owner_id"].as_str().unwrap();
+    fixture
+        .sessions
+        .delete_session(control_id, owner.into())
+        .await
+        .unwrap();
+    fixture
+        .sessions
+        .delete_session(middle_id, owner.into())
+        .await
+        .unwrap();
+    let payload = json!({"idempotency_key":"after-delete", "expected_parent_cursor":child["child_head"]["cursor"], "reason":"retained exact head"}).to_string();
+    let (status, value) = control(
+        &fixture.app,
+        "POST",
+        &format!("/sessions/{child_id}/forks"),
+        "/sessions/{session_id}/forks",
+        &payload,
+    )
+    .await;
+    fixture.close().await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "retained inherited head must remain authorized: {value}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real disposable MatrixOne; ordinary parent scope laundering regression"]
+async fn provider_fork_review_rejects_history_laundering_through_ordinary_parent() {
+    let fixture = ReviewFixture::new().await;
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(signed_in_scope(
+            "POST",
+            "/chat/stream",
+            "/chat/stream",
+            &fixture.moi.payload("B-PARENT-CONTINUATION").to_string(),
+            "other-workspace",
+        ))
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    let parsed = events(&body);
+    let mut fork_status = None;
+    if let Some(run) = parsed
+        .iter()
+        .find(|event| event["type"] == "session_info")
+        .and_then(|event| event["run_id"].as_str())
+    {
+        let path = format!("/sessions/{}/runs/{run}/cursor", fixture.parent);
+        let (cursor_status, cursor) = self::response(
+            &fixture.app,
+            signed_in_scope(
+                "GET",
+                &path,
+                "/sessions/{session_id}/runs/{run_id}/cursor",
+                "",
+                "other-workspace",
+            ),
+        )
+        .await;
+        assert_eq!(cursor_status, StatusCode::OK, "{cursor}");
+        let payload = json!({"idempotency_key":"laundered-history", "expected_parent_cursor":cursor, "reason":"B inherited A history"}).to_string();
+        fork_status = Some(
+            self::response(
+                &fixture.app,
+                signed_in_scope(
+                    "POST",
+                    &format!("/sessions/{}/forks", fixture.parent),
+                    "/sessions/{session_id}/forks",
+                    &payload,
+                    "other-workspace",
+                ),
+            )
+            .await
+            .0,
+        );
+    }
+    let leaked = fixture
+        .provider
+        .requests
+        .lock()
+        .await
+        .iter()
+        .skip(1)
+        .any(|request| {
+            request.body["messages"]
+                .to_string()
+                .contains("WORKSPACE-A-PRIVATE-HISTORY")
+        });
+    fixture.close().await;
+    assert!(
+        status == StatusCode::FORBIDDEN
+            || parsed
+                .iter()
+                .any(|event| event["error_code"] == "session_fork_forbidden"),
+        "B continued A parent: {status}; B then prepared fork: {fork_status:?}; model received A history: {leaked}"
+    );
+    assert!(!leaked);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real disposable MatrixOne; invalid ordinary provider scope proof"]
+async fn provider_fork_review_rejects_ordinary_session_with_invalid_scope_proof() {
+    let fixture = ReviewFixture::new().await;
+    let owner = fixture.parent_cursor["owner_id"].as_str().unwrap();
+    let pool = fixture.state.shared_pool.as_ref().unwrap();
+    let raw: String = sqlx::query_scalar(
+        "SELECT CAST(`metadata` AS CHAR) FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(owner)
+    .bind(&fixture.parent)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    let mut metadata: Value = serde_json::from_str(&raw).unwrap();
+    metadata["__astra_provider_scope_proof_v1"] = Value::Null;
+    sqlx::query("UPDATE agent_sessions SET `metadata` = ? WHERE user_id = ? AND session_id = ?")
+        .bind(metadata.to_string())
+        .bind(owner)
+        .bind(&fixture.parent)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(signed_http_request(
+            "POST",
+            "/chat/stream",
+            "/chat/stream",
+            fixture.moi.payload("MISSING-PROOF").to_string().into(),
+        ))
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    let requests = fixture.provider.requests.lock().await.len();
+    let interaction_path = "/provider-interactions/respond";
+    let interaction = json!({"run_id": &fixture.parent_run, "session_id": &fixture.parent, "request_id": "not-created", "cancelled": true});
+    let (interaction_status, interaction_body) = self::response(
+        &fixture.app,
+        signed_http_request(
+            "POST",
+            interaction_path,
+            interaction_path,
+            interaction.to_string(),
+        ),
+    )
+    .await;
+    fixture.close().await;
+    assert!(
+        status == StatusCode::FORBIDDEN
+            || events(&body)
+                .iter()
+                .any(|event| event["error_code"] == "session_fork_forbidden"),
+        "{status} {body}"
+    );
+    assert_eq!(
+        requests, 1,
+        "invalid proof must not start another model request"
+    );
+    assert_eq!(
+        interaction_status,
+        StatusCode::FORBIDDEN,
+        "{interaction_body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real disposable MatrixOne; existing unbound chat is not a fork source"]
+async fn provider_fork_review_preserves_unbound_chat_without_claiming_its_history() {
+    let mut fixture = ReviewFixture::new().await;
+    let owner = fixture.parent_cursor["owner_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let pool = fixture.state.shared_pool.as_ref().unwrap().clone();
+    let raw: String = sqlx::query_scalar(
+        "SELECT CAST(`metadata` AS CHAR) FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&owner)
+    .bind(&fixture.parent)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    // Model the persisted data from before scope binding was recorded.
+    let mut metadata: Value = serde_json::from_str(&raw).unwrap();
+    metadata
+        .as_object_mut()
+        .unwrap()
+        .remove("__astra_provider_scope_proof_v1");
+    sqlx::query("UPDATE agent_sessions SET `metadata` = ? WHERE user_id = ? AND session_id = ?")
+        .bind(metadata.to_string())
+        .bind(&owner)
+        .bind(&fixture.parent)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    let run = fixture
+        .moi
+        .chat(
+            &fixture.app,
+            "EXISTING-CONVERSATION-CONTINUES",
+            "REVIEW-ANSWER",
+        )
+        .await;
+    let (cursor_status, cursor_error) = control(
+        &fixture.app,
+        "GET",
+        &format!("/sessions/{}/runs/{run}/cursor", fixture.parent),
+        "/sessions/{session_id}/runs/{run_id}/cursor",
+        "",
+    )
+    .await;
+    let payload = json!({"idempotency_key":"unbound-history", "expected_parent_cursor":fixture.parent_cursor, "reason":"cannot claim old history"});
+    let (fork_status, fork_error) = control(
+        &fixture.app,
+        "POST",
+        &format!("/sessions/{}/forks", fixture.parent),
+        "/sessions/{session_id}/forks",
+        &payload.to_string(),
+    )
+    .await;
+    let stored: String = sqlx::query_scalar(
+        "SELECT CAST(`metadata` AS CHAR) FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&owner)
+    .bind(&fixture.parent)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    let forks: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM session_forks WHERE owner_user_id = ?")
+            .bind(&owner)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+    fixture.close().await;
+    assert_eq!(cursor_status, StatusCode::FORBIDDEN, "{cursor_error}");
+    assert_eq!(fork_status, StatusCode::FORBIDDEN, "{fork_error}");
+    assert!(
+        serde_json::from_str::<Value>(&stored)
+            .unwrap()
+            .get("__astra_provider_scope_proof_v1")
+            .is_none()
+    );
+    assert_eq!(
+        forks, 0,
+        "a later Run must not make unbound history forkable"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real disposable MatrixOne; first provider chat creates a scoped session"]
+async fn provider_fork_review_scopes_new_ordinary_chat_session() {
+    let fixture = ReviewFixture::new().await;
+    let mut first = fixture.moi.payload("NEW-ORDINARY-HISTORY");
+    first.as_object_mut().unwrap().remove("session_id");
+    let (status, body) = post(&fixture.app, "/chat/stream", &first).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let parsed = events(&body);
+    assert!(
+        parsed.iter().any(|event| event["type"] == "run_finished"),
+        "{body}"
+    );
+    let session_id = parsed
+        .iter()
+        .find(|event| event["type"] == "session_info")
+        .and_then(|event| event["session_id"].as_str())
+        .expect("new session id");
+    let mut other = fixture.moi.payload("OTHER-WORKSPACE");
+    other["session_id"] = json!(session_id);
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(signed_in_scope(
+            "POST",
+            "/chat/stream",
+            "/chat/stream",
+            &other.to_string(),
+            "other-workspace",
+        ))
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    let requests = fixture.provider.requests.lock().await.len();
+    fixture.close().await;
+    assert!(
+        status == StatusCode::FORBIDDEN
+            || events(&body)
+                .iter()
+                .any(|event| event["error_code"] == "session_fork_forbidden"),
+        "{status} {body}"
+    );
+    assert_eq!(requests, 2, "other workspace must not invoke the model");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real disposable MatrixOne; PR review prepare cancellation regression"]
+async fn provider_fork_review_cancels_interrupted_prepare() {
+    let fixture = ReviewFixture::new().await;
+    let payload = json!({"idempotency_key":"cancel-prepare", "expected_parent_cursor":fixture.parent_cursor, "reason":"cancel pending continuation"}).to_string();
+    let (status, manifest) = control(
+        &fixture.app,
+        "POST",
+        &format!("/sessions/{}/forks", fixture.parent),
+        "/sessions/{session_id}/forks",
+        &payload,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{manifest}");
+    let fork_id = manifest["fork_id"].as_str().unwrap();
+    let (status, value) = control(
+        &fixture.app,
+        "POST",
+        &format!("/sessions/{}/forks/{fork_id}/abort", fixture.parent),
+        "/sessions/{session_id}/forks/{fork_id}/abort",
+        r#"{"detail":"request cancelled","grace_seconds":1}"#,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "provider can cancel a prepared child: {value}"
+    );
+    assert_eq!(value["state"], "aborted");
+    let path = format!("/sessions/{}/forks", fixture.parent);
+    let abort_path = format!("{path}/{fork_id}/abort");
+    assert_eq!(
+        control(
+            &fixture.app,
+            "POST",
+            &abort_path,
+            "/sessions/{session_id}/forks/{fork_id}/abort",
+            r#"{"detail":"request cancelled","grace_seconds":1}"#
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (status, retry) = control(
+        &fixture.app,
+        "POST",
+        &path,
+        "/sessions/{session_id}/forks",
+        &payload,
+    )
+    .await;
+    assert_eq!(status, StatusCode::GONE, "{retry}");
+    assert_eq!(retry["error_code"], "session_fork_aborted");
+    let activate_path = format!("{path}/{fork_id}/activate-for-continuation");
+    assert_eq!(
+        control(
+            &fixture.app,
+            "POST",
+            &activate_path,
+            "/sessions/{session_id}/forks/{fork_id}/activate-for-continuation",
+            "{}"
+        )
+        .await
+        .0,
+        StatusCode::GONE
+    );
+
+    let pool = fixture.state.shared_pool.as_ref().unwrap();
+    let owner = fixture.parent_cursor["owner_id"].as_str().unwrap();
+    let child_id = manifest["child_key"]["session_id"].as_str().unwrap();
+    let coordinator = DatabaseSessionForkCoordinator::new(
+        pool.clone(),
+        Arc::new(DatabaseSessionContextCoordinator::new(pool.clone())),
+    );
+    // Model a completely lost prepare response. Its persisted pin deadline is
+    // the recovery authority; a caller need not retain the returned fork ID.
+    let lost_payload = json!({"idempotency_key":"lost-prepare", "expected_parent_cursor":fixture.parent_cursor, "reason":"lost response"}).to_string();
+    let (status, lost) = control(
+        &fixture.app,
+        "POST",
+        &path,
+        "/sessions/{session_id}/forks",
+        &lost_payload,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{lost}");
+    sqlx::query("UPDATE conversation_manifest_pins SET grace_expires_at_ms = 0 WHERE owner_user_id = ? AND pin_id IN (?, ?)")
+        .bind(owner).bind(fork_id).bind(lost["fork_id"].as_str().unwrap()).execute(pool.get()).await.unwrap();
+    assert_eq!(
+        coordinator
+            .abort_expired_provider_prepares(100)
+            .await
+            .unwrap(),
+        1
+    );
+    let (status, expired) = control(
+        &fixture.app,
+        "POST",
+        &path,
+        "/sessions/{session_id}/forks",
+        &lost_payload,
+    )
+    .await;
+    assert_eq!(status, StatusCode::GONE, "{expired}");
+    assert_eq!(expired["error_code"], "session_fork_aborted");
+
+    sqlx::query("UPDATE agent_session_lifecycle_fences SET delete_requested_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE user_id = ? AND delete_requested_at IS NOT NULL")
+        .bind(owner).execute(pool.get()).await.unwrap();
+    sqlx::query("UPDATE conversation_manifest_pins SET grace_expires_at_ms = 0 WHERE owner_user_id = ? AND pin_state = 'grace'")
+        .bind(owner).execute(pool.get()).await.unwrap();
+    let swept = astra_services::runtime_maintenance::maintain_runtime_storage(
+        pool,
+        Some(&coordinator),
+        &astra_services::runtime_maintenance::RuntimeMaintenancePolicy {
+            batch_limit: 100,
+            delete_intent_grace_secs: 0,
+        },
+        &mut Default::default(),
+    )
+    .await;
+    assert!(
+        swept.cleanup_errors.is_empty(),
+        "{:?}",
+        swept.cleanup_errors
+    );
+    let children: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND session_id IN (?, ?)",
+    )
+    .bind(owner)
+    .bind(child_id)
+    .bind(lost["child_key"]["session_id"].as_str().unwrap())
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(children, 0, "both cancelled children must be reclaimed");
+    let pins: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_manifest_pins WHERE owner_user_id = ?",
+    )
+    .bind(owner)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        pins, 0,
+        "cancelled preparations cannot pin history indefinitely"
+    );
+    assert_eq!(
+        control(
+            &fixture.app,
+            "POST",
+            &path,
+            "/sessions/{session_id}/forks",
+            &payload
+        )
+        .await
+        .0,
+        StatusCode::GONE
+    );
+    assert_eq!(
+        control(
+            &fixture.app,
+            "POST",
+            &abort_path,
+            "/sessions/{session_id}/forks/{fork_id}/abort",
+            r#"{"detail":"request cancelled","grace_seconds":1}"#
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    // Active children are never cancelled by this recovery owner.
+    let (active, active_child) = fork(
+        &fixture.app,
+        &fixture.parent,
+        &fixture.parent_cursor,
+        "active-control",
+    )
+    .await;
+    let active_id = active["manifest"]["fork_id"].as_str().unwrap();
+    assert_eq!(
+        control(
+            &fixture.app,
+            "POST",
+            &format!("{path}/{active_id}/abort"),
+            "/sessions/{session_id}/forks/{fork_id}/abort",
+            r#"{"detail":"must not delete active","grace_seconds":1}"#
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        fixture
+            .sessions
+            .get_session(active_child.clone(), owner.into())
+            .await
+            .unwrap()
+            .status,
+        "active"
+    );
+    fixture
+        .sessions
+        .delete_session(active_child, owner.into())
+        .await
+        .unwrap();
+    fixture
+        .sessions
+        .delete_session(fixture.parent.clone(), owner.into())
+        .await
+        .unwrap();
+    coordinator
+        .collect_orphaned_fork_records(100)
+        .await
+        .unwrap();
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM session_forks WHERE owner_user_id = ?")
+            .bind(owner)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+    assert_eq!(
+        receipts, 0,
+        "parent deletion must release its cancelled-fork receipts"
+    );
+    fixture.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real disposable MatrixOne; PR review fork quota regression"]
+async fn provider_fork_review_charges_creation_once() {
+    let fixture = ReviewFixture::new().await;
+    let owner = fixture.parent_cursor["owner_id"].as_str().unwrap();
+    sqlx::query("INSERT INTO resource_limits (user_id, max_sessions_per_day) VALUES (?, 2)")
+        .bind(owner)
+        .execute(fixture.state.shared_pool.as_ref().unwrap().get())
+        .await
+        .unwrap();
+    fork(
+        &fixture.app,
+        &fixture.parent,
+        &fixture.parent_cursor,
+        "quota-child",
+    )
+    .await;
+    let payload = json!({"idempotency_key":"over-quota", "expected_parent_cursor":fixture.parent_cursor, "reason":"second fork must exceed daily limit"}).to_string();
+    let (status, value) = control(
+        &fixture.app,
+        "POST",
+        &format!("/sessions/{}/forks", fixture.parent),
+        "/sessions/{session_id}/forks",
+        &payload,
+    )
+    .await;
+    let charged = fixture
+        .state
+        .resource_governor
+        .get_usage(owner)
+        .await
+        .sessions_created;
+    fixture.close().await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "fork must share the configured daily limit: {value}"
+    );
+    assert_eq!(charged, 2, "prepare replay cannot charge creation twice");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real disposable MatrixOne; provider-signed Session fork contract"]
 async fn provider_signed_forks_continue_from_exact_history_without_inherited_authority() {
@@ -151,6 +1026,10 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     settings.memoria.base_url = endpoint.clone();
+    settings.edge_token_auth = astra_core::EdgeTokenAuthConfig {
+        key: super::fork_auth_compat::USER_TOKEN_KEY.into(),
+        check_endpoint: format!("{endpoint}/check"),
+    };
     let gateway_app = gateway_router(gateway_state.clone());
     let gateway_task = tokio::spawn(async move {
         axum::serve(listener, gateway_app).await.unwrap();
@@ -258,6 +1137,58 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(error["error_code"], "session_fork_not_found");
     let fork_id = active["manifest"]["fork_id"].as_str().unwrap();
+    // A genuinely authenticated legacy credential for the same MOI subject
+    // still belongs to a different owner namespace; it cannot reach this fork
+    // through legacy Session reads or controls.
+    let now = chrono::Utc::now().timestamp();
+    let legacy_token = super::fork_auth_compat::token(json!({
+        "sub":"moi-contract-user", "workspace_id":"other-workspace",
+        "iss":"moi-core", "iat":now, "exp":now+3600, "purpose":"runtime"
+    }));
+    let own_list = Request::builder()
+        .uri("/sessions")
+        .header("authorization", format!("Bearer {legacy_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (legacy_status, legacy_sessions) = response(&app, own_list).await;
+    assert_eq!(
+        legacy_status,
+        StatusCode::OK,
+        "legacy credential is valid: {legacy_sessions}"
+    );
+    assert!(
+        legacy_sessions["sessions"].as_array().unwrap().is_empty(),
+        "legacy cannot list HMAC-owned Sessions"
+    );
+    for (method, target, body) in [
+        ("GET", format!("/sessions/{parent}/forks"), String::new()),
+        (
+            "POST",
+            format!("/sessions/{child}/context/segments:batchGet"),
+            json!({"manifest_root": first_cursor["canonical_root_hash"]}).to_string(),
+        ),
+        ("POST", format!("/sessions/{child}/cancel"), String::new()),
+        ("DELETE", format!("/sessions/{child}"), String::new()),
+        (
+            "POST",
+            format!("/sessions/{parent}/forks/{fork_id}/activate"),
+            json!({"placement":"server","writer_ttl_seconds":30}).to_string(),
+        ),
+    ] {
+        let request = Request::builder()
+            .method(method)
+            .uri(target)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {legacy_token}"))
+            .body(Body::from(body))
+            .unwrap();
+        let (status, error) = response(&app, request).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "legacy cannot own HMAC fork: {error}"
+        );
+    }
     for (method, path, route, body) in [
         (
             "GET",
@@ -319,12 +1250,6 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
             format!("/sessions/{parent}/forks/{fork_id}/activate"),
             "/sessions/{session_id}/forks/{fork_id}/activate",
             r#"{"placement":"server","writer_ttl_seconds":30}"#,
-        ),
-        (
-            "POST",
-            format!("/sessions/{parent}/forks/{fork_id}/abort"),
-            "/sessions/{session_id}/forks/{fork_id}/abort",
-            r#"{"detail":"legacy admission control","grace_seconds":60}"#,
         ),
     ] {
         let (status, error) = control(&app, method, &path, route, body).await;
@@ -435,8 +1360,8 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
     sqlx::query("UPDATE conversation_manifest_nodes SET reachable = 1 WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND manifest_root = ?")
         .bind(owner).bind(&parent).bind(first_cursor["canonical_root_hash"].as_str().unwrap()).execute(pool).await.unwrap();
     assert_eq!(cursor(&app, &parent, &first).await, first_cursor);
-    // A legacy completed run has no canonical history. Missing scope evidence
-    // still denies access before classifying its projection eligibility.
+    // A scoped Session can contain an older completed Run with no canonical
+    // history. Session authorization must not invent its missing fork cursor.
     let (status, legacy) = control(
         &app,
         "POST",
@@ -453,10 +1378,9 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
         .execute(pool).await.unwrap();
     let legacy_path = format!("/sessions/{legacy_session}/runs/{legacy_run}/cursor");
     let (status, value) = control(&app, "GET", &legacy_path, cursor_route, "").await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(value["error_code"], "session_fork_forbidden");
-    // A diagnostic run_started row is no longer canonical admission evidence.
-    // It must not grant scope to a legacy run with no immutable opening.
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(value["error_code"], "session_fork_cursor_unsupported");
+    // A diagnostic event cannot supply the missing canonical commit either.
     let diagnostic_started = json!({"event_type":"run_started", "data":{
         "provider_run_owner":{"provider_id":"moi","provider_scope_id":"moi-contract-workspace"}
     }})
@@ -468,8 +1392,8 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
         .execute(pool).await.unwrap();
     assert_eq!(diagnostic_insert.rows_affected(), 1);
     let (status, value) = control(&app, "GET", &legacy_path, cursor_route, "").await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(value["error_code"], "session_fork_forbidden");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(value["error_code"], "session_fork_cursor_unsupported");
 
     // The middle Session is ordinary mutable state; its descendants retain
     // immutable history without retaining its live head or execution authority.

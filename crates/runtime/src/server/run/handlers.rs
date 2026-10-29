@@ -510,6 +510,25 @@ async fn load_run_prompt_observability(
     Ok((true, prompt_request_count, latest_prompt_request))
 }
 
+pub(crate) async fn authorize_provider_run_session(
+    state: &AppState,
+    principal: &AuthPrincipal,
+    run_id: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let AuthPrincipalOrigin::ProviderAuthorizedRequest(context) = &principal.origin else {
+        return Ok(());
+    };
+    let owner = astra_services::runs::ProviderRunOwner {
+        provider_id: context.provider_id.clone(),
+        provider_scope_id: context.provider_scope_id.clone(),
+    };
+    state
+        .execution
+        .run_lifecycle_service
+        .authorize_provider_run_scope(principal.user.user_id.clone(), run_id.to_owned(), owner)
+        .await
+}
+
 pub(crate) async fn stream_run_handler(
     State(state): State<AppState>,
     trace: Option<axum::Extension<crate::server::RequestTrace>>,
@@ -549,6 +568,19 @@ pub(crate) async fn stream_run_handler(
             );
         }
     };
+
+    if let Err((status, error)) = authorize_provider_run_session(&state, &principal, &run_id).await
+    {
+        return sse_error_response_from_error_with_context(
+            status,
+            error.0,
+            SseErrorContext {
+                request_id: request_id.as_deref(),
+                run_id: Some(&run_id),
+                ..SseErrorContext::default()
+            },
+        );
+    }
 
     if query.replay_only {
         return match state
@@ -634,6 +666,7 @@ pub(crate) async fn delete_run_handler(
             external_request_descriptor(&method, &uri, &headers, "/chat/runs/{run_id}", &body),
         )
         .await?;
+    authorize_provider_run_session(&state, &principal, &run_id).await?;
     cancel_run_for_user(&state, run_id, principal.user.user_id).await
 }
 

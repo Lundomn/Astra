@@ -102,10 +102,16 @@ trust store to the Server. Restart the process after changing its trust settings
 - `ASTRA_JWT_ALGORITHM` (default `HS256`)
 - `ASTRA_JWT_ACCESS_TTL_MINUTES` (default `10080` in code; production should override)
 - `ASTRA_JWT_REFRESH_TTL_DAYS` (default `7`)
-- `ASTRA_TOKEN_ENCRYPTION_KEY` (high-entropy secret from which Astra derives Fernet encryption; changing it makes existing provider credentials undecryptable)
+- `ASTRA_TOKEN_ENCRYPTION_KEY` (high-entropy secret from which Astra derives Fernet encryption; changing it makes existing provider credentials undecryptable and invalidates request-signed Session scope bindings)
 - `ASTRA_RUNTIME_ROOT_SECRET`
 
 ### Provider Request Auth
+
+Replicas sharing request-signed provider Sessions must use the same
+`ASTRA_TOKEN_ENCRYPTION_KEY`. New Sessions authenticate their provider/workspace
+binding with this key. Key rotation does not turn an unverifiable binding into
+an old unbound Session; access is rejected rather than adopting the new request's
+workspace.
 
 Provider-originated service requests are authenticated under `auth.provider_request_auth` in
 `server.toml`. Astra validates these request tokens locally; it does not call a provider callback

@@ -1,4 +1,4 @@
-//! Existing user-token admission must not acquire request-HMAC prerequisites.
+//! Existing user-token controls remain separate from request-signed MOI forks.
 use astra_core::{
     AppSettings, EdgeTokenAuthConfig, ErrorResponse, ProviderRequestAuthConfig, SharedPool,
 };
@@ -37,9 +37,9 @@ use std::{
 use tower::ServiceExt;
 use uuid::Uuid;
 
-const USER_TOKEN_KEY: &str = "moi-fork-legacy-credential-test-key";
+pub(super) const USER_TOKEN_KEY: &str = "moi-fork-legacy-credential-test-key";
 
-fn token(claims: Value) -> String {
+pub(super) fn token(claims: Value) -> String {
     let claims = URL_SAFE_NO_PAD.encode(claims.to_string());
     let mut signer = Hmac::<Sha256>::new_from_slice(USER_TOKEN_KEY.as_bytes()).unwrap();
     signer.update(claims.as_bytes());
@@ -211,15 +211,13 @@ impl LegacyFixture {
             ));
             assert_eq!(principal.is_edge_registration(), edge);
             assert_eq!(auth.current_user(&headers).await.unwrap(), principal.user);
+            let request = SessionCreateRequestData {
+                agent_id: None,
+                title: Some(format!("credential fork auth {name}")),
+                metadata: None,
+            };
             let session = sessions
-                .create_session(
-                    principal.user.user_id.clone(),
-                    SessionCreateRequestData {
-                        agent_id: None,
-                        title: Some(format!("legacy fork auth {name}")),
-                        metadata: None,
-                    },
-                )
+                .create_session(principal.user.user_id.clone(), request)
                 .await
                 .expect("canonical session owner creates parent");
             let key = SessionKeyV1::owner_session(
@@ -370,6 +368,16 @@ impl LegacyFixture {
 #[ignore = "real disposable MatrixOne; existing moi-user-token fork admission"]
 async fn legacy_runtime_and_edge_tokens_prepare_before_server_projection() {
     let fixture = LegacyFixture::new().await;
+    for case in &fixture.cases {
+        let mut forged: Value =
+            serde_json::from_str(&case.prepare_body("foreign-history-root")).unwrap();
+        forged["expected_parent_cursor"]["canonical_root_hash"] = json!("0".repeat(64));
+        let path = format!("/sessions/{}/forks", case.key.session_id);
+        let (status, error) = response(&fixture.app, case.request(&path, forged.to_string())).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{error}");
+        assert_eq!(error["error_code"], "session_fork_conflict");
+    }
+    fixture.assert_no_forks_or_pins().await;
     let mut observed = Vec::new();
     for case in &fixture.cases {
         let result = response(
@@ -382,34 +390,96 @@ async fn legacy_runtime_and_edge_tokens_prepare_before_server_projection() {
     }
     // Record both real mechanisms before asserting; an edge-only exemption
     // must not hide the runtime-token compatibility regression.
+    let mut outcomes = Vec::new();
     for (case, (status, manifest)) in fixture.cases.iter().zip(observed) {
-        assert_eq!(
+        let activation = if status == StatusCode::OK {
+            let path = format!(
+                "/sessions/{}/forks/{}/activate",
+                case.key.session_id,
+                manifest["fork_id"].as_str().unwrap()
+            );
+            Some(
+                response(
+                    &fixture.app,
+                    case.request(
+                        &path,
+                        json!({"placement":"server","writer_ttl_seconds":30}).to_string(),
+                    ),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        outcomes.push((
+            case.name,
+            serde_json::to_value(&case.cursor).unwrap(),
             status,
-            StatusCode::OK,
-            "{} previously admitted prepare: {manifest}",
-            case.name
-        );
-        assert_eq!(
-            manifest["parent_head"]["cursor"],
-            serde_json::to_value(&case.cursor).unwrap()
-        );
-        let path = format!(
-            "/sessions/{}/forks/{}/activate-for-continuation",
-            case.key.session_id,
-            manifest["fork_id"].as_str().unwrap()
-        );
-        let (status, active) = response(&fixture.app, case.request(&path, "{}".into())).await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "{} continuation: {active}",
-            case.name
-        );
-        assert_eq!(active["manifest"]["state"], "active");
-        assert!(active.get("writer_lease").is_none());
+            manifest,
+            activation,
+        ));
     }
     fixture.assert_canonical_without_server_projection().await;
     fixture.cleanup().await;
+    for (name, cursor, status, manifest, activation) in outcomes {
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{name} previously admitted prepare: {manifest}"
+        );
+        assert_eq!(manifest["parent_head"]["cursor"], cursor);
+        let (status, active) = activation.expect("successful prepare must be activated");
+        assert_eq!(status, StatusCode::OK, "{name} continuation: {active}");
+        assert_eq!(active["manifest"]["state"], "active");
+        assert_eq!(
+            active["writer_lease"]["key"],
+            active["manifest"]["child_key"]
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real disposable MatrixOne; new provider fork controls require request signing"]
+async fn legacy_runtime_and_edge_tokens_cannot_use_new_provider_fork_controls() {
+    let fixture = LegacyFixture::new().await;
+    let mut observed = Vec::new();
+    for case in &fixture.cases {
+        for (method, path, body) in [
+            (
+                "GET",
+                format!(
+                    "/sessions/{}/runs/{}/cursor",
+                    case.key.session_id,
+                    Uuid::new_v4()
+                ),
+                "",
+            ),
+            (
+                "POST",
+                format!(
+                    "/sessions/{}/forks/{}/activate-for-continuation",
+                    case.key.session_id,
+                    Uuid::new_v4()
+                ),
+                "{}",
+            ),
+        ] {
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("authorization", format!("Bearer {}", case.token))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let (status, body) = response(&fixture.app, request).await;
+            observed.push((case.name, status, body));
+        }
+    }
+    fixture.assert_no_forks_or_pins().await;
+    fixture.cleanup().await;
+    for (name, status, body) in observed {
+        assert_eq!(status, StatusCode::FORBIDDEN, "{name}: {body}");
+    }
 }
 
 struct RequestOnlyProviderAuth {

@@ -308,11 +308,28 @@ after bounded cleanup. Deleted Sessions retain no live head or execution state.
 Deleting the final descendant releases fork metadata, pins and manifest rows,
 including the node-local payloads stored by the current canonical owner.
 
-`moi_fresh_astra/fork_auth_compat.rs` adds two focused checks to this same target:
-real runtime and Edge user tokens can prepare at a canonical head before Server
-projection; a custom request-only provider authenticator without provenance
-cannot bypass scope or retry legacy authentication. The canonical verifier also
-proves the legacy/HMAC mechanism distinction and single nonce consumption.
+`moi_fresh_astra/fork_auth_compat.rs` checks that real runtime and Edge user
+tokens retain the existing prepare and writer-activation contract at a
+canonical head before Server projection. These legacy credentials cannot use
+the new provider cursor or continuation-activation controls. A custom
+request-only provider authenticator without mechanism evidence cannot bypass
+scope or retry legacy authentication. The canonical verifier also proves the
+legacy/HMAC mechanism distinction and single nonce consumption.
+
+MOI's new provider fork integration uses request-bound HMAC authentication.
+Those principals own Sessions under `provider_authorized:<provider>:<subject>`;
+legacy MOI user tokens use the separate `external_authorized:moi:<subject>`
+owner namespace and retain their existing subject-owned Session contract.
+Legacy credentials cannot read or control a request-signed provider's fork.
+This integration does not change legacy APIs into workspace-scoped APIs.
+
+New request-signed provider Sessions and forks enforce scope at common Run
+admission and access. Existing ordinary Sessions without a scope binding retain
+their previous chat behavior, but cannot serve as a source for a new provider
+fork. A later Run never claims that Session's historical scope. A malformed
+binding or an existing fork manifest cannot use the ordinary-session fallback.
+The fresh-database fixtures do not establish an existing-database migration or
+repair older ordinary Sessions' pre-existing scope behavior.
 
 Buffered and live consumers share the pinned MOI SSE framing rules, including
 LF/CRLF, multiline data, EOF frames and stopping at `[DONE]`. Negative controls
