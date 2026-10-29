@@ -541,6 +541,26 @@ execution without increasing contention on a shared database. The required
 `Test: online (core)` check aggregates all selected online jobs; the integration
 job retains `Test: online (integration)`.
 
+The integration lane also runs the real Next/browser-session database test. It
+installs the Node version pinned in `.nvmrc`, builds the local SDK and Web from
+that job's checkout, and installs Playwright's Chromium headless shell. The real
+browser checks recovery from an unreadable session, retry and explicit sign-in.
+Web, SDK and Node-version changes select this lane as
+well as their ordinary static checks; the other online lanes do not install Node.
+Before running the integration lane, `make test-online` without a lane, or
+`make test-ignored-integration` on a clean local checkout, run:
+
+```bash
+nvm use
+npm --prefix packages/sdk ci --ignore-scripts
+npm --prefix packages/sdk run build
+npm --prefix web ci
+npm --prefix web run build
+(cd web && npm exec -- playwright install --with-deps chromium --only-shell)
+```
+
+Missing Web build artifacts fail the test; they do not silently skip coverage.
+
 `make test-online` still runs the complete suite, and `ASTRA_ONLINE_LANE=core`
 still runs all three core groups. To reproduce a CI shard, choose
 `ASTRA_ONLINE_LANE=core-runtime`, `core-turn-core`, `core-services`, or
@@ -549,6 +569,19 @@ with `ASTRA_TEST_DB_IT_TEST_THREADS=1`. Parallel CI isolation comes from separat
 service stacks; distinct database names alone do not remove shared-host load.
 All existing test selections, features, exclusions, and per-test deadlines are
 retained.
+
+The integration lane includes `pool_shutdown_db_it`. It forwards a real MySQL
+handshake and query, withholds only the returned connection's health-check ping,
+and verifies that public `SharedPool::close()` completes and the client socket
+closes without a ping response. A second case withholds a queued transaction
+rollback, then verifies rollback and key-lock release using an independent
+connection. Run these cases against the explicitly configured
+disposable MatrixOne instance with:
+
+```bash
+ASTRA_TEST_DB_IT=1 cargo nextest run -p astra-runtime --test pool_shutdown_db_it \
+  --profile strict-online-ci --run-ignored only
+```
 
 Memoria identity/credential fixtures require `ASTRA_TEST_DB_IT=1` and an
 explicit `ASTRA_TEST_DATABASE` matching the effective database name. The normal

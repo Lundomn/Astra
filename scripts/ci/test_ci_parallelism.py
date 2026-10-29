@@ -129,6 +129,8 @@ class MacRunnerTests(unittest.TestCase):
             self.assertIn("needs: [scope, macos-plan]", section)
             self.assertIn("github.run_attempt > 1", section, "Failed-only reruns must ignore reused mini outputs")
             self.assertIn("'macos-15' || 'ubuntu-latest'", section)
+            self.assertIn('["success","failure","obsolete"]', section,
+                          "Obsolete runs must not allocate hosted Macs")
         self.assertNotIn("pull_request_target:", workflow)
         self.assertNotIn("self-hosted", workflow.split("  vendored-terminal:\n", 1)[1])
 
@@ -138,7 +140,7 @@ class MacRunnerTests(unittest.TestCase):
             section = workflow.split(f"\n  {job}:\n", 1)[1]
             block = section.split("        run: |\n", 1)[1].split("      - ", 1)[0]
             script = "\n".join(line[10:] for line in block.splitlines())
-            for outcome in ("success", "failure", "hosted", "", "skipped"):
+            for outcome in ("success", "failure", "obsolete", "hosted", "", "skipped"):
                 with self.subTest(job=job, outcome=outcome), tempfile.TemporaryDirectory() as directory:
                     result = subprocess.run(["bash", "-c", script], env={
                         **os.environ, "MINI_RESULT": outcome,
@@ -328,6 +330,44 @@ sys.exit(1 if kind == "cargo" and os.environ["ASTRA_CI_FAIL_PACKAGE"] in args el
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid ASTRA_ONLINE_LANE", result.stdout)
         self.assertEqual(records, [])
+
+
+class NextIntegrationPrerequisitesTests(unittest.TestCase):
+    def test_selected_integration_lane_builds_web_and_stops_on_failure(self):
+        workflow = (ROOT / ".github/workflows/test.yml").read_text()
+        online = workflow.split("\n  test-online:\n", 1)[1]
+        setup = online.split("      - uses: actions/setup-node@", 1)[1].split("      - name: Run online tests", 1)[0]
+        condition = "if: env.RUN_TESTS == 'true' && matrix.lane == 'integration'"
+        self.assertEqual(setup.count(condition), 3)
+        self.assertIn("node-version-file: .nvmrc", setup)
+        self.assertIn("working-directory: web\n        run: npm exec -- playwright install --with-deps chromium --only-shell", setup)
+        script = workflow_run_script(".github/workflows/test.yml", "Build Web for real Next integration")
+        expected = [
+            ["--prefix", "packages/sdk", "ci", "--ignore-scripts"],
+            ["--prefix", "packages/sdk", "run", "build"],
+            ["--prefix", "web", "ci"],
+            ["--prefix", "web", "run", "build"],
+        ]
+        for fail_at in range(5):
+            with self.subTest(fail_at=fail_at), tempfile.TemporaryDirectory() as directory:
+                fixture = Path(directory)
+                calls = fixture / "calls.jsonl"
+                npm = fixture / "npm"
+                npm.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, sys
+log = pathlib.Path(os.environ["CALLS"])
+with log.open("a") as out:
+    out.write(json.dumps(sys.argv[1:]) + "\\n")
+sys.exit(23 if len(log.read_text().splitlines()) == int(os.environ["FAIL_AT"]) else 0)
+''')
+                npm.chmod(0o755)
+                result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=fixture,
+                                        env={**os.environ, "PATH": f"{fixture}{os.pathsep}{os.environ['PATH']}",
+                                             "CALLS": str(calls), "FAIL_AT": str(fail_at)},
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 23 if fail_at else 0, result.stderr)
+                recorded = [json.loads(line) for line in calls.read_text().splitlines()]
+                self.assertEqual(recorded, expected[:fail_at or 4])
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ from ci_scope import classify, main, select_macos_runner
 
 class CiScopeTests(unittest.TestCase):
     def test_macos_allowlist_uses_author_id_including_bots_and_login_renames(self):
-        for author_id in (39627130, 52204121, 49699333):
+        for author_id in (39627130, 52204121, 49699333, 523063, 134036682):
             with self.subTest(author_id=author_id):
                 event = {"pull_request": {"user": {"id": author_id, "login": "renamed-login"}},
                          "sender": {"id": 999999999}}
@@ -33,11 +33,18 @@ class CiScopeTests(unittest.TestCase):
         for event in ({}, {"pull_request": None}, []):
             self.assertEqual(select_macos_runner("pull_request", event), ["macos-15"])
 
-    def test_macos_trusted_pushes_and_manual_events_remain_hosted(self):
-        for event_name in ("push", "workflow_dispatch", "pull_request_target"):
+    def test_other_pushes_and_manual_events_remain_hosted(self):
+        for event_name in ("workflow_dispatch", "pull_request_target"):
             self.assertEqual(select_macos_runner(event_name,
                 {"ref": "refs/heads/main", "sender": {"id": 39627130}}), ["macos-15"])
-        self.assertEqual(select_macos_runner("push", {"ref": "refs/heads/develop"}), ["macos-15"])
+        self.assertEqual(select_macos_runner("push", {"ref": "refs/heads/main"}), ["macos-15"])
+        self.assertEqual(select_macos_runner("push", {"ref": "refs/heads/main"}, main_enabled=True),
+                         ["self-hosted", "macOS", "ARM64", "mac-arm64-main"])
+        for enabled in (False, True):
+            for ref in ("refs/heads/develop", "refs/heads/feature", "refs/tags/v1.0", "main", None):
+                with self.subTest(enabled=enabled, ref=ref):
+                    self.assertEqual(select_macos_runner("push", {"ref": ref}, main_enabled=enabled),
+                                     ["macos-15"])
 
     def test_macos_missing_event_routes_to_hosted_without_omitting_scope_checks(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -126,7 +133,7 @@ class CiScopeTests(unittest.TestCase):
         self.assert_rename_selects_expected_scopes(
             "packages/sdk/src/moved.ts",
             "web/lib/moved.ts",
-            {"sdk", "web"},
+            {"sdk", "web", "online_integration"},
         )
 
     def test_runtime_to_cli_rename_keeps_runtime_validation(self) -> None:
@@ -269,12 +276,16 @@ class CiScopeTests(unittest.TestCase):
         self.assertTrue(scopes["sdk"])
         self.assertTrue(scopes["web"])
         self.assertFalse(scopes["rust"])
+        self.assertTrue(scopes["online_integration"])
+        self.assertFalse(scopes["online_core"])
 
-    def test_web_change_does_not_run_sdk_or_rust(self) -> None:
+    def test_web_change_selects_real_next_integration_without_unrelated_lanes(self) -> None:
         scopes = classify(["web/app/page.tsx"])
         self.assertTrue(scopes["web"])
         self.assertFalse(scopes["sdk"])
         self.assertFalse(scopes["rust"])
+        self.assertTrue(scopes["online_integration"])
+        self.assertFalse(scopes["online_core"])
 
     def test_cli_source_only_selects_cli_tests(self) -> None:
         scopes = classify(["crates/astra-cli/src/main.rs"])
@@ -292,6 +303,7 @@ class CiScopeTests(unittest.TestCase):
                 self.assertTrue(scopes["test_cli"])
                 self.assertEqual(sum(scopes.values()), 1)
         self.assertTrue(classify([".nvmrc"])["test_cli"])
+        self.assertTrue(classify([".nvmrc"])["online_integration"])
 
     def test_test_only_rust_change_selects_owning_shard(self) -> None:
         scopes = classify(["crates/core/tests/repo_layout_contract.rs"])
