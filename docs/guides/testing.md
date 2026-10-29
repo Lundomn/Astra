@@ -294,7 +294,7 @@ signer and real router, with its own `astra_test_moi_fork_<uuid>` database.
 It exercises signed prepare, continuation activation, and exact committed
 root-run cursor lookup, then continues the parent, two siblings, and a nested
 fork through ordinary chat. Signature path and replay controls use the supported
-cursor route; legacy list/read/writer-activation/abort routes retain their
+cursor route; legacy list/read/writer-activation routes retain their
 existing authentication rather than admitting request-signed provider tokens.
 The finite model inventory checks the actual inherited input and excludes later
 parent or sibling turns. Activation replay must preserve a continued child's
