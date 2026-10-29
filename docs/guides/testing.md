@@ -341,6 +341,101 @@ behind; CI disposes of the entire isolated dependency stack. The dedicated
 feature keeps this test out of generic offline/online lanes, avoiding duplicate
 full-stack execution.
 
+## Released CLI and Edge compatibility
+
+Matrixflow [#19966](https://github.com/matrixorigin/matrixflow/issues/19966)
+tracks the independent client/server rollout contract. The frozen MOI test
+above remains unchanged: it is not a historical Astra CLI or Edge test.
+
+`scripts/ci/historical-clients.json` is the reviewed, immutable linux/amd64
+artifact inventory. It pins component version, source commit, original bundle,
+archive URL, size, and SHA256. `historical_clients.py` checks the downloaded or
+cached bytes on every use and safely extracts the exact binary; it does not
+execute an installer or follow a moving channel. A missing artifact, wrong
+digest, unsupported architecture, or failed dependency is a failure, not a
+skipped test or an opportunity to substitute a different version.
+
+The executable support baseline is CLI/Edge **0.2.12**. The fixed samples have
+the following distinct roles; passing negative cases does not confer support:
+
+| Consumer | Required behavior against the candidate Server |
+| --- | --- |
+| Published CLI 0.2.12, source `70a5ee3e` | Complete unversioned v2 catalog, ordinary chat and authoritative final output, tool result return, approval allow/deny, cancellation and same-session reuse |
+| Published Edge 0.2.12, source `70a5ee3e` | Schema v2 registration, connection, task execution and result return |
+| Published CLI 0.2.10, source `5aacae0d` | Negative catalog sample: the installed strict decoder rejects v2; upgrade required, no positive execution claim |
+| Published Edge 0.2.10, source `5aacae0d` | Explicit schema v1 rejection and upgrade guidance; it is not a positive execution baseline |
+| Candidate CLI | Explicit v2 discovery and ordinary chat through the real candidate Server; rollback checks identify the exact historical Server source rather than calling it current Prod |
+
+Cold resume after cancellation starts with a real completed turn and verifies
+its committed cursor before interrupting the following turn. Cancellation must
+preserve that cursor; a new CLI process must resume the same Session with a
+different completed Run while the cancelled Run remains cancelled. A separate
+first-turn cancellation verifies the existing boundary: cancellation revokes
+that turn's Context, so a Session with no committed history returns 404 from
+the hydration API and the historical CLI explicitly rejects cold resume. Raw
+transcript evidence is not promoted into invented canonical history.
+
+CLI/Edge 0.2.10 must be upgraded to 0.2.12 or later. The CLI negative case
+records its actual unknown-field failure; it does not pretend the installed
+binary can display a new Server upgrade message. The standalone Edge negative
+case checks its existing schema-v1 rejection and upgrade hint. These samples
+do not identify the original screenshot's exact client/server pair, and the
+original 0.2.10 conversation failure is not claimed as fixed.
+
+`user_models_http` exercises both real catalog routes with independent frozen
+0.2.10/0.2.12 decoders. Unversioned and explicit-v2 responses retain the complete
+0.2.12 shape, including null and non-null metadata; the 0.2.10 reader must reject
+it. Four reasoning protocols and non-null prices are checked without a version
+header. This protects the wire inputs used by the historical picker, not an
+actual TUI interaction. The real 0.2.12 `model list` journey also verifies
+that its decoded output retains the configured protocol value and non-null
+pricing, rather than accepting a successful exit alone. Invalid versions, authentication denial, unknown
+execution enums, and nested authority metadata remain covered. Current
+readers accept additive page/item metadata, while the strict 0.2.12 fixture
+rejects it: future additions require a new negotiated format, not changes to
+unversioned/v2 responses. CLI tests distinguish malformed JSON from unsupported
+schema using stable `model_catalog_json_invalid` / `model_catalog_schema_mismatch`
+reason metadata without echoing received bodies.
+
+The shared CLI CI execution runs `client_compatibility` with the dedicated
+`moi-compat-tests` feature and isolated MatrixOne/Memoria. It starts the real
+production router with fresh storage, then invokes
+`scripts/ci/client_compatibility.py` using downloaded historical executables
+and the already-built candidate CLI. The provider is a finite, controlled
+OpenAI wire fixture. Client state is isolated in temporary HOME/XDG/workspace
+directories, and authorization, tool admission, approvals, and persistence
+still cross their production owners. Each CLI logs the synthetic fixture account
+into its isolated profile through `admin login`; a bearer environment variable
+alone is not a bound stdio profile. Captured one-shot chats explicitly select
+the published read-only `plan` permission mode because they have no terminal
+or approval channel; stdio approval journeys retain `prompt` mode and its real
+approval channel. The special performance/capture-SHA
+baseline is not loosened to accept historical clients.
+
+Tool journeys pair their own case-specific call IDs with a unique preceding
+assistant declaration and tool result in the complete provider request. A
+runtime context suffix may legitimately appear as `role=user` after a tool
+result, so the fixture never treats the last user-role message as a turn boundary.
+After an approved write, the controlled model performs a full `read_file` of
+the same target and checks its real content before returning its single final
+answer. This satisfies the existing post-mutation observation boundary. The
+denied-write branch performs no readback and must leave the target absent.
+
+Both IDC and public candidate-image smoke jobs invoke the same driver after
+the existing candidate digest/revision and stack health checks. They reuse
+that image rather than rebuilding a Server for each consumer. The existing
+required job results include these failures; no skip, retry, or larger timeout
+is used to turn a failure into success.
+
+Reports record exact artifact/source identities, scenario outcomes, failure
+categories, and elapsed time. PR jobs retain the JSON report in the job summary
+without changing the existing CLI JUnit timing artifact. Candidate-image jobs
+also upload the report as a standalone artifact. Reports do not contain tokens,
+raw client output, provider responses, or user data. Passing a catalog parser test is not a full
+conversation result. Support is advertised only for the exact successful
+combinations and feature scopes recorded by CI; testing two versions does not
+prove every intervening version or all-platform installation behavior.
+
 ## Where Tests Live
 
 - `crates/runtime/tests/` — HTTP integration tests for `astra-runtime` (including `*_contract.rs`, `system_matrix_http_e2e/`, bridge E2E).
@@ -509,6 +604,15 @@ users or sessions. The Phase-0 production baseline journeys have additional
 exclusive-run configuration; see their dedicated instructions before enabling
 them.
 
+The slow-fanout root-cancellation journey uses the fixture-owned Session, so
+`ctx.close()` drains run/finalizer work before deleting its data. It must not
+delete another Session before that drain. All cancelled-child replay responses
+share one 10-second deadline and retain the 1 MiB body limit. Its
+`root_cancel_phase` markers record only phase names and elapsed time, allowing a
+CI timeout to distinguish setup, provider entry, cancellation, replay and
+teardown without publishing identities or payloads. The suite's 60-second
+per-test limit and cancellation/late-output assertions remain in force.
+
 Requires the same environment as `astra-server`: `MATRIXONE_*`,
 `ASTRA_JWT_SECRET`, `ASTRA_TOKEN_ENCRYPTION_KEY`, Memoria, and embedding
 settings parsed by `astra_core::AppSettings::from_env`. Use a local `.env` if
@@ -517,6 +621,43 @@ set **`ASTRA_DATABASE_PREFIX`** (effective DB = prefix + `ASTRA_DATABASE`).
 Optionally set **`ASTRA_AUTO_CREATE_DATABASE=1`** so the first
 `ensure_core_schema` (server or online tests) runs `CREATE DATABASE IF NOT
 EXISTS` for that effective name (bootstrap catalog defaults to `mysql`).
+
+### Ordinary-chat SQL budget
+
+`chat_sql_budget::ordinary_chat_and_readonly_rounds_have_bounded_total_sql`
+uses the same isolated MatrixOne setup and scripted loopback provider as the
+system HTTP journeys. Run this test by exact name in its own process because
+it owns the global SQL tracing subscriber:
+
+```bash
+MEMORIA_SELF_HOSTED_MASTER_ACCESS=1 \
+cargo test -p astra-runtime --features e2e-hooks --test chat_sql_budget \
+  ordinary_chat_and_readonly_rounds_have_bounded_total_sql -- --ignored --exact --nocapture
+```
+
+The 20-statement limit measures each request on an initialized server pool,
+including transactions, periodic control reads and the real observer's SQL.
+Pool initialization happens before capture; no statements are filtered out
+inside the measured interval. Warm-context setup consumes its complete SSE
+response and waits for observer completion before the next request starts;
+it must not use shutdown drain, which closes admission for that next request.
+Capture ends only after
+both the measured run and its observer finish: the detached observer is not
+owned by `drain_background_runs`. The authorized probe requires the exact expected
+number of both `scheduled` dispatches and `success` outcomes. An extra scheduled
+observer fails even if it is still pending when the expected successes finish.
+Errors, dropped work, missing completions, and skipped
+outcomes (`not_configured`, `access_disabled`, `empty`) fail the probe even when
+successful observations are also present. Disabled access is covered separately;
+it cannot satisfy this HTTP-path SQL measurement.
+The readonly-round comparison accounts for exact periodic control reads and
+at most one account/session authentication snapshot when its 30-second cache
+expires. Those statements still count toward the raw 20-statement limit;
+repeated authentication snapshots or any other extra readonly-round SQL fail.
+The HTTP fixture binds both the Memoria URL and its master credential to the
+strict local mock. Enabling self-hosted access exercises the authenticated
+observer request, including its authority queries; a run with access disabled
+does not validate that HTTP path. Wrong credentials still fail authentication.
 
 ### Durable provider concurrency and cancellation
 
@@ -746,6 +887,31 @@ The database tests cover canonical-context handoff recovery, shared fencing and
 lease takeover. Runtime tests exercise authenticated exit/close/status HTTP
 routes and partial-stage retry after lost receipts. CLI tests cover distinct
 Astra/Memoria owners and unsuccessful queue acknowledgments without purge.
+
+## Real Memoria observer authentication smoke
+
+`memoria_observer_live` checks the production observer worker against a real
+Memoria with owner-scoped authentication support (#250 or later) and its database.
+Use only a dedicated local test service. Supply `ASTRA_TEST_MEMORIA_OBSERVER_URL`
+(a loopback HTTP origin) and `ASTRA_TEST_MEMORIA_OBSERVER_KEY` privately through
+the test process environment; do not put credentials in command arguments or
+commit them. The test creates unique synthetic owners and retains their test
+memories. It rejects remote origins and redirects.
+
+```bash
+ASTRA_TEST_MEMORIA_OBSERVER_LIVE=1 cargo test -p astra-runtime \
+  --features live-provider-tests --test memoria_observer_live \
+  live_memoria_owner_observe -- --ignored --exact --nocapture
+```
+
+The feature, ignored-test selection and explicit opt-in are all required, so
+ordinary offline and database CI lanes cannot enable it via inherited credentials.
+It verifies that the legacy impersonation header fails with 400, the production
+self-hosted observer succeeds with `X-User-Id`, the target owner's session contains
+stored memories, and a second owner's view of the same session is empty. This is
+an observer authentication/storage check, not MOI identity or prompt recall E2E.
+The deterministic `turn_observer_authority` target remains the offline contract
+suite; it does not substitute for the real-backend smoke.
 
 ## What "done" Means
 

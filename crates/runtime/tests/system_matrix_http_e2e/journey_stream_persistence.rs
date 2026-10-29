@@ -2172,15 +2172,30 @@ pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
 /// must settle the already-accepted fixed group once. No delayed child may
 /// publish success and the cancelled root must never advance to synthesis.
 pub async fn run_stream_root_cancel_settles_slow_fanout_without_late_synthesis() {
+    let journey_started = tokio::time::Instant::now();
+    let phase = |name: &str| {
+        eprintln!(
+            "root_cancel_phase={name} elapsed_ms={}",
+            journey_started.elapsed().as_millis()
+        );
+    };
+    phase("bootstrap_started");
     let b = bootstrap().await;
+    phase("bootstrap_completed");
     let ctx = &b.ctx;
     let app = &ctx.app;
     let auth = b.auth_header.clone();
     let user_id = ctx.user_id.clone();
 
-    let (status, session) = post_json(
+    // Keep one lifecycle owner. The fixture drains its run/finalizer tasks
+    // before deleting this session; deleting an extra session first can race
+    // the child finalizers even after their durable status is visible.
+    let session_id = ctx.session_id.clone();
+    // Preserve the original journey's metadata and configured trace defaults,
+    // rather than inheriting bootstrap's explicit full_llm_capture=false.
+    let (status, session) = super::harness::put_json(
         app,
-        "/sessions",
+        &format!("/sessions/{session_id}"),
         Some(auth.as_str()),
         json!({
             "title": "slow fanout root cancel gate",
@@ -2188,11 +2203,11 @@ pub async fn run_stream_root_cancel_settles_slow_fanout_without_late_synthesis()
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED, "create session: {session}");
-    let session_id = session["session_id"]
-        .as_str()
-        .expect("session_id")
-        .to_string();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "configure cancel session: {session}"
+    );
     let forbidden_late_reply = "This synthesis must not appear after root cancellation.";
     let fixture_model = format!("mock-{}", ctx.suffix);
     let root_model = fixture_model.clone();
@@ -2224,6 +2239,7 @@ pub async fn run_stream_root_cancel_settles_slow_fanout_without_late_synthesis()
 native_child_script(child_model.clone(),"Start three slow reviews; the user will cancel the live root.","Return finding two.",child_responses.remove(0)),
 native_child_script(child_model.clone(),"Start three slow reviews; the user will cancel the live root.","Return finding three.",child_responses.remove(0)),
     ]).await;
+    phase("provider_scripts_installed");
     let payload = json!({
         "message": "Start three slow reviews; the user will cancel the live root.","execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "session_id": session_id,
@@ -2242,6 +2258,7 @@ native_child_script(child_model.clone(),"Start three slow reviews; the user will
         .header("x-astra-e2e-test-secret", test_secret)
         .body(Body::from(payload.to_string()))
         .expect("root cancellation stream request");
+    phase("root_stream_requested");
     let response = app
         .clone()
         .oneshot(request)
@@ -2249,6 +2266,7 @@ native_child_script(child_model.clone(),"Start three slow reviews; the user will
         .expect("root cancellation stream response");
     let stream_status = response.status();
     assert_eq!(stream_status, StatusCode::OK);
+    phase("root_stream_opened");
     let mut stream = response.into_body().into_data_stream();
     let mut stream_bytes = Vec::new();
 
@@ -2283,6 +2301,7 @@ native_child_script(child_model.clone(),"Start three slow reviews; the user will
         }
     };
 
+    phase("children_entered_provider");
     let root_run_id: String = sqlx::query_scalar(
         "SELECT run_id FROM agent_runs \
          WHERE user_id = ? AND session_id = ? AND depth = 0 \
@@ -2346,6 +2365,7 @@ native_child_script(child_model.clone(),"Start three slow reviews; the user will
     )
     .await;
 
+    phase("cancellation_requested");
     let (cancel_status, cancel_body) = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         delete_json(
@@ -2372,6 +2392,7 @@ native_child_script(child_model.clone(),"Start three slow reviews; the user will
         "the HTTP receipt must not claim a terminal state before the live executor settles"
     );
 
+    phase("cancellation_acknowledged");
     let stream_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         match tokio::time::timeout_at(stream_deadline, stream.next()).await {
@@ -2382,6 +2403,7 @@ native_child_script(child_model.clone(),"Start three slow reviews; the user will
             Err(_) => panic!("cancelled fanout stream did not terminate"),
         }
     }
+    phase("root_stream_completed");
     drop(releases);
     let raw_sse = String::from_utf8_lossy(&stream_bytes).into_owned();
     assert_eq!(stream_status, StatusCode::OK, "cancelled stream: {raw_sse}");
@@ -2471,6 +2493,7 @@ native_child_script(child_model.clone(),"Start three slow reviews; the user will
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     };
+    phase("durable_tree_settled");
     assert_eq!(rows.len(), 4, "cancelled durable fanout tree: {rows:?}");
     assert_eq!(
         rows.iter()
@@ -2506,10 +2529,12 @@ native_child_script(child_model.clone(),"Start three slow reviews; the user will
         streamed_child_ids.is_subset(&durable_child_ids),
         "live terminal must belong to the durable fixed group"
     );
+    phase("child_replay_started");
+    let replay_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     for child_run_id in &durable_child_ids {
-        let response = app
-            .clone()
-            .oneshot(
+        let response = tokio::time::timeout_at(
+            replay_deadline,
+            app.clone().oneshot(
                 Request::builder()
                     .uri(format!(
                         "/chat/runs/{child_run_id}/stream?last_index=0&replay_only=true"
@@ -2517,13 +2542,19 @@ native_child_script(child_model.clone(),"Start three slow reviews; the user will
                     .header("authorization", auth.as_str())
                     .body(Body::empty())
                     .unwrap(),
-            )
-            .await
-            .expect("replay exact cancelled child");
+            ),
+        )
+        .await
+        .expect("cancelled-child replay response exceeded shared 10s deadline")
+        .expect("replay exact cancelled child");
         assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
+        let bytes = tokio::time::timeout_at(
+            replay_deadline,
+            axum::body::to_bytes(response.into_body(), 1024 * 1024),
+        )
+        .await
+        .expect("cancelled-child replay body exceeded shared 10s deadline")
+        .expect("read exact cancelled child replay");
         let replay = parse_sse_events(&String::from_utf8_lossy(&bytes));
         let terminal: Vec<_> = replay
             .iter()
@@ -2544,6 +2575,7 @@ native_child_script(child_model.clone(),"Start three slow reviews; the user will
                     .is_some_and(|text| text.contains("late child output must be suppressed"))
         }));
     }
+    phase("child_replay_completed");
     let orphan_transcripts: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM session_transcript_items AS transcript \
          LEFT JOIN agent_runs AS run \
@@ -2560,8 +2592,9 @@ native_child_script(child_model.clone(),"Start three slow reviews; the user will
     .expect("count cancelled fanout orphan transcript identities");
     assert_eq!(orphan_transcripts, 0);
 
-    cleanup_session_data(&ctx.shared_pool, &user_id, &session_id).await;
+    phase("fixture_close_started");
     ctx.close().await;
+    phase("completed");
 }
 
 /// A canonical Work graph is not decorative: after the root creates it, a
@@ -3318,6 +3351,15 @@ pub async fn run_stream_context_trace_persistence() {
     assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
     let session_id = sess["session_id"].as_str().expect("session_id").to_string();
 
+    let (missing_status, _) = post_json(
+        app,
+        &format!("/sessions/{session_id}/resume?continuation_only=true"),
+        Some(auth.as_str()),
+        json!({}),
+    )
+    .await;
+    assert_eq!(missing_status, StatusCode::NOT_FOUND);
+
     let fixture_model = format!("mock-{}", ctx.suffix);
     ctx.install_native_provider(auth,vec![ProviderScript::new("run_stream_context_trace_persistence",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="context trace persistence test")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Context trace reply.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{ "prompt_tokens": 100, "completion_tokens": 50,
                     "prompt_tokens_details": {"cached_tokens": 0, "cache_creation_input_tokens": 0} }}))])]).await;
@@ -3364,6 +3406,71 @@ pub async fn run_stream_context_trace_persistence() {
         message["role"] == "assistant"
             && message["content"].as_str() == Some("Context trace reply.")
     }));
+    // An unrelated legacy checkpoint must not be decoded during a canonical
+    // per-turn refresh. The full restore still detects the corruption.
+    sqlx::query(
+        "INSERT INTO session_checkpoints \
+         (checkpoint_id, user_id, session_id, number, turn, summary, state_json) \
+         VALUES (?, ?, ?, 2147483647, 0, 'heavy', 'not-json')",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(user_id)
+    .bind(&session_id)
+    .execute(pool)
+    .await
+    .expect("seed corrupt legacy checkpoint");
+    let audits_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_audit_logs WHERE user_id = ? AND resource_type = 'session' AND resource_id = ? AND action = 'session_update'")
+        .bind(user_id).bind(&session_id).fetch_one(pool).await.unwrap();
+    let (continuation_status, continuation) = post_json(
+        app,
+        &format!("/sessions/{session_id}/resume?continuation_only=true"),
+        Some(auth.as_str()),
+        json!({}),
+    )
+    .await;
+    assert_eq!(continuation_status, StatusCode::OK, "{continuation}");
+    let audits_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_audit_logs WHERE user_id = ? AND resource_type = 'session' AND resource_id = ? AND action = 'session_update'")
+        .bind(user_id).bind(&session_id).fetch_one(pool).await.unwrap();
+    assert_eq!(audits_after, audits_before);
+    assert_eq!(continuation["session_id"], session_id);
+    assert_eq!(
+        continuation["resume_bundle"],
+        serde_json::to_value(restored.resume_bundle.as_ref().unwrap()).unwrap()
+    );
+    assert!(continuation.get("total_tokens_in").is_none());
+    sqlx::query("UPDATE agent_sessions SET status = 'paused' WHERE user_id = ? AND session_id = ?")
+        .bind(user_id)
+        .bind(&session_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let (reactivate_status, _) = post_json(
+        app,
+        &format!("/sessions/{session_id}/resume?continuation_only=true"),
+        Some(auth.as_str()),
+        json!({}),
+    )
+    .await;
+    assert_eq!(reactivate_status, StatusCode::OK);
+    let (status,): (String,) =
+        sqlx::query_as("SELECT status FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(user_id)
+            .bind(&session_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "active");
+    let reactivation_audits: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_audit_logs WHERE user_id = ? AND resource_type = 'session' AND resource_id = ? AND action = 'session_update'")
+        .bind(user_id).bind(&session_id).fetch_one(pool).await.unwrap();
+    assert_eq!(reactivation_audits, audits_after + 1);
+    let (full_status, _) = post_json(
+        app,
+        &format!("/sessions/{session_id}/resume"),
+        Some(auth.as_str()),
+        json!({}),
+    )
+    .await;
+    assert_eq!(full_status, StatusCode::INTERNAL_SERVER_ERROR);
     for table in [
         "session_state_items",
         "session_state_item_events",
