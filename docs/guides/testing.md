@@ -207,6 +207,11 @@ requires the item never to start. Use `require_board_before_execution` to reject
 unbound pre-reads and require successful evidence under the delivered assignment.
 Parallel batch position alone does not prove cancellation/execution ordering.
 
+The offline `multi_agent_binding_http_e2e` journeys exercise sessionless runtime
+execution, real model/skill HTTP, and canonical SSE projection. They do not
+exercise inbound HTTP authentication or persistent Session creation/admission;
+those boundaries require the real database consumer journey below.
+
 ## MOI consumer compatibility with a fresh Astra database
 
 `Test: MOI fresh-Astra compatibility` starts real MatrixOne and the real Astra

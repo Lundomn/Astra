@@ -3,6 +3,8 @@
 //!
 //! These tests exercise the `/chat/stream` → `ServerAgenticLoopHost` path (NOT the bridge),
 //! using native loopback provider responses through the real Server execution path.
+//! Binding ownership cases enter the sessionless runtime boundary directly;
+//! real persistent provider Session admission is covered by `moi_fresh_astra`.
 //!
 //! ```text
 //! cargo test -p astra-runtime --test web_agent_e2e --features e2e-hooks
@@ -209,21 +211,6 @@ impl AuthService for StubAuth {
 struct StubSession;
 #[async_trait]
 impl SessionService for StubSession {
-    async fn create_provider_session(
-        &self,
-        _identity: astra_services::ProviderSessionCreationIdentity,
-        request: SessionCreateRequestData,
-        quota: astra_services::resource_governor::LimitCheck,
-    ) -> Result<astra_services::SessionCreationResult, (StatusCode, Json<ErrorResponse>)> {
-        astra_services::resource_governor::enforce_session_create_quota(&quota)?;
-        let session = self.create_session(String::new(), request).await?;
-        Ok(astra_services::SessionCreationResult {
-            session,
-            created: true,
-            admission_facts: astra_services::SessionAdmissionFacts::default(),
-        })
-    }
-
     async fn create_session(
         &self,
         _: String,
@@ -725,7 +712,7 @@ fn build_test_app_with_agent_bindings(
     binding_service: Arc<InMemoryAgentBindingService>,
     models: Arc<TestModelService>,
     inference: Option<&ProviderObservationsFixture>,
-) -> (Router, Arc<RecordingObserverWorker>) {
+) -> (AppState, Arc<RecordingObserverWorker>) {
     init_env();
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
@@ -748,7 +735,7 @@ fn build_test_app_with_agent_bindings(
         lifecycle
     };
     let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
-    (build_app(state), observer_worker)
+    (state, observer_worker)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1356,6 +1343,37 @@ async fn start_agent_binding_gateway(
     (format!("http://{address}/capabilities"), calls, server)
 }
 
+// Binding ownership is exercised through real provider HTTP and canonical
+// execution. Persistent Session creation/admission is covered by moi_fresh_astra.
+async fn provider_binding_stream_collect(state: &AppState, payload: Value) -> Vec<Value> {
+    let mut headers = HeaderMap::new();
+    headers.insert("authorization", PROVIDER_TOKEN.parse().unwrap());
+    let principal = StubAuth
+        .current_principal_for_request(
+            &headers,
+            ProviderRequestDescriptor {
+                method: "POST".into(),
+                path: "/chat/stream".into(),
+                route: Some("/chat/stream".into()),
+                request_id: None,
+                body_digest: None,
+            },
+        )
+        .await
+        .unwrap();
+    let response = astra_runtime::server::provider_test_support::ephemeral_provider_chat_stream(
+        state,
+        &principal,
+        normalize_chat_stream_payload(payload),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+        .await
+        .unwrap();
+    parse_sse_events(&String::from_utf8_lossy(&body))
+}
+
 fn agent_binding_chat_payload(
     foundation_binding_id: &str,
     extension_binding_id: &str,
@@ -1431,7 +1449,7 @@ let inference=ProviderObservationsFixture::default();
 let model_endpoint=format!("{}/v1",gateway.base_url);
 let (app,observer_worker)=build_test_app_with_agent_bindings(binding_service, Arc::new(TestModelService{judgment_base_url:Some(model_endpoint.clone())}),Some(&inference));
 
-        let events = provider_chat_stream_collect(
+        let events = provider_binding_stream_collect(
             &app,
             agent_binding_chat_payload(
                 &foundation_binding_id,
@@ -1547,7 +1565,7 @@ async fn multi_agent_binding_http_e2e_reports_exact_missing_binding_id() {
         None,
     );
 
-    let events = provider_chat_stream_collect(
+    let events = provider_binding_stream_collect(
         &app,
         agent_binding_chat_payload(
             &foundation_binding_id,
