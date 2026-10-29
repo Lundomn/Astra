@@ -36,7 +36,7 @@ MACOS_SELF_HOSTED_LABELS = ["self-hosted", "macOS", "ARM64", "mac-arm64-mini"]
 
 
 def select_macos_runner(event_name: str, event: dict) -> list[str]:
-    # Trusted pushes must not consume persistent state left by unmerged PRs.
+    # Main must not consume persistent host state left by unmerged PRs.
     if event_name == "pull_request" and isinstance(event, dict):
         pull_request = event.get("pull_request")
         author = pull_request.get("user") if isinstance(pull_request, dict) else None

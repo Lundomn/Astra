@@ -33,11 +33,12 @@ class CiScopeTests(unittest.TestCase):
         for event in ({}, {"pull_request": None}, []):
             self.assertEqual(select_macos_runner("pull_request", event), ["macos-15"])
 
-    def test_macos_trusted_pushes_and_manual_events_remain_hosted(self):
-        for event_name in ("push", "workflow_dispatch", "pull_request_target"):
+    def test_other_pushes_and_manual_events_remain_hosted(self):
+        for event_name in ("workflow_dispatch", "pull_request_target"):
             self.assertEqual(select_macos_runner(event_name,
                 {"ref": "refs/heads/main", "sender": {"id": 39627130}}), ["macos-15"])
-        self.assertEqual(select_macos_runner("push", {"ref": "refs/heads/develop"}), ["macos-15"])
+        for ref in ("refs/heads/main", "refs/heads/develop", "refs/heads/feature", "refs/tags/v1.0", "main", None):
+            self.assertEqual(select_macos_runner("push", {"ref": ref}), ["macos-15"])
 
     def test_macos_missing_event_routes_to_hosted_without_omitting_scope_checks(self):
         with tempfile.TemporaryDirectory() as directory:

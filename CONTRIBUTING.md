@@ -112,10 +112,12 @@ strict profile without retries, preserving the complete inventory's CI JUnit
 file and avoiding three separate Cargo test builds.
 On macOS, the default terminal-reader lane runs the CLI Bash regression using
 its existing test executable. PR authors in a static contributor ID allowlist
-can attempt one self-hosted ARM bundle containing all five Mac lanes. Trusted
-main/develop pushes and release builds use hosted runners.
-A bounded queue/setup failure falls back to hosted jobs in parallel; real test
-failures remain failures. Other authors and reruns use hosted macOS. Linux
+can attempt one self-hosted ARM bundle containing all five Mac lanes.
+Main/develop pushes and release builds remain hosted; the PR mini shares a
+persistent account and toolchain, so it cannot provide an isolated main build.
+A 15-minute queue/discovery or setup failure falls back to hosted jobs in parallel;
+real test failures remain failures. Updated/closed PRs
+request cancellation instead of starting hosted Mac tests. Other authors and reruns use hosted macOS. Linux
 execution starts independently. The ordinary workflow retains required checks
 and fork approval; no App or custom check source is needed.
 See [runner operations](docs/guides/repository-automation.md#self-hosted-macos-tests)
