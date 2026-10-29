@@ -1106,6 +1106,11 @@ where
     if user_id.starts_with("external_authorized:moi:") {
         return Ok(());
     }
+    // Local identities cannot address request-signed provider Sessions. Their
+    // ordinary admission already validates Session ownership and lifecycle.
+    if required.is_none() && !provider_session_namespace(user_id) {
+        return Ok(());
+    }
     let key = SessionKeyV1::owner_session("server", user_id, session_id, "main");
     let row = sqlx::query(
         "SELECT JSON_EXTRACT(s.`metadata`, '$.__astra_provider_scope_proof_v1') IS NOT NULL AS has_scope_binding,

@@ -209,6 +209,21 @@ impl AuthService for StubAuth {
 struct StubSession;
 #[async_trait]
 impl SessionService for StubSession {
+    async fn create_provider_session(
+        &self,
+        _identity: astra_services::ProviderSessionCreationIdentity,
+        request: SessionCreateRequestData,
+        quota: astra_services::resource_governor::LimitCheck,
+    ) -> Result<astra_services::SessionCreationResult, (StatusCode, Json<ErrorResponse>)> {
+        astra_services::resource_governor::enforce_session_create_quota(&quota)?;
+        let session = self.create_session(String::new(), request).await?;
+        Ok(astra_services::SessionCreationResult {
+            session,
+            created: true,
+            admission_facts: astra_services::SessionAdmissionFacts::default(),
+        })
+    }
+
     async fn create_session(
         &self,
         _: String,

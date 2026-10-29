@@ -562,7 +562,7 @@ async fn provider_fork_review_rejects_ordinary_session_with_invalid_scope_proof(
             "POST",
             "/chat/stream",
             "/chat/stream",
-            fixture.moi.payload("MISSING-PROOF").to_string().into(),
+            fixture.moi.payload("MISSING-PROOF").to_string(),
         ))
         .await
         .unwrap();
