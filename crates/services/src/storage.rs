@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-24-v110";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-29-v116";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -3042,19 +3042,16 @@ async fn ensure_core_schema_while_leased(
         pool,
         "auth_refresh_tokens",
         "CREATE TABLE IF NOT EXISTS auth_refresh_tokens (
-            token_id VARCHAR(64) PRIMARY KEY,
+            session_id VARCHAR(64) PRIMARY KEY,
             user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NULL,
             token_hash VARCHAR(255) NOT NULL,
-            token_prefix VARCHAR(16) NULL,
+            browser_handle_hash VARCHAR(64) NULL,
+            browser_ciphertext TEXT NULL,
             expires_at DATETIME(6) NOT NULL,
             is_revoked SMALLINT NOT NULL DEFAULT 0,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_auth_refresh_tokens_hash (token_hash),
-            INDEX idx_auth_refresh_tokens_session (session_id),
             INDEX idx_auth_refresh_tokens_user_expires (user_id, expires_at),
-            INDEX idx_auth_refresh_tokens_expires_at (expires_at),
-            INDEX idx_auth_refresh_tokens_prefix (token_prefix)
+            INDEX idx_auth_refresh_tokens_expires_at (expires_at)
         )",
     )
     .execute(&pool)
@@ -3115,7 +3112,7 @@ async fn ensure_core_schema_while_leased(
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (provider_id, external_subject),
-            INDEX idx_external_identity_user (astra_user_id)
+            INDEX idx_external_identity_user (astra_user_id, provider_id, external_subject, updated_at)
         )",
     )
     .execute(&pool)
@@ -5358,6 +5355,41 @@ async fn verify_core_schema_shape(
                     .into(),
             ));
         }
+        if table == "auth_refresh_tokens"
+            && column == "session_id"
+            && (!row
+                .try_get::<String, _>("DATA_TYPE")?
+                .eq_ignore_ascii_case("varchar")
+                || row.try_get::<String, _>("IS_NULLABLE")? != "NO"
+                || row.try_get::<Option<i64>, _>("CHARACTER_MAXIMUM_LENGTH")? != Some(64))
+        {
+            return Err(sqlx::Error::Protocol(
+                "invalid auth_refresh_tokens.session_id shape".into(),
+            ));
+        }
+        if table == "auth_refresh_tokens"
+            && matches!(
+                column.as_str(),
+                "browser_handle_hash" | "browser_ciphertext"
+            )
+        {
+            let kind = if column == "browser_handle_hash" {
+                "varchar"
+            } else {
+                "text"
+            };
+            if !row
+                .try_get::<String, _>("DATA_TYPE")?
+                .eq_ignore_ascii_case(kind)
+                || row.try_get::<String, _>("IS_NULLABLE")? != "YES"
+                || (column == "browser_handle_hash"
+                    && row.try_get::<Option<i64>, _>("CHARACTER_MAXIMUM_LENGTH")? != Some(64))
+            {
+                return Err(sqlx::Error::Protocol(format!(
+                    "invalid auth_refresh_tokens.{column} shape"
+                )));
+            }
+        }
         Ok((table, column))
     })
     .collect::<Result<BTreeSet<_>, sqlx::Error>>()?;
@@ -5376,7 +5408,10 @@ async fn verify_core_schema_shape(
                 "updated_at",
             ][..],
         ),
-        ("auth_refresh_tokens", &["session_id"][..]),
+        (
+            "auth_refresh_tokens",
+            &["session_id", "browser_handle_hash", "browser_ciphertext"][..],
+        ),
         (
             "agent_sessions",
             &[
@@ -5481,6 +5516,17 @@ async fn verify_core_schema_shape(
     {
         let table: String = row.try_get("TABLE_NAME")?;
         let index: String = row.try_get("INDEX_NAME")?;
+        if table == "auth_refresh_tokens"
+            && matches!(
+                index.as_str(),
+                "idx_auth_refresh_tokens_user_expires" | "idx_auth_refresh_tokens_expires_at"
+            )
+            && row.try_get::<i64, _>("NON_UNIQUE")? != 1
+        {
+            return Err(sqlx::Error::Protocol(format!(
+                "auth_refresh_tokens.{index} must be non-unique; recreate the database"
+            )));
+        }
         if table == "session_transcript_items"
             && index == "uq_transcript_owner_session_source_event"
             && row.try_get::<i64, _>("NON_UNIQUE")? != 0
@@ -5501,6 +5547,53 @@ async fn verify_core_schema_shape(
             .entry((table, index))
             .or_default()
             .push(row.try_get("COLUMN_NAME")?);
+    }
+
+    for obsolete in [
+        "uq_auth_refresh_browser_handle",
+        "uq_auth_refresh_tokens_hash",
+        "idx_auth_refresh_tokens_session",
+    ] {
+        if indexes.contains_key(&("auth_refresh_tokens".to_owned(), obsolete.to_owned())) {
+            return Err(sqlx::Error::Protocol(format!(
+                "obsolete auth_refresh_tokens.{obsolete} index; recreate the database"
+            )));
+        }
+    }
+
+    // Cover canonical provider ownership and browser existence checks, including
+    // issuer ordering, so an absent identity never requires a base-table scan.
+    ensure_index_shape(
+        &indexes,
+        "auth_external_identities",
+        "idx_external_identity_user",
+        &[
+            "astra_user_id",
+            "provider_id",
+            "external_subject",
+            "updated_at",
+        ],
+    )?;
+
+    ensure_index_shape(&indexes, "auth_refresh_tokens", "PRIMARY", &["session_id"])?;
+    ensure_index_shape(
+        &indexes,
+        "auth_refresh_tokens",
+        "idx_auth_refresh_tokens_user_expires",
+        &["user_id", "expires_at"],
+    )?;
+
+    ensure_index_shape(
+        &indexes,
+        "auth_refresh_tokens",
+        "idx_auth_refresh_tokens_expires_at",
+        &["expires_at"],
+    )?;
+
+    if columns.contains(&("auth_refresh_tokens".to_owned(), "token_id".to_owned())) {
+        return Err(sqlx::Error::Protocol(
+            "obsolete auth_refresh_tokens.token_id column; recreate the database".into(),
+        ));
     }
 
     fail_if_obsolete_shape(
@@ -6867,7 +6960,7 @@ pub struct CleanupResult {
 
 /// Configuration for expiry policies of authentication and operational data.
 pub struct RetentionPolicy {
-    /// Max age in days for expired/revoked refresh tokens (default: 7)
+    /// Minimum days to retain refresh tokens after expiry (default: 7).
     pub refresh_token_days: u32,
     /// Max age in days for inactive auth tokens (default: 30)
     pub auth_token_days: u32,
@@ -6892,16 +6985,128 @@ pub async fn cleanup_inactive_memoria_credentials(pool: &sqlx::MySqlPool) -> Res
         .map_err(|error| format!("cleanup inactive Memoria credentials: {error}"))
 }
 
+const AUTH_REFRESH_TOKEN_BATCH_LIMIT: u32 = 1000;
+
+/// Result of a refresh retention batch, including evidence of an invalid index result.
+pub struct RefreshCleanupBatch {
+    pub selected: usize,
+    pub invalid: usize,
+    pub deleted: u64,
+    pub cutoff: chrono::NaiveDateTime,
+}
+
+/// Whether a batch warrants another pass, a retry, or no immediate work.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RefreshCleanupStatus {
+    More,
+    Retry,
+    Idle,
+}
+
+impl RefreshCleanupBatch {
+    pub fn status(&self) -> RefreshCleanupStatus {
+        if self.invalid > 0 || (self.selected > 0 && self.deleted == 0) {
+            RefreshCleanupStatus::Retry
+        } else if self.selected >= AUTH_REFRESH_TOKEN_BATCH_LIMIT as usize {
+            RefreshCleanupStatus::More
+        } else {
+            RefreshCleanupStatus::Idle
+        }
+    }
+}
+
+/// Remove one batch of expired refresh sessions. This runs off the request path.
+pub async fn cleanup_refresh_session_batch(
+    pool: &sqlx::MySqlPool,
+    policy: &RetentionPolicy,
+    round_cutoff: Option<chrono::NaiveDateTime>,
+) -> Result<RefreshCleanupBatch, String> {
+    let retention = chrono::Duration::try_days(i64::from(policy.refresh_token_days))
+        .ok_or_else(|| "invalid refresh retention duration".to_string())?;
+    let app_cutoff = chrono::Utc::now()
+        .naive_utc()
+        .checked_sub_signed(retention)
+        .ok_or_else(|| "refresh retention cutoff out of range".to_string())?;
+    let cutoff = match round_cutoff {
+        Some(cutoff) => cutoff.min(app_cutoff),
+        None => {
+            let database_now: chrono::NaiveDateTime = sqlx::query_scalar("SELECT UTC_TIMESTAMP(6)")
+                .fetch_one(pool)
+                .await
+                .map_err(|error| format!("read refresh cleanup time: {error}"))?;
+            database_now
+                .checked_sub_signed(retention)
+                .ok_or_else(|| "refresh retention cutoff out of range".to_string())?
+                .min(app_cutoff)
+        }
+    };
+
+    // MatrixOne 4.2.5 can return future rows when NOW()/DATE_SUB() is used
+    // directly as an index range bound. Bind a concrete DATETIME instead.
+    let candidates: Vec<(String, chrono::NaiveDateTime)> = sqlx::query_as(
+        "SELECT session_id, expires_at FROM auth_refresh_tokens FORCE INDEX (idx_auth_refresh_tokens_expires_at) WHERE expires_at < ? LIMIT ?",
+    )
+    .bind(cutoff)
+    .bind(AUTH_REFRESH_TOKEN_BATCH_LIMIT)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("select refresh cleanup candidates: {error}"))?;
+    let selected = candidates.len();
+    let ids: std::collections::BTreeSet<_> = candidates
+        .into_iter()
+        .filter_map(|(id, expiry)| (expiry < cutoff).then_some(id))
+        .collect();
+    let invalid = selected - ids.len();
+    if ids.is_empty() {
+        return Ok(RefreshCleanupBatch {
+            selected,
+            invalid,
+            deleted: 0,
+            cutoff,
+        });
+    }
+
+    let deleted = delete_expired_refresh_candidates(pool, ids, cutoff, policy.refresh_token_days)
+        .await
+        .map_err(|error| format!("delete expired refresh sessions: {error}"))?;
+    Ok(RefreshCleanupBatch {
+        selected,
+        invalid,
+        deleted,
+        cutoff,
+    })
+}
+
+async fn delete_expired_refresh_candidates(
+    pool: &sqlx::MySqlPool,
+    ids: std::collections::BTreeSet<String>,
+    cutoff: chrono::NaiveDateTime,
+    retention_days: u32,
+) -> Result<u64, sqlx::Error> {
+    let mut deletion =
+        QueryBuilder::<MySql>::new("DELETE FROM auth_refresh_tokens WHERE session_id IN (");
+    let mut values = deletion.separated(", ");
+    for id in ids {
+        values.push_bind(id);
+    }
+    deletion
+        .push(") AND expires_at < ")
+        .push_bind(cutoff)
+        .push(" AND expires_at < DATE_SUB(UTC_TIMESTAMP(6), INTERVAL ")
+        .push_bind(retention_days)
+        .push(" DAY)");
+    Ok(deletion.build().execute(pool).await?.rows_affected())
+}
+
 /// Purge expired authentication and operational records with TTL/expiry semantics.
 ///
-/// Returns a list of per-table cleanup results showing how many rows were deleted.
-/// Each DELETE uses a LIMIT to avoid long-running locks; callers should invoke
-/// repeatedly until all results show 0 rows deleted for a full sweep.
+/// Returns per-table deletion counts for one bounded sweep. A failure can
+/// follow committed batches; callers may retry. A zero count reflects only the
+/// candidates returned by the database, not proof that an index omitted none.
 pub async fn cleanup_expired_data(
     pool: &sqlx::Pool<MySql>,
     policy: &RetentionPolicy,
 ) -> Result<Vec<CleanupResult>, String> {
-    const AUTH_REFRESH_TOKEN_BATCH_LIMIT: u32 = 1000;
     const AUTH_PROOF_BATCH_LIMIT: u32 = 1000;
     const DEVICE_CHALLENGE_BATCH_LIMIT: u32 = 1000;
     const AUTH_TOKEN_BATCH_LIMIT: u32 = 1000;
@@ -6909,24 +7114,29 @@ pub async fn cleanup_expired_data(
     const AUTH_AUDIT_LOG_BATCH_LIMIT: u32 = 1000;
     let mut results = Vec::new();
 
-    // 1. Expired + revoked refresh tokens
-    let deleted = sqlx::query(
-        "DELETE FROM auth_refresh_tokens \
-         WHERE (expires_at < NOW(6) OR is_revoked = 1) \
-           AND created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
-         ORDER BY created_at ASC, token_id ASC \
-         LIMIT ?",
-    )
-    .bind(policy.refresh_token_days)
-    .bind(AUTH_REFRESH_TOKEN_BATCH_LIMIT)
-    .execute(pool)
-    .await
-    .map(|r| r.rows_affected())
-    .map_err(|e| format!("cleanup auth_refresh_tokens: {e}"))?;
-    results.push(CleanupResult {
-        table: "auth_refresh_tokens",
-        rows_deleted: deleted,
-    });
+    let refresh_error = match cleanup_refresh_session_batch(pool, policy, None).await {
+        Ok(batch) => {
+            results.push(CleanupResult {
+                table: "auth_refresh_tokens",
+                rows_deleted: batch.deleted,
+            });
+            if batch.status() == RefreshCleanupStatus::Retry {
+                tracing::warn!(
+                    selected = batch.selected,
+                    invalid = batch.invalid,
+                    deleted = batch.deleted,
+                    "refresh retention made incomplete progress"
+                );
+                Some("refresh retention made incomplete progress; retry cleanup".to_owned())
+            } else {
+                None
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "refresh retention batch failed");
+            Some(error)
+        }
+    };
 
     let deleted = sqlx::query(
         "DELETE FROM auth_reauthentication_proofs
@@ -7018,12 +7228,94 @@ pub async fn cleanup_expired_data(
         rows_deleted: deleted,
     });
 
+    if let Some(error) = refresh_error {
+        return Err(error);
+    }
     Ok(results)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_cleanup_distinguishes_more_work_from_stalled_or_invalid_results() {
+        let cutoff = chrono::Utc::now().naive_utc();
+        for (selected, invalid, deleted, expected) in [
+            (0, 0, 0, RefreshCleanupStatus::Idle),
+            (12, 0, 12, RefreshCleanupStatus::Idle),
+            (1000, 0, 999, RefreshCleanupStatus::More),
+            (1000, 0, 0, RefreshCleanupStatus::Retry),
+            (1000, 1, 999, RefreshCleanupStatus::Retry),
+            (1, 1, 0, RefreshCleanupStatus::Retry),
+        ] {
+            assert_eq!(
+                RefreshCleanupBatch {
+                    selected,
+                    invalid,
+                    deleted,
+                    cutoff
+                }
+                .status(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ASTRA_TEST_DB_IT=1 and an isolated MatrixOne catalog"]
+    async fn refresh_cleanup_rechecks_retention_for_every_selected_key() {
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let settings = MatrixOneSettings::from_env();
+        ensure_core_schema(&settings, "mysql").await.unwrap();
+        let pool = connect_matrixone(&settings).await.unwrap();
+        let now: chrono::NaiveDateTime = sqlx::query_scalar("SELECT UTC_TIMESTAMP(6)")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        // Simulate a previously captured cutoff from a faster clock: only the
+        // database-time retention recheck can reject the other three IDs.
+        let cutoff = now + chrono::Duration::days(30);
+        let ids: Vec<String> = (0..4).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+        for (id, expiry) in ids.iter().zip([
+            now - chrono::Duration::days(8),
+            now - chrono::Duration::days(1),
+            now + chrono::Duration::days(1),
+            now - chrono::Duration::days(8),
+        ]) {
+            sqlx::query("INSERT INTO auth_refresh_tokens (session_id,user_id,token_hash,expires_at) VALUES (?, ?, ?, ?)")
+                .bind(id).bind(id).bind(id).bind(expiry).execute(&pool).await.unwrap();
+        }
+        // Model a candidate renewed after selection but before the keyed DELETE.
+        sqlx::query("UPDATE auth_refresh_tokens SET expires_at = ? WHERE session_id = ?")
+            .bind(now + chrono::Duration::days(1))
+            .bind(&ids[3])
+            .execute(&pool)
+            .await
+            .unwrap();
+        let deleted =
+            delete_expired_refresh_candidates(&pool, ids.iter().cloned().collect(), cutoff, 7)
+                .await
+                .unwrap();
+        assert_eq!(deleted, 1);
+        for (index, id) in ids.iter().enumerate() {
+            let exists: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM auth_refresh_tokens WHERE session_id = ?")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(exists, i64::from(index != 0));
+        }
+        for id in &ids {
+            sqlx::query("DELETE FROM auth_refresh_tokens WHERE session_id = ?")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        pool.close().await;
+    }
 
     #[test]
     fn fresh_database_visibility_retry_is_limited_to_unknown_database() {
