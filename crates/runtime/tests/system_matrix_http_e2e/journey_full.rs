@@ -290,41 +290,18 @@ pub async fn run_product_matrix_full_journey(
     .await;
     assert_eq!(st_mkt, StatusCode::OK, "marketplace installed: {mkt_j}");
 
-    // Per-run skill name so parallel E2E processes do not contend on global marketplace stats rows.
-    let mkt_probe_skill = format!("e2e_matrix_mkt_{suffix}");
-    let (st_qr, qr_j) = post_json(
+    for path in ["/marketplace/search", "/marketplace/stats/example"] {
+        let (status, _) = get_json(app, path, Some(auth_header), &[]).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "retired route: {path}");
+    }
+    let (status, _) = post_json(
         app,
         "/marketplace/quality-report",
         Some(auth_header),
-        json!({
-            "skill_name": mkt_probe_skill.as_str(),
-            "skill_version": "1.0.0",
-            "runtime_version": "matrix-e2e",
-            "success_rate": 0.95,
-            "avg_tokens": 120.0,
-            "invocation_count": 3
-        }),
+        json!({}),
     )
     .await;
-    assert_eq!(
-        st_qr,
-        StatusCode::NO_CONTENT,
-        "marketplace quality report: {qr_j}"
-    );
-
-    let (st_mst, mst_j) = get_json(
-        app,
-        &format!("/marketplace/stats/{mkt_probe_skill}"),
-        None,
-        &[],
-    )
-    .await;
-    assert_eq!(st_mst, StatusCode::OK, "marketplace skill stats: {mst_j}");
-    assert_eq!(mst_j["skill_name"].as_str(), Some(mkt_probe_skill.as_str()));
-
-    let (st_msearch, ms_j) = get_json(app, "/marketplace/search?limit=10", None, &[]).await;
-    assert_eq!(st_msearch, StatusCode::OK, "marketplace search: {ms_j}");
-    assert!(ms_j["results"].is_array(), "search results: {ms_j}");
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     let (st_agent, agent_j) = post_json(
         app,
@@ -461,36 +438,6 @@ pub async fn run_product_matrix_full_journey(
                 .any(|e| e["event_id"].as_str() == Some(manual_event_id.as_str()))
         }),
         "manual event missing in list: {ev_sess}"
-    );
-
-    let (st_dv_chain, dv_chain) = get_json(
-        app,
-        &format!("/data-versioning/lineage/{manual_event_id}/chain"),
-        Some(auth_header),
-        &[],
-    )
-    .await;
-    assert_eq!(
-        st_dv_chain,
-        StatusCode::OK,
-        "data-versioning lineage chain: {dv_chain}"
-    );
-    assert!(
-        dv_chain.as_array().is_some_and(|a| !a.is_empty()),
-        "expected non-empty lineage for manual event: {dv_chain}"
-    );
-
-    let (st_dv_up, dv_up) = get_json(
-        app,
-        &format!("/data-versioning/lineage/{manual_event_id}/upstream"),
-        Some(auth_header),
-        &[],
-    )
-    .await;
-    assert_eq!(
-        st_dv_up,
-        StatusCode::OK,
-        "data-versioning upstream lineage: {dv_up}"
     );
 
     let (st_ctx, ctx_j) = post_json(
@@ -780,65 +727,8 @@ pub async fn run_product_matrix_full_journey(
     let (st_runs, runs) = get_json(app, "/runs", Some(auth_header), &[]).await;
     assert_eq!(st_runs, StatusCode::OK, "list runs: {runs}");
 
-    let (st_cpl, cpl_j) =
-        get_json(app, "/data-versioning/checkpoints", Some(auth_header), &[]).await;
-    assert_eq!(
-        st_cpl,
-        StatusCode::OK,
-        "list checkpoints (read-only): {cpl_j}"
-    );
-    assert!(
-        cpl_j.is_array(),
-        "checkpoints list should be a JSON array: {cpl_j}"
-    );
-
-    let sb_name = format!("sb_{suffix}");
-    let (st_sb, sb_j) = post_json(
-        app,
-        "/sandbox",
-        Some(auth_header),
-        json!({ "name": sb_name, "description": "matrix e2e sandbox" }),
-    )
-    .await;
-    assert_eq!(st_sb, StatusCode::CREATED, "create sandbox: {sb_j}");
-
-    let sb_row =
-        sqlx::query("SELECT user_id, status FROM infra_sandbox_metadata WHERE sandbox_name = ?")
-            .bind(&sb_name)
-            .fetch_optional(pool)
-            .await
-            .expect("sandbox select");
-    let sb_row = sb_row.expect("infra_sandbox_metadata row");
-    assert_eq!(
-        sb_row.try_get::<String, _>("user_id").ok().as_deref(),
-        Some(user_id.as_str())
-    );
-
-    let (st_sbl, sbl) = get_json(app, "/sandbox", Some(auth_header), &[]).await;
-    assert_eq!(st_sbl, StatusCode::OK, "list sandboxes: {sbl}");
-    assert!(
-        sbl["sandboxes"].as_array().is_some_and(|a| {
-            a.iter()
-                .any(|s| s["sandbox_name"].as_str() == Some(sb_name.as_str()))
-        }),
-        "sandbox not listed: {sbl}"
-    );
-
-    let (st_sbg, sbg) = get_json(app, &format!("/sandbox/{sb_name}"), Some(auth_header), &[]).await;
-    assert_eq!(st_sbg, StatusCode::OK, "get sandbox: {sbg}");
-
-    let st_sbd = delete_no_content(app, &format!("/sandbox/{sb_name}"), Some(auth_header)).await;
-    assert_eq!(st_sbd, StatusCode::NO_CONTENT, "delete sandbox");
-
-    let sb_gone = sqlx::query("SELECT 1 FROM infra_sandbox_metadata WHERE sandbox_name = ?")
-        .bind(&sb_name)
-        .fetch_optional(pool)
-        .await
-        .expect("sandbox gone");
-    assert!(
-        sb_gone.is_none(),
-        "sandbox row should be removed after DELETE"
-    );
+    let (retired_status, _) = get_json(app, "/sandbox", Some(auth_header), &[]).await;
+    assert_eq!(retired_status, StatusCode::NOT_FOUND);
 
     let (st_sks, sks_j) = get_json(app, "/skills", Some(auth_header), &[]).await;
     assert_eq!(st_sks, StatusCode::OK, "list skills: {sks_j}");

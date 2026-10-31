@@ -6,7 +6,7 @@ use astra_core::{
 };
 use axum::{Json, http::StatusCode};
 use sha2::Digest;
-use sqlx::{Execute, Executor, MySql, QueryBuilder, Row, Transaction, query, query_scalar};
+use sqlx::{Execute, Executor, MySql, QueryBuilder, Row, query, query_scalar};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -1505,59 +1505,6 @@ where
     })
 }
 
-/// Lock a session fence for diagnostic expiry, claiming a fence-less session
-/// only when its durable root no longer exists.
-///
-/// A historical prompt diagnostic can outlive both its session row and fence.
-/// The claim is serialized with every session writer: if no root exists while
-/// holding the fence, record a completed deletion fence before deleting the
-/// diagnostic so a later writer cannot recreate that session identity.
-pub(crate) async fn lock_or_claim_orphaned_agent_session_write_fence(
-    tx: &mut Transaction<'_, MySql>,
-    session_id: &str,
-    user_id: &str,
-) -> Result<AgentSessionWriteFenceState, sqlx::Error> {
-    query(
-        "INSERT IGNORE INTO agent_session_lifecycle_fences \
-         (session_id, user_id, created_at, updated_at) \
-         VALUES (?, ?, NOW(6), NOW(6))",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .execute(&mut **tx)
-    .await?;
-
-    match lock_existing_agent_session_write_fence(tx, session_id, user_id).await? {
-        AgentSessionWriteFenceState::Writable => {
-            let session_exists: Option<i32> = sqlx::query_scalar(
-                "SELECT 1 FROM agent_sessions \
-                 WHERE user_id = ? AND session_id = ? FOR UPDATE",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-            if session_exists.is_some() {
-                return Ok(AgentSessionWriteFenceState::Writable);
-            }
-
-            query(
-                "UPDATE agent_session_lifecycle_fences \
-                 SET delete_requested_at = COALESCE(delete_requested_at, NOW(6)), \
-                     database_deleted_at = COALESCE(database_deleted_at, NOW(6)), \
-                     updated_at = NOW(6) \
-                 WHERE user_id = ? AND session_id = ?",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .execute(&mut **tx)
-            .await?;
-            lock_existing_agent_session_write_fence(tx, session_id, user_id).await
-        }
-        state => Ok(state),
-    }
-}
-
 /// Acquire the durable lifecycle fence for one session-bound write.
 ///
 /// The fence row is created before the session root and survives hard delete.
@@ -2037,35 +1984,6 @@ async fn verify_work_canonical_schema(
             "work_check_runs",
             &["work_item_id", "work_item_revision", "work_item_attempt_id"],
         ),
-        (
-            "work_patch_materialization_operations",
-            &[
-                "executor_token",
-                "executor_lease_expires_at",
-                "recovery_after",
-                "apply_invocation_ref",
-                "observed_subject_revision",
-                "apply_outcome",
-                "failure_code",
-                "verification_evidence_hash",
-                "verification_outcome",
-            ],
-        ),
-        (
-            "work_patch_commit_operations",
-            &[
-                "active_target_branch_id",
-                "provider_ref",
-                "policy_decision_ref",
-                "executor_token",
-                "executor_lease_expires_at",
-                "recovery_after",
-                "commit_invocation_ref",
-                "index_reconciled",
-                "commit_author_name",
-                "commit_author_email",
-            ],
-        ),
         ("work_items", &["last_revision"]),
         ("work_item_revisions", &["parent_revision"]),
         (
@@ -2138,23 +2056,6 @@ async fn verify_work_canonical_schema(
             "work_branches",
             "idx_work_branches_deletion",
             &["owner_id", "deletion_operation_id", "deletion_requested_at"],
-        ),
-        (
-            "work_patch_materialization_operations",
-            "idx_work_patch_materialization_recovery",
-            &["operation_state", "recovery_after", "operation_id"],
-        ),
-        (
-            "work_patch_materialization_operations",
-            "idx_work_patch_materialization_source_history",
-            &[
-                "owner_id",
-                "work_id",
-                "target_branch_id",
-                "source_branch_id",
-                "created_at",
-                "operation_id",
-            ],
         ),
         (
             "work_branch_control_operations",
@@ -3821,63 +3722,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    core_schema_create!(pool, "prompt_request_records",
-        "CREATE TABLE IF NOT EXISTS prompt_request_records (
-            request_id VARCHAR(64) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            run_id VARCHAR(64) NULL,
-            turn BIGINT NOT NULL,
-            round BIGINT NOT NULL,
-            attempt BIGINT NOT NULL,
-            source VARCHAR(64) NOT NULL,
-            model VARCHAR(128) NOT NULL,
-            provider VARCHAR(64) NOT NULL,
-            max_output_tokens BIGINT NULL,
-            message_count BIGINT NOT NULL,
-            tool_count BIGINT NOT NULL,
-            previous_request_id VARCHAR(64) NULL,
-            request_hash VARCHAR(64) NOT NULL,
-            summary_json LONGTEXT NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            created_at_unix_ms BIGINT NULL,
-            PRIMARY KEY (user_id, request_id),
-            UNIQUE KEY uq_prompt_request_attempt (user_id, session_id, run_id, turn, round, source, attempt),
-            INDEX idx_prompt_requests_owner_session_created (user_id, session_id, created_at, turn, round, attempt),
-            INDEX idx_prompt_requests_owner_run_created (user_id, run_id, created_at, turn, round, attempt),
-            INDEX idx_prompt_requests_owner_previous (user_id, session_id, previous_request_id),
-            INDEX idx_prompt_requests_retention_ms (created_at_unix_ms, user_id, request_id, session_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "prompt_deltas",
-        "CREATE TABLE IF NOT EXISTS prompt_deltas (
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            request_id VARCHAR(64) NOT NULL,
-            delta_seq INT NOT NULL,
-            logical_key VARCHAR(191) NOT NULL,
-            chunk_kind VARCHAR(32) NOT NULL,
-            position INT NOT NULL,
-            op VARCHAR(16) NOT NULL,
-            reuse_count INT NULL,
-            chunk_id VARCHAR(80) NULL,
-            chunk_hash VARCHAR(64) NULL,
-            previous_chunk_hash VARCHAR(64) NULL,
-            chunk_tokens BIGINT NULL,
-            chunk_bytes BIGINT NULL,
-            previous_chunk_tokens BIGINT NULL,
-            previous_chunk_bytes BIGINT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, request_id, delta_seq),
-            INDEX idx_prompt_deltas_owner_request_position (user_id, session_id, request_id, position, delta_seq)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     core_schema_create!(
         pool,
         "session_device_leases",
@@ -3991,69 +3835,6 @@ async fn ensure_core_schema_while_leased(
     .await?;
 
     // ── Context manifest v1 (Phase 3 / G1+G3+G10+G26+G27) ───────────────
-    core_schema_create!(pool, "context_manifests",
-        "CREATE TABLE IF NOT EXISTS context_manifests (
-            manifest_id VARCHAR(128) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(128) NOT NULL,
-            run_id VARCHAR(128) NULL,
-            turn_id VARCHAR(128) NOT NULL,
-            model_provider VARCHAR(64) NOT NULL,
-            model_name VARCHAR(128) NOT NULL,
-            context_window_tokens INT NOT NULL,
-            max_output_tokens INT NOT NULL,
-            total_estimated_tokens INT NOT NULL,
-            stable_prefix_hash VARCHAR(128) NULL,
-            prompt_cache_key VARCHAR(255) NULL,
-            compaction_version VARCHAR(64) NULL,
-            policy_version VARCHAR(64) NOT NULL,
-            tokenizer_id VARCHAR(128) NULL,
-            budget_template_id VARCHAR(64) NULL,
-            turn_intent VARCHAR(64) NULL,
-            reason VARCHAR(64) NOT NULL,
-            dropped_count INT NOT NULL DEFAULT 0,
-            manifest_json LONGTEXT NOT NULL,
-            request_id VARCHAR(128) NULL,
-            trace_id VARCHAR(128) NULL,
-            payload_hash VARCHAR(80) NOT NULL,
-            ingestion_write_id VARCHAR(64) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, manifest_id),
-            INDEX idx_ctx_manifest_owner_session_created (user_id, session_id, created_at, manifest_id),
-            INDEX idx_ctx_manifest_owner_session_run_created (user_id, session_id, run_id, created_at, manifest_id),
-            INDEX idx_ctx_manifest_user_created (user_id, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "context_manifest_items",
-        "CREATE TABLE IF NOT EXISTS context_manifest_items (
-            user_id VARCHAR(128) NOT NULL,
-            manifest_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(128) NOT NULL,
-            item_order INT NOT NULL,
-            zone VARCHAR(64) NOT NULL,
-            source_table VARCHAR(64) NOT NULL,
-            source_id VARCHAR(128) NOT NULL,
-            source_hash VARCHAR(128) NULL,
-            included SMALLINT NOT NULL,
-            token_estimate INT NOT NULL DEFAULT 0,
-            budget_tokens INT NOT NULL DEFAULT 0,
-            reason VARCHAR(128) NOT NULL,
-            render_mode VARCHAR(64) NOT NULL,
-            raw_ref VARCHAR(255) NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, manifest_id, item_order),
-            INDEX idx_manifest_items_source (user_id, source_table, source_id),
-            INDEX idx_manifest_items_manifest_zone (user_id, manifest_id, zone, included),
-            INDEX idx_manifest_items_raw_ref (user_id, raw_ref)
-        )",
-    )
-    .execute(&pool)
-    .await?;
 
     core_schema_create!(
         pool,
@@ -4230,31 +4011,6 @@ async fn ensure_core_schema_while_leased(
             INDEX idx_ctx_decisions_owner_session_type_created (user_id, session_id, decision_type, created_at),
             INDEX idx_ctx_decisions_owner_event_id (user_id, event_id),
             INDEX idx_ctx_decisions_owner_context_capture_id (user_id, context_capture_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "skill_selection_events",
-        "CREATE TABLE IF NOT EXISTS skill_selection_events (
-            event_id VARCHAR(64) PRIMARY KEY,
-            session_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            agent_id VARCHAR(255) NULL,
-            user_query LONGTEXT NULL,
-            selected_skills JSON NULL,
-            skill_name VARCHAR(255) NULL,
-            skill_version VARCHAR(64) NULL,
-            selection_method VARCHAR(64) NULL,
-            execution_success BIGINT NULL,
-            execution_time_ms BIGINT NULL,
-            user_feedback_score BIGINT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_skill_selection_owner_session_created (user_id, session_id, created_at),
-            INDEX idx_skill_selection_user_created (user_id, created_at),
-            INDEX idx_skill_selection_skill_created (skill_name, created_at)
         )",
     )
     .execute(&pool)
@@ -4664,37 +4420,6 @@ async fn ensure_core_schema_while_leased(
 
     core_schema_create!(
         pool,
-        "skill_metrics",
-        "CREATE TABLE IF NOT EXISTS skill_metrics (
-            metric_id            VARCHAR(255) PRIMARY KEY,
-            skill_name           VARCHAR(255) NOT NULL,
-            metric_type          VARCHAR(32) NOT NULL,
-            metric_slot          VARCHAR(255) NOT NULL,
-            skill_version        VARCHAR(50) NULL,
-            runtime_version      VARCHAR(50) NULL,
-            publisher_id         VARCHAR(255) NULL,
-            total_installs       BIGINT NOT NULL DEFAULT 0,
-            active_users_7d      INT NOT NULL DEFAULT 0,
-            avg_quality          FLOAT NOT NULL DEFAULT 0.0,
-            avg_rating           FLOAT NOT NULL DEFAULT 0.0,
-            report_count         INT NOT NULL DEFAULT 0,
-            compatibility_score  FLOAT NOT NULL DEFAULT 0.0,
-            trust_tier           VARCHAR(32) NULL,
-            success_rate         FLOAT NULL,
-            avg_tokens           FLOAT NULL,
-            invocation_count     INT NULL,
-            created_at           DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at           DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_skill_metrics_slot (skill_name, metric_type, metric_slot),
-            INDEX idx_skill_metrics_lookup (skill_name, metric_type, created_at),
-            INDEX idx_skill_metrics_ranking (metric_type, avg_quality, active_users_7d),
-            INDEX idx_skill_metrics_tier (metric_type, trust_tier, updated_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-    core_schema_create!(
-        pool,
         "edge_agent_registry",
         "CREATE TABLE IF NOT EXISTS edge_agent_registry (
             user_id VARCHAR(128) NOT NULL,
@@ -4910,32 +4635,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    core_schema_create!(
-        pool,
-        "session_checkpoints",
-        "CREATE TABLE IF NOT EXISTS session_checkpoints (
-            checkpoint_id VARCHAR(64) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            number INT NOT NULL,
-            turn INT NOT NULL,
-            title VARCHAR(500) NULL,
-            summary LONGTEXT NULL,
-            tools_json JSON NULL,
-            state_json LONGTEXT NULL,
-            total_tokens BIGINT NOT NULL DEFAULT 0,
-            had_stalls SMALLINT NOT NULL DEFAULT 0,
-            error_count INT NOT NULL DEFAULT 0,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, checkpoint_id),
-            UNIQUE KEY uq_session_checkpoints_owner_number (user_id, session_id, number),
-            INDEX idx_ckpt_owner_session_turn (user_id, session_id, turn),
-            INDEX idx_ckpt_user_created (user_id, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     core_schema_create!(pool, "session_artifacts",
         "CREATE TABLE IF NOT EXISTS session_artifacts (
             artifact_id VARCHAR(64) NOT NULL,
@@ -4958,7 +4657,6 @@ async fn ensure_core_schema_while_leased(
             normalize_version VARCHAR(16) NULL,
             cold_storage_ref VARCHAR(255) NULL,
             derived_from_artifact_id VARCHAR(128) NULL,
-            referenced_by_manifest_count INT NOT NULL DEFAULT 0,
             referenced_by_state_items_count INT NOT NULL DEFAULT 0,
             referenced_by_citation_count INT NOT NULL DEFAULT 0,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -5259,63 +4957,8 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    // ─── Infrastructure tables ───────────────────────────────────────────────────
-
-    core_schema_create!(pool, "infra_sandbox_metadata",
-        "CREATE TABLE IF NOT EXISTS infra_sandbox_metadata (
-            sandbox_name VARCHAR(128) PRIMARY KEY,
-            user_id      VARCHAR(128) NOT NULL,
-            description  TEXT NOT NULL,
-            created_by   VARCHAR(128) NOT NULL,
-            status       VARCHAR(32) NOT NULL DEFAULT 'active',
-            created_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-            INDEX idx_ism_user (user_id),
-            INDEX idx_ism_status (status)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // ─── Data versioning tables ──────────────────────────────────────────────────
 
-    core_schema_create!(
-        pool,
-        "data_versioning_checkpoints",
-        "CREATE TABLE IF NOT EXISTS data_versioning_checkpoints (
-            checkpoint_id   VARCHAR(36) PRIMARY KEY,
-            checkpoint_name VARCHAR(128) NOT NULL,
-            user_id         VARCHAR(128) NOT NULL,
-            description     TEXT,
-            created_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE INDEX idx_dvc_user_name (user_id, checkpoint_name)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    // ─── Conversation State Log (CSL) ──────────────────────────────────────────
-
-    core_schema_create!(
-        pool,
-        "conversation_log",
-        "CREATE TABLE IF NOT EXISTS conversation_log (
-            user_id       VARCHAR(128) NOT NULL,
-            session_id    VARCHAR(64) NOT NULL,
-            seq           BIGINT NOT NULL,
-            turn          INT NOT NULL,
-            entry_type    TINYINT NOT NULL,
-            trace_id      VARCHAR(64) DEFAULT NULL,
-            message_count INT DEFAULT NULL,
-            payload       MEDIUMTEXT NOT NULL,
-            created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, seq),
-            INDEX idx_csl_owner_snapshot (user_id, session_id, entry_type, seq DESC),
-            INDEX idx_csl_owner_turn (user_id, session_id, turn)
-        )",
-    )
-    .execute(&pool)
-    .await?;
     verify_core_schema_shape(&pool, &settings.database).await?;
     let declarations = pool.authority.declarations()?;
     publish_core_schema_table_contracts(&pool, &declarations).await?;
@@ -5457,17 +5100,6 @@ async fn verify_core_schema_shape(
                 "canonical_completed_turn",
                 "canonical_conversation_seq",
                 "canonical_root_hash",
-            ][..],
-        ),
-        ("prompt_request_records", &["created_at_unix_ms"][..]),
-        (
-            "prompt_deltas",
-            &[
-                "reuse_count",
-                "chunk_tokens",
-                "chunk_bytes",
-                "previous_chunk_tokens",
-                "previous_chunk_bytes",
             ][..],
         ),
         ("inference_provider_attempts", &["context_expired_at"][..]),
@@ -5906,83 +5538,6 @@ async fn verify_core_schema_shape(
         "uq_transcript_owner_session_source_event",
         &["user_id", "session_id", "source_event_id"],
     )?;
-    ensure_index_shape(
-        &indexes,
-        "prompt_request_records",
-        "PRIMARY",
-        &["user_id", "request_id"],
-    )?;
-    for (index, expected_columns) in [
-        (
-            "uq_prompt_request_attempt",
-            &[
-                "user_id",
-                "session_id",
-                "run_id",
-                "turn",
-                "round",
-                "source",
-                "attempt",
-            ][..],
-        ),
-        (
-            "idx_prompt_requests_owner_session_created",
-            &[
-                "user_id",
-                "session_id",
-                "created_at",
-                "turn",
-                "round",
-                "attempt",
-            ][..],
-        ),
-        (
-            "idx_prompt_requests_owner_run_created",
-            &[
-                "user_id",
-                "run_id",
-                "created_at",
-                "turn",
-                "round",
-                "attempt",
-            ][..],
-        ),
-        (
-            "idx_prompt_requests_owner_previous",
-            &["user_id", "session_id", "previous_request_id"][..],
-        ),
-        (
-            "idx_prompt_requests_retention_ms",
-            &["created_at_unix_ms", "user_id", "request_id", "session_id"][..],
-        ),
-    ] {
-        ensure_index_shape(&indexes, "prompt_request_records", index, expected_columns)?;
-    }
-    fail_if_obsolete_shape(
-        pool,
-        database,
-        "prompt_deltas",
-        &[
-            "user_id",
-            "session_id",
-            "request_id",
-            "delta_seq",
-            "logical_key",
-            "chunk_kind",
-            "position",
-            "op",
-            "chunk_id",
-            "chunk_hash",
-            "previous_chunk_hash",
-            "created_at",
-        ],
-        &["delta_id", "payload_json"],
-        &[
-            "uq_prompt_delta_request_seq",
-            "idx_prompt_deltas_request_position",
-        ],
-    )
-    .await?;
     fail_if_obsolete_shape(
         pool,
         database,
@@ -6014,91 +5569,6 @@ async fn verify_core_schema_shape(
         "session_device_lease_events",
         "idx_lease_events_owner_session_device",
         &["user_id", "session_id", "device_id", "created_at"],
-    )?;
-    fail_if_obsolete_shape(
-        pool,
-        database,
-        "context_manifests",
-        &[
-            "user_id",
-            "manifest_id",
-            "payload_hash",
-            "ingestion_write_id",
-        ],
-        &[],
-        &[],
-    )
-    .await?;
-    fail_if_required_columns_missing_or_nullable(
-        pool,
-        database,
-        "context_manifests",
-        &["payload_hash", "ingestion_write_id"],
-    )
-    .await?;
-    fail_if_varchar_columns_shorter_than(
-        pool,
-        database,
-        "context_manifests",
-        &[("payload_hash", 80), ("ingestion_write_id", 64)],
-    )
-    .await?;
-    ensure_index_shape(
-        &indexes,
-        "context_manifests",
-        "PRIMARY",
-        &["user_id", "manifest_id"],
-    )?;
-    for (index, expected_columns) in [
-        (
-            "idx_ctx_manifest_owner_session_created",
-            &["user_id", "session_id", "created_at", "manifest_id"][..],
-        ),
-        (
-            "idx_ctx_manifest_owner_session_run_created",
-            &[
-                "user_id",
-                "session_id",
-                "run_id",
-                "created_at",
-                "manifest_id",
-            ][..],
-        ),
-    ] {
-        ensure_index_shape(&indexes, "context_manifests", index, expected_columns)?;
-    }
-    fail_if_obsolete_shape(
-        pool,
-        database,
-        "context_manifest_items",
-        &["user_id", "manifest_id", "item_order"],
-        &["id"],
-        &["uq_manifest_item_order"],
-    )
-    .await?;
-    ensure_index_shape(
-        &indexes,
-        "context_manifest_items",
-        "PRIMARY",
-        &["user_id", "manifest_id", "item_order"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "context_manifest_items",
-        "idx_manifest_items_manifest_zone",
-        &["user_id", "manifest_id", "zone", "included"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "context_manifest_items",
-        "idx_manifest_items_source",
-        &["user_id", "source_table", "source_id"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "context_manifest_items",
-        "idx_manifest_items_raw_ref",
-        &["user_id", "raw_ref"],
     )?;
     fail_if_obsolete_shape(
         pool,
@@ -6317,19 +5787,6 @@ async fn verify_core_schema_shape(
     ] {
         ensure_index_shape(&indexes, "ctx_decision_audits", index, expected_columns)?;
     }
-    fail_if_required_columns_missing_or_nullable(
-        pool,
-        database,
-        "skill_selection_events",
-        &["user_id"],
-    )
-    .await?;
-    ensure_index_shape(
-        &indexes,
-        "skill_selection_events",
-        "idx_skill_selection_owner_session_created",
-        &["user_id", "session_id", "created_at"],
-    )?;
     ensure_index_shape(
         &indexes,
         "inference_invocations",
@@ -6579,25 +6036,6 @@ async fn verify_core_schema_shape(
     )?;
     ensure_index_shape(
         &indexes,
-        "session_checkpoints",
-        "PRIMARY",
-        &["user_id", "session_id", "checkpoint_id"],
-    )?;
-    for (index, expected_columns) in [
-        (
-            "uq_session_checkpoints_owner_number",
-            &["user_id", "session_id", "number"][..],
-        ),
-        (
-            "idx_ckpt_owner_session_turn",
-            &["user_id", "session_id", "turn"][..],
-        ),
-        ("idx_ckpt_user_created", &["user_id", "created_at"][..]),
-    ] {
-        ensure_index_shape(&indexes, "session_checkpoints", index, expected_columns)?;
-    }
-    ensure_index_shape(
-        &indexes,
         "session_artifacts",
         "PRIMARY",
         &["user_id", "session_id", "artifact_id"],
@@ -6823,40 +6261,6 @@ pub fn database_user_from_row(
     decode_database_user_row(&row)
 }
 
-trait ActiveSkillVersionRow {
-    fn string_column(&self, column: &'static str) -> Result<String, sqlx::Error>;
-}
-
-impl ActiveSkillVersionRow for sqlx::mysql::MySqlRow {
-    fn string_column(&self, column: &'static str) -> Result<String, sqlx::Error> {
-        self.try_get(column)
-    }
-}
-
-fn invalid_active_skill_version_value(column: &'static str, value: &str) -> sqlx::Error {
-    sqlx::Error::Decode(Box::new(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        format!("skills_registry decode column `{column}`: empty value `{value}`"),
-    )))
-}
-
-fn decode_active_skill_version_row(
-    row: &impl ActiveSkillVersionRow,
-) -> Result<(String, String), sqlx::Error> {
-    let skill_name = row.string_column("skill_name")?;
-    if skill_name.trim().is_empty() {
-        return Err(invalid_active_skill_version_value(
-            "skill_name",
-            &skill_name,
-        ));
-    }
-    let version = row.string_column("version")?;
-    if version.trim().is_empty() {
-        return Err(invalid_active_skill_version_value("version", &version));
-    }
-    Ok((skill_name, version))
-}
-
 pub fn session_record_from_row(
     row: sqlx::mysql::MySqlRow,
 ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
@@ -6916,37 +6320,6 @@ pub async fn log_session_audit(
             "failed to write auth audit log"
         );
     }
-}
-
-pub async fn resolve_active_skill_versions(
-    pool: &sqlx::Pool<MySql>,
-    skill_names: BTreeSet<&str>,
-) -> Result<HashMap<String, String>, sqlx::Error> {
-    if skill_names.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let mut query_builder = QueryBuilder::<MySql>::new(
-        "SELECT skill_name, version FROM skills_registry WHERE is_active = 1 AND skill_name IN (",
-    );
-    {
-        let mut separated = query_builder.separated(", ");
-        for skill_name in &skill_names {
-            separated.push_bind(skill_name);
-        }
-    }
-    query_builder.push(") ORDER BY skill_name ASC, version DESC");
-
-    let rows = query_builder.build().fetch_all(pool).await?;
-    let mut versions = HashMap::new();
-    for row in rows {
-        let (skill_name, version) = decode_active_skill_version_row(&row)?;
-        if versions.contains_key(&skill_name) {
-            continue;
-        }
-        versions.insert(skill_name, version);
-    }
-    Ok(versions)
 }
 
 // ─── Expired Data Cleanup ────────────────────────────────────────────────────
@@ -7550,97 +6923,6 @@ mod tests {
                 sqlx::Error::ColumnNotFound(name) => assert_eq!(name, column),
                 err => panic!("expected ColumnNotFound({column}), got {err:?}"),
             }
-        }
-    }
-
-    struct FakeActiveSkillVersionRow {
-        failed_column: Option<&'static str>,
-        skill_name: &'static str,
-        version: &'static str,
-    }
-
-    impl FakeActiveSkillVersionRow {
-        fn complete() -> Self {
-            Self {
-                failed_column: None,
-                skill_name: "skill-a",
-                version: "v2",
-            }
-        }
-
-        fn fail_on(column: &'static str) -> Self {
-            Self {
-                failed_column: Some(column),
-                ..Self::complete()
-            }
-        }
-
-        fn with_values(skill_name: &'static str, version: &'static str) -> Self {
-            Self {
-                failed_column: None,
-                skill_name,
-                version,
-            }
-        }
-    }
-
-    impl ActiveSkillVersionRow for FakeActiveSkillVersionRow {
-        fn string_column(&self, column: &'static str) -> Result<String, sqlx::Error> {
-            if self.failed_column == Some(column) {
-                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
-            }
-
-            Ok(match column {
-                "skill_name" => self.skill_name,
-                "version" => self.version,
-                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
-            }
-            .to_string())
-        }
-    }
-
-    #[test]
-    fn active_skill_version_row_decode_preserves_database_values() {
-        let (skill_name, version) =
-            decode_active_skill_version_row(&FakeActiveSkillVersionRow::complete()).unwrap();
-
-        assert_eq!(skill_name, "skill-a");
-        assert_eq!(version, "v2");
-    }
-
-    #[test]
-    fn active_skill_version_row_decode_fails_loudly_on_missing_columns() {
-        for column in ["skill_name", "version"] {
-            match decode_active_skill_version_row(&FakeActiveSkillVersionRow::fail_on(column))
-                .unwrap_err()
-            {
-                sqlx::Error::ColumnNotFound(name) => assert_eq!(name, column),
-                err => panic!("expected ColumnNotFound({column}), got {err:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn active_skill_version_row_decode_fails_loudly_on_empty_values() {
-        for (column, row) in [
-            (
-                "skill_name",
-                FakeActiveSkillVersionRow::with_values("   ", "v2"),
-            ),
-            (
-                "version",
-                FakeActiveSkillVersionRow::with_values("skill-a", ""),
-            ),
-        ] {
-            let error = decode_active_skill_version_row(&row).unwrap_err();
-            assert!(
-                matches!(error, sqlx::Error::Decode(_)),
-                "expected decode error for `{column}`, got {error:?}"
-            );
-            assert!(
-                error.to_string().contains(column),
-                "decode error should identify `{column}`: {error}"
-            );
         }
     }
 

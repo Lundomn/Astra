@@ -2,8 +2,7 @@ use crate::db_row::RowExt;
 use crate::server::run::lifecycle::TranscriptPersistPayload;
 use crate::server::*;
 use astra_core::{STATUS_CANCELLED, error_response, is_duplicate_key_error};
-use astra_services::context_manifest::session_artifact_raw_payload_is_available;
-use astra_services::session_restore::SessionRestoreService;
+use astra_services::session_artifact_store::session_artifact_raw_payload_is_available;
 use astra_services::session_workspace::{
     WORKSPACE_METADATA_ARTIFACT_KIND, WORKSPACE_METADATA_PROJECTION_ID, WorkspaceMetadata,
 };
@@ -63,7 +62,6 @@ pub(crate) struct SessionStateResponse {
     pub transcript_high_watermark: i64,
     pub active_run: Option<ActiveRunProjection>,
     pub workspace_authority: Option<WorkspaceAuthorityResponse>,
-    pub latest_context_manifest: Option<ContextManifestSummaryResponse>,
     pub state_summary: Vec<StateCategorySummaryResponse>,
     pub artifact_previews: Vec<ArtifactPreviewResponse>,
     pub anchor_memory: Vec<UserAnchorMemoryResponse>,
@@ -111,20 +109,6 @@ pub(crate) struct WorkspaceAuthorityResponse {
 }
 
 #[derive(Serialize, Debug, PartialEq, Eq)]
-pub(crate) struct ContextManifestSummaryResponse {
-    pub manifest_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-    pub turn_id: String,
-    pub reason: String,
-    pub total_estimated_tokens: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub budget_template_id: Option<String>,
-    pub policy_version: String,
-    pub created_at: String,
-}
-
-#[derive(Serialize, Debug, PartialEq, Eq)]
 pub(crate) struct StateCategorySummaryResponse {
     pub category: String,
     pub count: u32,
@@ -142,15 +126,6 @@ pub(crate) struct ArtifactPreviewResponse {
     pub round: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
-}
-
-#[derive(Serialize, Debug, PartialEq, Eq)]
-pub(crate) struct PromptRequestObservabilityResponse {
-    pub request_id: String,
-    pub request_hash: String,
-    pub message_count: u32,
-    pub tool_count: u32,
-    pub delta_counts: astra_services::PromptDeltaCounts,
 }
 
 #[derive(Serialize, Debug, PartialEq, Eq)]
@@ -175,9 +150,6 @@ pub(crate) struct CanonicalHeadObservabilityResponse {
 #[derive(Serialize, Debug, PartialEq, Eq)]
 pub(crate) struct SessionProjectionObservabilityResponse {
     pub observability_available: bool,
-    pub prompt_request_count: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_prompt_request: Option<PromptRequestObservabilityResponse>,
     pub canonical_heads: Vec<CanonicalHeadObservabilityResponse>,
     pub model_request_trace_coverage: astra_services::ModelRequestTraceCoverage,
     pub cursor_conflict_count: u64,
@@ -526,7 +498,8 @@ pub(crate) async fn list_resumable_sessions_handler(
         return Err(internal_error("shared MatrixOne pool is not configured"));
     };
     let limit = query.limit.clamp(1, MAX_RESUMABLE_SESSION_LIMIT);
-    let svc = astra_services::session_restore::HybridRestoreService::new(shared_pool.get().clone());
+    let svc =
+        astra_services::session_restore::SessionRestoreService::new(shared_pool.get().clone());
     let mut sessions = svc
         .list_resumable_sessions(&user.user_id)
         .await
@@ -621,13 +594,6 @@ pub(crate) async fn get_session_state_handler(
     let replay_required = transcript_replay_required || run_event_replay_required;
     let workspace_authority =
         load_workspace_authority(&state, &session.user_id, &session.session_id).await?;
-    let latest_context_manifest = load_latest_context_manifest(
-        pool,
-        &session.user_id,
-        &session.session_id,
-        active_run.as_ref().map(|run| run.run_id.as_str()),
-    )
-    .await?;
     let state_summary = load_state_summary(pool, &session.user_id, &session.session_id).await?;
     let artifact_previews =
         load_artifact_previews(&state, &session.user_id, &session.session_id).await?;
@@ -664,7 +630,6 @@ pub(crate) async fn get_session_state_handler(
         transcript_high_watermark,
         active_run,
         workspace_authority,
-        latest_context_manifest,
         state_summary,
         artifact_previews,
         anchor_memory,
@@ -1005,21 +970,6 @@ fn decode_state_category_summary(
     })
 }
 
-fn decode_context_manifest_summary(
-    row: &impl RowExt,
-) -> Result<ContextManifestSummaryResponse, String> {
-    Ok(ContextManifestSummaryResponse {
-        manifest_id: session_row_string(row, "manifest_id")?,
-        run_id: session_row_optional_string(row, "run_id")?,
-        turn_id: session_row_string(row, "turn_id")?,
-        reason: session_row_string(row, "reason")?,
-        total_estimated_tokens: session_row_u32(row, "total_estimated_tokens")?,
-        budget_template_id: session_row_optional_string(row, "budget_template_id")?,
-        policy_version: session_row_string(row, "policy_version")?,
-        created_at: session_row_string(row, "created_at")?,
-    })
-}
-
 fn decode_canonical_head_observability(
     row: &impl RowExt,
 ) -> Result<CanonicalHeadObservabilityResponse, String> {
@@ -1061,21 +1011,6 @@ async fn load_session_projection_observability(
     user_id: &str,
     session_id: &str,
 ) -> Result<SessionProjectionObservabilityResponse, (StatusCode, Json<ErrorResponse>)> {
-    let prompt_request_count =
-        astra_services::count_prompt_requests_for_session(pool, user_id, session_id)
-            .await
-            .map_err(internal_error)?;
-    let latest_prompt_request =
-        astra_services::load_latest_prompt_observability_for_session(pool, user_id, session_id)
-            .await
-            .map_err(internal_error)?
-            .map(|request| PromptRequestObservabilityResponse {
-                request_id: request.request_id,
-                request_hash: request.request_hash,
-                message_count: request.message_count,
-                tool_count: request.tool_count,
-                delta_counts: request.delta_counts,
-            });
     let canonical_heads = sqlx::query(
         "SELECT isolation_domain, branch_id, completed_turn, journal_event_seq, conversation_seq,
                 canonical_root_hash, projection_schema, compaction_generation,
@@ -1160,8 +1095,6 @@ async fn load_session_projection_observability(
         .map(|record| record.event.compaction);
     Ok(SessionProjectionObservabilityResponse {
         observability_available: true,
-        prompt_request_count,
-        latest_prompt_request,
         canonical_heads,
         model_request_trace_coverage,
         cursor_conflict_count,
@@ -1251,63 +1184,6 @@ async fn load_artifact_previews(
             created_at: artifact.created_at,
         })
         .collect())
-}
-
-async fn load_latest_context_manifest(
-    pool: &SharedPool,
-    user_id: &str,
-    session_id: &str,
-    preferred_run_id: Option<&str>,
-) -> Result<Option<ContextManifestSummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
-    if let Some(run_id) = preferred_run_id
-        && let Some(summary) =
-            fetch_latest_context_manifest(pool, user_id, session_id, Some(run_id)).await?
-    {
-        return Ok(Some(summary));
-    }
-    fetch_latest_context_manifest(pool, user_id, session_id, None).await
-}
-
-async fn fetch_latest_context_manifest(
-    pool: &SharedPool,
-    user_id: &str,
-    session_id: &str,
-    run_id: Option<&str>,
-) -> Result<Option<ContextManifestSummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let row = if let Some(run_id) = run_id {
-        sqlx::query(
-            "SELECT manifest_id, run_id, turn_id, reason, total_estimated_tokens,
-                    budget_template_id, policy_version,
-                    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
-             FROM context_manifests
-             WHERE user_id = ? AND session_id = ? AND run_id = ?
-             ORDER BY created_at DESC, manifest_id DESC
-             LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .bind(run_id)
-        .fetch_optional(pool.get())
-        .await
-        .map_err(internal_error)?
-    } else {
-        sqlx::query(
-            "SELECT manifest_id, run_id, turn_id, reason, total_estimated_tokens,
-                    budget_template_id, policy_version,
-                    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
-             FROM context_manifests
-             WHERE user_id = ? AND session_id = ?
-             ORDER BY created_at DESC, manifest_id DESC
-             LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .fetch_optional(pool.get())
-        .await
-        .map_err(internal_error)?
-    };
-    row.map(|row| decode_context_manifest_summary(&row).map_err(internal_error))
-        .transpose()
 }
 
 pub(crate) async fn update_session_handler(
@@ -2105,73 +1981,60 @@ pub(crate) async fn resume_session_handler(
     let Some(shared_pool) = state.shared_pool.as_ref() else {
         return Err(internal_error("shared MatrixOne pool is not configured"));
     };
-    let legacy = if query.continuation_only {
-        None
-    } else {
-        let svc =
-            astra_services::session_restore::HybridRestoreService::new(shared_pool.get().clone());
-        svc.restore_session(&user_id, &session.session_id)
-            .await
-            .map_err(internal_error)?
-    };
     let key = server_session_key(&user_id, &session.session_id);
-    let canonical_snapshot = match state.session_context_coordinator.as_ref() {
-        Some(coordinator) => Some(
-            coordinator
-                .load_admission_snapshot(&key)
-                .await
-                .map_err(session_context_http_error)?,
-        ),
-        None => None,
-    };
-    let mut restored = legacy.unwrap_or_else(|| astra_services::session_restore::RestoredSession {
-        session_id: session.session_id.clone(),
-        last_status: "active".into(),
-        restored_from_cloud: true,
-        ..Default::default()
-    });
-    if let Some(snapshot) = canonical_snapshot
-        && let Some(head) = snapshot.head
-    {
-        let coordinator = state
-            .session_context_coordinator
-            .as_ref()
-            .expect("coordinator produced the canonical head");
-        let materialized = coordinator
-            .materialize(&head)
-            .await
-            .map_err(session_context_http_error)?;
-        let materialized_root =
-            astra_turn_types::canonical_conversation_root(&materialized.messages);
-        let bundle = astra_turn_types::select_resume_bundle(
-            Some(&head.cursor),
-            [astra_turn_types::ResumeCandidateV1 {
-                source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
-                cursor: head.cursor.clone(),
-                conversation_messages: materialized.messages,
-                materialized_conversation_root_hash: Some(materialized_root),
-                degraded_reasons: Vec::new(),
-                repair_actions: Vec::new(),
-                projections: astra_turn_types::ResumeProjectionSetV1 {
-                    provider: Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
-                        head.cursor.clone(),
-                        astra_turn_types::ResumeProviderProjectionV1 {
-                            ..Default::default()
-                        },
-                    )),
-                    ..Default::default()
-                },
-            }],
-        )
-        .map_err(internal_error)?;
-        astra_services::session_restore::install_canonical_resume_bundle(&mut restored, bundle)
-            .map_err(internal_error)?;
-    } else if restored.resume_bundle.is_none() && restored.conversation_messages.is_empty() {
-        return Err(error_response(
+    let coordinator = state
+        .session_context_coordinator
+        .as_ref()
+        .ok_or_else(|| internal_error("session context coordinator is not configured"))?;
+    let snapshot = coordinator
+        .load_admission_snapshot(&key)
+        .await
+        .map_err(session_context_http_error)?;
+    let head = snapshot.head.ok_or_else(|| {
+        error_response(
             StatusCode::NOT_FOUND,
             format!("session {} has no resumable state", session.session_id),
-        ));
-    }
+        )
+    })?;
+    let materialized = coordinator
+        .materialize(&head)
+        .await
+        .map_err(session_context_http_error)?;
+    let materialized_root = astra_turn_types::canonical_conversation_root(&materialized.messages);
+    let bundle = astra_turn_types::select_resume_bundle(
+        Some(&head.cursor),
+        [astra_turn_types::ResumeCandidateV1 {
+            source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
+            cursor: head.cursor.clone(),
+            conversation_messages: materialized.messages,
+            materialized_conversation_root_hash: Some(materialized_root),
+            degraded_reasons: Vec::new(),
+            repair_actions: Vec::new(),
+            projections: astra_turn_types::ResumeProjectionSetV1 {
+                provider: Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
+                    head.cursor.clone(),
+                    Default::default(),
+                )),
+                ..Default::default()
+            },
+        }],
+    )
+    .map_err(internal_error)?;
+    let mut restored = if query.continuation_only {
+        astra_services::session_restore::RestoredSession {
+            session_id: session.session_id.clone(),
+            restored_from_cloud: true,
+            ..Default::default()
+        }
+    } else {
+        astra_services::session_restore::SessionRestoreService::new(shared_pool.get().clone())
+            .load_cloud_summary(&user_id, &session.session_id)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "session no longer exists"))?
+    };
+    astra_services::session_restore::install_canonical_resume_bundle(&mut restored, bundle)
+        .map_err(internal_error)?;
     // Resume is the hydration API consumed by CLI clients. Cross-placement
     // observation and control remain explicit operations on `/attachments`
     // and `/handoffs`; inferring a Server attachment here would assign the
@@ -3485,7 +3348,6 @@ fn session_artifact_response(
         retention_policy: artifact.retention_policy,
         retention_until: artifact.retention_until,
         status: artifact.status,
-        referenced_by_manifest_count: artifact.referenced_by_manifest_count,
         referenced_by_state_items_count: artifact.referenced_by_state_items_count,
         referenced_by_citation_count: artifact.referenced_by_citation_count,
         referenced_by_durable_count: artifact.referenced_by_durable_count,
@@ -4023,7 +3885,6 @@ mod tests {
         SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
         StoredSessionArtifact,
     };
-    use astra_services::{ContextManifestWrite, DatabaseContextManifestStore};
     use async_trait::async_trait;
     use axum::{
         Json,
@@ -4204,9 +4065,6 @@ mod tests {
                 "role" => "assistant",
                 "content" => "answer",
                 "category" => "decision",
-                "manifest_id" => "manifest-1",
-                "turn_id" => "turn-1",
-                "policy_version" => "v1",
                 "created_at" => "2026-06-26T12:00:00",
                 "expires_at" => "2026-06-26T14:00:00",
                 "event_type" => "auto_expire",
@@ -4224,7 +4082,6 @@ mod tests {
             self.fail_if_needed(column)?;
             Ok(match column {
                 "run_id" => Some("run-1".to_string()),
-                "budget_template_id" => Some("budget-1".to_string()),
                 "canonical_root_hash" => Some("a".repeat(64)),
                 "source_event_id" => None,
                 "payload_json" => Some(
@@ -4248,7 +4105,6 @@ mod tests {
                 "item_seq" => Ok(7),
                 "last_monotonic_id" => Ok(42),
                 "total" => Ok(4),
-                "total_estimated_tokens" => Ok(123),
                 "high_watermark" => Ok(11),
                 "last_event_idx" => Ok(10),
                 "completed_turn" => Ok(5),
@@ -4445,117 +4301,6 @@ mod tests {
             HeaderValue::from_static("Bearer session-test-token"),
         );
         headers
-    }
-
-    fn manifest_fixture_id(prefix: &str) -> String {
-        format!("{prefix}-{}", Uuid::new_v4().simple())
-    }
-
-    async fn insert_manifest_session(pool: &SharedPool, user_id: &str, session_id: &str) {
-        sqlx::query(
-            "INSERT INTO agent_sessions
-             (session_id, user_id, agent_id, title, status, metadata, created_at, updated_at)
-             VALUES (?, ?, 'perf-agent', 'perf session', 'active', '{}', NOW(6), NOW(6))",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .execute(pool.get())
-        .await
-        .expect("insert manifest reader session");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires ASTRA_TEST_DB_IT=1; live MatrixOne"]
-    async fn latest_manifest_reader_prefers_run_and_preserves_owner_scope() {
-        const MANIFESTS: usize = 3;
-
-        let pool = crate::turn::services::setup_live_pool_for_test().await;
-        let user_id = manifest_fixture_id("reader-user");
-        let session_id = manifest_fixture_id("reader-session");
-        let preferred_run_id = manifest_fixture_id("reader-preferred-run");
-        let latest_run_id = manifest_fixture_id("reader-latest-run");
-        let manifest_prefix = manifest_fixture_id("reader-manifest");
-        insert_manifest_session(&pool, &user_id, &session_id).await;
-
-        let store = DatabaseContextManifestStore::new(pool.clone());
-        for index in 0..MANIFESTS {
-            let outcome = store
-                .save_manifest(
-                    ContextManifestWrite {
-                        manifest_id: format!("{manifest_prefix}-{index:04}"),
-                        user_id: user_id.clone(),
-                        session_id: session_id.clone(),
-                        run_id: Some(if index + 1 == MANIFESTS {
-                            latest_run_id.clone()
-                        } else {
-                            preferred_run_id.clone()
-                        }),
-                        turn_id: format!("turn-{index}"),
-                        model_provider: "mock".to_string(),
-                        model_name: "perf-read-llm".to_string(),
-                        context_window_tokens: 8_000,
-                        max_output_tokens: 700,
-                        total_estimated_tokens: 1_200,
-                        policy_version: "context_manifest_v1".to_string(),
-                        tokenizer_id: Some("estimated_v1".to_string()),
-                        budget_template_id: Some("budget_v1_8k".to_string()),
-                        turn_intent: Some("normal".to_string()),
-                        reason: "normal_turn".to_string(),
-                        manifest_json: json!({}),
-                    },
-                    vec![],
-                )
-                .await
-                .expect("seed manifest");
-            assert_eq!(
-                outcome,
-                DurableCaptureOutcome::Inserted,
-                "seed must be a fresh capture"
-            );
-        }
-
-        let preferred =
-            load_latest_context_manifest(&pool, &user_id, &session_id, Some(&preferred_run_id))
-                .await
-                .expect("read preferred manifest")
-                .expect("preferred run has a manifest");
-        assert_eq!(
-            preferred.manifest_id,
-            format!("{manifest_prefix}-{:04}", MANIFESTS - 2)
-        );
-
-        let fallback = load_latest_context_manifest(&pool, &user_id, &session_id, None)
-            .await
-            .expect("read latest manifest")
-            .expect("session has a manifest");
-        assert_eq!(
-            fallback.manifest_id,
-            format!("{manifest_prefix}-{:04}", MANIFESTS - 1)
-        );
-
-        let missing_preferred = load_latest_context_manifest(
-            &pool,
-            &user_id,
-            &session_id,
-            Some("perf-read-missing-run"),
-        )
-        .await
-        .expect("read missing run fallback")
-        .expect("missing run falls back to session latest");
-        assert_eq!(
-            missing_preferred.manifest_id,
-            format!("{manifest_prefix}-{:04}", MANIFESTS - 1)
-        );
-
-        let wrong_owner = load_latest_context_manifest(
-            &pool,
-            "perf-read-not-owner",
-            &session_id,
-            Some(&preferred_run_id),
-        )
-        .await
-        .expect("read foreign owner");
-        assert!(wrong_owner.is_none(), "must not read another owner");
     }
 
     #[tokio::test]
@@ -4979,51 +4724,6 @@ mod tests {
     }
 
     #[test]
-    fn context_manifest_summary_decode_preserves_values_and_fails_loudly() {
-        let summary = decode_context_manifest_summary(&FakeSessionRow::complete())
-            .expect("context manifest decodes");
-        assert_eq!(summary.manifest_id, "manifest-1");
-        assert_eq!(summary.run_id.as_deref(), Some("run-1"));
-        assert_eq!(summary.turn_id, "turn-1");
-        assert_eq!(summary.reason, "stale");
-        assert_eq!(summary.total_estimated_tokens, 123);
-        assert_eq!(summary.budget_template_id.as_deref(), Some("budget-1"));
-        assert_eq!(summary.policy_version, "v1");
-        assert_eq!(summary.created_at, "2026-06-26T12:00:00");
-
-        for column in [
-            "manifest_id",
-            "run_id",
-            "turn_id",
-            "reason",
-            "total_estimated_tokens",
-            "budget_template_id",
-            "policy_version",
-            "created_at",
-        ] {
-            let err = match decode_context_manifest_summary(&FakeSessionRow::fail_on(column)) {
-                Ok(_) => panic!("missing context manifest column must fail: {column}"),
-                Err(err) => err,
-            };
-            assert!(
-                err.contains(&format!("decode column `{column}`")),
-                "error should identify context manifest column {column}: {err}"
-            );
-        }
-        for value in [-1, i64::from(u32::MAX) + 1] {
-            let err = decode_context_manifest_summary(&FakeSessionRow::with_i64(
-                "total_estimated_tokens",
-                value,
-            ))
-            .expect_err("invalid token count must fail");
-            assert!(
-                err.contains("total_estimated_tokens"),
-                "error should identify token column: {err}"
-            );
-        }
-    }
-
-    #[test]
     fn canonical_head_observability_decode_is_exact_and_fails_loudly() {
         let head = decode_canonical_head_observability(&FakeSessionRow::complete())
             .expect("canonical head decodes");
@@ -5249,7 +4949,6 @@ mod tests {
             retention_policy: None,
             retention_until: None,
             status: Some("active".to_string()),
-            referenced_by_manifest_count: 0,
             referenced_by_state_items_count: 0,
             referenced_by_citation_count: 0,
             referenced_by_durable_count: 0,

@@ -525,20 +525,35 @@ npm ci --ignore-scripts --prefix scripts/tui-reflow
 ASTRA_TEST_BINARY="$PWD/target/debug/astra" npm test --prefix scripts/tui-reflow
 ```
 
-CI runs the default terminal reader, `use-dev-tty` reader, and reflow binary in
-three parallel jobs on each of Linux and macOS. Separate builds keep dev-tty
-feature unification out of the default-reader checks. The existing
-`Test: terminal PTY (ubuntu-latest)` and `Test: terminal PTY (macos-15)` required
-checks aggregate the full terminal matrix; a failed, cancelled, or unexpectedly
-skipped shard cannot pass either gate. Unaffected changes skip the heavy jobs.
-Push runs populate the terminal dependency cache once per OS and the separate
-macOS workspace-coordination cache. The Rust terminal-reader PTY tests also
+CI runs the default terminal reader, `use-dev-tty` reader and all eight
+production-binary reflow journeys in three parallel Linux jobs. Linux also runs
+the complete vendored units with both reader feature sets. One Mac bundle runs
+the existing default CLI PTY/Bash suite, native workspace coordination/Clippy,
+and the single Mio simultaneous-readiness regression on Darwin's kqueue.
+The same dispatcher selects this platform-native inventory on Darwin and the
+full inventory on Linux. Mac does not prepare Node or build the production CLI
+and alternate-feature CLI graphs just to repeat the portable integration matrix.
+
+The existing Mac-named terminal/vendor check names are compatibility gates for
+this platform split: they require passing native Mac results and passing Linux
+terminal/vendor matrices, and their summaries state what ran on each OS. Failed,
+cancelled or unexpectedly skipped required work cannot pass. This intentionally
+removes macOS production-binary reflow and dev-tty cross-product coverage; Linux
+cannot prove those exact Darwin combinations. Default Mac PTY tests retain real
+SIGINT/terminal restoration, input and resize/cursor behavior. Unaffected changes
+skip heavy jobs. IDC failure never allocates paid fallback; producer stamps must
+match the current run and SHA, with a valid producer attempt no later than the
+current attempt. Failed-only reruns can reuse a same-version Mac success after
+Linux recovery. Node/reflow-only changes run Linux coverage and skip Mac; mixed
+native or unknown changes retain Mac coverage. Pushes populate the terminal
+cache once per OS.
+The Rust terminal-reader PTY tests also
 verify that a resize cursor query preserves keyboard/paste input and times out
 when the terminal does not answer.
 
 ## Live MatrixOne system E2E
 
-CI runs four independent online jobs: `core-runtime`, `core-turn-core`,
+CI runs three independent online jobs: `core-runtime`,
 `core-services`, and `integration`. Each runner starts its own MatrixOne and
 Memoria stack and keeps `ASTRA_TEST_DB_IT_TEST_THREADS=1`. The core shards use
 distinct database suffixes as well. This parallelizes package builds and test
@@ -567,8 +582,8 @@ npm --prefix web run build
 Missing Web build artifacts fail the test; they do not silently skip coverage.
 
 `make test-online` still runs the complete suite, and `ASTRA_ONLINE_LANE=core`
-still runs all three core groups. To reproduce a CI shard, choose
-`ASTRA_ONLINE_LANE=core-runtime`, `core-turn-core`, `core-services`, or
+still runs both core groups. To reproduce a CI shard, choose
+`ASTRA_ONLINE_LANE=core-runtime`, `core-services`, or
 `integration` and run `make test-online NEXTEST_ONLINE_PROFILE=strict-online-ci`
 with `ASTRA_TEST_DB_IT_TEST_THREADS=1`. Parallel CI isolation comes from separate
 service stacks; distinct database names alone do not remove shared-host load.

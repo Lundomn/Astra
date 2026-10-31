@@ -96,22 +96,17 @@ class SchemaInventoryTest(unittest.TestCase):
             "works",
             "work_establishment_operations",
             "work_goal_revisions",
-            "work_criteria",
             "work_criterion_revisions",
             "work_criterion_sets",
             "work_graph_revisions",
             "work_graph_sequences",
             "work_items",
             "work_item_revisions",
-            "work_item_edges",
             "work_branches",
             "work_branch_creation_operations",
             "work_branch_control_operations",
             "work_branch_deletion_operations",
             "work_branch_subjects",
-            "work_patch_artifacts",
-            "work_patch_materialization_operations",
-            "work_patch_commit_operations",
             "work_proposal_sequences",
             "work_proposals",
             "work_proposal_trigger_attempts",
@@ -131,7 +126,7 @@ class SchemaInventoryTest(unittest.TestCase):
             row["table"] for row in self.inventory["tables"] if row["domain"] == "work"
         }
         self.assertEqual(expected, actual)
-        self.assertEqual(33, len(actual))
+        self.assertEqual(28, len(actual))
 
     def test_storage_and_work_metadata_are_explicit_and_closed_world(self) -> None:
         inventory_names = {row["table"] for row in self.inventory["tables"]}
@@ -366,7 +361,6 @@ fn char_literal() { let slash = '/'; }
             "agent_sessions",
             "agent_runs",
             "run_checkpoints",
-            "conversation_log",
             "session_transcript_items",
             "tool_invocation_ledger",
             "semantic_read_observations",
@@ -435,11 +429,9 @@ fn char_literal() { let slash = '/'; }
 
     def test_state_task_workspace_tables_have_semantic_metadata(self) -> None:
         second_batch = {
-            "context_manifests",
             "session_device_leases",
             "session_device_lease_events",
             "session_state_items",
-            "data_versioning_checkpoints",
             "sweeper_leases",
             "workspace_records",
             "workspace_cleanup_debts",
@@ -465,10 +457,6 @@ fn char_literal() { let slash = '/'; }
 
     def test_state_task_workspace_metadata_locks_boundary_decisions(self) -> None:
         self.assertIn(
-            "parent manifest summary",
-            self.tables["context_manifests"]["merge_guidance"],
-        )
-        self.assertIn(
             "current projection surface",
             self.tables["session_state_items"]["merge_guidance"],
         )
@@ -479,10 +467,6 @@ fn char_literal() { let slash = '/'; }
         self.assertIn(
             "append-only audit",
             self.tables["session_device_lease_events"]["merge_guidance"],
-        )
-        self.assertIn(
-            "DatabaseDataVersioningService reads and writes",
-            self.tables["data_versioning_checkpoints"]["merge_guidance"],
         )
         self.assertIn(
             "cleanup debt can outlive the workspace record",
@@ -580,8 +564,6 @@ fn char_literal() { let slash = '/'; }
     def test_skill_and_agent_tables_have_semantic_metadata(self) -> None:
         skill_agent_tables = {
             "skills_registry",
-            "skill_metrics",
-            "skill_selection_events",
             "skill_installations",
             "skill_settings",
             "skill_resource_bindings",
@@ -615,14 +597,6 @@ fn char_literal() { let slash = '/'; }
         self.assertIn(
             "shared runtime catalog",
             self.tables["skills_registry"]["merge_guidance"],
-        )
-        self.assertIn(
-            "high-churn projections",
-            self.tables["skill_metrics"]["merge_guidance"],
-        )
-        self.assertIn(
-            "readers stop querying this table directly",
-            self.tables["skill_selection_events"]["merge_guidance"],
         )
         self.assertIn(
             "user's installed/activated state",
@@ -668,11 +642,9 @@ fn char_literal() { let slash = '/'; }
             "session_artifact_content_refs",
             "session_artifact_content_reservations",
             "session_artifact_content_upload_leases",
-            "session_checkpoints",
             "user_preferences",
             "edge_agent_registry",
             "plans",
-            "infra_sandbox_metadata",
         }
         for table in session_workflow_tables:
             with self.subTest(table=table):
@@ -703,10 +675,6 @@ fn char_literal() { let slash = '/'; }
             self.tables["session_artifacts"]["merge_guidance"],
         )
         self.assertIn(
-            "session-level restore snapshots",
-            self.tables["session_checkpoints"]["merge_guidance"],
-        )
-        self.assertIn(
             "per-user sync state",
             self.tables["user_preferences"]["merge_guidance"],
         )
@@ -718,10 +686,6 @@ fn char_literal() { let slash = '/'; }
             "current mutable plan state",
             self.tables["plans"]["merge_guidance"],
         )
-        self.assertIn(
-            "workspace_records track reusable workspaces",
-            self.tables["infra_sandbox_metadata"]["merge_guidance"],
-        )
 
 
     def test_high_growth_tables_have_retention_metadata(self) -> None:
@@ -729,9 +693,6 @@ fn char_literal() { let slash = '/'; }
             "agent_events",
             "agent_run_events",
             "run_checkpoints",
-            "conversation_log",
-            "prompt_request_records",
-            "prompt_deltas",
             "agent_message_queue",
         ]
         for table in high_growth_tables:
@@ -743,23 +704,6 @@ fn char_literal() { let slash = '/'; }
                 self.assertNotEqual(row["rebuildability"], "unclassified")
                 self.assertNotEqual(row["merge_guidance"], "unclassified")
 
-    def test_prompt_delta_retention_is_parent_bound(self) -> None:
-        parent = self.tables["prompt_request_records"]
-        child = self.tables["prompt_deltas"]
-        self.assertIn("parent fact", parent["state_class"])
-        self.assertIn("user_id/request_id", parent["primary_query"])
-        self.assertIn("session is inactive", parent["retention_policy"])
-        self.assertIn("run is terminal", parent["retention_policy"])
-        self.assertIn("ordered bounded batches", parent["retention_policy"])
-        self.assertIn("after child deltas", parent["retention_policy"])
-        self.assertIn("created_at_unix_ms", parent["retention_policy"])
-        self.assertIn("MatrixOne", parent["retention_policy"])
-        self.assertIn("do not delete child deltas independently", parent["merge_guidance"])
-        self.assertIn("prompt_request_records", child["retention_policy"])
-        self.assertIn("independent TTL breaks", child["retention_policy"])
-        self.assertIn("bounded batches", child["retention_policy"])
-        self.assertIn("before prompt_request_records", child["retention_policy"])
-        self.assertIn("position/delta_seq", child["primary_query"])
 
     def test_session_sync_log_is_removed_from_production_schema(self) -> None:
         self.assertNotIn(
@@ -833,7 +777,6 @@ fn char_literal() { let slash = '/'; }
             "session_state_revisions",
             "session_history_chunks",
             "session_artifacts_grants",
-            "data_versioning_checkpoints",
         }
         self.assertEqual(set(self.p1_5_reviews), expected)
 
@@ -868,21 +811,12 @@ fn char_literal() { let slash = '/'; }
             "creation path",
             self.p1_5_reviews["session_artifacts_grants"]["rationale"],
         )
-        self.assertIn(
-            "rollback/list",
-            self.p1_5_reviews["data_versioning_checkpoints"]["user_api_impact"],
-        )
 
     def test_p1_5_consolidation_source_evidence_still_exists(self) -> None:
         expectations = {
             "crates/services/src/state_sync.rs": [
                 "pull_all_preferences",
                 "user_preferences",
-            ],
-            "crates/services/src/data_versioning.rs": [
-                "data_versioning_checkpoints",
-                "create_checkpoint",
-                "list_checkpoints",
             ],
             "crates/services/src/storage.rs": [
                 "validate_core_schema_table_claim",
@@ -905,12 +839,9 @@ fn char_literal() { let slash = '/'; }
         self.assertIn("ordered bounded batches", delivery["retention_policy"])
         self.assertIn("consumer-scoped delivery state", delivery["merge_guidance"])
 
-    def test_conversation_log_retention_has_runtime_compaction_boundary(self) -> None:
-        row = self.tables["conversation_log"]
-        self.assertIn("model context reconstruction", row["retention_policy"])
-        self.assertIn("runtime compaction", row["retention_policy"])
-        self.assertIn("ordered bounded batches", row["retention_policy"])
-        self.assertIn("session hard delete", row["retention_policy"])
+    def test_retired_projection_tables_are_absent(self) -> None:
+        for table in ("conversation_log", "skill_selection_events", "infra_sandbox_metadata", "skill_metrics", "session_checkpoints"):
+            self.assertNotIn(table, self.tables)
 
     def test_session_high_growth_retention_mentions_bounded_hard_delete(self) -> None:
         for table in [
@@ -933,7 +864,6 @@ fn char_literal() { let slash = '/'; }
             "agent_message_queue",
             "agent_message_broadcast_delivery",
             "edge_pending_dispatch",
-            "context_manifest_items",
             "resource_limits",
             "resource_usage",
             "llm_provider_admission_windows",
@@ -957,7 +887,6 @@ fn char_literal() { let slash = '/'; }
         self.assertEqual(auto_increment, set())
         self.assertNotIn("agent_message_queue", auto_increment)
         self.assertNotIn("edge_pending_dispatch", auto_increment)
-        self.assertNotIn("context_manifest_items", auto_increment)
         self.assertNotIn("session_state_item_events", auto_increment)
         self.assertNotIn("auth_user_roles", auto_increment)
         self.assertNotIn("mcp_servers", auto_increment)
@@ -991,12 +920,6 @@ fn char_literal() { let slash = '/'; }
         self.assertIn("turn_chain_id", row["primary_query"])
         self.assertIn("edge poll", row["primary_query"])
 
-    def test_context_manifest_items_uses_manifest_order_identity(self) -> None:
-        row = self.tables["context_manifest_items"]
-        self.assertEqual(row["primary_key"], ["user_id", "manifest_id", "item_order"])
-        self.assertEqual(row["auto_increment_columns"], [])
-        self.assertEqual(row["auto_increment_hotspot_risk"], "not_applicable")
-        self.assertIn("manifest-local item", row["primary_query"])
 
     def test_session_state_item_events_uses_owner_event_identity(self) -> None:
         row = self.tables["session_state_item_events"]

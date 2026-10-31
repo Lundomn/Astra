@@ -836,8 +836,8 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
             );
         }
         if scenario == "ordinary" && !warm_context && !held_for_control {
-            use astra_services::session_restore::{HybridRestoreService, SessionRestoreService};
-            let restore = HybridRestoreService::new(b.ctx.pool.clone());
+            use astra_services::session_restore::SessionRestoreService;
+            let restore = SessionRestoreService::new(b.ctx.pool.clone());
             let extra_ids = (0..19)
                 .map(|_| uuid::Uuid::new_v4().to_string())
                 .collect::<Vec<_>>();
@@ -1137,5 +1137,197 @@ async fn post_provider_context_limit_preserves_answer_usage_and_tool_facts() {
             .drain_background_runs(std::time::Duration::from_secs(5))
             .await
     );
+    b.ctx.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1; provider is scripted localhost HTTP"]
+async fn skill_turns_preserve_results_without_a_selection_projection() {
+    require_system_e2e_env();
+    let capture = SqlCapture::default();
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
+        .expect("this integration process owns its SQL subscriber");
+    for present in [true, false] {
+        let b = bootstrap().await;
+        let skill_name = format!("cleanup-probe-{}", b.ctx.suffix);
+        {
+            sqlx::query("INSERT INTO skills_registry (skill_id, skill_name, version, skill_definition, created_by) VALUES (?, ?, '1.0.0', CAST(? AS JSON), ?)")
+                .bind(uuid::Uuid::new_v4().to_string()).bind(&skill_name)
+                .bind(json!({"skill_type":"local", "instructions":"Cleanup probe instructions."}).to_string())
+                .bind(&b.ctx.user_id).execute(&b.ctx.pool).await.unwrap();
+        }
+        let requested_skill = if present {
+            skill_name.clone()
+        } else {
+            format!("missing-{}", b.ctx.suffix)
+        };
+        let model = format!("mock-{}", b.ctx.suffix);
+        b.ctx.install_native_provider(&b.auth_header, vec![ProviderScript::new(
+            "selected skill and missing skill retain their real results",
+            move |request| request.body["model"] == model && request.body["stream"] == true,
+            vec![
+                answer(json!({"role":"assistant", "content":"", "tool_calls":[{
+                    "id":"selected-skill", "type":"function", "function":{"name":"skill",
+                    "arguments":json!({"skill_name":requested_skill}).to_string()}
+                }]}), "tool_calls"),
+                answer(json!({"role":"assistant", "content":"Skill round complete."}), "stop"),
+            ],
+        )]).await;
+        prime_chat_pool(&b.ctx).await;
+        *capture.0.lock().unwrap() = Some(Vec::new());
+        let request = axum::http::Request::builder().method("POST").uri("/chat/stream")
+            .header("authorization", &b.auth_header).header("content-type", "application/json")
+            .body(axum::body::Body::from(json!({"message":"Use the requested skill.",
+                "session_id": b.ctx.session_id, "model_selection":seeded_model_selection(&b.ctx),
+                "allow_skills":[skill_name],
+                "execution_policy":{"turn_intent":"fixed_default", "skill_auto_route":"disabled"}
+            }).to_string())).unwrap();
+        let (status, body) = collect_full_sse_stream(&b.ctx.app, request, 30).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        let events = parse_sse_events(&body);
+        assert!(
+            events
+                .iter()
+                .any(|event| event["type"] == "run_finished" && event["status"] == "completed"),
+            "{body}"
+        );
+        assert!(
+            b.ctx
+                .app_state
+                .drain_background_runs(std::time::Duration::from_secs(5))
+                .await
+        );
+        wait_for_chat_observers(b.ctx.app_state.metrics_registry(), 1).await;
+        let samples = capture.0.lock().unwrap().take().unwrap();
+        assert!(!samples.is_empty());
+        assert!(
+            samples
+                .iter()
+                .all(|sample| !sample.sql.contains("skill_selection_events")),
+            "neither success nor failure may issue a detached selection write"
+        );
+        let requests = b.ctx.native_provider_requests().await;
+        let result = requests.last().unwrap().body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| {
+                message["role"] == "tool" && message["tool_call_id"] == "selected-skill"
+            })
+            .and_then(|message| message["content"].as_str())
+            .unwrap_or_else(|| panic!("skill result missing: {body}"));
+        if present {
+            assert!(result.contains("Cleanup probe instructions."), "{result}");
+            assert!(result.contains("<skill-loaded"), "{result}");
+        } else {
+            assert!(
+                result.contains(&format!("Unknown skill `{requested_skill}`")),
+                "{result}"
+            );
+            assert!(!result.contains("<skill-loaded"), "{result}");
+        }
+        eprintln!(
+            "skill_selection present={present} total_sql={} retired_projection_sql=0",
+            samples.len()
+        );
+        b.ctx.close().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1; this process owns SQL capture"]
+async fn concurrent_run_projections_preserve_one_hundred_session_identities() {
+    require_system_e2e_env();
+    let capture = SqlCapture::default();
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
+        .expect("this integration binary owns its SQL subscriber");
+    let b = bootstrap().await;
+    let prefix = format!("poll-{}-", uuid::Uuid::new_v4());
+    let mut tasks = tokio::task::JoinSet::new();
+    for index in 0..100_u32 {
+        let session_id = format!("{prefix}s{index}");
+        let run_id = format!("{prefix}r{index}");
+        sqlx::query(
+            "INSERT INTO agent_sessions (session_id, user_id, status) VALUES (?, ?, 'active')",
+        )
+        .bind(&session_id)
+        .bind(&b.ctx.user_id)
+        .execute(&b.ctx.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_runs
+             (run_id, user_id, session_id, root_run_id, ancestor_path, depth, retry_scope,
+              status, execution_mode, owner_pod_id, owner_lease_expires_at,
+              run_generation, last_event_idx, total_prompt_tokens, total_completion_tokens,
+              total_tool_calls, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 0, 'node', 'running', 'web_agent', 'poll-fixture',
+                     TIMESTAMPADD(MINUTE, 5, NOW(6)), 0, -1, ?, 0, 0, NOW(6), NOW(6))",
+        )
+        .bind(&run_id)
+        .bind(&b.ctx.user_id)
+        .bind(&session_id)
+        .bind(&run_id)
+        .bind(&run_id)
+        .bind(index + 1)
+        .execute(&b.ctx.pool)
+        .await
+        .unwrap();
+    }
+    *capture.0.lock().unwrap() = Some(Vec::new());
+    for index in 0..100_u32 {
+        let app = b.ctx.app.clone();
+        let auth = b.auth_header.clone();
+        let session_id = format!("{prefix}s{index}");
+        let run_id = format!("{prefix}r{index}");
+        tasks.spawn(async move {
+            let (status, body) = get_json(
+                &app,
+                &format!("/chat/runs/{run_id}/projection?recent_limit=1"),
+                Some(&auth),
+                &[],
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            assert_eq!(body["run_id"], run_id);
+            assert_eq!(body["session_id"], session_id);
+            assert_eq!(body["status"], "running");
+            assert_eq!(body["total_prompt_tokens"], index + 1);
+            assert!(body["recent_events"].as_array().unwrap().is_empty());
+            assert!(body.get("observability").is_none());
+        });
+    }
+    let mut completed = 0;
+    while let Some(result) = tasks.join_next().await {
+        result.expect("independent public projection read");
+        completed += 1;
+    }
+    assert_eq!(completed, 100);
+    let samples = capture.0.lock().unwrap().take().unwrap();
+    assert!(
+        !samples.is_empty(),
+        "the query observer must cover real database reads"
+    );
+    assert!(
+        samples
+            .iter()
+            .all(|sample| !sample.sql.contains("prompt_request_records")
+                && !sample.sql.contains("prompt_deltas"))
+    );
+    let (rows, tokens): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), CAST(SUM(total_prompt_tokens) AS SIGNED) FROM agent_runs WHERE user_id = ? AND run_id LIKE ?",
+    ).bind(&b.ctx.user_id).bind(format!("{prefix}%")).fetch_one(&b.ctx.pool).await.unwrap();
+    assert_eq!((rows, tokens), (100, 5050));
+    for sql in [
+        "DELETE FROM agent_runs WHERE user_id = ? AND run_id LIKE ?",
+        "DELETE FROM agent_sessions WHERE user_id = ? AND session_id LIKE ?",
+    ] {
+        sqlx::query(sql)
+            .bind(&b.ctx.user_id)
+            .bind(format!("{prefix}%"))
+            .execute(&b.ctx.pool)
+            .await
+            .unwrap();
+    }
     b.ctx.close().await;
 }

@@ -415,29 +415,6 @@ All events in a causal chain.
 
 ---
 
-## Sandbox
-
-### POST /sandbox
-
-```json
-// Request
-{"name": "experiment_1", "description": "Test new prompt", "created_by": "alice"}
-
-// Response 201
-{"sandbox_name": "experiment_1", "status": "active"}
-```
-
-### GET /sandbox
-
-List the current user's sandboxes. Query param: optional `pattern` name
-filter.
-
-### GET /sandbox/{name}
-
-### DELETE /sandbox/{name} → 204
-
----
-
 ## Skills
 
 ### GET /skills
@@ -518,7 +495,10 @@ identity. `build_git_dirty=false` is an explicit clean-build declaration;
 Cargo builds (debug or release) without a valid attestation nonce or a complete
 trusted source declaration conservatively report `true`, even in a clean
 checkout. They do not watch every tracked file, so unrelated edits can reuse
-core without leaving an old clean identity that artifact verification accepts.
+the artifact identity library without leaving an old clean identity that artifact
+verification accepts. Git identity is embedded by `astra-build-info`, near the
+executable boundary, so commit metadata alone does not rebuild `astra-core`
+and its ordinary library consumers.
 
 Identity-sensitive builds must either use a valid 64-hex
 `ASTRA_BUILD_ATTESTATION_NONCE` (which watches all tracked files, even when the
@@ -567,3 +547,31 @@ field `conversation_authority` is unsupported and rejected as
 Run admission. A caller must finish or release an outstanding standalone
 Controller writer before starting Server chat. Session/Work Controller APIs
 and their signed execution grants remain separate supported contracts.
+
+## Retired persistence APIs
+
+`/sandbox` and `/sandbox/{name}` metadata CRUD,
+`/data-versioning/sandbox/{name}/checkpoint`, `/marketplace/quality-report`,
+`/marketplace/stats/{skill_name}` and `/marketplace/search` are no longer routed.
+The five `/data-versioning/checkpoints` and `/data-versioning/lineage` operations
+are also retired. They do not create database snapshots or expose lineage
+traversal. Skill registry/install and canonical `/events` APIs remain.
+
+The seven Work `patch-artifacts`, `patch-materializations` and `patch-commits`
+paths are also retired for all their methods. Work branches, graphs, evidence,
+recovery-point capture and ordinary authorized Git tools remain. No replacement
+patch API or compatibility route is registered.
+
+Run projection no longer includes the prompt-hash `observability` object. Session
+`projection_observability` no longer contains `prompt_request_count` or
+`latest_prompt_request`; canonical heads and actual model-request coverage remain.
+Session state also omits `latest_context_manifest`. Artifact responses omit
+`referenced_by_manifest_count`; only the retired diagnostic counter is removed.
+Real durable reference edges, state/citation counts and upload retention remain.
+The retired hash-diff history is not equivalent to measured provider cache usage.
+
+`POST /sessions/{id}/resume` returns canonical hydration (`session_id`,
+`last_status`, diagnostic totals and `resume_bundle`), rather than a Session
+header with `created_at`. Both full and `?continuation_only=true` restore
+require valid owner-scoped canonical Context; missing state returns 404 without
+activating the Session. Corrupt canonical state fails without activation.

@@ -76,7 +76,7 @@ use astra_services::{
     WorkspaceRecordStoreError, WorkspaceStateStore,
 };
 use astra_text_utils::xml_escape::{xml_escape_attr, xml_escape_text};
-use astra_tools::patch_materialization::observe_git_worktree_revision;
+use astra_tools::workspace_observation::observe_git_worktree_revision;
 use astra_turn_types::ModelSelection;
 use sqlx::Row;
 
@@ -127,10 +127,7 @@ use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, AgentLiveEventSink, AgentLiveSendError, AgentLiveSignal,
     AgentLiveTermination, SharedAgentLiveEventSink,
 };
-use astra_turn_core::contracts::{
-    TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker,
-    TurnSkillSelectionRecord,
-};
+use astra_turn_core::contracts::{TurnObserverRequest, TurnObserverWorker};
 use astra_turn_core::interruption::{InterruptionKind, ResumeAction, ResumeMode};
 use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
 use astra_turn_types::UserIntentStatus;
@@ -3908,7 +3905,7 @@ fn flush_turn_observability(
     execution_generation: Option<u64>,
 ) {
     let scope_matches = state.current_session_id.as_deref() == Some(session_id)
-        && state.context_manifest_user_id.as_deref() == Some(user_id);
+        && state.owner_user_id.as_deref() == Some(user_id);
     if !scope_matches {
         tracing::warn!("turn observability flush rejected: execution owner/session mismatch");
         return;
@@ -4793,7 +4790,6 @@ struct LoopEnvironment {
     run_id: String,
     agent_id: String,
     model_name: Option<String>,
-    shared_pool: Option<SharedPool>,
     thinking: astra_turn_core::thinking_config::ThinkingConfig,
     compact_strategy: astra_turn_core::microcompact::CompactStrategy,
     inference_purpose: astra_turn_types::InferencePurpose,
@@ -5722,8 +5718,6 @@ pub struct AgenticRunLifecycleService {
     /// Per-run progress event channel receivers (Phase F.3).
     /// Key: run_id → receiver that the WS handler drains.
     progress_channels: Arc<TokioMutex<HashMap<String, mpsc::Receiver<ProgressEvent>>>>,
-    /// Hook DB writer for decision audit + skill selection persistence.
-    hook_db_writer: Option<Arc<dyn TurnHookDbWriter>>,
     /// Memoria observer worker for cross-session knowledge extraction.
     observer_worker: Option<Arc<dyn TurnObserverWorker>>,
     /// Auxiliary event writer for ask_user lifecycle audit events.
@@ -5852,7 +5846,6 @@ impl AgenticRunLifecycleService {
             approval_channels: Arc::new(TokioMutex::new(HashMap::new())),
             user_prompt_channels: Arc::new(TokioMutex::new(HashMap::new())),
             progress_channels: Arc::new(TokioMutex::new(HashMap::new())),
-            hook_db_writer: None,
             observer_worker: None,
             auxiliary_event_writer: None,
             trace_ingestion: None,
@@ -6260,11 +6253,6 @@ impl AgenticRunLifecycleService {
         service: Arc<dyn astra_services::AgentBindingService>,
     ) -> Self {
         self.agent_binding_service = service;
-        self
-    }
-
-    pub fn with_hook_db_writer(mut self, writer: Arc<dyn TurnHookDbWriter>) -> Self {
-        self.hook_db_writer = Some(writer);
         self
     }
 
@@ -11849,7 +11837,6 @@ impl AgenticRunLifecycleService {
             run_id: run_id.to_owned(),
             agent_id: authorization.agent_id,
             model_name: authorization.model_name,
-            shared_pool: self.shared_pool.clone(),
             thinking: authorization.thinking,
             compact_strategy: authorization
                 .model_execution
@@ -12141,7 +12128,6 @@ impl AgenticRunLifecycleService {
             run_id,
             agent_id,
             model_name,
-            shared_pool,
             thinking,
             compact_strategy,
             inference_purpose,
@@ -12174,9 +12160,8 @@ impl AgenticRunLifecycleService {
             current_session_id: Some(session_id),
             current_run_id: Some(run_id),
             self_agent_id: agent_id,
-            context_manifest_pool: shared_pool,
-            context_manifest_user_id: Some(user_id),
-            context_manifest_model_name: model_name.clone(),
+            owner_user_id: Some(user_id),
+            policy_model_name: model_name.clone(),
             final_text: facts.original.final_text,
             final_text_model_item_id: facts.original.final_text_model_item_id,
             final_text_streamed: facts.original.final_text_streamed,
@@ -12348,7 +12333,7 @@ impl AgenticRunLifecycleService {
         // Wire the plan repository so enter/exit_plan_mode tools work and
         // the write-tool guard can check `active_plan_id`.
         if let Some(shared) = &self.shared_pool {
-            executor.set_context_manifest_pool(shared.clone());
+            executor.set_service_pool(shared.clone());
             if let Some(binding) = work_runtime_binding {
                 executor.set_work_binding(runtime_tool_executor::WorkRuntimeBinding::new(
                     shared.clone(),
@@ -13823,7 +13808,6 @@ impl AgenticRunLifecycleService {
                 .map(|heartbeat| heartbeat.terminal_authority()),
             owner_pod_id: self.run_engine.execution_owner_pod_id().map(str::to_owned),
             user_message,
-            hook_db_writer: self.hook_db_writer.clone(),
             observer_worker: self.observer_worker.clone(),
             metrics_registry: self.metrics_registry.clone(),
         };
@@ -15694,7 +15678,7 @@ impl AgenticRunLifecycleService {
                 &facts.hooks,
             );
             let mut state = Self::assemble_loop_state(environment, facts);
-            state.context_manifest_user_id = Some(user_id.clone());
+            state.owner_user_id = Some(user_id.clone());
             state.current_run_owner_generation = Some(execution_owner_generation);
             state.runtime_manifest = Self::build_runtime_manifest(
                 &request,
@@ -24321,7 +24305,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             run_id: config.run_id.clone(),
             agent_id: config.agent_profile.agent_id.clone(),
             model_name: child_model_name.clone(),
-            shared_pool: self.shared_pool.clone(),
             thinking: generation_controls.thinking.clone(),
             inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             request_constraints: config.request_constraints.clone(),
@@ -24467,7 +24450,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             }
 
             if let Some(pool) = self.shared_pool.as_ref() {
-                executor.set_context_manifest_pool(pool.clone());
+                executor.set_service_pool(pool.clone());
                 if let Some(binding) = durable_work_binding.as_ref() {
                     let owner_id = WorkOwnerId::parse(config.user_id.clone())
                         .map_err(|error| format!("invalid child Work owner binding: {error}"))?;

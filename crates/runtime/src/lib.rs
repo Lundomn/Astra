@@ -49,9 +49,7 @@ pub use self_model::introspection;
 
 // ── Internal modules: runtime storage helpers ────────────────────────────────
 
-pub(crate) use data_layer::storage::{
-    ensure_core_schema, insert_turn_skill_selection, resolve_active_skill_versions,
-};
+pub(crate) use data_layer::storage::ensure_core_schema;
 
 // ── Public modules: runtime core ─────────────────────────────────────────────
 
@@ -148,9 +146,6 @@ pub use astra_services::{
         ContextService, DatabaseContextService, SnapshotCreateRequestData, SnapshotListFilter,
         SnapshotListItem, SnapshotListRecord, SnapshotRecord, UnconfiguredContextService,
     },
-    data_versioning::{
-        DataVersioningService, DatabaseDataVersioningService, UnconfiguredDataVersioningService,
-    },
     decisions::{
         DatabaseDecisionService, DecisionCreateRequestData, DecisionListFilter, DecisionListRecord,
         DecisionRecord, DecisionService, DecisionWithContextRecord, UnconfiguredDecisionService,
@@ -160,9 +155,6 @@ pub use astra_services::{
         EventRecord, EventService, UnconfiguredEventService,
     },
     marketplace::{DatabaseMarketplaceService, MarketplaceService, UnconfiguredMarketplaceService},
-    marketplace_stats::{
-        DatabaseMarketplaceStatsService, MarketplaceStatsService, NoopMarketplaceStatsService,
-    },
     mcp_registry::{
         DatabaseMcpRegistryService, McpRegisterRecord, McpRegisterRequestData, McpRegistryService,
         UnconfiguredMcpRegistryService,
@@ -181,7 +173,6 @@ pub use astra_services::{
         CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, RunLifecycleService,
         RunListRecord, RunStatusRecord,
     },
-    sandbox::{DatabaseSandboxService, SandboxRecord, SandboxService, UnconfiguredSandboxService},
     session_audit::{
         AuditSessionListItem, AuditSessionListParams, AuditSessionListResponse, CrossSessionStats,
         CrossSessionStatsParams, CrossSessionToolAnalytics, DatabaseSessionAuditService,
@@ -224,13 +215,12 @@ pub use orchestration::AgentHistoryRecord;
 // ── Re-exports: turn engine ──────────────────────────────────────────────────
 
 pub use astra_turn_core::contracts::{
-    TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnHookDbPersistPlan, TurnHookDbWriter,
-    TurnObserverOutcome, TurnObserverRequest, TurnObserverWorker, TurnSkillSelectionRecord,
+    TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnObserverOutcome, TurnObserverRequest,
+    TurnObserverWorker,
 };
 
 pub use turn::services::{
-    DatabaseTraceEventWriter, DatabaseTurnAuxiliaryEventWriter, DatabaseTurnHookDbWriter,
-    DatabaseTurnObserverWorker,
+    DatabaseTraceEventWriter, DatabaseTurnAuxiliaryEventWriter, DatabaseTurnObserverWorker,
 };
 
 pub use astra_turn_core::{

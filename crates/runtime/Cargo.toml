@@ -40,6 +40,7 @@ name = "client_compatibility"
 required-features = ["moi-compat-tests"]
 
 [dependencies]
+astra-build-info.workspace = true
 crc32fast = "1.4"
 dirs = "6.0.0"
 fastrand = "2"
@@ -60,7 +61,7 @@ astra-server-types = { workspace = true, features = ["server"] }
 astra-sync-protocol.workspace = true
 astra-mcp.workspace = true
 astra-skills.workspace = true
-astra-turn-core = { workspace = true, features = ["db-store"] }
+astra-turn-core.workspace = true
 astra-turn-types.workspace = true
 astra-services.workspace = true
 astra-tools.workspace = true
